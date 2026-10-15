@@ -219,3 +219,143 @@ def test_validate_rollout_root_rejects_a_world_writable_sessions_root(tmp_path: 
 
     sessions.chmod(0o755)
     validate_rollout_root(sessions)  # Codex's own 0755 must stay acceptable.
+
+
+# --- Codex CLI 0.149+/0.160 item format (#2316) -------------------------------
+
+FIXTURE_0160 = Path(__file__).parent / "fixtures" / "codex_rollout_0_160_1.jsonl"
+FIXTURE_0160_ID = "00000000-0000-7000-8000-000000002316"
+CAPTURED_0160 = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
+SPEECH_0160_NEWEST_FIRST = [
+    ("assistant", "synthetic answer two"),
+    ("assistant", "synthetic progress note"),
+    ("user", "synthetic question two"),
+    ("assistant", "synthetic answer one"),
+    ("user", "synthetic question one"),
+]
+
+
+def _install_0160(root: Path, extra: list[str] | None = None) -> Path:
+    sessions = root / "sessions" / "2026" / "10" / "11"
+    sessions.mkdir(mode=0o755, parents=True, exist_ok=True)
+    path = sessions / f"rollout-2026-10-11T11-00-00-{FIXTURE_0160_ID}.jsonl"
+    body = FIXTURE_0160.read_text(encoding="utf-8")
+    path.write_text(body + "".join(line + "\n" for line in extra or ()), encoding="utf-8")
+    path.chmod(0o644)
+    return path
+
+
+def _non_speech_0160() -> list[str]:
+    """The fixture's own tool/reasoning/token records, re-stamped after the speech."""
+
+    lines = []
+    for raw in FIXTURE_0160.read_text(encoding="utf-8").splitlines():
+        record = json.loads(raw)
+        payload = record["payload"]
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        if record["type"] == "response_item" and payload.get("type") != "message":
+            lines.append(record)
+        elif payload.get("type") == "token_count" or item.get("type") in {"CommandExecution", "Reasoning"}:
+            lines.append(record)
+    assert len(lines) >= 4
+    restamped = []
+    for record in lines:
+        payload = dict(record["payload"])
+        if "turn_id" in payload:
+            payload["turn_id"] = "turn-0002"
+        restamped.append(
+            json.dumps({**record, "timestamp": "2026-10-11T11:20:00.000Z", "payload": payload})
+        )
+    return restamped
+
+
+def test_codex_0160_item_completed_speech_is_read(tmp_path: Path) -> None:
+    """0.160.1 writes no user_message event; speech lives in item_completed."""
+
+    path = _install_0160(tmp_path)
+    assert b'"user_message"' not in path.read_bytes()
+
+    messages, last_turn_id, truncated = read_codex_rollout_candidates(
+        path, FIXTURE_0160_ID, limits=TranscriptBounds(), captured=CAPTURED_0160
+    )
+
+    assert [(m.role, m.text) for m in messages] == SPEECH_0160_NEWEST_FIRST
+    assert last_turn_id == "turn-0002"
+    assert truncated is False
+    joined = " ".join(m.text for m in messages)
+    for leaked in ("SYNTHETIC-DEVELOPER", "SYNTHETIC-INJECTED", "SYNTHETIC-TOOL", "SYNTHETIC-REASONING", "SYNTHETIC-DIFF"):
+        assert leaked not in joined
+
+
+def test_mixed_legacy_and_item_speech_is_not_double_counted(tmp_path: Path) -> None:
+    """One utterance in both spellings counts once; legacy-only speech survives."""
+
+    item = {"type": "item_completed", "turn_id": "turn-1"}
+    path = _write_rollout(
+        tmp_path,
+        "sess-mixed",
+        [
+            _line("event_msg", {"type": "user_message", "message": "같은 질문"}, NOW - timedelta(minutes=9)),
+            _line("event_msg", {**item, "item": {"type": "UserMessage", "id": "u1", "content": [{"type": "text", "text": "같은 질문"}]}}, NOW - timedelta(minutes=9)),
+            _line("event_msg", {**item, "item": {"type": "AgentMessage", "id": "a1", "content": [{"type": "Text", "text": "첫 줄"}, {"type": "Text", "text": "둘째 줄"}]}}, NOW - timedelta(minutes=8)),
+            _line("event_msg", {"type": "agent_message", "message": "첫 줄 둘째 줄"}, NOW - timedelta(minutes=8)),
+            _line("event_msg", {"type": "agent_message", "message": "레거시에만 있는 답"}, NOW - timedelta(minutes=7)),
+            _line("response_item", {"type": "agent_message", "author": "x", "recipient": "y", "content": [{"type": "input_text", "text": "inter-agent traffic"}]}, NOW - timedelta(minutes=7)),
+        ],
+    )
+
+    messages, _turn, _truncated = read_codex_rollout_candidates(
+        path, "sess-mixed", limits=TranscriptBounds(), captured=NOW
+    )
+
+    assert [(m.role, m.text) for m in messages] == [
+        ("assistant", "레거시에만 있는 답"),
+        ("assistant", "첫 줄\n둘째 줄"),
+        ("user", "같은 질문"),
+    ]
+
+
+def test_tool_heavy_tail_does_not_exhaust_the_item_budget(tmp_path: Path) -> None:
+    """Non-speech records after the last message must not hide the speech."""
+
+    tail = _non_speech_0160() * 80  # >= 320 non-speech records after the speech
+    path = _install_0160(tmp_path, tail)
+
+    messages, last_turn_id, _truncated = read_codex_rollout_candidates(
+        path, FIXTURE_0160_ID, limits=TranscriptBounds(), captured=CAPTURED_0160
+    )
+
+    assert [(m.role, m.text) for m in messages] == SPEECH_0160_NEWEST_FIRST
+    assert last_turn_id == "turn-0002"
+
+
+def test_speech_beyond_the_first_tail_window_is_found_within_the_byte_bound(
+    tmp_path: Path,
+) -> None:
+    """A tail of megabytes of tool output widens once, bounded by bytes."""
+
+    bulky = json.dumps(
+        {
+            "timestamp": "2026-10-11T11:30:00.000Z",
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": "c", "output": "x" * (512 * 1024)},
+        }
+    )
+    path = _install_0160(tmp_path, [bulky] * 6)  # ~3 MiB, past the 1.6 MiB default window
+
+    messages, _turn, _truncated = read_codex_rollout_candidates(
+        path, FIXTURE_0160_ID, limits=TranscriptBounds(), captured=CAPTURED_0160
+    )
+
+    assert [(m.role, m.text) for m in messages] == SPEECH_0160_NEWEST_FIRST
+
+
+def test_item_budget_counts_speech_only(tmp_path: Path) -> None:
+    path = _install_0160(tmp_path)
+
+    messages, _turn, truncated = read_codex_rollout_candidates(
+        path, FIXTURE_0160_ID, limits=TranscriptBounds(max_items=2), captured=CAPTURED_0160
+    )
+
+    assert [(m.role, m.text) for m in messages] == SPEECH_0160_NEWEST_FIRST[:2]
+    assert truncated is True

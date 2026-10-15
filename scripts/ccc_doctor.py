@@ -568,6 +568,27 @@ def _read_regular_text(path: Path) -> str | None:
             os.close(fd)
 
 
+_EMPTY_SNAPSHOT_SUCCESS_STATUSES = frozenset({"snapshot_done", "extraction_done"})
+
+
+def _is_empty_snapshot_success(job: dict[str, Any]) -> bool:
+    """True for a job that "succeeded" on a zero-byte snapshot (#2316).
+
+    Extraction accounting records the snapshot size per attempt; a job is an
+    empty success when every recorded attempt saw 0 bytes. Jobs without
+    accounting (snapshot_done awaiting extraction, or older journals) fall back
+    to the stored snapshot's byte_count.
+    """
+    if job.get("status") not in _EMPTY_SNAPSHOT_SUCCESS_STATUSES:
+        return False
+    accounting = job.get("extraction_accounting")
+    if isinstance(accounting, list) and accounting:
+        sizes = [entry.get("snapshot_bytes") if isinstance(entry, dict) else None for entry in accounting]
+        return all(type(size) is int and size == 0 for size in sizes)
+    snapshot = job.get("snapshot")
+    return isinstance(snapshot, dict) and type(snapshot.get("byte_count")) is int and snapshot["byte_count"] == 0
+
+
 def claude_project_slug(project_root: Path) -> str:
     """Mirror of bridge/core/conversation_paths.claude_project_dir_name."""
     return str(project_root).replace("/", "-").replace("_", "-").replace(".", "-")
@@ -923,6 +944,7 @@ class Doctor:
         self.check_distill_readiness()
         self.check_claude_transcripts_privacy()
         self.check_snapshot_refusals()
+        self.check_empty_snapshot_successes()
         self.check_skill_promotion_backlog()
         self.check_skill_pending_backlog()
         self.check_skill_prescreen()
@@ -1452,13 +1474,17 @@ class Doctor:
             return
         self.add("정상", item, f"mode={mode:04o}: {directory}", "none")
 
-    def check_snapshot_refusals(self) -> None:
-        """Count distill jobs terminalized as invalid_snapshot_request in the last 7 days (#2306)."""
-        item = "distill snapshot refusals"
+    def _recent_distill_jobs(self) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+        """Parsed distill job files modified in the last 7 days, per journal label.
+
+        Returns ``([(label, job), ...], unreadable)``. Only regular files are
+        jobs (#2308): the bridge opens job files O_NOFOLLOW and refuses anything
+        else, so a FIFO/symlink/dir named *.json is skipped (reading a FIFO
+        would hang the doctor) rather than counted as unreadable.
+        """
         root = self._served_project_root()
         cutoff = time.time() - _SNAPSHOT_REFUSAL_WINDOW_SECONDS
-        scanned = 0
-        refused: list[tuple[str, str]] = []
+        jobs: list[tuple[str, dict[str, Any]]] = []
         unreadable = 0
         for rel, label in _SNAPSHOT_REFUSAL_JOURNALS:
             journal = root / rel
@@ -1468,15 +1494,11 @@ class Doctor:
             try:
                 entries = list(os.scandir(journal))
             except OSError:
-                unreadable += 1  # a refusal hidden behind an unreadable dir is not "0"
+                unreadable += 1  # a finding hidden behind an unreadable dir is not "0"
                 continue
             for entry in entries:
                 if not entry.name.endswith(".json"):
                     continue
-                # #2308: only regular files are jobs. The bridge opens job files
-                # O_NOFOLLOW and refuses anything else, so a FIFO/symlink/dir
-                # named *.json cannot hold a refusal — skip it (reading a FIFO
-                # would hang the doctor) rather than count it as unreadable.
                 with contextlib.suppress(OSError):
                     if not entry.is_file(follow_symlinks=False):
                         continue
@@ -1493,10 +1515,19 @@ class Doctor:
                 except (OSError, ValueError):
                     unreadable += 1
                     continue
-                scanned += 1
-                if isinstance(job, dict) and job.get("error_code") == "invalid_snapshot_request":
-                    stamp = str(job.get("updated_at") or job.get("created_at") or "")[:16]
-                    refused.append((stamp, label))
+                jobs.append((label, job if isinstance(job, dict) else {}))
+        return jobs, unreadable
+
+    def check_snapshot_refusals(self) -> None:
+        """Count distill jobs terminalized as invalid_snapshot_request in the last 7 days (#2306)."""
+        item = "distill snapshot refusals"
+        jobs, unreadable = self._recent_distill_jobs()
+        scanned = len(jobs)
+        refused: list[tuple[str, str]] = []
+        for label, job in jobs:
+            if job.get("error_code") == "invalid_snapshot_request":
+                stamp = str(job.get("updated_at") or job.get("created_at") or "")[:16]
+                refused.append((stamp, label))
         extra = f"; unreadable={unreadable}" if unreadable else ""
         if not refused:
             if unreadable:
@@ -1519,6 +1550,47 @@ class Doctor:
             "those sessions were not distilled. Find the reason in the bridge log "
             "('distill snapshot refused'), fix it (e.g. the claude transcripts dir mode), "
             "and decide any replay separately — replay needs explicit approval. The count "
+            "covers the last 7 days, so it clears on its own a week after the cause is fixed",
+        )
+
+    def check_empty_snapshot_successes(self) -> None:
+        """Count distill "successes" whose snapshot carried zero bytes in the last 7 days (#2316).
+
+        A job that reaches snapshot_done/extraction_done with an empty
+        transcript reports success at every layer while the session's memory is
+        discarded — no error_code, so check_snapshot_refusals never sees it.
+        Body-free: only counts, timestamps and journal labels are reported.
+        """
+        item = "distill empty snapshots"
+        jobs, unreadable = self._recent_distill_jobs()
+        empty: list[tuple[str, str]] = []
+        for label, job in jobs:
+            if _is_empty_snapshot_success(job):
+                stamp = str(job.get("updated_at") or job.get("created_at") or "")[:16]
+                empty.append((stamp, label))
+        extra = f"; unreadable={unreadable}" if unreadable else ""
+        if not empty:
+            if unreadable:
+                self.add(
+                    "경고",
+                    item,
+                    f"recent=0 (7d, scanned={len(jobs)}){extra}",
+                    "a distill journal (dir or job file) could not be read as this user; "
+                    "run ccc-doctor as the bridge user to see empty-snapshot distills",
+                )
+                return
+            self.add("정상", item, f"recent=0 (7d, scanned={len(jobs)}){extra}", "none")
+            return
+        latest = max(stamp for stamp, _ in empty)
+        channels = ",".join(sorted({channel for _, channel in empty}))
+        self.add(
+            "경고",
+            item,
+            f"snapshot_bytes=0 successes={len(empty)} in 7d (latest {latest}, {channels}){extra}",
+            "those sessions were marked distilled but their snapshot was empty, so nothing was "
+            "stored. A bridge with #2316 reads the Codex 0.149+ item format and fails an empty "
+            "snapshot as retryable instead; if this count keeps growing after that, check the "
+            "snapshot reader for that provider. Any replay needs explicit approval. The count "
             "covers the last 7 days, so it clears on its own a week after the cause is fixed",
         )
 
