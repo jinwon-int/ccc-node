@@ -99,6 +99,22 @@ ln -s "$TMP/outside/x.jsonl" "$TMP/claude/p2/link.jsonl"
 python3 "$GG" index claude "$TMP/claude" >/dev/null
 ok "symlinked transcript is skipped" '[ -z "$(s 심볼릭)" ]'
 
+# ---- 6b. self-echo + automation exclusion (shadow: 16% of seoseo index) --------
+mkdir -p "$TMP/claude/p3" "$TMP/claude/-tmp-ccc-claude-distill-x1"
+printf '%s\n' '{"type":"user","message":{"content":"아래는 peer 메모리(요약 사실)와 MemPalace(원문 발췌)에서 검색한 근거다. 질문: 에코질문"}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"합성답변 에코"}]}}' > "$TMP/claude/p3/synth.jsonl"
+printf '%s\n' '{"type":"user","message":{"content":"디스틸 입력 본문"}}' > "$TMP/claude/-tmp-ccc-claude-distill-x1/d.jsonl"
+printf '%s\n' '{"type":"user","message":{"content":"[external_event: github_pr_checks terminal=failure]"}}' \
+  '{"type":"user","message":{"content":"<ccc_skill_advice>스킬안내잡음</ccc_skill_advice>진짜 질문 본문"}}' > "$TMP/claude/p3/noise.jsonl"
+python3 "$GG" index claude "$TMP/claude" >/dev/null
+ok "synthesis prompt session not indexed" '[ -z "$(s 에코질문)" ] && [ -z "$(s 합성답변)" ]'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"나중에 붙은 합성 응답"}]}}' >> "$TMP/claude/p3/synth.jsonl"
+python3 "$GG" index claude "$TMP/claude" >/dev/null
+ok "synthesis session stays excluded on append" '[ -z "$(s "나중에 붙은")" ]'
+ok "distill working dir not indexed" '[ -z "$(s 디스틸)" ]'
+ok "bridge external_event line dropped" '[ -z "$(s github_pr_checks)" ]'
+ok "skill advice block stripped, message kept" '[ -z "$(s 스킬안내잡음)" ] && grep -q "진짜 질문" <<<"$(s 진짜)"'
+
 # ---- 7. status ------------------------------------------------------------------
 st="$(python3 "$GG" status)"
 ok "status reports ok + integrity" 'grep -q "\"state\": \"ok\"" <<<"$st" && grep -q "\"integrity\": \"ok\"" <<<"$st"'

@@ -49,6 +49,19 @@ _HANGUL_RUN = re.compile(r"[가-힣]+")
 _TOKEN = re.compile(r"[A-Za-z0-9_.\-/#]+|[가-힣]+")
 _REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 _CMD_NOISE = re.compile(r"^\s*<(command-|local-command-|bash-|task-notification)", re.S)
+_ADVICE = re.compile(r"<ccc_skill_advice>.*?</ccc_skill_advice>", re.S)
+# Bridge/harness events and interrupts are not conversation.
+_NOISE_PREFIX = ("[external_event:", "[Request interrupted", "[SYSTEM NOTIFICATION")
+# nunchi's own synthesis prompts (dialectic / synthesize-stdin). A session that
+# opens with one is a synthesis call, not a conversation: indexing it makes
+# every later query retrieve its own echoed prompt (#2331 shadow: 16% of the
+# seoseo index). Keep in sync with nunchi.py's prompt openings.
+_SELF_PROMPTS = (
+    "아래는 peer 메모리(요약 사실)와 MemPalace",
+    "아래는 Family Wiki에서 검색한 근거다",
+)
+# Automation working dirs whose transcripts are pipeline I/O, not dialogue.
+_SKIP_DIR_MARKERS = ("ccc-claude-distill", "nunchi-audit-synth")
 _STOP = {
     "the", "a", "an", "of", "to", "in", "and", "or", "is", "are", "was", "were",
     "what", "which", "how", "when", "where", "who", "why", "did", "do", "does",
@@ -83,7 +96,7 @@ def connect(path=None):
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS files(
         path TEXT PRIMARY KEY, provider TEXT, size INTEGER, offset INTEGER,
-        inode INTEGER, indexed_at REAL);
+        inode INTEGER, indexed_at REAL, skip INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS chunks(
         id INTEGER PRIMARY KEY, provider TEXT, scope TEXT, session TEXT,
         path TEXT, seq INTEGER, ts TEXT, role TEXT, body TEXT,
@@ -135,8 +148,8 @@ def _text_blocks(content, allowed):
 
 
 def _clean(text):
-    text = _REMINDER.sub("", text or "").strip()
-    if not text or _CMD_NOISE.match(text):
+    text = _ADVICE.sub("", _REMINDER.sub("", text or "")).strip()
+    if not text or _CMD_NOISE.match(text) or text.startswith(_NOISE_PREFIX):
         return ""
     return text[:MAX_BODY]
 
@@ -239,14 +252,17 @@ def index_file(c, provider, path, root, scope, embed_rows):
     if st is None:
         return 0
     key = str(Path(path).absolute())
-    row = c.execute("SELECT size, offset, inode FROM files WHERE path=?", (key,)).fetchone()
+    row = c.execute("SELECT size, offset, inode, skip FROM files WHERE path=?",
+                    (key,)).fetchone()
     offset = 0
+    skip = 1 if any(m in key for m in _SKIP_DIR_MARKERS) else 0
     if row:
-        _size, prev_off, inode = row
+        _size, prev_off, inode, prev_skip = row
         if inode != st.st_ino or st.st_size < prev_off:
             _drop_path(c, key)          # rewritten/rotated → reindex from scratch
         else:
             offset = prev_off
+            skip = skip or (prev_skip or 0)
     if offset == st.st_size and row:
         return 0
     seq0 = c.execute("SELECT COALESCE(MAX(seq), -1) FROM chunks WHERE path=?",
@@ -271,15 +287,21 @@ def index_file(c, provider, path, root, scope, embed_rows):
         if not parsed:
             continue
         role, text, ts, session = parsed
+        if skip:
+            continue
+        if role == "USER" and (text or "").lstrip().startswith(_SELF_PROMPTS):
+            skip = 1                     # synthesis session: drop it whole
+            _drop_path(c, key)
+            continue
         body = _clean(text)
         if not body:
             continue
         added += _insert(c, provider, scope, session or session_default, key, seq,
                          ts, role, body, embed_rows)
         seq += 1
-    c.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?)",
-              (key, provider, st.st_size, offset + len(consumed), st.st_ino, time.time()))
-    return added
+    c.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)",
+              (key, provider, st.st_size, offset + len(consumed), st.st_ino, time.time(), skip))
+    return 0 if skip else added
 
 
 def index_dir(provider, root, scope="", embed=None):
