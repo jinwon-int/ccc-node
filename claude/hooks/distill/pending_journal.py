@@ -59,6 +59,7 @@ _HARD_CLASSES = {
 }
 _DISABLED = {"0", "false", "FALSE", "off", "OFF", "no", "NO"}
 _MAX_TEXT = 4096
+_RESUME_POLICY_RE = re.compile(r"^(write|skip(:[a-z0-9_-]{1,40})?)$")
 _ENV_FIELDS = (
     "isolation_profile",
     "wiki_memory_enabled",
@@ -87,7 +88,15 @@ _LEGACY_DEFAULTS: dict[str, object] = {
     "honcho_memory_enabled": "1",
     "memory_user_label": "Seo Jin On / 서진원",
     "memory_assistant_label": "ccc-node assistant",
+    # #2319: records enqueued before resume ownership existed keep writing.
+    "resume_policy": "write",
 }
+
+
+def _validate_resume_policy(value: object) -> None:
+    """#2319: ``write`` | ``skip[:reason]`` — anything else is an invalid job."""
+    if not isinstance(value, str) or not _RESUME_POLICY_RE.fullmatch(value):
+        raise ValueError("invalid_resume_policy")
 
 
 def _text(value: object, field: str, *, allow_empty: bool = True) -> str:
@@ -284,6 +293,7 @@ class PendingV1Journal(JsonJournalCore):
             )
         if type(record.get("dryrun")) is not int or record["dryrun"] not in {0, 1}:
             raise ValueError("invalid_dryrun")
+        _validate_resume_policy(record.get("resume_policy"))
         if "retry_after" in record:
             _text(record.get("retry_after"), "retry_after")
         if "last_failed_at" in record:
@@ -446,6 +456,9 @@ def _record_from_environment() -> dict[str, Any]:
         "source_project": os.environ.get("CLAUDE_DISTILL_SOURCE_PROJECT", ""),
         "trigger": os.environ.get("CLAUDE_DISTILL_TRIGGER", "manual"),
         "dryrun": int(os.environ.get("CLAUDE_DISTILL_DRYRUN", "0")),
+        # #2319: resolved once by distill.sh at enqueue time so a replayed job
+        # (pending-drain) keeps the ownership verdict of its original session.
+        "resume_policy": os.environ.get("CLAUDE_DISTILL_RESUME_POLICY") or "write",
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "isolation_profile": os.environ.get("CCC_NODE_ISOLATION_PROFILE", "fleet"),
         "wiki_memory_enabled": os.environ.get("CCC_WIKI_MEMORY_ENABLED", "1"),
@@ -475,6 +488,7 @@ def _child_environment(record: Mapping[str, Any]) -> dict[str, str]:
             "CLAUDE_DISTILL_SOURCE_CWD": str(record["source_cwd"]),
             "CLAUDE_DISTILL_SOURCE_PROJECT": str(record["source_project"]),
             "CLAUDE_DISTILL_DRYRUN": str(record["dryrun"]),
+            "CLAUDE_DISTILL_RESUME_POLICY": str(record.get("resume_policy") or "write"),
             "CCC_NODE_ISOLATION_PROFILE": str(record["isolation_profile"]),
             "CCC_WIKI_MEMORY_ENABLED": str(record["wiki_memory_enabled"]),
             "CCC_HONCHO_MEMORY_ENABLED": str(record["honcho_memory_enabled"]),

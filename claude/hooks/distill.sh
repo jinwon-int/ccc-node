@@ -166,7 +166,16 @@ run_bg_pipeline() {
   # returning success; no external sink call runs while its lock is held.
   # CLAUDE_DISTILL_CAPTURED_AT (the job's enqueue time, set by the pending
   # journal) is stamped into the resume.md header for ordering (#2310).
-  python3 "$HOOKDIR/distill/local-memory-commit.py" --mode both < "$STASH" >> "$LOG" 2>&1 || \
+  # #2319: a session that does not own resume.md (see resolve_resume_policy)
+  # still contributes facts, but never replaces the owner's thread resume.
+  local COMMIT_MODE=both RESUME_POLICY="${CLAUDE_DISTILL_RESUME_POLICY:-write}"
+  case "$RESUME_POLICY" in
+    skip*)
+      COMMIT_MODE=facts
+      log "local-memory mode=facts reason=resume-policy policy=$RESUME_POLICY trigger=$TRIGGER pid=$PIPE_PID"
+      ;;
+  esac
+  python3 "$HOOKDIR/distill/local-memory-commit.py" --mode "$COMMIT_MODE" < "$STASH" >> "$LOG" 2>&1 || \
     log "local-memory-commit non-zero"
 
   if wiki_memory_disabled; then
@@ -219,6 +228,52 @@ scope_allows_project() {
   done < <(scope_values)
   [ "$any" = "0" ] && return 0
   return 1
+}
+
+# ---- resume ownership (#2319) ----------------------------------------------
+# resume.md is the single "직전 세션에서 이어서" source the next session reads.
+# The bridge sink writes it for the owner's main thread (those sessions never
+# reach this hook: CCC_BRIDGE_DISTILL_MANAGED). Every other session that ends
+# here — agent-cron headless runs, A2A review lanes, a non-bridge process that
+# re-opened a bridge transcript under a new session id — used to overwrite it
+# unconditionally, so the owner's next session resumed cron chatter instead of
+# their conversation (6/12 nodes on 2026-10-15). Policy values:
+#   write            (default) resume + facts, unchanged behavior
+#   skip:<reason>    facts only; resume.md is left to its owner
+# Explicit opt-out: CCC_DISTILL_RESUME_POLICY=skip (headless.sh sets it).
+# Automatic: the transcript (or the hook session id) belongs to a bridge
+# session store, i.e. the bridge owns that thread's resume.
+bridge_session_stores() {
+  if [ -n "${CCC_BRIDGE_SESSION_STORES:-}" ]; then
+    printf '%s\n' "$CCC_BRIDGE_SESSION_STORES" | tr ':' '\n'
+  else
+    printf '%s\n' "${HOME:-/root}/.telegram_bot/sessions.json" \
+      "${HOME:-/root}/.ccc-matrix/sessions.json"
+  fi
+}
+
+transcript_is_bridge_owned() {
+  local sid="$1" tsid="$2" store
+  while IFS= read -r store; do
+    [ -n "$store" ] && [ -r "$store" ] || continue
+    if jq -e --arg a "$sid" --arg b "$tsid" \
+      '[.. | objects | .session_id? | strings] | any(. == $a or . == $b)' \
+      "$store" >/dev/null 2>&1; then
+      return 0
+    fi
+  done < <(bridge_session_stores)
+  return 1
+}
+
+resolve_resume_policy() {
+  case "${CCC_DISTILL_RESUME_POLICY:-}" in
+    skip|skip:*|facts-only|0|off|OFF|false|FALSE|no|NO) printf 'skip:env'; return ;;
+  esac
+  if transcript_is_bridge_owned "$SESSION_ID" "$(basename "$TRANSCRIPT_PATH" .jsonl)"; then
+    printf 'skip:bridge-owned-transcript'
+    return
+  fi
+  printf 'write'
 }
 
 log "start trigger=$TRIGGER dryrun=$DRYRUN pid=$$"
@@ -297,6 +352,11 @@ export CLAUDE_DISTILL_TRANSCRIPT="$TRANSCRIPT_PATH"
 export CLAUDE_DISTILL_SOURCE_CWD="$SOURCE_CWD"
 export CLAUDE_DISTILL_SOURCE_PROJECT="$PROJECT_ENC"
 export CLAUDE_DISTILL_DRYRUN="$DRYRUN"
+RESUME_POLICY="$(resolve_resume_policy)"
+case "$RESUME_POLICY" in
+  skip*) log "resume policy=skip reason=${RESUME_POLICY#skip:} session=$SESSION_ID trigger=$TRIGGER pid=$$" ;;
+esac
+export CLAUDE_DISTILL_RESUME_POLICY="$RESUME_POLICY"
 
 # Python is the sole owner of queue serialization, ID derivation and dedup.
 PENDING_ADAPTER="$DISTILL_LIB_DIR/distill/pending_journal.py"

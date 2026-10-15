@@ -65,6 +65,26 @@ def _enabled(value: str) -> bool:
     return value.lower() not in {"0", "false", "off", "no"}
 
 
+_RESUME_SKIP_VALUES = {"skip", "facts-only", "0", "off", "false", "no"}
+
+
+def _resume_policy() -> str:
+    """``write`` or ``skip`` (#2319).
+
+    distill.sh resolves ownership once per session and hands the verdict down
+    as ``CLAUDE_DISTILL_RESUME_POLICY`` (``write`` | ``skip:<reason>``); callers
+    that know they are automated (headless.sh) export
+    ``CCC_DISTILL_RESUME_POLICY`` directly. Either spelling of skip means: this
+    session may add facts but must not replace the owner's resume.md.
+    """
+    for key in ("CLAUDE_DISTILL_RESUME_POLICY", "CCC_DISTILL_RESUME_POLICY"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            head = value.split(":", 1)[0].lower()
+            return "skip" if head in _RESUME_SKIP_VALUES else "write"
+    return "write"
+
+
 def _validate_audience(state_dir: Path) -> str:
     scoped = _enabled(os.environ.get("CCC_MEMORY_AUDIENCE_SCOPED", "0"))
     audience = os.environ.get("CCC_MEMORY_AUDIENCE", "legacy")
@@ -262,11 +282,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         transaction_module = _load_transaction_module()
         header = _capture_header(os.environ.get("CLAUDE_DISTILL_CAPTURED_AT"))
         facts_added = 0
+        mode = args.mode
+        if _resume_policy() == "skip" and mode in {"both", "resume"}:
+            if mode == "resume":
+                print("local-memory: resume skipped reason=resume-policy")
+                return 0
+            mode = "facts"
 
         def transform(current: Mapping[str, bytes | None]) -> Mapping[str, bytes | None]:
             nonlocal facts_added
             desired: dict[str, bytes | None] = {}
-            if args.mode in {"both", "facts"}:
+            if mode in {"both", "facts"}:
                 facts, facts_added = _render_facts(
                     document,
                     current["memory-facts.jsonl"],
@@ -275,7 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 if facts is not None:
                     desired["memory-facts.jsonl"] = facts
-            if args.mode in {"both", "resume"}:
+            if mode in {"both", "resume"}:
                 resume = _render_resume(document, max_resume, header=header)
                 if resume is not None:
                     desired["resume.md"] = resume
@@ -287,7 +313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             actor="distill",
             tool="local-memory-commit",
             session=str(document.get("session_id") or ""),
-            diff=f"mode-{args.mode}",
+            diff=f"mode-{mode}",
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         print(f"local-memory commit failed: {error}", file=sys.stderr)
