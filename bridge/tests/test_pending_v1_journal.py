@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 from pathlib import Path
@@ -284,6 +285,21 @@ def test_child_capture_time_is_the_record_enqueue_time_never_inherited(
 
     unparseable = dict(record(transcript), created_at="not-a-time")
     assert "CLAUDE_DISTILL_CAPTURED_AT" not in pending._child_environment(unparseable)
+
+
+def test_child_capture_time_from_a_clock_ahead_is_clamped_to_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2310 review: a future created_at must not outrank every bridge capture."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("body", encoding="utf-8")
+    monkeypatch.delenv("CLAUDE_DISTILL_CAPTURED_AT", raising=False)
+
+    before = datetime.now(timezone.utc)
+    future = dict(record(transcript), created_at="2099-01-01T00:00:00Z")
+    stamped = pending._parse_iso(pending._child_environment(future)["CLAUDE_DISTILL_CAPTURED_AT"])
+    assert stamped is not None
+    assert before - timedelta(seconds=1) <= stamped <= datetime.now(timezone.utc)
 
 
 def test_replayed_job_keeps_its_original_capture_time(

@@ -493,6 +493,10 @@ def _child_environment(record: Mapping[str, Any]) -> dict[str, str]:
     env.pop("CLAUDE_DISTILL_CAPTURED_AT", None)
     captured = _parse_iso(str(record["created_at"]))
     if captured is not None:
+        # A created_at stamped while the host clock ran ahead (e.g. before NTP
+        # sync at boot) would otherwise outrank every bridge capture until the
+        # wall clock caught up; a capture can never be later than now.
+        captured = min(captured, datetime.now(timezone.utc))
         env["CLAUDE_DISTILL_CAPTURED_AT"] = captured.isoformat().replace("+00:00", "Z")
     scoped, audience, scope = _route(record)
     if scoped:
