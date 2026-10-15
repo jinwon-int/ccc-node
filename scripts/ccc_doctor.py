@@ -549,13 +549,23 @@ def _read_regular_text(path: Path) -> str | None:
     try:
         fd = os.open(path, flags)
     except OSError as error:
-        if error.errno == errno.ELOOP:  # O_NOFOLLOW hit a symlink
+        # ELOOP: O_NOFOLLOW hit a symlink; ENXIO: a Unix socket; EISDIR: a
+        # directory on platforms that refuse O_RDONLY on one. None is a job.
+        if error.errno in (errno.ELOOP, errno.ENXIO, errno.EISDIR):
             return None
         raise
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+    try:
+        # Check the type on the raw descriptor: fdopen() raises IsADirectoryError
+        # for a directory before the ``with`` owns the fd, which leaked it.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        return handle.read().decode("utf-8")
+        handle = os.fdopen(fd, "rb")
+        fd = -1  # owned by the file object from here on
+        with handle:
+            return handle.read().decode("utf-8")
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def claude_project_slug(project_root: Path) -> str:

@@ -222,6 +222,24 @@ class TranscriptsPrivacyCheck(unittest.TestCase):
             self.assertIsNone(_read_regular_text(link))
         self.assertEqual(_read_regular_text(self.base / "target.json"), "{}")
 
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "needs /proc/self/fd to count descriptors")
+    def test_entry_swapped_to_directory_or_socket_is_skipped_without_fd_leak(self) -> None:
+        import socket
+
+        from ccc_doctor import _read_regular_text
+
+        directory = self.base / "dir.json"
+        directory.mkdir()
+        sock_path = self.base / "sock.json"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(str(sock_path))
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(20):
+            self.assertIsNone(_read_regular_text(directory))
+            self.assertIsNone(_read_regular_text(sock_path))
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_only_other_errors_is_ok(self) -> None:
         journal = self.base / ".ccc-matrix" / "distill-journal"
         self._job(journal, "a", {"error_code": "snapshot_read_failed"})
