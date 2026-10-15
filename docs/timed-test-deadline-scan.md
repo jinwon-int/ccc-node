@@ -3,6 +3,8 @@
 `scripts/timed_test_deadline_scan.py` reports timed tests (canary, observation
 window, trial) whose absolute KST end datetime has passed with no verdict
 comment. `scripts/install-timed-test-deadline-scan-cron.sh` runs it three times a day.
+The opt-in `--mode followup` also reports follow-ups promised by a verdict that
+are past due with nothing posted after them (see below).
 
 ## Install
 
@@ -26,6 +28,42 @@ stderr, listed under `repo_errors` in `--json` output (a `⚠ 부분 스캔` blo
 the text report), and every other repo is still scanned and reported. The run
 then exits 4 even if findings exist, because the result is known to be
 incomplete. Keep repos with Issues disabled out of the repos file.
+
+## Follow-up mode (#2324)
+
+`--mode followup` is opt-in; `expired` and `relative` output is unchanged. It
+reports `followup-overdue`: a verdict was posted, and that verdict comment or a
+later comment promised a follow-up at an absolute datetime that has passed with
+**no comment after it**.
+
+- Keywords: `후속`, `다음 확인`, `재측정`, `재확인`, `재점검`, `재카나리`,
+  `next action`/`next check`, `follow-up`. The line must also carry a date.
+  Dates are parsed as in the deadline scan: KST by default, and a time marked
+  `UTC`/`Z` is converted to KST.
+- Verdict: the first comment whose first line states a conclusion (as in the
+  early-verdict check) or that has a `판정:`/`Verdict:` label line. The issue
+  body and comments before the verdict are not read; those are bookings, which
+  `expired` covers.
+- Cleared when any comment is posted after the promised time, which counts as
+  evidence of action, or when a later comment moves the follow-up to a later
+  time.
+- Demoted to low confidence (`weak_reason`): `followup-mention` (keyword
+  mentioned in passing instead of written as a label such as `다음 확인: …` or
+  `| Next action | …`), `verdict-heading-only` (only the looser heading-window
+  verdict so far), `cross-reference`, `already-settled`, `claim-eta`,
+  `date-only`. A time already past when the comment was posted is a record,
+  not a promise (`past-at-posting`), and is never reported.
+- `--include-closed-days N` (followup mode only, default 0 = open issues only)
+  also fetches issues closed on or after `now - N days` with a second
+  `gh issue list --state closed --search "closed:>=YYYY-MM-DD"` query. GitHub
+  evaluates that date in UTC. The flag applies to `--repo`/`--repos-file`, not
+  `--input`. Using it with another mode, or with a negative N, exits 2.
+- In followup mode, `--json` adds `include_closed_days` to the payload and
+  `issue_state` (`open`/`closed`, or null when unknown) to each finding. The
+  text report marks closed issues `닫힌 이슈`.
+- Notices use their own dedup state, `notify-followup.json`. The installer
+  still wires only `expired`/`relative`, so for now run followup mode by hand,
+  e.g. `--repos-file … --mode followup --include-closed-days 45`.
 
 ## Owner notice
 

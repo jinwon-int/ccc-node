@@ -19,7 +19,7 @@ scanner finds 12 issues of which 7 are real — recall 7/7, precision 7/12 —
 and correctly stays quiet about ccc-node#1353, which was judged on time.
 ``--min-confidence high`` trades recall away for a shorter list.
 
-Two modes:
+Three modes:
 
 ``expired``
     Deadline is in the past and no verdict-shaped comment followed it — or
@@ -31,6 +31,18 @@ Two modes:
     A timed test described only in relative terms ("며칠", "1~2주", "T+24h",
     "24시간 후") with no absolute datetime anywhere in the paragraph. These
     violate the rule at write time, so they can never be judged on schedule.
+
+``followup`` (opt-in, #2324)
+    A verdict was posted, and the verdict comment or a later one promised a
+    follow-up ("다음 확인", "후속", "재측정", "재확인", "next action",
+    "follow-up") at an absolute KST datetime that has now passed with no
+    comment at all after it. The other modes treat a verdict as the end of an
+    issue, so a promised re-measure that never happened stayed invisible. A
+    promise that is not written as a label, or that rests on a heading-only
+    verdict, is demoted to low confidence. ``--include-closed-days N`` also
+    fetches issues closed within the last N days, because a verdict is often
+    followed by an immediate close (or a PR merge auto-close) that strands
+    its follow-up.
 
 Input is a JSONL dump (one issue object per line, ``--input``), a live ``gh``
 query (``--repo``), or an operator-owned allowlist file (``--repos-file``).
@@ -292,6 +304,36 @@ SELF_VERDICT_LINE = re.compile(
 )
 
 
+# --- followup mode (#2324 (2)) ------------------------------------------------
+#
+# A verdict ends the expired-mode question, but verdicts routinely promise more:
+# a re-measure, a re-canary, a conditional pass to re-check, a post-rollback
+# look. The 2026-10-15 deadline audit found 21 issues whose verdict promised a
+# follow-up that never happened, 12 of them already closed. Only promises with
+# an absolute datetime are scanned here; the KST/UTC handling and the
+# false-positive guards are the same ones the deadline scan uses.
+FOLLOWUP_KIND = "followup-overdue"
+FOLLOWUP_KEYWORD = re.compile(
+    r"(후속|다음\s*확인|재측정|재확인|재점검|재카나리"
+    r"|(?<![\w./-])next\s+(?:action|check)s?(?![\w./-])"
+    r"|(?<![\w./-])follow[\s-]?ups?(?![\w./-]))",
+    re.IGNORECASE,
+)
+# The promise is written as a label — "다음 확인: …", "- **후속 재측정**: …",
+# "| Next action | …", "Follow-up — …", "다음 확인 2026-10-14 09:00" — rather
+# than mentioned in passing ("후속 PR에서 …"). Plain "-" is not a separator
+# (it is inside every date), and the gap before the separator may not hold a
+# digit, so the colon of a clock time ("09:00") never passes for one.
+FOLLOWUP_LABEL = re.compile(
+    r"^[\s>*_#|-]*(?:\d+[.)]\s*)?\**\s*" + FOLLOWUP_KEYWORD.pattern
+    + r"(?:[^:：|\n\d]{0,20}?\**\s*(?:[:：|]|\s[—–]\s)|\**\s+(?=20\d{2}[-./년]))",
+    re.IGNORECASE,
+)
+# Demotion reasons specific to follow-up promises.
+FOLLOWUP_MENTION = "followup-mention"
+VERDICT_HEADING_ONLY = "verdict-heading-only"
+
+
 @dataclass(frozen=True)
 class Hit:
     """One deadline candidate found in an issue body or comment.
@@ -332,9 +374,12 @@ class Finding:
     confidence: str = "high"
     weak_reason: str | None = None
     dropped: list[str] = field(default_factory=list)
+    # Only followup findings carry it (closed issues are in scope there); the
+    # other kinds keep their JSON shape unchanged.
+    issue_state: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "repo": self.repo,
             "number": self.number,
             "title": self.title,
@@ -352,6 +397,9 @@ class Finding:
             ),
             "dropped_candidates": self.dropped,
         }
+        if self.kind == FOLLOWUP_KIND:
+            data["issue_state"] = self.issue_state
+        return data
 
 
 def parse_github_timestamp(raw: str) -> dt.datetime:
@@ -655,6 +703,136 @@ def _is_judged(
     return False
 
 
+def _verdict_strength(body: str) -> str | None:
+    """How firmly a comment reads as a verdict: ``strict``, ``heading`` or None.
+
+    ``strict`` is the early-verdict test (a conclusion on the first line) or a
+    self-verdict label line. ``heading`` is the looser expired-mode window,
+    which also accepts "판정" anywhere in the first 200 characters — enough to
+    open the follow-up window, not enough to trust what it promises.
+    """
+    if EARLY_VERDICT.search(_first_line(body)) or SELF_VERDICT_LINE.search(body):
+        return "strict"
+    if VERDICT.search(body[:VERDICT_HEADER_CHARS]):
+        return "heading"
+    return None
+
+
+def collect_followups(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
+    """Follow-up promises with a datetime, in the first verdict and after it.
+
+    The issue body is never a verdict, and comments before the first verdict
+    are bookings, which expired mode already judges. Demotion mirrors
+    collect_hits: cross-reference, already-settled, claim-eta,
+    past-at-posting and date-only, plus ``followup-mention`` (keyword not
+    written as a label) and ``verdict-heading-only`` (no strict verdict yet).
+    """
+    number = int(issue.get("number", 0))
+    url = issue.get("url", "")
+    hits: list[Hit] = []
+    dropped: list[str] = []
+    verdict: str | None = None
+    for comment in issue.get("comments") or []:
+        body = comment.get("body") or ""
+        posted = parse_github_timestamp(comment["createdAt"])
+        strength = _verdict_strength(body)
+        if strength == "strict" or (strength and verdict is None):
+            verdict = strength
+        if verdict is None:
+            continue
+        is_claim = bool(CLAIM_MARKER.search(body))
+        for paragraph in _iter_paragraphs(body):
+            bare = INLINE_CODE.sub("", paragraph)
+            if not FOLLOWUP_KEYWORD.search(bare):
+                continue
+            dates = _dates_in(paragraph)
+            if not dates:
+                continue
+            due, explicit = max(dates, key=lambda item: item[0])
+            # No comment-header check: the verdict comment's heading always
+            # reads as settled, which is the point of reading it here.
+            reason = classify_false_positive(paragraph, number)
+            if reason is None and (is_claim or CLAIM_ETA.search(paragraph)):
+                reason = "claim-eta"
+            if reason is None and due <= posted:
+                reason = "past-at-posting"
+            if reason is None and not explicit:
+                reason = "date-only"
+            if reason is None and not FOLLOWUP_LABEL.search(bare):
+                reason = FOLLOWUP_MENTION
+            if reason is None and verdict != "strict":
+                reason = VERDICT_HEADING_ONLY
+            if reason:
+                dropped.append(f"{reason}: {paragraph[:90]}")
+            hits.append(
+                Hit(
+                    deadline=due,
+                    paragraph=paragraph,
+                    source_url=comment.get("url", url),
+                    posted_at=posted,
+                    had_explicit_time=explicit,
+                    weak_reason=reason,
+                )
+            )
+    return hits, dropped
+
+
+def _judge_followup(
+    issue: dict[str, Any],
+    now: dt.datetime,
+    comment_times: Sequence[dt.datetime],
+) -> Finding | None:
+    """Report a promised follow-up whose time passed with nothing after it.
+
+    Any comment after the promised time counts as evidence of action — the
+    scanner cannot tell a result from a nag, and over-reporting a closed
+    question is the worse failure for a low-trust first version. A promise
+    is also cleared when a later comment re-schedules it to a later time.
+    """
+    hits, dropped = collect_followups(issue)
+    last_comment = max(comment_times, default=None)
+    overdue: list[Hit] = []
+    for hit in hits:
+        if hit.deadline >= now:
+            continue  # not due yet
+        if last_comment is not None and last_comment > hit.deadline:
+            continue  # somebody wrote something after the promised time
+        rescheduled = any(
+            other.posted_at is not None
+            and hit.posted_at is not None
+            and other.posted_at > hit.posted_at
+            and other.deadline > hit.deadline
+            and other.weak_reason not in NOT_A_BOOKING
+            for other in hits
+        )
+        if rescheduled:
+            continue
+        overdue.append(hit)
+    if not overdue:
+        return None
+    strong = [hit for hit in overdue if hit.confidence == "high"]
+    hit = max(strong or overdue, key=lambda item: item.deadline)
+    state = issue.get("state")
+    repo = str(issue.get("repo", "")) or "?"
+    return Finding(
+        repo=repo,
+        number=int(issue.get("number", 0)),
+        title=str(issue.get("title", "")),
+        url=str(issue.get("url", "")),
+        kind=FOLLOWUP_KIND,
+        deadline=hit.deadline,
+        days_overdue=(now - hit.deadline).days,
+        paragraph=hit.paragraph[:200],
+        source_url=hit.source_url,
+        comments_after=0,
+        last_comment_at=last_comment,
+        confidence=hit.confidence,
+        weak_reason=hit.weak_reason,
+        dropped=dropped,
+        issue_state=str(state).lower() if state else None,
+    )
+
+
 def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding | None:
     """Decide whether one issue needs attention under the given mode."""
     repo = str(issue.get("repo", "")) or "?"
@@ -663,6 +841,9 @@ def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding |
     url = str(issue.get("url", ""))
     comments = issue.get("comments") or []
     comment_times = [parse_github_timestamp(c["createdAt"]) for c in comments]
+
+    if mode == "followup":
+        return _judge_followup(issue, now, comment_times)
 
     if mode == "relative":
         offenders = find_relative_only(issue)
@@ -787,30 +968,68 @@ def load_repos_file(path: Path) -> list[str]:
     return repos
 
 
-def fetch_via_gh(repo: str, limit: int) -> list[dict[str, Any]]:
-    """Pull open issues with comments through the gh CLI."""
+def fetch_via_gh(
+    repo: str, limit: int, closed_since: dt.date | None = None
+) -> list[dict[str, Any]]:
+    """Pull open issues with comments through the gh CLI.
+
+    With ``closed_since`` (followup mode's ``--include-closed-days``), issues
+    closed on or after that date are fetched too, by a second ``gh`` query
+    using GitHub search (``closed:>=YYYY-MM-DD``, a UTC date). Without it the
+    query is exactly the open-only one the other modes always ran.
+    """
     fields = "number,title,url,body,comments,createdAt,updatedAt"
-    proc = subprocess.run(
-        ["gh", "issue", "list", "--repo", repo, "--state", "open",
-         "--limit", str(limit), "--json", fields],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"gh issue list failed for {repo}: {proc.stderr.strip()[:400]}")
-    issues = json.loads(proc.stdout or "[]")
-    for issue in issues:
-        issue["repo"] = repo
+    queries: list[tuple[str, list[str]]] = [("open", [])]
+    if closed_since is not None:
+        fields += ",state,closedAt"
+        queries.append(("closed", ["--search", f"closed:>={closed_since:%Y-%m-%d}"]))
+    issues: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for state, extra in queries:
+        proc = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--state", state,
+             "--limit", str(limit), *extra, "--json", fields],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            which = "" if state == "open" else f" ({state})"
+            raise RuntimeError(
+                f"gh issue list failed for {repo}{which}: {proc.stderr.strip()[:400]}"
+            )
+        for issue in json.loads(proc.stdout or "[]"):
+            number = issue.get("number")
+            if number in seen:
+                continue  # closed between the two queries
+            seen.add(number)
+            issue["repo"] = repo
+            issues.append(issue)
     return issues
 
 
 def format_report(findings: Sequence[Finding], now: dt.datetime, mode: str) -> str:
     if not findings:
+        if mode == "followup":
+            return f"[{now:%Y-%m-%d %H:%M} KST] {mode}: 해당 없음 — 판정 후 후속 기한 경과 0건"
         return f"[{now:%Y-%m-%d %H:%M} KST] {mode}: 해당 없음 — 기한 경과 미판정 0건"
     lines = [f"[{now:%Y-%m-%d %H:%M} KST] {mode}: {len(findings)}건"]
     for finding in findings:
         lines.append("")
+        if finding.kind == FOLLOWUP_KIND and finding.deadline is not None:
+            mark = "" if finding.confidence == "high" else f" | 신뢰도 낮음({finding.weak_reason})"
+            closed = " | 닫힌 이슈" if finding.issue_state == "closed" else ""
+            lines.append(
+                f"### {finding.repo}#{finding.number} | 후속 기한 {finding.deadline:%Y-%m-%d %H:%M}"
+                f" | 경과 {finding.days_overdue}일{closed}{mark}"
+            )
+            lines.append(f"    {finding.title[:100]}")
+            lines.append(f"    근거: {finding.paragraph[:150]}")
+            if finding.last_comment_at:
+                lines.append(f"    마지막 코멘트: {finding.last_comment_at:%Y-%m-%d %H:%M} KST")
+            lines.append("    후속 기한 후 코멘트 0건")
+            lines.append(f"    {finding.url}")
+            continue
         if finding.deadline is not None:
             mark = "" if finding.confidence == "high" else f" | 신뢰도 낮음({finding.weak_reason})"
             lines.append(
@@ -991,7 +1210,10 @@ def build_notify_text(
     """Short Korean owner notice: count, then repo#number / deadline / overdue /
     title / URL per finding. No paragraph or comment excerpts ever — those are
     issue prose and may quote anything."""
-    what = "기한 경과 미판정" if mode == "expired" else "절대 종료시각 없음"
+    if mode == "followup":
+        what = "판정 후 후속 기한 경과"
+    else:
+        what = "기한 경과 미판정" if mode == "expired" else "절대 종료시각 없음"
     head = f"⏰ 시한부 테스트 {what} {len(findings)}건"
     if reason == "new":
         head += f" (신규 {len(new)}건)"
@@ -1003,7 +1225,12 @@ def build_notify_text(
     for finding in ordered[:NOTIFY_MAX_FINDINGS]:
         repo = finding.repo if REPO_NAME.match(finding.repo or "") else "?"
         mark = "🆕" if finding_fingerprint(finding) in new else "•"
-        if finding.deadline is not None:
+        if finding.kind == FOLLOWUP_KIND and finding.deadline is not None:
+            lines.append(
+                f"{mark} {repo}#{int(finding.number)} · 후속 {finding.deadline:%Y-%m-%d %H:%M} KST"
+                f" · 경과 {finding.days_overdue}일"
+            )
+        elif finding.deadline is not None:
             lines.append(
                 f"{mark} {repo}#{int(finding.number)} · 종료 {finding.deadline:%Y-%m-%d %H:%M} KST"
                 f" · 경과 {finding.days_overdue}일"
@@ -1123,9 +1350,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("expired", "relative"),
+        choices=("expired", "relative", "followup"),
         default="expired",
-        help="expired: deadline passed with no verdict. relative: no absolute datetime at all.",
+        help="expired: deadline passed with no verdict. relative: no absolute datetime at all. "
+        "followup (opt-in): a follow-up promised at/after a verdict is past due with no "
+        "comment after it.",
+    )
+    parser.add_argument(
+        "--include-closed-days",
+        type=int,
+        default=0,
+        metavar="N",
+        help="followup mode only: also fetch issues closed within the last N days "
+        "(default 0 = open issues only). Applies to --repo/--repos-file, not --input.",
     )
     parser.add_argument("--now", help="KST override for testing, e.g. 2026-09-21T01:52")
     parser.add_argument("--limit", type=int, default=200, help="max issues per repo for --repo")
@@ -1152,8 +1389,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.include_closed_days < 0:
+        parser.error("--include-closed-days must be 0 or more")
+    if args.include_closed_days and args.mode != "followup":
+        parser.error("--include-closed-days is only used by --mode followup")
+    return args
+
+
+def _fetch_repos(
+    repos: Sequence[str], limit: int, closed_since: dt.date | None
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Fetch every repo, isolating per-repo failures into ``repo_errors`` (#2324)."""
+    issues: list[dict[str, Any]] = []
+    repo_errors: list[dict[str, str]] = []
+    for repo in repos:
+        try:
+            if closed_since is None:
+                issues.extend(fetch_via_gh(repo, limit))
+            else:
+                issues.extend(fetch_via_gh(repo, limit, closed_since))
+        except REPO_FETCH_ERRORS as exc:
+            detail = " ".join(str(exc).split())[:400] or type(exc).__name__
+            repo_errors.append({"repo": repo, "error": f"{type(exc).__name__}: {detail}"})
+            print(f"repo skipped (scan continues): {repo}: {type(exc).__name__}: {detail}",
+                  file=sys.stderr)
+    return issues, repo_errors
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = _parse_args(argv)
     now = (
         dt.datetime.strptime(args.now, "%Y-%m-%dT%H:%M")
         if args.now
@@ -1177,15 +1444,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
         else:
             repos = list(args.repo or [])
-        issues = []
-        for repo in repos:
-            try:
-                issues.extend(fetch_via_gh(repo, args.limit))
-            except REPO_FETCH_ERRORS as exc:
-                detail = " ".join(str(exc).split())[:400] or type(exc).__name__
-                repo_errors.append({"repo": repo, "error": f"{type(exc).__name__}: {detail}"})
-                print(f"repo skipped (scan continues): {repo}: {type(exc).__name__}: {detail}",
-                      file=sys.stderr)
+        closed_since = (
+            (now - dt.timedelta(days=args.include_closed_days)).date()
+            if args.include_closed_days
+            else None
+        )
+        issues, repo_errors = _fetch_repos(repos, args.limit, closed_since)
 
     findings = scan(issues, now, args.mode, args.min_confidence)
 
@@ -1200,6 +1464,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "findings": [f.to_dict() for f in findings],
             "repo_errors": repo_errors,
         }
+        if args.mode == "followup":
+            payload["include_closed_days"] = args.include_closed_days
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(format_report(findings, now, args.mode))
