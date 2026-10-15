@@ -2,7 +2,7 @@
 # Install the optional MemPalace verbatim layer on Android/Termux (#867).
 #
 # Native Android wheels are unavailable, so this creates a dedicated Debian 12
-# PRoot container and installs MemPalace 3.10.0 with sqlite_exact + CPU MiniLM.
+# PRoot container and installs MemPalace 3.11.0 with sqlite_exact + CPU MiniLM.
 # Existing palace data is never removed by this script.
 #
 #   install-termux-mempalace.sh --preview [--codex|--claude]
@@ -46,8 +46,16 @@ case "$HOME" in *:*) echo "HOME containing ':' is unsupported" >&2; exit 2 ;; es
 container="${CCC_TERMUX_MEMPALACE_CONTAINER:-ccc-mempalace}"
 case "$container" in ''|-*|*[!A-Za-z0-9_.-]*) echo "invalid container name" >&2; exit 2 ;; esac
 image="${CCC_TERMUX_MEMPALACE_IMAGE:-debian:12}"
-version="${CCC_TERMUX_MEMPALACE_VERSION:-3.10.0}"
-[ "$version" = 3.10.0 ] || { echo "unsupported MemPalace version: $version" >&2; exit 2; }
+version="${CCC_TERMUX_MEMPALACE_VERSION:-3.11.0}"
+case "$version" in
+  3.11.0) ;;
+  *) echo "unsupported MemPalace version: $version" >&2; exit 2 ;;
+esac
+# Managed pins this installer may upgrade in place. The venv must be on one of
+# these AND the installed lock must differ from the managed freeze only in its
+# mempalace== line (3.10.0 -> 3.11.0 ships the same dependency set); any other
+# version or lock drift still fails closed (#867 in-place mutation guard).
+upgradable_from="3.10.0"
 
 proot_cli="${CCC_TERMUX_MEMPALACE_PROOT_CLI:-$prefix/bin/proot-distro}"
 wrapper="$HOME/.local/bin/mempalace"
@@ -129,6 +137,18 @@ safe_managed_container() {
   [ -d "$base" ] && [ ! -L "$base" ] && [ "$(stat -c %u -- "$base")" = "$(id -u)" ] \
     && [ "$(stat -c %a -- "$base")" = 700 ] && safe_private_file "$marker" \
     && [ "$(cat -- "$marker")" = "ccc-node #867 managed container" ]
+}
+
+# True when the installed lock equals the managed freeze except for its
+# mempalace== line (the only delta a pin bump produces).
+lock_is_mempalace_only_delta() {
+  local lock="$1" norm
+  safe_private_file "$lock" || return 1
+  norm="$(mktemp)" || return 1
+  chmod 600 "$norm"
+  sed "s/^mempalace==.*/mempalace==${version}/" "$lock" > "$norm"
+  if cmp -s "$requirements_source" "$norm"; then rm -f "$norm"; return 0; fi
+  rm -f "$norm"; return 1
 }
 
 prepare_managed_dir() {
@@ -367,32 +387,44 @@ case "$ACTION" in
       echo "refusing to modify unmanaged container: $container" >&2
       exit 2
     fi
-    if find "$root/opt/ccc-mempalace/venv/lib" -type d -name 'mempalace-*.dist-info' \
-      ! -name "mempalace-$version.dist-info" -print -quit 2>/dev/null | grep -q .; then
-      echo "installed MemPalace version drift; refusing in-place mutation" >&2
-      exit 2
+    upgrade_from=""
+    installed_dist="$(find "$root/opt/ccc-mempalace/venv/lib" -type d -name 'mempalace-*.dist-info' \
+      ! -name "mempalace-$version.dist-info" -print -quit 2>/dev/null || true)"
+    if [ -n "$installed_dist" ]; then
+      installed_version="$(basename "$installed_dist")"
+      installed_version="${installed_version#mempalace-}"
+      installed_version="${installed_version%.dist-info}"
+      case " $upgradable_from " in
+        *" $installed_version "*)
+          if lock_is_mempalace_only_delta "$root/opt/ccc-mempalace/requirements.lock"; then
+            upgrade_from="$installed_version"
+          fi ;;
+      esac
+      if [ -z "$upgrade_from" ]; then
+        echo "installed MemPalace version drift; refusing in-place mutation" >&2
+        exit 2
+      fi
+      echo "upgrading MemPalace $upgrade_from -> $version in place (lock delta is mempalace== only)" >&2
     fi
     if [ -e "$root/opt/ccc-mempalace/requirements.lock" ] \
       || [ -L "$root/opt/ccc-mempalace/requirements.lock" ]; then
       safe_private_file "$root/opt/ccc-mempalace/requirements.lock" \
         || { echo "unsafe installed dependency lock" >&2; exit 2; }
-      if ! cmp -s "$requirements_source" "$root/opt/ccc-mempalace/requirements.lock"; then
+      if [ -n "$upgrade_from" ]; then
+        # In-place upgrade: the lock is rewritten by the guest pip freeze after
+        # the new pin installs and verifies; never pre-write it.
+        :
+      elif ! cmp -s "$requirements_source" "$root/opt/ccc-mempalace/requirements.lock"; then
         # Out-of-band package pin: rewrite the lock only when it matches the
         # managed freeze except for mempalace== and the venv is already on it.
-        lock_norm="$(mktemp)"
-        chmod 600 "$lock_norm"
-        sed "s/^mempalace==.*/mempalace==${version}/" \
-          "$root/opt/ccc-mempalace/requirements.lock" > "$lock_norm"
-        if cmp -s "$requirements_source" "$lock_norm" \
+        if lock_is_mempalace_only_delta "$root/opt/ccc-mempalace/requirements.lock" \
           && find "$root/opt/ccc-mempalace/venv/lib" -type d \
             -name "mempalace-$version.dist-info" -print -quit 2>/dev/null | grep -q .; then
-          rm -f "$lock_norm"
           catchup_tmp="$root/opt/ccc-mempalace/.requirements.lock.catchup.$$"
           cp "$requirements_source" "$catchup_tmp"
           chmod 600 "$catchup_tmp"
           mv -f "$catchup_tmp" "$root/opt/ccc-mempalace/requirements.lock"
         else
-          rm -f "$lock_norm"
           echo "installed dependency lock drift; refusing in-place mutation" >&2
           exit 2
         fi
@@ -433,6 +465,10 @@ case "$ACTION" in
       || { echo "MemPalace executable missing after install" >&2; exit 2; }
     cmp -s "$requirements_source" "$root/opt/ccc-mempalace/requirements.lock" \
       || { echo "MemPalace dependency lock mismatch after install" >&2; exit 2; }
+    if find "$root/opt/ccc-mempalace/venv/lib" -type d -name 'mempalace-*.dist-info' \
+      ! -name "mempalace-$version.dist-info" -print -quit 2>/dev/null | grep -q .; then
+      echo "MemPalace version mismatch after install" >&2; exit 2
+    fi
     install_wrapper
     if ! "$wrapper" --version >/dev/null; then
       disable_refresh_cron
