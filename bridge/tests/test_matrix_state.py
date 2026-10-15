@@ -647,6 +647,38 @@ class TestMatrixStore:
             assert s.sent_event("$old") == ("done", "$sent-old")
             assert s.sent_event(notice) == ("done", None)
 
+    def test_prune_leaves_no_body_bytes_in_the_database_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # DOC-3956 (2026-10-15): pruned rows lost their body logically, but
+        # SQLite kept the bytes on a free page, so login codes pasted in chat
+        # sat in inbox.sqlite3 long after the row was gone. secure_delete
+        # zeroes freed content, which is what the tombstone always promised.
+        # The compile-time default differs by platform (Ubuntu 3.45: on,
+        # Termux 3.53: off), so start every connection with it OFF to stand in
+        # for the Termux build the leak was found on.
+        real_connect = m.sqlite3.connect
+
+        def connect_default_off(*args: Any, **kwargs: Any) -> Any:
+            conn = real_connect(*args, **kwargs)
+            conn.execute("PRAGMA secure_delete=OFF")
+            return conn
+
+        monkeypatch.setattr(m.sqlite3, "connect", connect_default_off)
+        directory = tmp_path / "state"
+        body = "pasted-login-code-" + "Zq9" * 20
+        reply = "assistant-reply-" + "Kp4" * 20
+        with MatrixStore(directory, BOT) as s:
+            s.accept_batch([Request("$secret", ROOM, OWNER, body, SCOPE)], "t1")
+            s.claim()
+            s.finish("$secret", reply)
+            s.delivered("$secret")
+            later = time_of_done(s, "$secret") + m.PRUNE_AFTER_S + 1
+            assert s.prune(now=later) == 1
+        raw = (directory / "inbox.sqlite3").read_bytes()
+        assert body.encode() not in raw
+        assert reply.encode() not in raw
+
     def test_prune_starts_the_clock_for_rows_done_before_the_column(self, tmp_path: Path) -> None:
         directory = tmp_path / "state"
         with MatrixStore(directory, BOT) as s:
