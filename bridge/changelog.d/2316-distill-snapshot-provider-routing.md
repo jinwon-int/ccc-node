@@ -13,3 +13,7 @@
   `invalid_snapshot_request` or a silent empty success. `read_claude_snapshot`
   now raises `SnapshotUnavailableError` for a missing transcript file, like
   the Codex/Danso/Piri readers.
+  The retry window is the snapshot worker's 5 attempts times
+  `distill_extraction_poll_interval` (default 300s, about 25 minutes): a
+  job left behind by a provider switch is read only if the bridge switches
+  back within it; otherwise the loss is now visible instead of silent.

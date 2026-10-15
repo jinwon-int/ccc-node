@@ -126,6 +126,8 @@ async def test_codex_job_after_codex_to_claude_switch_is_not_read_by_claude(
     assert result.error_code == "snapshot_provider_mismatch"
     assert "snapshot_provider_mismatch" in caplog.text
     assert CODEX_THREAD not in caplog.text
+    assert job.job_id not in caplog.text  # only the 12-char prefix is logged
+    assert job.job_id[:12] in caplog.text
 
 
 @pytest.mark.anyio
