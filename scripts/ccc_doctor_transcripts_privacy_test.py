@@ -10,11 +10,14 @@ refusal count, and that it never changes anything it inspects.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+import contextlib
 import json
 import os
+import signal
 import sys
 import time
 import unittest
@@ -146,6 +149,78 @@ class TranscriptsPrivacyCheck(unittest.TestCase):
         self.assertEqual(row.klass, "경고")
         self.assertIn("unreadable=1", row.status)
         self.assertIn("bridge user", row.action)
+
+    def test_danso_and_claude_journals_are_labelled_apart(self) -> None:
+        refused = {"error_code": "invalid_snapshot_request", "updated_at": "2026-10-14T02:40:00Z"}
+        self._job(self.base / ".ccc-matrix" / "danso-distill-journal", "a", refused)
+        self._job(self.base / ".telegram_bot" / "danso-distill-journal", "b", refused)
+        danso = self.row(self.run_checks(), REFUSAL_ITEM)
+        self.assertIn("ccc-matrix/danso,telegram_bot/danso)", danso.status)
+
+        self._job(self.base / ".ccc-matrix" / "distill-journal", "c", refused)
+        both = self.row(self.run_checks(), REFUSAL_ITEM)
+        self.assertIn("invalid_snapshot_request=3", both.status)
+        self.assertIn("(latest 2026-10-14T02:40, ccc-matrix,ccc-matrix/danso,telegram_bot/danso)", both.status)
+
+    def test_claude_journal_label_has_no_danso_suffix(self) -> None:
+        self._job(self.base / ".telegram_bot" / "distill-journal", "a", {"error_code": "invalid_snapshot_request"})
+        row = self.row(self.run_checks(), REFUSAL_ITEM)
+        self.assertIn(", telegram_bot)", row.status)
+        self.assertNotIn("danso", row.status)
+
+    @contextlib.contextmanager
+    def deadline(self, seconds: int = 5) -> Iterator[None]:
+        """Fail (not hang) if the journal scan blocks — e.g. reading a FIFO (#2308)."""
+
+        def _expired(signum: int, frame: object) -> None:
+            raise AssertionError(f"did not finish within {seconds}s (blocked on a journal entry?)")
+
+        previous = signal.signal(signal.SIGALRM, _expired)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "needs mkfifo and SIGALRM")
+    def test_fifo_and_symlink_entries_are_skipped_in_bounded_time(self) -> None:
+        journal = self.base / ".ccc-matrix" / "distill-journal"
+        journal.mkdir(parents=True)
+        refused = {"error_code": "invalid_snapshot_request", "updated_at": "2026-10-14T02:40:00Z"}
+        outside = self.base / "outside.json"
+        outside.write_text(json.dumps(refused))
+        os.mkfifo(journal / "fifo.json")
+        (journal / "link-to-file.json").symlink_to(outside)
+        (journal / "link-to-fifo.json").symlink_to(journal / "fifo.json")
+        (journal / "dangling.json").symlink_to(self.base / "missing.json")
+        (journal / "dir.json").mkdir()
+        with self.deadline():
+            row = self.row(self.run_checks(), REFUSAL_ITEM)
+        self.assertEqual(row.klass, "정상")
+        self.assertIn("recent=0 (7d, scanned=0)", row.status)
+        self.assertNotIn("unreadable", row.status)
+
+        self._job(journal, "real", refused)
+        with self.deadline():
+            row = self.row(self.run_checks(), REFUSAL_ITEM)
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("invalid_snapshot_request=1 in 7d", row.status)
+        self.assertNotIn("unreadable", row.status)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "needs mkfifo and SIGALRM")
+    def test_entry_swapped_to_fifo_or_symlink_after_scan_is_skipped(self) -> None:
+        from ccc_doctor import _read_regular_text
+
+        fifo = self.base / "swapped.json"
+        os.mkfifo(fifo)
+        link = self.base / "link.json"
+        link.symlink_to(self.base / "target.json")
+        (self.base / "target.json").write_text("{}")
+        with self.deadline():
+            self.assertIsNone(_read_regular_text(fifo))
+            self.assertIsNone(_read_regular_text(link))
+        self.assertEqual(_read_regular_text(self.base / "target.json"), "{}")
 
     def test_only_other_errors_is_ok(self) -> None:
         journal = self.base / ".ccc-matrix" / "distill-journal"

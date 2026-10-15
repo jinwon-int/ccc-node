@@ -12,6 +12,7 @@ otherwise; ``경고`` (warning) findings do not change the exit code.
 from __future__ import annotations
 
 import contextlib
+import errno
 import filecmp
 import hashlib
 import importlib.util
@@ -526,12 +527,35 @@ _STALE_MEMORY_READ_LIMIT = STALE_MEMORY_READ_LIMIT
 # #2306: distill journal scan for terminal snapshot refusals.
 _SNAPSHOT_REFUSAL_WINDOW_SECONDS = 7 * 86400
 _SNAPSHOT_REFUSAL_MAX_FILES = 500
+# (journal dir relative to the served project root, label in the status row).
+# #2308: danso journals carry their own label so a danso refusal is not read as
+# a Claude one.
 _SNAPSHOT_REFUSAL_JOURNALS = (
-    ".telegram_bot/distill-journal",
-    ".ccc-matrix/distill-journal",
-    ".telegram_bot/danso-distill-journal",
-    ".ccc-matrix/danso-distill-journal",
+    (".telegram_bot/distill-journal", "telegram_bot"),
+    (".ccc-matrix/distill-journal", "ccc-matrix"),
+    (".telegram_bot/danso-distill-journal", "telegram_bot/danso"),
+    (".ccc-matrix/danso-distill-journal", "ccc-matrix/danso"),
 )
+
+
+def _read_regular_text(path: Path) -> str | None:
+    """Read a regular file without following a symlink or blocking on a FIFO.
+
+    Returns ``None`` when ``path`` is not a regular file (#2308) — swapped
+    after the scandir type check; the bridge's journal never reads such an
+    entry as a job either. Any other ``OSError`` propagates to the caller.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:  # O_NOFOLLOW hit a symlink
+            return None
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
+        return handle.read().decode("utf-8")
 
 
 def claude_project_slug(project_root: Path) -> str:
@@ -1426,7 +1450,7 @@ class Doctor:
         scanned = 0
         refused: list[tuple[str, str]] = []
         unreadable = 0
-        for rel in _SNAPSHOT_REFUSAL_JOURNALS:
+        for rel, label in _SNAPSHOT_REFUSAL_JOURNALS:
             journal = root / rel
             if not journal.is_dir():
                 continue
@@ -1439,21 +1463,30 @@ class Doctor:
             for entry in entries:
                 if not entry.name.endswith(".json"):
                     continue
+                # #2308: only regular files are jobs. The bridge opens job files
+                # O_NOFOLLOW and refuses anything else, so a FIFO/symlink/dir
+                # named *.json cannot hold a refusal — skip it (reading a FIFO
+                # would hang the doctor) rather than count it as unreadable.
                 with contextlib.suppress(OSError):
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
                     mtime = entry.stat(follow_symlinks=False).st_mtime
                     if mtime >= cutoff:
                         candidates.append((mtime, Path(entry.path)))
             candidates.sort(reverse=True)
             for _, path in candidates[:_SNAPSHOT_REFUSAL_MAX_FILES]:
                 try:
-                    job = json.loads(path.read_text(encoding="utf-8"))
+                    text = _read_regular_text(path)
+                    if text is None:
+                        continue
+                    job = json.loads(text)
                 except (OSError, ValueError):
                     unreadable += 1
                     continue
                 scanned += 1
                 if isinstance(job, dict) and job.get("error_code") == "invalid_snapshot_request":
                     stamp = str(job.get("updated_at") or job.get("created_at") or "")[:16]
-                    refused.append((stamp, rel.split("/", 1)[0].lstrip(".")))
+                    refused.append((stamp, label))
         extra = f"; unreadable={unreadable}" if unreadable else ""
         if not refused:
             if unreadable:
