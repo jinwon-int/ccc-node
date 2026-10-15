@@ -14,7 +14,20 @@ printf '%s' "$input" | bash "$HERE/lifecycle-feed.sh" UserPromptSubmit >/dev/nul
 prompt="$(printf '%s' "$input" | jq -r '.prompt // .user_prompt // empty' 2>/dev/null)"
 [ -n "$prompt" ] || exit 0
 
-if grep -Eq '(ghp_|gho_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}|(sk-)[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' <<<"$prompt"; then
+# OAuth `code#state` login codes (Wiki DOC-3956): a 30+ char run that mixes
+# upper case, lower case and digits, then `#`, then 20+ chars. ERE has no
+# lookahead, so the mix is checked on the extracted candidates.
+has_oauth_code() {
+  local cand
+  while IFS= read -r cand; do
+    case "${cand%%#*}" in *[A-Z]*) ;; *) continue ;; esac
+    case "${cand%%#*}" in *[a-z]*) ;; *) continue ;; esac
+    case "${cand%%#*}" in *[0-9]*) return 0 ;; esac
+  done < <(grep -oE '[A-Za-z0-9_-]{30,}#[A-Za-z0-9_-]{20,}' <<<"$1")
+  return 1
+}
+if grep -Eq '(ghp_|gho_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}|(sk-)[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' <<<"$prompt" \
+  || has_oauth_code "$prompt"; then
   state_dir="$(ccc_lifecycle_state_dir 2>/dev/null || true)"
   LOG="${CCC_AUDIT_LOG:-${state_dir:+$state_dir/audit.jsonl}}"
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"

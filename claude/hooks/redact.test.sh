@@ -32,6 +32,8 @@ gh_tok="ghp_${body_alnum}"
 sk_tok="sk-${body_alnum}"
 aws_tok="AKIA$(printf 'B%.0s' $(seq 1 16))"
 key_marker="$(printf -- '-----BEGIN %s PRIVATE KEY-----' RSA)"
+# OAuth `code#state` as pasted for a CLI login (mixed case + digits on the code side).
+oauth_tok="Q7$(printf 'k%.0s' $(seq 1 20))Z9$(printf 'm%.0s' $(seq 1 10))#$(printf 'w%.0s' $(seq 1 8))_Y4_Y4_Y4_Y4_Y4_Y4"
 
 # 1) GitHub-style token trips the warning
 rm -f "$CCC_AUDIT_LOG"
@@ -46,7 +48,7 @@ ok "audit record never contains the credential" \
   '! grep -Fq "$gh_tok" "$CCC_AUDIT_LOG"'
 
 # 2) Other credential shapes also trip it
-for tok in "$sk_tok" "$aws_tok" "$key_marker"; do
+for tok in "$sk_tok" "$aws_tok" "$key_marker" "$oauth_tok"; do
   run_hook "context: $tok end"
   ok "credential shape flagged: ${tok:0:9}..." \
     '[ "$rc" = 0 ] && [ -n "$out" ] && jq -e ".hookSpecificOutput.additionalContext" <<<"$out" >/dev/null'
@@ -57,6 +59,8 @@ rm -f "$CCC_AUDIT_LOG"
 run_hook "please review the PR and summarize the diff"
 ok "benign prompt produces no output" '[ "$rc" = 0 ] && [ -z "$out" ]'
 ok "benign prompt is not audited" '[ ! -s "$CCC_AUDIT_LOG" ]'
+run_hook "see https://github.com/jinwon-int/ccc-node/issues/2324#issuecomment-6185866830"
+ok "fragment link is not mistaken for an OAuth code" '[ "$rc" = 0 ] && [ -z "$out" ]'
 
 # 4) Robustness: empty and non-JSON stdin are silent successes
 out="$(printf '' | bash "$HOOK" 2>/dev/null)"; rc=$?

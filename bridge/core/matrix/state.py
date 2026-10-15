@@ -1014,6 +1014,11 @@ class Store:
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA journal_mode=DELETE")
             self._db.execute("PRAGMA synchronous=FULL")
+            # DOC-3956: zero freed content so a pruned tombstone (#1959) is
+            # body-free on disk too, not just logically. The compile-time
+            # default differs by build (Termux: off) and a login code pasted
+            # in chat survived on a free page after its row was pruned.
+            self._db.execute("PRAGMA secure_delete=ON")
             self._db.executescript(_SCHEMA)
             with self._db:
                 for key, value in (("account", account), ("schema", "1")):

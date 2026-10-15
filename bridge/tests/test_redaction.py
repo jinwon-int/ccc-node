@@ -28,6 +28,9 @@ GOOGLE_KEY = "AIza" + "Sy" + "A" * 33
 AWS_TEMPORARY = "ASIA" + "IOSFODNN7EXAMPLE"
 AWS_LONG_LIVED = "AKIA" + "IOSFODNN7EXAMPLE"
 SLACK_WEBHOOK = "https://hooks.slack.com/services/" + "T00000000/B00000000/" + "a" * 10
+# OAuth authorization code + state as pasted for a CLI login (`code#state`).
+# Mixed case and digits on the code side; assembled so no literal looks real.
+OAUTH_CODE_STATE = "Q7" + "k" * 20 + "Z9" + "m" * 10 + "#" + "w" * 8 + "_Y4" * 6
 
 LEAKY = [
     ("bearer", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123"),
@@ -44,6 +47,7 @@ LEAKY = [
     ("google api key", GOOGLE_KEY),
     ("keyed secret", "api_key=abcdefghijklmnop"),
     ("private key", "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"),
+    ("oauth code#state", "1\n" + OAUTH_CODE_STATE + "\n"),
 ]
 
 
@@ -54,7 +58,7 @@ def test_credential_shapes_are_detected_and_redacted(label: str, text: str) -> N
     assert REDACTION_MARKER in redacted, f"{label} not redacted"
 
 
-@pytest.mark.parametrize("secret", [AWS_TEMPORARY, SLACK_BOT, GOOGLE_KEY])
+@pytest.mark.parametrize("secret", [AWS_TEMPORARY, SLACK_BOT, GOOGLE_KEY, OAUTH_CODE_STATE])
 def test_secret_body_does_not_survive_redaction(secret: str) -> None:
     assert secret not in redact_credentials(f"leaked value: {secret} <-")
 
@@ -64,6 +68,10 @@ ORDINARY = [
     "see docs/memory.md for the AIza prefix discussion",
     "commit 8c77426 fix(scripts): take the drift detector from the canonical ref",
     "AKIA is the long-lived AWS access-key prefix",
+    # `#` shapes that are not OAuth codes: fragment links and anchors.
+    "https://github.com/jinwon-int/ccc-node/issues/2324#issuecomment-6185866830",
+    "see pages/runbooks/a2a-edge-secret-rotation.md#rb-957-rotation-procedure-steps",
+    "a-very-long-lowercase-heading-anchor-name#another-long-lowercase-anchor-target",
 ]
 
 
@@ -76,3 +84,15 @@ def test_ordinary_prose_is_left_alone(text: str) -> None:
 def test_non_string_input_is_returned_unchanged() -> None:
     assert redact_credentials(None) is None  # type: ignore[arg-type]
     assert contains_credential(None) is False  # type: ignore[arg-type]
+
+
+def test_long_dash_separated_blob_stays_linear() -> None:
+    # The OAuth `code#state` pattern once had unbounded runs: a long blob with
+    # many word boundaries and no `#` made it quadratic (80 KB took ~6 s).
+    import time
+
+    unit = "Ab3" + "x" * 5 + "-"
+    blob = unit * 22_000  # ~198 KB, a `-` every 9 chars, never a `#`
+    started = time.perf_counter()
+    assert redact_credentials(blob) == blob
+    assert time.perf_counter() - started < 2.0

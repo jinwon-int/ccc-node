@@ -45,6 +45,19 @@ CREDENTIAL_PATTERNS: Final = (
     re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/+_-]{10,}"),
     # Google API keys — a fixed 39-character AIza… shape.
     re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b"),
+    # OAuth authorization code + state pasted for a CLI login (`code#state`).
+    # On 2026-10-15 four such login codes were found in plaintext in session
+    # transcripts and a bridge inbox (Wiki DOC-3956) because no pattern here
+    # matched them. The code side must mix upper case, lower case and digits,
+    # so fragment links (`…/issues/1#issuecomment-…`) and lowercase anchors
+    # (`heading-name#other-heading`) are left alone. Every repetition is
+    # bounded: with open-ended runs, a long `-`-separated blob (many word
+    # boundaries, no `#`) made this pattern quadratic — 80 KB took ~6 s.
+    re.compile(
+        r"\b(?=[A-Za-z0-9_-]{0,255}[A-Z])(?=[A-Za-z0-9_-]{0,255}[a-z])"
+        r"(?=[A-Za-z0-9_-]{0,255}[0-9])"
+        r"[A-Za-z0-9_-]{30,256}#[A-Za-z0-9_-]{20,256}"
+    ),
     re.compile(
         r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
         r"secret|password)\s*[:=]\s*[^\s,;]{12,}",
