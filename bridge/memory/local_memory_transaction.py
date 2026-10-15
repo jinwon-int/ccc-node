@@ -504,7 +504,15 @@ class LocalMemoryTransaction:
         # target.  Otherwise a corrupt later snapshot could leave the first
         # target restored and the second target unchanged.
         preimages = {name: self._read_before(manifest, name) for name in _TARGETS}
+        current = self._read_targets()
         for name in _TARGETS:
+            # #2310 L2: a target already holding its pre-image is not
+            # rewritten — one the action never changed (resume.md on a
+            # facts-only commit) or one restored before a crash. A rewrite
+            # only bumps its mtime, which the bridge sink reads as the age of a
+            # resume without a stamped capture (#2301 L3).
+            if self._target_matches_side(current[name], manifest["targets"][name], "before"):
+                continue
             self._write_target(name, preimages[name])
         if not self._state_matches(self._read_targets(), manifest, "before"):
             raise LocalMemoryTransactionError("rollback restore verification failed")

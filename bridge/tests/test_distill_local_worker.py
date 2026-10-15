@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -670,6 +672,144 @@ def test_unstamped_resume_without_new_capture_is_overwritten(tmp_path: Path) -> 
     result = sink.write(extraction_output(), job_id="9" * 64, captured_at=None)
     assert result.resume_written
     assert "cli" not in resume.read_text()
+
+
+_HOOK_COMMIT = Path(__file__).parents[2] / "claude/hooks/distill/local-memory-commit.py"
+_TRANSACTION = Path(__file__).parents[1] / "memory/local_memory_transaction.py"
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _hook_commit(state: Path, activity: str, captured_at: str | None) -> None:
+    """Run the hook-path committer the way distill.sh does (``--mode both``)."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("CCC_", "CLAUDE_DISTILL_"))
+    }
+    env.update(
+        {
+            "CCC_STATE_DIR": str(state),
+            "CCC_LOCAL_MEMORY_TRANSACTION_PY": str(_TRANSACTION),
+        }
+    )
+    if captured_at is not None:
+        env["CLAUDE_DISTILL_CAPTURED_AT"] = captured_at
+    document = {
+        "session_id": "cli-session",
+        "trigger": "sessionend",
+        "honcho": [{"kind": "decision", "text": f"Fact from {activity}.", "subject": "u"}],
+        "resume": {"last_activity": activity},
+    }
+    subprocess.run(
+        [sys.executable, str(_HOOK_COMMIT), "--mode", "both"],
+        input=json.dumps(document),
+        text=True,
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_hook_resume_capture_time_orders_bridge_sink(tmp_path: Path) -> None:
+    """#2310 L1 repro: CLI session ended 3 min ago, its extraction landed now,
+    bridge capture 1 min ago -> the bridge resume is written (the mtime proxy
+    kept the CLI resume). An older bridge capture still loses to it."""
+    from telegram_bot.memory.distill_local_sink import CodexLocalMemorySink
+    from test_distill_local_sink import extraction_output
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    resume = state / "resume.md"
+    sink = CodexLocalMemorySink(state, audience="private", resume_never_regresses=True)
+    now = datetime.now(timezone.utc)
+    cli_captured = _iso(now - timedelta(minutes=3))
+
+    _hook_commit(state, "hook-path CLI session", cli_captured)
+    header, body = resume.read_text().split("\n", 1)
+    assert header.startswith("<!-- ccc-node:distill captured_at=")
+    assert header.endswith(" -->")
+    assert sink._current_resume_captured_at(resume.read_bytes()) == (
+        datetime.fromisoformat(cli_captured.replace("Z", "+00:00"))
+    )
+    assert body == "- 마지막 작업: hook-path CLI session\n"
+    # Extraction finished now: the file mtime is later than the bridge capture.
+    assert datetime.fromtimestamp(resume.stat().st_mtime, timezone.utc) > now - timedelta(
+        minutes=1
+    )
+
+    result = sink.write(
+        extraction_output(last_activity="bridge session"),
+        job_id="a" * 64,
+        captured_at=_iso(now - timedelta(minutes=1)),
+    )
+    assert result.resume_written
+    assert "bridge session" in resume.read_text()
+
+    # A bridge capture older than the CLI capture is kept out; facts merge.
+    _hook_commit(state, "later CLI session", cli_captured)
+    result = sink.write(
+        extraction_output(last_activity="older bridge session", fact_text="Older fact."),
+        job_id="b" * 64,
+        captured_at=_iso(now - timedelta(minutes=5)),
+    )
+    assert not result.resume_written
+    assert "later CLI session" in resume.read_text()
+    assert "Older fact." in (state / "memory-facts.jsonl").read_text()
+
+
+def test_hook_resume_without_capture_time_stays_headerless(tmp_path: Path) -> None:
+    """Outside the pending journal (no CLAUDE_DISTILL_CAPTURED_AT) or with an
+    unusable value, the hook resume is unchanged: no header, mtime ordering."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    for value in (None, "", "not-a-time", "2026-10-15T00:00:00"):
+        _hook_commit(state, f"cli {value!r}", value)
+        assert (state / "resume.md").read_text() == f"- 마지막 작업: cli {value!r}\n"
+
+
+def test_facts_only_rollback_keeps_unstamped_resume_age(tmp_path: Path) -> None:
+    """#2310 L2 repro: a header-less resume last written yesterday, then a
+    facts-only commit + rollback: its mtime stays yesterday, so a bridge
+    capture from an hour ago still replaces it."""
+    from telegram_bot.memory.distill_local_sink import CodexLocalMemorySink
+    from telegram_bot.memory.local_memory_transaction import LocalMemoryTransaction
+    from test_distill_local_sink import extraction_output
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    resume = state / "resume.md"
+    resume.write_text("- 마지막 작업: yesterday's CLI session\n")
+    resume.chmod(0o600)
+    now = datetime.now(timezone.utc)
+    yesterday = (now - timedelta(days=1)).timestamp()
+    os.utime(resume, (yesterday, yesterday))
+    before_ns = resume.stat().st_mtime_ns
+
+    transaction = LocalMemoryTransaction(state)
+    committed = transaction.commit(
+        lambda _current: {"memory-facts.jsonl": b'{"text":"facts only"}\n'},
+        provider="claude",
+        actor="distill",
+        tool="local-memory-commit",
+        session="facts-only",
+        diff="mode-facts",
+    )
+    assert committed.changed_targets == ("memory-facts.jsonl",)
+    transaction.rollback(str(committed.action_id))
+    assert resume.stat().st_mtime_ns == before_ns
+    assert not (state / "memory-facts.jsonl").exists()
+
+    sink = CodexLocalMemorySink(state, audience="private", resume_never_regresses=True)
+    result = sink.write(
+        extraction_output(last_activity="bridge session an hour ago"),
+        job_id="c" * 64,
+        captured_at=_iso(now - timedelta(hours=1)),
+    )
+    assert result.resume_written
+    assert "bridge session an hour ago" in resume.read_text()
 
 
 @pytest.mark.anyio

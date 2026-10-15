@@ -327,3 +327,79 @@ def test_commit_rejects_linked_targets_without_mutating_the_peer(
         )
 
     assert peer.read_bytes() == b"unchanged\n"
+
+
+def _age(path: Path, seconds_ago: int = 86400) -> int:
+    stamp = path.stat().st_mtime - seconds_ago
+    os.utime(path, (stamp, stamp))
+    return path.stat().st_mtime_ns
+
+
+def test_rollback_does_not_rewrite_targets_the_action_left_unchanged(
+    tmp_path: Path,
+) -> None:
+    """#2310 L2: a facts-only commit + rollback leaves resume.md untouched."""
+    state = private_state(tmp_path)
+    write_state(state, "memory-facts.jsonl", b"old facts\n")
+    write_state(state, "resume.md", b"- headerless resume\n")
+    resume_ns = _age(state / "resume.md")
+    transaction = LocalMemoryTransaction(state)
+    result = transaction.commit(
+        lambda _current: {"memory-facts.jsonl": b"new facts\n"},
+        provider="claude",
+        actor="distill",
+        tool="local-memory-commit",
+        session="facts-only",
+        diff="mode-facts",
+    )
+    assert result.changed_targets == ("memory-facts.jsonl",)
+
+    assert transaction.rollback(str(result.action_id)).status == "rolled-back"
+
+    assert (state / "memory-facts.jsonl").read_bytes() == b"old facts\n"
+    assert (state / "resume.md").read_bytes() == b"- headerless resume\n"
+    assert (state / "resume.md").stat().st_mtime_ns == resume_ns
+
+
+def test_recovery_abort_does_not_rewrite_targets_still_at_their_preimage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2310 L2: crash-recovery abort touches neither an unchanged target nor
+    one the interrupted commit never reached."""
+    state = private_state(tmp_path)
+    write_state(state, "memory-facts.jsonl", b"old facts\n")
+    write_state(state, "resume.md", b"- headerless resume\n")
+    facts_ns = _age(state / "memory-facts.jsonl")
+    resume_ns = _age(state / "resume.md")
+    interrupted = LocalMemoryTransaction(state)
+
+    def lost_before_write(name: str, payload: bytes | None) -> None:
+        raise OSError("simulated process loss")
+
+    monkeypatch.setattr(interrupted, "_write_target", lost_before_write)
+    with pytest.raises(OSError, match="simulated"):
+        interrupted.commit(
+            lambda _current: {"memory-facts.jsonl": b"partial facts\n"},
+            provider="codex",
+            actor="distill",
+            tool="local-memory-sink",
+            session="partial",
+            diff="mode-both",
+        )
+    aborted = next((state / "memory-rollback" / "actions").iterdir())
+
+    recovered = LocalMemoryTransaction(state).commit(
+        lambda _current: {},
+        provider="codex",
+        actor="distill",
+        tool="local-memory-sink",
+        session="next",
+        diff="mode-both",
+    )
+
+    assert recovered.action_id is None
+    assert json.loads((aborted / "manifest.json").read_text())["state"] == "aborted"
+    assert (state / "memory-facts.jsonl").read_bytes() == b"old facts\n"
+    assert (state / "memory-facts.jsonl").stat().st_mtime_ns == facts_ns
+    assert (state / "resume.md").stat().st_mtime_ns == resume_ns
