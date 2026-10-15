@@ -34,6 +34,12 @@ fi
 
 BIN="${CCC_CLAUDE_BIN:-claude}"
 ALLOWED="${CCC_ALLOWED_TOOLS:-Read,Grep,Glob}"
+# #2319: a headless run is an automated session (cron / A2A / CI). Its SessionEnd
+# distill may still add facts, but must not replace ~/.claude/state/resume.md —
+# that file is the owner's "직전 세션에서 이어서" handoff and belongs to the bridge
+# thread (hourly agent-cron runs were overwriting it fleet-wide). An explicit
+# caller value wins.
+export CCC_DISTILL_RESUME_POLICY="${CCC_DISTILL_RESUME_POLICY:-skip}"
 command -v "$BIN" >/dev/null 2>&1 || { echo "ccc-headless: '$BIN' not found in PATH" >&2; exit 127; }
 
 args=(-p "$PROMPT" --output-format json --allowedTools "$ALLOWED")
