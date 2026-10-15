@@ -391,6 +391,14 @@ repair("[drawers]\nsqlite count: 1\nhnsw count: 2\ndivergence: 1\nstatus: OK", "
 repair("[drawers]\nsqlite count: -1\nhnsw count: 1\ndivergence: 0\nstatus: OK", "malformed")
 repair("[drawers]\nsqlite count: 1\nsqlite count: 1\nhnsw count: 1\ndivergence: 0\nstatus: OK", "malformed")
 repair("[drawers]\nsqlite count: 1,000\nhnsw count: 1,000\ndivergence: 0\nstatus: OK\n[closets]", "ok")
+# MemPalace 3.10+: rows committed to SQLite but not yet flushed to HNSW are
+# reported OK "within flush-lag tolerance" (the hub node right after its
+# 2026-10-15 from-sqlite rebuild: 303,009 / 302,895 / 114). SQLite ahead of
+# HNSW + OK is ok; the reverse is not.
+repair("[drawers]\nsqlite count: 303,009\nhnsw count: 302,895\ndivergence: 114\nstatus: OK\nnote: HNSW 302,895 / sqlite 303,009 (within flush-lag tolerance)\n[closets]", "ok")
+repair("[drawers]\nsqlite count: 303,009\nhnsw count: 302,895\ndivergence: 113\nstatus: OK\n[closets]", "malformed")
+repair("[drawers]\nsqlite count: 302,895\nhnsw count: 303,009\ndivergence: 114\nstatus: OK\n[closets]", "malformed")
+repair("[drawers]\nsqlite count: 303,009\nhnsw count: 302,895\ndivergence: 114\nstatus: DIVERGED\n[closets]", "diverged")
 with mock.patch.object(probe.subprocess, "run", side_effect=subprocess.TimeoutExpired("mp", 5)):
     assert probe.mempalace_index_probe(Path("/mp"), Path("/"))["status"] == "timeout"
 with mock.patch.object(probe.subprocess, "run", return_value=subprocess.CompletedProcess([], 9, "secret", "secret")):
