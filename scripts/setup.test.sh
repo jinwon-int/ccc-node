@@ -1335,6 +1335,79 @@ HOME="$TMP/owner-guard-home" CCC_CLAUDE_DIR="$og_claude" CCC_HERMES_DIR="$TMP/ow
   CCC_SETUP_TEST_REPO_OWNER_UID=65534 CCC_SETUP_ALLOW_OWNER_MISMATCH=1 bash "$SETUP" --no-backup --dry-run >/dev/null 2>&1; rc=$?
 ok "owner mismatch override proceeds" '[ "$rc" = 0 ]'
 
+# #2323: the opt-out covers the harness install into the running account's home
+# only. The bridge unit reconcile and the .git/hooks guard install act on the
+# checkout owner's state, so a mismatched opt-out run skips both with a note;
+# CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1 forces them. Fixture: a
+# private repo copy whose own renderer installed a ccc-generated unit into a
+# scratch systemd dir, then drifted, plus a call-recording systemctl stub.
+om_repo="$TMP/owner-mismatch-repo"
+cp -a "$guard_repo" "$om_repo"
+om_home="$TMP/owner-mismatch-home"; mkdir -p "$om_home"
+om_sd="$TMP/owner-mismatch-systemd"
+om_ctl="$TMP/owner-mismatch-systemctl"; om_calls="$TMP/owner-mismatch-systemctl.calls"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\n' "$om_calls" > "$om_ctl"; chmod +x "$om_ctl"
+om_unit="$om_sd/ccc-telegram-bridge.service"
+om_reset() { # drift the unit, drop the guard hooks, clear the systemctl log
+  sed -i 's/^Restart=always$/Restart=on-failure/' "$om_unit"
+  rm -f "$om_repo/.git/hooks/post-checkout" "$om_repo/.git/hooks/pre-commit"
+  : > "$om_calls"
+}
+om_setup() { # [extra env assignments...] -- [setup args...]
+  local -a envs=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  (cd "$om_repo" && env ${envs[@]+"${envs[@]}"} HOME="$om_home" CCC_CLAUDE_DIR="$om_home/.claude" \
+    CCC_HERMES_DIR="$om_home/.hermes" CCC_SYSTEMD_DIR="$om_sd" CCC_SYSTEMD_SCOPE=user \
+    CCC_SYSTEMCTL="$om_ctl" PATH="$REAL_PATH" bash "$om_repo/setup.sh" --no-backup "$@" 2>&1)
+}
+mkdir -p "$TMP/owner-mismatch-project"
+HOME="$om_home" CCC_SYSTEMD_DIR="$om_sd" CCC_SYSTEMD_SCOPE=user CCC_SYSTEMCTL="$om_ctl" \
+  bash "$om_repo/bridge/service-systemd.sh" install --project-root "$TMP/owner-mismatch-project" >/dev/null 2>&1
+ok "owner-mismatch fixture: a ccc-generated unit is installed" '[ -f "$om_unit" ] && grep -q "^Restart=always$" "$om_unit"'
+
+# (1) opt-out + mismatch: no unit replace, no daemon-reload, no .git/hooks, notes.
+om_reset
+# shellcheck disable=SC2034  # om_unit_before is read via eval inside ok()
+om_unit_before="$(sha256sum "$om_unit")"
+out="$(om_setup CCC_SETUP_TEST_REPO_OWNER_UID=65534 CCC_SETUP_ALLOW_OWNER_MISMATCH=1)"; rc=$?
+ok "opt-out mismatch run still installs the harness" '[ "$rc" = 0 ] && [ -d "$om_home/.claude/hooks" ]'
+ok "opt-out mismatch run announces the owner-side scope reduction" \
+  'grep -q "owner mismatch allowed by CCC_SETUP_ALLOW_OWNER_MISMATCH=1 (checkout owned by uid 65534" <<<"$out"'
+ok "opt-out mismatch run leaves the drifted bridge unit untouched" \
+  '[ "$(sha256sum "$om_unit")" = "$om_unit_before" ] && ! grep -q "daemon-reload" "$om_calls"'
+ok "opt-out mismatch run notes the skipped unit reconcile and how to run it" \
+  'grep -q "bridge systemd unit reconcile skipped: owner mismatch" <<<"$out" && grep -q "Run setup.sh as the checkout owner" <<<"$out"'
+ok "opt-out mismatch run installs no .git/hooks guard" \
+  '[ ! -e "$om_repo/.git/hooks/post-checkout" ] && [ ! -e "$om_repo/.git/hooks/pre-commit" ]'
+ok "opt-out mismatch run notes the skipped .git/hooks install" \
+  'grep -q "managed-checkout guard: .git/hooks install skipped: owner mismatch" <<<"$out" && ! grep -q "managed-checkout guard installed" <<<"$out"'
+out="$(om_setup CCC_SETUP_TEST_REPO_OWNER_UID=65534 CCC_SETUP_ALLOW_OWNER_MISMATCH=1 -- --dry-run)"; rc=$?
+ok "opt-out mismatch dry-run reports the skips instead of drift" \
+  '[ "$rc" = 0 ] && grep -q "bridge systemd unit reconcile skipped" <<<"$out" && ! grep -q "systemd unit drift detected" <<<"$out" && ! grep -q "would install managed-checkout guard" <<<"$out"'
+
+# (2) opt-out + mismatch + explicit side-effects flag: both steps run.
+om_reset
+out="$(om_setup CCC_SETUP_TEST_REPO_OWNER_UID=65534 CCC_SETUP_ALLOW_OWNER_MISMATCH=1 \
+  CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1)"; rc=$?
+ok "side-effects flag: unit reconciled (drift repaired + daemon-reload)" \
+  '[ "$rc" = 0 ] && grep -q "^Restart=always$" "$om_unit" && grep -q "daemon-reload" "$om_calls"'
+ok "side-effects flag: .git/hooks guard installed" \
+  'grep -q "ccc-node:managed-checkout-guard" "$om_repo/.git/hooks/post-checkout" && grep -q "ccc-node:managed-checkout-guard" "$om_repo/.git/hooks/pre-commit"'
+ok "side-effects flag: no skip notes" '! grep -q "skipped: owner mismatch" <<<"$out"'
+
+# (3) owner match (no seam): unchanged behaviour, even with the flags set.
+om_reset
+out="$(om_setup CCC_SETUP_ALLOW_OWNER_MISMATCH=1)"; rc=$?
+ok "owner match: unit reconciled and guard installed as before" \
+  '[ "$rc" = 0 ] && grep -q "^Restart=always$" "$om_unit" && grep -q "daemon-reload" "$om_calls" && [ -x "$om_repo/.git/hooks/post-checkout" ]'
+ok "owner match: no owner-mismatch notes" \
+  '! grep -q "owner mismatch" <<<"$out" && grep -q "managed-checkout guard installed" <<<"$out"'
+om_reset
+out="$(om_setup)"; rc=$?
+ok "owner match without opt-out: unit reconciled and guard installed" \
+  '[ "$rc" = 0 ] && grep -q "^Restart=always$" "$om_unit" && grep -q "daemon-reload" "$om_calls" && [ -x "$om_repo/.git/hooks/pre-commit" ] && ! grep -q "owner mismatch" <<<"$out"'
+
 # #1480: Termux has no /usr, so the hardcoded /usr/bin/stat and /usr/bin/id
 # resolved to nothing and the guard passed silently on empty values. The
 # candidate dirs are now resolved like readlink (/usr/bin, /bin, $PREFIX/bin);
