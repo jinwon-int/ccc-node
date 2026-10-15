@@ -2,10 +2,10 @@
 # Tests for gotgan.py — nunchi's own verbatim store (#2331).
 # Fully isolated: GOTGAN_DB/NUNCHI_HOME point into a temp dir, embeddings are
 # forced off (no model download, no network), MemPalace CLI is a PATH stub.
+# shellcheck disable=SC2034  # $out/$st are read inside ok()'s eval strings
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GG="$HERE/gotgan.py"
-NP="$HERE/nunchi.py"
 # shellcheck source=claude/hooks/lib/test-stub.sh
 . "$HERE/../lib/test-stub.sh"
 ccc_test_reset_hook_env
