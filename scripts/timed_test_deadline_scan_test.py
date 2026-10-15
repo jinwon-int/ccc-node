@@ -1341,5 +1341,280 @@ class NotifyTests(unittest.TestCase):
         self.assertTrue((self.state / "timed-test-deadline-scan.notify-relative.json").is_file())
 
 
+    def test_followup_mode_uses_its_own_state_and_wording(self) -> None:
+        issue = _fu_issue([_comment(FU_VERDICT, FU_VERDICT_AT)])
+        code, _ = self._run([issue], "2026-10-15T16:00", "--mode", "followup", "--notify", "high")
+        self.assertEqual(code, 1)
+        (record,) = self._spooled()
+        self.assertIn("판정 후 후속 기한 경과 1건", record["text"])
+        self.assertIn(f"{FU_REPO}#42 · 후속 2026-10-14 09:00 KST · 경과 1일", record["text"])
+        self.assertTrue((self.state / "timed-test-deadline-scan.notify-followup.json").is_file())
+
+
+
+# --- followup mode (#2324 (2)) ------------------------------------------------
+# Synthesized fixtures: a verdict that promises a follow-up at an absolute KST
+# time, then silence. Generic repo names only.
+FU_REPO = "example-org/example-repo"
+FU_NOW = dt.datetime(2026, 10, 15, 16, 0)
+FU_VERDICT_AT = "2026-10-13T01:00:00Z"  # 2026-10-13 10:00 KST
+FU_VERDICT = "## 재측정 판정 — 조건부 합격\n지표는 기준 안이다.\n다음 확인: 2026-10-14 09:00 KST"
+
+
+def _fu_issue(comments: list[dict], **extra) -> dict:
+    issue = _issue(number=42, repo=FU_REPO, title="followup fixture", comments=comments)
+    issue.update(extra)
+    return issue
+
+
+class FollowupModeTests(unittest.TestCase):
+    def test_overdue_followup_after_verdict_is_reported(self) -> None:
+        issue = _fu_issue([_comment(FU_VERDICT, FU_VERDICT_AT, "https://example/c/9")])
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.kind, "followup-overdue")
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 14, 9, 0))
+        self.assertEqual(finding.days_overdue, 1)
+        self.assertEqual(finding.confidence, "high")
+        self.assertEqual(finding.comments_after, 0)
+        self.assertEqual(finding.source_url, "https://example/c/9")
+        self.assertIn("다음 확인", finding.paragraph)
+
+    def test_followup_in_a_later_comment_counts(self) -> None:
+        issue = _fu_issue(
+            [
+                _comment("## 관측 종료 판정 — 합격", FU_VERDICT_AT),
+                _comment("- **후속 재측정**: 2026-10-14 09:00 KST", "2026-10-13T03:00:00Z"),
+            ]
+        )
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.confidence, "high")
+
+    def test_english_label_is_recognised(self) -> None:
+        issue = _fu_issue(
+            [_comment("**Verdict**: PASS\nNext action: 2026-10-14 09:00 KST re-measure", FU_VERDICT_AT)]
+        )
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.confidence, "high")
+
+    def test_comment_after_followup_time_clears_it(self) -> None:
+        issue = _fu_issue(
+            [
+                _comment(FU_VERDICT, FU_VERDICT_AT),
+                _comment("재측정 결과: 기준 안", "2026-10-14T01:30:00Z"),  # 10:30 KST
+            ]
+        )
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "followup"))
+
+    def test_comment_before_followup_time_is_not_evidence(self) -> None:
+        issue = _fu_issue(
+            [
+                _comment(FU_VERDICT, FU_VERDICT_AT),
+                _comment("참고 링크 추가", "2026-10-13T20:00:00Z"),  # 10-14 05:00 KST
+            ]
+        )
+        self.assertIsNotNone(scanner.judge_issue(issue, FU_NOW, "followup"))
+
+    def test_future_followup_is_not_reported(self) -> None:
+        issue = _fu_issue([_comment(FU_VERDICT, FU_VERDICT_AT)])
+        early = dt.datetime(2026, 10, 14, 8, 59)
+        self.assertIsNone(scanner.judge_issue(issue, early, "followup"))
+
+    def test_followup_before_any_verdict_is_ignored(self) -> None:
+        # A booking's own plan is expired mode's business, not a promise made
+        # by a verdict.
+        issue = _fu_issue(
+            [_comment("## 실행 계획\n다음 확인: 2026-10-14 09:00 KST", FU_VERDICT_AT)]
+        )
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "followup"))
+
+    def test_issue_body_is_never_a_verdict(self) -> None:
+        issue = _fu_issue([])
+        issue["body"] = "## 판정 — 합격\n다음 확인: 2026-10-14 09:00 KST"
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "followup"))
+
+    def test_marked_utc_followup_is_converted_to_kst(self) -> None:
+        issue = _fu_issue(
+            [_comment("## 판정 — 합격\n다음 확인: 2026-10-14 00:00 UTC", FU_VERDICT_AT)]
+        )
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.deadline, dt.datetime(2026, 10, 14, 9, 0))
+
+    def test_rescheduled_followup_is_not_reported(self) -> None:
+        issue = _fu_issue(
+            [
+                _comment(FU_VERDICT, FU_VERDICT_AT),
+                _comment("다음 확인: 2026-10-20 09:00 KST 로 미룬다", "2026-10-13T11:00:00Z"),
+            ]
+        )
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "followup"))
+
+    def test_passing_mention_is_demoted(self) -> None:
+        issue = _fu_issue(
+            [_comment("## 판정 — 합격\n후속 PR에서 2026-10-14 09:00 KST 이후 확인한다", FU_VERDICT_AT)]
+        )
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.confidence, "low")
+        self.assertEqual(finding.weak_reason, "followup-mention")
+
+    def test_cross_reference_and_date_only_are_demoted(self) -> None:
+        for line, reason in (
+            ("다음 확인: #7 에서 2026-10-14 09:00 KST", "cross-reference"),
+            ("다음 확인: 2026-10-13", "date-only"),
+        ):
+            with self.subTest(line=line):
+                issue = _fu_issue([_comment(f"## 판정 — 합격\n{line}", FU_VERDICT_AT)])
+                finding = scanner.judge_issue(issue, FU_NOW, "followup")
+                assert finding is not None
+                self.assertEqual(finding.weak_reason, reason)
+
+    def test_heading_only_verdict_is_demoted(self) -> None:
+        issue = _fu_issue(
+            [_comment("## 진행 메모\n판정: 보류\n다음 확인: 2026-10-14 09:00 KST", FU_VERDICT_AT)]
+        )
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.weak_reason, "verdict-heading-only")
+
+    def test_past_at_posting_record_is_not_a_promise(self) -> None:
+        issue = _fu_issue(
+            [_comment("## 판정 — 합격\n재측정: 2026-10-12 09:00 KST 에 했다", FU_VERDICT_AT)]
+        )
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "followup"))
+
+    def test_min_confidence_high_drops_demoted_followups(self) -> None:
+        issue = _fu_issue(
+            [_comment("## 판정 — 합격\n후속 PR에서 2026-10-14 09:00 KST 이후 확인한다", FU_VERDICT_AT)]
+        )
+        self.assertEqual(scanner.scan([issue], FU_NOW, "followup", "high"), [])
+        self.assertEqual(len(scanner.scan([issue], FU_NOW, "followup", "low")), 1)
+
+    def test_closed_issue_state_is_reported(self) -> None:
+        issue = _fu_issue([_comment(FU_VERDICT, FU_VERDICT_AT)], state="CLOSED")
+        finding = scanner.judge_issue(issue, FU_NOW, "followup")
+        assert finding is not None
+        self.assertEqual(finding.to_dict()["issue_state"], "closed")
+        report = scanner.format_report([finding], FU_NOW, "followup")
+        self.assertIn("후속 기한 2026-10-14 09:00 | 경과 1일 | 닫힌 이슈", report)
+        self.assertIn("후속 기한 후 코멘트 0건", report)
+
+    def test_clean_followup_report_wording(self) -> None:
+        self.assertEqual(
+            scanner.format_report([], FU_NOW, "followup"),
+            "[2026-10-15 16:00 KST] followup: 해당 없음 — 판정 후 후속 기한 경과 0건",
+        )
+
+
+class FollowupExistingModesTests(unittest.TestCase):
+    """followup is opt-in: the other modes must not see it at all."""
+
+    def test_followup_shape_is_invisible_to_existing_modes(self) -> None:
+        issue = _fu_issue([_comment(FU_VERDICT, FU_VERDICT_AT)])
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "expired"))
+        self.assertIsNone(scanner.judge_issue(issue, FU_NOW, "relative"))
+
+    def test_expired_output_shape_is_unchanged(self) -> None:
+        issue = _issue(
+            comments=[_comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-16T22:23:42Z")]
+        )
+        finding = scanner.judge_issue(issue, NOW, "expired")
+        assert finding is not None
+        self.assertNotIn("issue_state", finding.to_dict())
+        self.assertEqual(
+            scanner.format_report([finding], NOW, "expired").splitlines()[2],
+            "### jinwon-int/ccc-node#1527 | 종료 2026-09-17 07:32 | 경과 3일",
+        )
+        self.assertEqual(
+            scanner.format_report([], NOW, "expired"),
+            "[2026-09-21 01:52 KST] expired: 해당 없음 — 기한 경과 미판정 0건",
+        )
+
+    def test_expired_json_has_no_followup_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "issues.jsonl"
+            path.write_text(json.dumps(_issue(), ensure_ascii=False) + "\n", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                scanner.main(["--input", str(path), "--now", "2026-09-21T01:52", "--json"])
+        self.assertNotIn("include_closed_days", json.loads(out.getvalue()))
+
+
+class IncludeClosedDaysTests(unittest.TestCase):
+    def _main(self, *args: str) -> tuple[int, list]:
+        calls: list = []
+
+        def fetch(*call_args):
+            calls.append(call_args)
+            return []
+
+        with mock.patch.object(scanner, "fetch_via_gh", side_effect=fetch), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = scanner.main(["--repo", "o/r", "--now", "2026-10-15T16:00", *args])
+        return code, calls
+
+    def test_default_is_zero_and_open_only(self) -> None:
+        self.assertEqual(scanner.build_parser().parse_args(["--repo", "o/r"]).include_closed_days, 0)
+        _, calls = self._main("--mode", "followup")
+        self.assertEqual(calls, [("o/r", 200)])
+
+    def test_followup_mode_passes_the_closed_since_date(self) -> None:
+        code, calls = self._main("--mode", "followup", "--include-closed-days", "45")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [("o/r", 200, dt.date(2026, 8, 31))])
+
+    def test_other_modes_reject_the_flag(self) -> None:
+        for mode in ("expired", "relative"):
+            with self.subTest(mode=mode), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self._main("--mode", mode, "--include-closed-days", "5")
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_negative_days_are_rejected(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            self._main("--mode", "followup", "--include-closed-days", "-1")
+        self.assertEqual(raised.exception.code, 2)
+
+    def _gh(self, outputs: list[list[dict]]):
+        procs = [
+            mock.Mock(returncode=0, stdout=json.dumps(out), stderr="") for out in outputs
+        ]
+        return mock.patch.object(scanner.subprocess, "run", side_effect=procs)
+
+    def test_fetch_without_closed_since_runs_the_original_query(self) -> None:
+        with self._gh([[{"number": 1}]]) as run:
+            issues = scanner.fetch_via_gh("o/r", 50)
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["gh", "issue", "list", "--repo", "o/r", "--state", "open", "--limit", "50",
+             "--json", "number,title,url,body,comments,createdAt,updatedAt"],
+        )
+        self.assertEqual(issues, [{"number": 1, "repo": "o/r"}])
+
+    def test_fetch_with_closed_since_adds_a_closed_query(self) -> None:
+        with self._gh([[{"number": 1}], [{"number": 1}, {"number": 2, "state": "CLOSED"}]]) as run:
+            issues = scanner.fetch_via_gh("o/r", 50, dt.date(2026, 8, 31))
+        self.assertEqual(run.call_count, 2)
+        closed_argv = run.call_args_list[1].args[0]
+        self.assertIn("closed", closed_argv)
+        self.assertIn("closed:>=2026-08-31", closed_argv)
+        self.assertTrue(closed_argv[-1].endswith(",state,closedAt"))
+        self.assertEqual([issue["number"] for issue in issues], [1, 2])
+
+    def test_closed_query_failure_raises_for_isolation(self) -> None:
+        procs = [
+            mock.Mock(returncode=0, stdout="[]", stderr=""),
+            mock.Mock(returncode=1, stdout="", stderr="boom"),
+        ]
+        with mock.patch.object(scanner.subprocess, "run", side_effect=procs):
+            with self.assertRaises(RuntimeError) as raised:
+                scanner.fetch_via_gh("o/r", 50, dt.date(2026, 8, 31))
+        self.assertIn("(closed)", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
