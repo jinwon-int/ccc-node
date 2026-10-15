@@ -106,6 +106,21 @@ ok "status lexical-only (no vectors)" 'grep -q "\"vectors\": 0" <<<"$st"'
 ok "absent db reports absent" 'GOTGAN_DB="$TMP/none.db" python3 "$GG" status | grep -q "\"state\": \"absent\""'
 ok "search on absent db is empty, rc 0" '[ -z "$(GOTGAN_DB="$TMP/none.db" python3 "$GG" search 배정)" ]'
 
+# ---- 7b. read path never takes a write lock (bench q2 30s stall regression) ----
+ok "repeated searches in one process do not block" 'timeout 20 python3 -c "
+import sys, time; sys.path.insert(0, \"$HERE\"); import gotgan
+t = time.time()
+for _ in range(5):
+    gotgan.search(\"교체된\", 3)
+sys.exit(0 if time.time() - t < 5 else 1)"'
+ok "search succeeds while a writer transaction is open" 'timeout 20 python3 -c "
+import sys, sqlite3, os; sys.path.insert(0, \"$HERE\"); import gotgan
+w = sqlite3.connect(os.environ[\"GOTGAN_DB\"]); w.execute(\"BEGIN IMMEDIATE\")
+w.execute(\"INSERT OR REPLACE INTO meta VALUES(\x27probe\x27, \x271\x27)\")
+hits = gotgan.search(\"교체된\", 3)
+w.rollback(); sys.exit(0 if hits else 1)"'
+ok "index works after reads (no lingering lock)" 'python3 "$GG" index claude "$TMP/claude" >/dev/null'
+
 # ---- 8. nunchi backend switch ---------------------------------------------------
 cat > "$TMP/bin/mempalace" <<'SH'
 #!/usr/bin/env bash

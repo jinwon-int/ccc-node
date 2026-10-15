@@ -96,11 +96,20 @@ def connect(path=None):
     CREATE TABLE IF NOT EXISTS vecs(id INTEGER PRIMARY KEY, v BLOB);
     """)
     c.execute("INSERT OR IGNORE INTO meta VALUES('schema', ?)", (str(SCHEMA_VERSION),))
+    c.commit()   # never leave a write transaction open across calls
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
     return c
+
+
+def connect_ro(path=None):
+    """Read-only connection for search/status: takes no write lock, so a
+    long-lived caller (dialectic, bench) can never block a concurrent indexer
+    or another reader."""
+    path = path or db_path()
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
 
 
 def bigrams(text):
@@ -291,6 +300,7 @@ def index_dir(provider, root, scope="", embed=None):
     c.execute("INSERT OR REPLACE INTO meta VALUES('last_index', ?)",
               (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
     c.commit()
+    c.close()
     return {"provider": provider, "files_changed": files, "chunks_added": total}
 
 
@@ -405,7 +415,14 @@ def _excerpt(body, ts):
 def search(query, n=3, scope="", path=None, embed=None):
     if not os.path.exists(path or db_path()):
         return []
-    c = connect(path)
+    c = connect_ro(path)
+    try:
+        return _search(c, query, n, scope, embed)
+    finally:
+        c.close()
+
+
+def _search(c, query, n, scope, embed):
     limit = max(n * 10, 30)
     ranks, ts = _lex_rank(c, query, scope, limit)
     model = _embedder() if embed is None else embed
@@ -440,7 +457,14 @@ def status(path=None):
     p = path or db_path()
     if not os.path.exists(p):
         return {"state": "absent", "db": p}
-    c = connect(p)
+    c = connect_ro(p)
+    try:
+        return _status(c, p)
+    finally:
+        c.close()
+
+
+def _status(c, p):
     meta = dict(c.execute("SELECT k, v FROM meta"))
     return {
         "state": "ok", "db": p, "bytes": os.path.getsize(p),
