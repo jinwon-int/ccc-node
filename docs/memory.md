@@ -332,7 +332,7 @@ and readiness probe. Refresh timestamps may be at most five minutes ahead of
 the probe to allow small clock corrections. `ccc-memory-check.sh --json`
 reports only body-free status scalars and the read-only `mempalace
 repair-status` drawer comparison. Missing, failed, stale, malformed, or
-provider-mismatched refreshes and any unknown or divergent index state degrade
+provider-mismatched refreshes and an unknown, `DIVERGED` or malformed index state degrade
 readiness even when SQLite is readable and recently touched.
 
 The readiness probe resolves `CCC_STATE_DIR`, `NUNCHI_HOME`, `NUNCHI_DB`, and

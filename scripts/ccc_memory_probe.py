@@ -385,7 +385,12 @@ def parse_repair_status(text: str) -> dict[str, object]:
     divergence = int(values["divergence"])
     reported = str(values["reported_status"])
     consistent = divergence == abs(sqlite_count - hnsw_count)
-    if reported == "OK" and consistent and divergence == 0 and sqlite_count == hnsw_count:
+    # MemPalace >= 3.10 reports ``OK`` with a small positive divergence while
+    # rows committed to SQLite are not yet flushed into the HNSW segment (its
+    # own flush-lag tolerance; it reports ``DIVERGED`` once that is exceeded).
+    # Trust that verdict when the lag runs in the only direction a flush lag
+    # can: SQLite ahead of HNSW. HNSW ahead of SQLite is still malformed.
+    if reported == "OK" and consistent and sqlite_count >= hnsw_count:
         return {**result, "status": "ok"}
     if reported == "DIVERGED" and consistent and divergence > 0:
         return {**result, "status": "diverged"}
