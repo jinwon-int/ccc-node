@@ -17,8 +17,15 @@ delay for a daytime deadline about 6 h, #2150), `--mode expired`, `--notify high
 line, operator-owned); until it exists the scan exits 3 (not configured).
 
 Exit codes: 0 clean, 1 findings (`--exit-nonzero-on-findings`), 2 unusable repo
-list, 3 not configured. The full report is appended to
+list, 3 not configured, 4 partial scan. The full report is appended to
 `~/.claude/state/timed-test-deadline-scan.cron.log`.
+
+Partial scan (#2324): a repo that cannot be read — Issues disabled, `gh`
+failure, timeout, unparsable output — is skipped with a `repo skipped` line on
+stderr, listed under `repo_errors` in `--json` output (a `⚠ 부분 스캔` block in
+the text report), and every other repo is still scanned and reported. The run
+then exits 4 even if findings exist, because the result is known to be
+incomplete. Keep repos with Issues disabled out of the repos file.
 
 ## Owner notice
 

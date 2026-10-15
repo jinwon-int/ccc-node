@@ -975,6 +975,86 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+class RepoFetchIsolationTests(unittest.TestCase):
+    """#2324 (1): one unreadable repo must not silence every other repo.
+
+    Reproduced 2026-10-15: a 45-repo list that included a repository with
+    Issues disabled raised RuntimeError out of fetch_via_gh on that repo and
+    the whole run printed a traceback — zero findings, no JSON, for all 45.
+    """
+
+    _EXPIRED = _issue(
+        comments=[_comment("검증 종료 예정: 2026-09-17 07:32 KST", "2026-09-16T22:23:42Z")]
+    )
+
+    def _run(self, side_effect, *extra: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(scanner, "fetch_via_gh", side_effect=side_effect), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = scanner.main(
+                ["--repo", "o/disabled", "--repo", "o/live", "--now", "2026-09-21T01:52", *extra]
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def _one_fails(self, exc: BaseException):
+        live = dict(self._EXPIRED, repo="o/live")
+
+        def fetch(repo: str, limit: int):
+            if repo == "o/disabled":
+                raise exc
+            return [live]
+
+        return fetch
+
+    def test_one_failing_repo_does_not_abort_the_rest(self) -> None:
+        exc = RuntimeError("gh issue list failed for o/disabled: the repository has disabled issues")
+        code, out, err = self._run(self._one_fails(exc), "--json", "--exit-nonzero-on-findings")
+        payload = json.loads(out)
+        self.assertEqual(payload["finding_count"], 1)
+        self.assertEqual([e["repo"] for e in payload["repo_errors"]], ["o/disabled"])
+        self.assertIn("disabled issues", payload["repo_errors"][0]["error"])
+        self.assertIn("o/disabled", err)
+        # A partial scan outranks "findings": the list is known to be incomplete.
+        self.assertEqual(code, scanner.EXIT_PARTIAL_SCAN)
+
+    def test_partial_scan_without_the_findings_flag_is_still_nonzero(self) -> None:
+        exc = RuntimeError("gh issue list failed for o/disabled: boom")
+        code, out, _ = self._run(self._one_fails(exc))
+        self.assertEqual(code, scanner.EXIT_PARTIAL_SCAN)
+        self.assertIn("o/disabled", out)  # the text report names the skipped repo
+
+    def test_timeouts_and_bad_json_are_isolated_too(self) -> None:
+        for exc in (
+            scanner.subprocess.TimeoutExpired(cmd="gh", timeout=300),
+            json.JSONDecodeError("Expecting value", "", 0),
+            OSError("gh: not found"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                code, out, _ = self._run(self._one_fails(exc), "--json")
+                payload = json.loads(out)
+                self.assertEqual(payload["finding_count"], 1)
+                self.assertEqual(len(payload["repo_errors"]), 1)
+                self.assertEqual(code, scanner.EXIT_PARTIAL_SCAN)
+
+    def test_every_repo_failing_is_partial_not_clean(self) -> None:
+        def fetch(repo: str, limit: int):
+            raise RuntimeError(f"gh issue list failed for {repo}: offline")
+
+        code, out, _ = self._run(fetch, "--json")
+        payload = json.loads(out)
+        self.assertEqual(payload["finding_count"], 0)
+        self.assertEqual(len(payload["repo_errors"]), 2)
+        self.assertEqual(code, scanner.EXIT_PARTIAL_SCAN)
+
+    def test_clean_fetch_reports_empty_repo_errors_and_exits_zero(self) -> None:
+        code, out, _ = self._run(lambda repo, limit: [], "--json", "--exit-nonzero-on-findings")
+        self.assertEqual(json.loads(out)["repo_errors"], [])
+        self.assertEqual(code, 0)
+
+    def test_partial_scan_code_is_distinct_from_every_other_code(self) -> None:
+        self.assertNotIn(scanner.EXIT_PARTIAL_SCAN, (0, 1, 2, scanner.EXIT_NOT_CONFIGURED))
+
+
 _BOOKING = "검증 종료 예정: 2026-09-17 07:32 KST"
 _BOOKED_AT = "2026-09-16T22:23:42Z"
 
@@ -1035,6 +1115,54 @@ class NotifyTests(unittest.TestCase):
         if not self.spool.is_dir():
             return []
         return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(self.spool.glob("*.json"))]
+
+    def _run_repos(self, fetched: dict[str, list[dict] | Exception], now: str) -> tuple[int, str]:
+        def fetch(repo: str, limit: int):
+            result = fetched[repo]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        args = ["--now", now, "--notify", "high", "--exit-nonzero-on-findings"]
+        for repo in fetched:
+            args += ["--repo", repo]
+        err = io.StringIO()
+        with mock.patch.object(scanner, "fetch_via_gh", side_effect=fetch), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = scanner.main(args)
+        return code, err.getvalue()
+
+    def _state_fingerprints(self) -> list[str]:
+        state = self.state / "timed-test-deadline-scan.notify-expired.json"
+        return json.loads(state.read_text(encoding="utf-8"))["fingerprints"]
+
+    def test_partial_scan_keeps_skipped_repo_fingerprints(self) -> None:
+        # #2324: an unreadable repo is not "its findings were resolved". Dropping
+        # them from the dedup set would re-announce them as new once it recovers.
+        a = dict(_high(1913), repo="o/a")
+        b = dict(_high(7), repo="o/b")
+        self._run_repos({"o/a": [a], "o/b": [b]}, "2026-09-21T01:52")
+        self.assertEqual(len(self._spooled()), 1)
+        both = sorted(self._state_fingerprints())
+
+        code, err = self._run_repos(
+            {"o/a": [a], "o/b": RuntimeError("gh issue list failed for o/b: offline")},
+            "2026-09-21T09:20",
+        )
+        self.assertEqual(code, scanner.EXIT_PARTIAL_SCAN)
+        self.assertEqual(sorted(self._state_fingerprints()), both)
+        self.assertEqual(len(self._spooled()), 1)  # nothing new to say
+
+        _, err = self._run_repos({"o/a": [a], "o/b": [b]}, "2026-09-21T13:20")
+        self.assertEqual(len(self._spooled()), 1)  # recovery is not a new finding
+        self.assertNotIn("reason=new", err)
+
+    def test_partial_scan_still_drops_resolved_findings_of_readable_repos(self) -> None:
+        a = dict(_high(1913), repo="o/a")
+        b = dict(_high(7), repo="o/b")
+        self._run_repos({"o/a": [a], "o/b": [b]}, "2026-09-21T01:52")
+        self._run_repos({"o/a": [], "o/b": RuntimeError("offline")}, "2026-09-21T09:20")
+        self.assertEqual(self._state_fingerprints(), ["o/b#7@2026-09-17T07:32"])
 
     def test_high_finding_is_spooled_owner_only(self) -> None:
         code, err = self._run([_high(1913, title="관측 종료 판정 대기")], "2026-09-21T01:52", "--notify", "high")
