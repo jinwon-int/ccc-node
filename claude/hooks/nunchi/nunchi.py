@@ -1420,6 +1420,49 @@ def mempalace_verbatim(query, n=3):
     return "\n".join(lines[:40])
 
 
+def gotgan_verbatim(query, n=3):
+    """#2331 — the same excerpt contract served from nunchi's own store.
+
+    gotgan.py sits beside this file and needs only stdlib sqlite3, so the
+    import is local and cheap; any failure (missing module, absent or locked
+    DB) is the same silent "" the MemPalace path returns.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import gotgan
+        # Audience isolation is by DB file: a scoped child runs with its own
+        # NUNCHI_HOME (the same redirect MemPalace gets via HOME), so no
+        # scope filter is layered on top here.
+        hits = gotgan.search(query, n)
+        return "\n".join(gotgan.format_lines(hits)[:40])
+    except Exception:
+        return ""
+
+
+VERBATIM_BACKENDS = ("mempalace", "gotgan", "both")
+
+
+def verbatim_excerpts(query, n=3):
+    """Pick the verbatim layer: CCC_NUNCHI_VERBATIM_BACKEND (#2331).
+
+    Default stays `mempalace`, so live behavior does not move until a node
+    opts in. `both` concatenates MemPalace then gotgan lines, de-duplicated,
+    for the shadow comparison the issue's P2 gate measures.
+    """
+    backend = os.environ.get("CCC_NUNCHI_VERBATIM_BACKEND", "mempalace").strip().lower()
+    if backend not in VERBATIM_BACKENDS:
+        backend = "mempalace"
+    if backend == "gotgan":
+        return gotgan_verbatim(query, n)
+    if backend == "mempalace":
+        return mempalace_verbatim(query, n)
+    lines = [s for s in mempalace_verbatim(query, n).splitlines() if s]
+    for s in gotgan_verbatim(query, n).splitlines():
+        if s and s not in lines:
+            lines.append(s)
+    return "\n".join(lines[:40])
+
+
 # Ways a synthesis answer says "the evidence does not contain this". The
 # dialectic prompt asks for the literal "기록 없음", but backends paraphrase it
 # (gwakga answered "질문한 내용에 대한 근거 기록이 없습니다" for q6, which a
@@ -1465,7 +1508,7 @@ def dialectic(query, target):
     facts = search(c, query, target, limit=12, include_history=True)
     current = [f"- {r[3]}{_because_suffix(r[6])}" for r in facts if not r[5]]
     history = [f"- ({r[4][:10]}~{r[5][:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if r[5]]
-    verbatim = mempalace_verbatim(query, 3)   # §3: verbatim layer, optional
+    verbatim = verbatim_excerpts(query, 3)   # §3: verbatim layer, optional (#2331)
     prompt = (
         "아래는 peer 메모리(요약 사실)와 MemPalace(원문 발췌)에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
         "근거에 없는 내용은 지어내지 말고 '기록 없음'이라 하라. 시일이 닫힌(valid_to 있는) 사실은 과거 이력이다.\n"
