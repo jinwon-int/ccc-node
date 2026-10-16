@@ -76,6 +76,17 @@ okc "$RC" 1 "a down bridge exits nonzero"
 ok "down node reported" 'grep -q "^DOWN beta" "$OUT"'
 ok "healthy node still OK" 'grep -q "^OK alpha" "$OUT"'
 
+# ---- retired on purpose (DOC-4014, #2343) ----------------------------------
+# The node answered AVAIL=retired: no bridge, but a retirement marker. Not a
+# failure, and not OK either — reported under its own name with the marker.
+reply beta - retired -
+echo "RETIRED=telegram-retire-20261016" >> "$TMP/reply/beta"
+run "alpha beta"
+okc "$RC" 0 "a retired bridge does not fail the run"
+ok "retired node reported under its own name, with its marker" \
+  'grep -q "^RETIRED beta marker=telegram-retire-20261016$" "$OUT" && ! grep -qE "^(OK|DOWN|UNVERIFIED) beta" "$OUT"'
+ok "healthy node beside it still OK" 'grep -q "^OK alpha" "$OUT"'
+
 # ---- degraded: alive and serving, but not restartable ----------------------
 # The gongyung 2026-08-11 shape: the bot answered Telegram normally while
 # start.sh reported "degraded" (running with no pid file). Reported as DOWN,
@@ -871,16 +882,42 @@ PATH="$TMP/danso-noarg-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TM
 ok "a service without --data-dir is asked without one" \
   'grep -q "^AVAIL=yes$" "$TMP/danso-noarg-out"'
 
-# No ccc bridge and no danso service: still DOWN, as before.
-mkdir -p "$TMP/empty-bin"
+# No ccc bridge and no danso service: still DOWN, as before. HOME is pinned to
+# an empty directory: the watcher host itself may carry a retirement marker
+# (gwakga does since 2026-10-16), and the probe reads the marker from HOME.
+mkdir -p "$TMP/empty-bin" "$TMP/empty-home"
 cat > "$TMP/empty-bin/ps" <<EOF
 #!$(command -v sh)
 exit 0
 EOF
 chmod +x "$TMP/empty-bin/ps"
-PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/empty-out"
+PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" HOME="$TMP/empty-home" sh "$TMP/owner-probe.sh" > "$TMP/empty-out"
 ok "a node with neither runtime is still DOWN" \
   'grep -q "^AVAIL=no$" "$TMP/empty-out" && grep -q "^RUNTIME=-$" "$TMP/empty-out" && ! grep -q "^KIND=danso$" "$TMP/empty-out"'
+
+# ---- retired on purpose: the probe side (DOC-4014, #2343) ------------------
+# The 2026-10-16 fleet retirement left `~/.claude/state/telegram-retire-<date>/`
+# (the rollback backup) on every retired node. With no runtime at all, that
+# directory turns the answer from DOWN into RETIRED, naming the newest marker.
+mkdir -p "$TMP/retired-home/.claude/state/telegram-retire-20261001" \
+         "$TMP/retired-home/.claude/state/telegram-retire-20261016"
+PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" HOME="$TMP/retired-home" sh "$TMP/owner-probe.sh" > "$TMP/retired-out"
+ok "no runtime plus a retirement marker is RETIRED, not DOWN" \
+  'grep -q "^AVAIL=retired$" "$TMP/retired-out" && ! grep -q "^AVAIL=no$" "$TMP/retired-out" && grep -q "^RUNTIME=-$" "$TMP/retired-out"'
+ok "the newest marker is named and the probe completes" \
+  'grep -q "^RETIRED=telegram-retire-20261016$" "$TMP/retired-out" && [ "$(tail -1 "$TMP/retired-out")" = PROBE_COMPLETE=1 ]'
+# A marker file (not a directory) is not a declaration.
+mkdir -p "$TMP/file-home/.claude/state"; : > "$TMP/file-home/.claude/state/telegram-retire-20261016"
+PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" HOME="$TMP/file-home" sh "$TMP/owner-probe.sh" > "$TMP/file-out"
+ok "a plain file where the marker directory should be is ignored" 'grep -q "^AVAIL=no$" "$TMP/file-out"'
+# The marker softens absence only. A bridge that IS running is judged on its
+# answer (a TM-4018 rollback leaves the marker behind), so a failing bridge on
+# a once-retired node still pages.
+PATH="$TMP/probe-bin:$PATH" HOME="$TMP/retired-home" PROBE_STATUS=unavailable sh "$TMP/owner-probe.sh" > "$TMP/retired-running-out"
+ok "a running bridge is judged on its answer despite the marker" \
+  'grep -q "^AVAIL=no$" "$TMP/retired-running-out" && ! grep -q "^AVAIL=retired$" "$TMP/retired-running-out"'
+PATH="$TMP/probe-bin:$PATH" HOME="$TMP/retired-home" sh "$TMP/owner-probe.sh" > "$TMP/retired-running-out"
+ok "a healthy bridge is available despite the marker" 'grep -q "^AVAIL=yes$" "$TMP/retired-running-out"'
 
 # ---- runtime owner is not the service manager ------------------------------
 # Execute the POSIX probe: a system service may use User=gongmyoung without
@@ -1032,6 +1069,27 @@ run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:30:00Z
 okc "$RC" 1 "state mode: a confirmed recovery of an alerted node is reported"
 ok "state mode: RECOVERED names the node and its old verdict" \
   'grep -q "^RECOVERED alpha channel=telegram was=DOWN since=2026-10-01T00:45:00Z for=0h45m$" "$OUT"'
+# A pair retired on purpose closes its alert once, then stays quiet (#2343):
+# the 2026-10-16 shape, 11 pairs alerted DOWN and then declared retired.
+reply alpha /opt/ccc-node no /opt/ccc-node
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:35:00Z
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:40:00Z
+okc "$RC" 1 "state mode: the pair is alerted DOWN before its retirement"
+reply alpha - retired -
+echo "RETIRED=telegram-retire-20261001" >> "$TMP/reply/alpha"
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:41:00Z
+okc "$RC" 0 "state mode: a first retired answer does not page"
+ok "state mode: retirement is a recovery in progress" \
+  'grep -q "^RECOVERING alpha channel=telegram was=DOWN now=RETIRED confirm=1/2$" "$OUT"'
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:42:00Z
+okc "$RC" 1 "state mode: a confirmed retirement closes the alert, once"
+ok "state mode: RECOVERED says the pair is retired, not restored" \
+  'grep -q "^RECOVERED alpha channel=telegram was=DOWN now=RETIRED since=2026-10-01T01:35:00Z for=0h07m$" "$OUT"'
+run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:43:00Z
+okc "$RC" 0 "state mode: a retired pair then stays quiet"
+ok "state mode: retired pairs are counted, not listed" \
+  '! grep -q " alpha " "$OUT" && grep -q "^SUMMARY checked=2 ok=0 retired=1 " "$OUT"'
+reply alpha /opt/ccc-node yes /opt/ccc-node
 # An explicitly requested recheck still works in state mode.
 run_state "beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:45:00Z CCC_FLEET_DEGRADED_RECHECK=1
 ok "state mode: CCC_FLEET_DEGRADED_RECHECK=1 is honoured" '[ "$(wc -l < "$TMP/reply/beta.flags")" = 2 ]'

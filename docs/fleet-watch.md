@@ -28,6 +28,21 @@ after the reviewed fix is integrated into the normal checkout.
   `UNVERIFIED`, not evidence of downtime. A successful transport exit and final
   completion marker are required before accepting a result; a truncated doctor
   response cannot become `OK`.
+- **Retired channel (#2343):** a node with no ccc bridge and no Danso service
+  that carries a retirement marker — a directory
+  `~/.claude/state/telegram-retire-<YYYYMMDD>/` in the home of the account the
+  watcher logs in as — reports `RETIRED <node> marker=<name>` instead of
+  `DOWN`. The directory is what the 2026-10-16 fleet retirement (Wiki DOC-4014:
+  Telegram bridges stopped and disabled on 11 of 12 nodes, Matrix is the main
+  channel) left behind as each node's rollback backup, so it is the node's own
+  declaration and no node list lives in the watcher. It softens absence only:
+  a bridge that is running is judged on its answer, marker or not, so a
+  rollback (TM-4018) needs no cleanup and a failing bridge on a once-retired
+  node still pages. `RETIRED` is not a failure in plain mode and is folded like
+  `OK` in change mode (below). To retire a channel on another node, create the
+  directory (it is where the retirement's backups belong) after stopping and
+  disabling the bridge; to un-retire, start the bridge — the marker is inert
+  while a bridge runs.
 - **Matrix availability:** identify the Matrix process by its exact
   `CCC_CHANNEL=matrix` environment or systemd cgroup. Check its private
   `BOT_DATA_DIR/health.json` only when it is fresh and names that PID. An older
@@ -118,7 +133,14 @@ script's output and exit codes are unchanged.
 
   The following rows never page: `PENDING` (abnormal, not yet confirmed),
   `KNOWN` (already alerted, with `next-alert=`) and `RECOVERING`. `OK` rows are
-  dropped. A final `SUMMARY` row gives the totals. The report is ordered NEW,
+  dropped. A final `SUMMARY` row gives the totals. A `RETIRED` row (#2343) is
+  folded like `OK`: a pair that was alerted closes through
+  `RECOVERING`/`RECOVERED … was=<VERDICT> now=RETIRED` exactly once (so the
+  2026-10-16 retirement's eleven `NEW-DOWN` alerts end in one `RECOVERED=11`
+  page rather than a daily `STILL-DOWN`), and a retired pair is otherwise
+  silent — counted as `retired=N` in the `SUMMARY`, which keeps its old shape
+  when nothing is retired. A node that later runs its bridge again and fails
+  is `NEW` like any other. The report is ordered NEW,
   STILL, RECOVERED, PENDING, KNOWN, RECOVERING. A chronic `KNOWN` pair
   therefore never hides a `NEW` one, and the alert title counts only the
   paging rows: `NEW-DEGRADED=1 NEW-UNVERIFIED=1 (node-a)`.
