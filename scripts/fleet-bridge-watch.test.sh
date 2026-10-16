@@ -884,7 +884,8 @@ ok "a service without --data-dir is asked without one" \
 
 # No ccc bridge and no danso service: still DOWN, as before. HOME is pinned to
 # an empty directory: the watcher host itself may carry a retirement marker
-# (gwakga does since 2026-10-16), and the probe reads the marker from HOME.
+# (the scheduled watcher's node does since 2026-10-16), and the probe reads the
+# marker from HOME.
 mkdir -p "$TMP/empty-bin" "$TMP/empty-home"
 cat > "$TMP/empty-bin/ps" <<EOF
 #!$(command -v sh)
