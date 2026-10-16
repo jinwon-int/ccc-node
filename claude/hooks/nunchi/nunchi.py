@@ -82,6 +82,7 @@ import glob
 import hashlib
 import json
 import os
+from itertools import zip_longest
 import re
 import sqlite3
 import time
@@ -1440,14 +1441,18 @@ def gotgan_verbatim(query, n=3):
 
 
 VERBATIM_BACKENDS = ("mempalace", "gotgan", "both")
+VERBATIM_BOTH_CAP_PER_BACKEND = 20   # both: each backend keeps its own share of the 40-line budget
 
 
 def verbatim_excerpts(query, n=3):
     """Pick the verbatim layer: CCC_NUNCHI_VERBATIM_BACKEND (#2331).
 
     Default stays `mempalace`, so live behavior does not move until a node
-    opts in. `both` concatenates MemPalace then gotgan lines, de-duplicated,
-    for the shadow comparison the issue's P2 gate measures.
+    opts in. `both` interleaves the two backends under a per-backend cap, so
+    the shadow comparison actually sees both: the first cut appended gotgan
+    after MemPalace and then truncated at 40 lines, and MemPalace alone fills
+    40 lines on most queries (shadow-node smoke 2026-10-16: 40/0), so `both` was
+    silently a MemPalace bench.
     """
     backend = os.environ.get("CCC_NUNCHI_VERBATIM_BACKEND", "mempalace").strip().lower()
     if backend not in VERBATIM_BACKENDS:
@@ -1456,11 +1461,15 @@ def verbatim_excerpts(query, n=3):
         return gotgan_verbatim(query, n)
     if backend == "mempalace":
         return mempalace_verbatim(query, n)
-    lines = [s for s in mempalace_verbatim(query, n).splitlines() if s]
-    for s in gotgan_verbatim(query, n).splitlines():
-        if s and s not in lines:
-            lines.append(s)
-    return "\n".join(lines[:40])
+    per = VERBATIM_BOTH_CAP_PER_BACKEND
+    mp = [s for s in mempalace_verbatim(query, n).splitlines() if s][:per]
+    gg = [s for s in gotgan_verbatim(query, n).splitlines() if s][:per]
+    lines = []
+    for pair in zip_longest(mp, gg):
+        for s in pair:
+            if s and s not in lines:
+                lines.append(s)
+    return "\n".join(lines[:2 * per])
 
 
 # Ways a synthesis answer says "the evidence does not contain this". The
