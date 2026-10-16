@@ -223,6 +223,9 @@ case "\${REVIEW_STUB_MODE:-revised}" in
   prose)
     printf 'I revised the skill and it looks great now.'
     ;;
+  wrong-outcome)
+    printf '{"outcome":"revision","skillName":"stub-skill","changeSummary":"x"}'
+    ;;
   # exit 3 on purpose: the handler must report an agent crash as 1 (an
   # environment failure), never pass the agent's own code through (#1460).
   crash) exit 3 ;;
@@ -287,6 +290,19 @@ ok "drop_recommendation outcome composes a bounded result (#1460)" \
 make_revise_task
 REVIEW_STUB_MODE=prose run_revise_handler >/dev/null 2>&1; rc=$?
 ok "prose-only reviser output is a deterministic handler failure (exit 3, #1460)" '[ "$rc" = 3 ]'
+# #2354: the same dead end #1619 closed for the review handler — the temp dir
+# takes model-out.txt away, so the failure line must carry what was seen.
+make_revise_task
+REVIEW_STUB_MODE=prose run_revise_handler 2> "$TMP/revise-prose.err" >/dev/null
+ok "unparseable reviser output reports size, object count and an excerpt (#2354)" \
+  'grep -q "HANDLER_FAIL: no parseable revise result JSON in reviser output (bytes=" "$TMP/revise-prose.err" &&
+   grep -q "json_objects_found=0, outcomes_seen=-" "$TMP/revise-prose.err" &&
+   grep -q "HANDLER_FAIL_HEAD: I revised the skill and it looks great now." "$TMP/revise-prose.err"'
+# A JSON object with the wrong outcome word is the other common shape: name it.
+make_revise_task
+REVIEW_STUB_MODE=wrong-outcome run_revise_handler 2> "$TMP/revise-wrong.err" >/dev/null; rc=$?
+ok "a JSON result with an unknown outcome word is named in the failure line (#2354)" \
+  '[ "$rc" = 3 ] && grep -q "json_objects_found=1, outcomes_seen=\[.revision.\]" "$TMP/revise-wrong.err"'
 
 make_revise_task
 REVIEW_STUB_MODE=crash run_revise_handler >/dev/null 2>&1; rc=$?
