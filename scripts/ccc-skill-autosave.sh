@@ -1004,9 +1004,18 @@ else
     curator_args="run --auto"
     [ "$AUTONOMY_STATE" = "dry-run" ] && curator_args="run --auto --dry-run"
     log "curator config file=$(curator_env_file_state) applied=${CURATOR_ENV_APPLIED:-none} archive=$(curator_archive_state) archive_after_days=${CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS:-90}"
-    summary="$(python3 "$CURATOR" $curator_args 2>>"$LOG")" \
-      && log "curator $(printf '%s' "$summary" | head -c 500)" \
-      || log "curator failed (non-fatal)"
+    curator_rc=0
+    summary="$(python3 "$CURATOR" $curator_args 2>>"$LOG")" || curator_rc=$?
+    if [ "$curator_rc" = 0 ]; then
+      log "curator $(printf '%s' "$summary" | head -c 500)"
+    else
+      # curator.py refuses with `{"ok": false, "code": "<reason>"}` on STDOUT
+      # and exit 2 — stderr stays empty. Logging only "failed" threw that
+      # reason away: on one node the curator failed every night from
+      # 2026-10-12 (archive directory mode 755 -> `unsafe_state_directory`)
+      # and nothing in the log said why until someone re-ran it by hand.
+      log "curator failed (non-fatal) rc=$curator_rc $(printf '%s' "$summary" | head -c 500)"
+    fi
   fi
 fi
 

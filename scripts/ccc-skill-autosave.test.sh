@@ -731,6 +731,10 @@ from pathlib import Path
 line = " ".join(sys.argv[1:]) + " archive=" + os.environ.get("CCC_SKILL_CURATOR_ARCHIVE_ENABLED", "unset")
 with Path(os.environ["CURATOR_TOUCH"]).open("a", encoding="utf-8") as handle:
     handle.write(line + "\n")
+# The real curator reports a refusal on stdout and exits 2 (stderr empty).
+if os.environ.get("CURATOR_FAIL"):
+    print('{"code":"unsafe_state_directory","ok":false}')
+    sys.exit(2)
 print('{"ok":true,"command":"run"}')
 PY
 STATE13="$TMP/state13"; mkdir -p "$STATE13"; chmod 700 "$STATE13"
@@ -751,6 +755,13 @@ ok "#2011: CCC_SKILL_CURATOR_ENABLED=false skips the curator" '[ ! -s "$TMP/cura
 ok "#2011: the curator off-switch is logged" 'grep -q "curator skipped reason=disabled" "$STATE13/skill-autosave.log"'
 run13 CCC_AUTONOMY=dry-run
 ok "#2011: autonomy dry-run keeps the curator report-only" 'grep -qx "run --auto --dry-run archive=unset" "$TMP/curator13.touched"'
+# A refusing curator must leave its reason in the log. The real curator prints
+# {"ok": false, "code": ...} on stdout and exits 2 with nothing on stderr; a
+# bare "failed" line hid a nightly unsafe_state_directory refusal for days.
+run13 CURATOR_FAIL=1
+ok "curator refusal is logged with its exit code and reason" \
+  'grep -q "curator failed (non-fatal) rc=2 {\"code\":\"unsafe_state_directory\",\"ok\":false}" "$STATE13/skill-autosave.log"'
+ok "curator refusal does not fail the sweep" 'run13 CURATOR_FAIL=1'
 out="$(CCC_STATE_DIR="$STATE13" bash "$AUTOSAVE" status 2>&1)"
 ok "#2011: status reports curator enabled with archive moves off" \
   'printf "%s" "$out" | grep -q "^curator: enabled, archive moves off"'
