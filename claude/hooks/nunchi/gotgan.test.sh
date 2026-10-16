@@ -148,6 +148,16 @@ v() { PATH="$TMP/bin:$PATH" CCC_NUNCHI_VERBATIM_BACKEND="$1" python3 -c \
 ok "default backend stays mempalace" 'out="$(PATH="$TMP/bin:$PATH" python3 -c "import sys; sys.path.insert(0, \"$HERE\"); import nunchi; print(nunchi.verbatim_excerpts(\"교체된\", 3))")"; grep -q MP-STUB-LINE <<<"$out" && ! grep -q 교체된 <<<"$out"'
 ok "gotgan backend serves gotgan only" 'out="$(v gotgan)"; grep -q 교체된 <<<"$out" && ! grep -q MP-STUB-LINE <<<"$out"'
 ok "both backend merges" 'out="$(v both)"; grep -q 교체된 <<<"$out" && grep -q MP-STUB-LINE <<<"$out"'
+cat > "$TMP/bin/mempalace" <<'SH'
+#!/usr/bin/env bash
+for i in $(seq 1 60); do echo "MP-FLOOD-$i"; done
+SH
+ok "both: a flooding MemPalace does not starve gotgan (per-backend cap)" 'out="$(v both)"; grep -q 교체된 <<<"$out" && [ "$(grep -c MP-FLOOD <<<"$out")" -le 20 ] && [ "$(wc -l <<<"$out")" -le 40 ]'
+ok "both: interleaved — a gotgan line appears within the first 2 lines" 'out="$(v both)"; head -2 <<<"$out" | grep -q 교체된'
+cat > "$TMP/bin/mempalace" <<'SH'
+#!/usr/bin/env bash
+echo "MP-STUB-LINE"
+SH
 ok "unknown backend falls back to mempalace" 'out="$(v bogus)"; grep -q MP-STUB-LINE <<<"$out"'
 ok "gotgan backend with absent db is empty" 'out="$(GOTGAN_DB="$TMP/none.db" v gotgan)"; [ -z "$out" ]'
 
