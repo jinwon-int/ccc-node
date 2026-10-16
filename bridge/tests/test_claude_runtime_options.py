@@ -518,3 +518,55 @@ def test_fleet_browser_off_by_default_for_unrestricted_owner(
         tmp_path,
     )
     assert "fleet-browser" not in (options.mcp_servers or {})
+
+
+# ---- caller-scoped MCP servers (#372 P4) -----------------------------------
+# The native-mls responder hands its in-process steward tool server to the
+# runtime through SessionRequest.mcp_servers. It must land in the SDK options
+# on an unbound runtime (the responder has no bridge settings), compose with the
+# profile bundles on a bound one, and never shadow a fleet bundle by name.
+
+
+_STEWARD_SERVER = {"type": "stdio", "command": "/opt/steward/bin/mcp", "args": ["--rooms"]}
+
+
+def test_request_mcp_servers_reach_the_sdk_options_without_settings(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime()
+    options = runtime._build_options(
+        SessionRequest(working_directory=str(tmp_path), mcp_servers={"steward": _STEWARD_SERVER}),
+        _reject,
+    )
+    assert options.mcp_servers == {"steward": _STEWARD_SERVER}
+    # No implicit widening: the permission mode / can_use_tool still gate calls.
+    assert not options.allowed_tools
+    assert not options.disallowed_tools
+
+
+def test_request_without_mcp_servers_leaves_options_untouched(tmp_path: Path) -> None:
+    options = ClaudeRuntime()._build_options(
+        SessionRequest(working_directory=str(tmp_path)), _reject
+    )
+    assert not options.mcp_servers
+
+
+def test_request_mcp_servers_compose_with_profile_bundles(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(
+        settings=_settings(tmp_path, bridge_web_mcp_mode="searxng-firecrawl")
+    )
+    options = runtime._build_options(
+        SessionRequest(working_directory=str(tmp_path), mcp_servers={"steward": _STEWARD_SERVER}),
+        _reject,
+    )
+    assert set(options.mcp_servers) == {"searxng", "firecrawl", "steward"}
+    assert FIRECRAWL_SEARCH_TOOL in options.allowed_tools
+
+
+def test_request_mcp_server_name_collision_fails_closed(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(
+        settings=_settings(tmp_path, bridge_web_mcp_mode="searxng-firecrawl")
+    )
+    with pytest.raises(ValueError, match="conflicting MCP server definitions"):
+        runtime._build_options(
+            SessionRequest(working_directory=str(tmp_path), mcp_servers={"firecrawl": _STEWARD_SERVER}),
+            _reject,
+        )

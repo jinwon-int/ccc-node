@@ -328,6 +328,39 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                     memory_environment=invalid,
                 )
 
+    async def test_session_request_mcp_servers_are_validated_and_immutable(self) -> None:
+        # #372 P4: caller-scoped MCP servers ride on the request; the mapping is
+        # snapshotted (a later caller mutation must not reach the adapter) and
+        # names are bounded identifiers because they become tool-name prefixes.
+        server = {"type": "stdio", "command": "/opt/steward/bin/mcp", "args": ["--rooms"]}
+        servers: dict[str, object] = {"steward": server}
+        request = SessionRequest(working_directory="/workspace", mcp_servers=servers)
+
+        servers["rogue"] = {"type": "stdio", "command": "/bin/false"}
+
+        assert request.mcp_servers is not None
+        self.assertEqual(list(request.mcp_servers), ["steward"])
+        self.assertIs(request.mcp_servers["steward"], server)
+        with self.assertRaises(TypeError):
+            cast(dict[str, object], request.mcp_servers)["rogue"] = server
+        self.assertIsNone(SessionRequest(working_directory="/workspace").mcp_servers)
+        invalid_servers: tuple[object, ...] = (
+            {},
+            {"": server},
+            {"bad name": server},
+            {"bad\x00name": server},
+            {"x" * 65: server},
+            {"steward": {}},
+            {"steward": "not-a-mapping"},
+            ["steward"],
+        )
+        for invalid in invalid_servers:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                SessionRequest(
+                    working_directory="/workspace",
+                    mcp_servers=cast(Any, invalid),
+                )
+
     async def test_tool_lifecycle_events_are_typed_immutable_snapshots(self) -> None:
         arguments: dict[str, JsonValue] = {"command": "pwd", "paths": ["."]}
         output: dict[str, JsonValue] = {"exitCode": 0, "lines": ["/workspace"]}

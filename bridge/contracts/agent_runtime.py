@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass
 from enum import Enum
 import math
+import re
 from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias
 
@@ -140,6 +141,30 @@ class ApprovalRequestEvent:
 
 
 _APPROVAL_PATH_KEYS = ("path", "file_path", "filePath", "paths", "target", "targets")
+# SDK MCP server names become tool-name prefixes (``mcp__<name>__<tool>``);
+# keep them to the same ASCII identifier shape the permission rules expect.
+_MCP_SERVER_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _freeze_mcp_servers(value: object) -> Mapping[str, object]:
+    """Validate and snapshot ``SessionRequest.mcp_servers`` (#372 P4).
+
+    A non-empty mapping of identifier names to non-empty server configs; the
+    configs themselves are kept by reference (an in-process SDK server is a
+    live object, not JSON) while the outer mapping is frozen so a caller's
+    later mutation cannot reach the adapter.
+    """
+
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("mcp servers must be a non-empty mapping")
+    servers: dict[str, object] = {}
+    for name, server in value.items():
+        if not isinstance(name, str) or not _MCP_SERVER_NAME_RE.fullmatch(name):
+            raise ValueError("mcp server name is invalid")
+        if not isinstance(server, Mapping) or not server:
+            raise ValueError("mcp server config must be a non-empty mapping")
+        servers[name] = server
+    return MappingProxyType(servers)
 
 
 def approval_target_kind(arguments: object) -> str:
@@ -381,10 +406,19 @@ class SessionRequest:
     approvals_reviewer: str | None = None
     sandbox_policy: Mapping[str, JsonValue] | None = None
     memory_environment: Mapping[str, str] | None = None
+    # Caller-scoped MCP servers (#372 P4): ``{name: server config}`` in the
+    # Claude Agent SDK ``mcp_servers`` shape (stdio/http dicts or in-process
+    # SDK servers from ``create_sdk_mcp_server``). Adapters merge them after
+    # their own execution-profile bundles and fail closed on a name collision.
+    # Provider-neutral in intent; adapters that cannot express it must refuse
+    # the request rather than drop it silently.
+    mcp_servers: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not self.working_directory:
             raise ValueError("working directory must not be empty")
+        if self.mcp_servers is not None:
+            object.__setattr__(self, "mcp_servers", _freeze_mcp_servers(self.mcp_servers))
         if self.effort is not None and not self.effort:
             raise ValueError("effort must not be empty")
         if self.approval_policy is not None and not self.approval_policy:
