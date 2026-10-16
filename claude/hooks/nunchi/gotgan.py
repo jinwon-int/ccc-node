@@ -55,7 +55,7 @@ _NOISE_PREFIX = ("[external_event:", "[Request interrupted", "[SYSTEM NOTIFICATI
 # nunchi's own synthesis prompts (dialectic / synthesize-stdin). A session that
 # opens with one is a synthesis call, not a conversation: indexing it makes
 # every later query retrieve its own echoed prompt (#2331 shadow: 16% of the
-# seoseo index). Keep in sync with nunchi.py's prompt openings.
+# the shadow node index). Keep in sync with nunchi.py's prompt openings.
 _SELF_PROMPTS = (
     "아래는 peer 메모리(요약 사실)와 MemPalace",
     "아래는 Family Wiki에서 검색한 근거다",
