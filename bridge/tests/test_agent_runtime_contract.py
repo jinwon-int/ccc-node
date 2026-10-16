@@ -344,7 +344,7 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             cast(dict[str, object], request.mcp_servers)["rogue"] = server
         self.assertIsNone(SessionRequest(working_directory="/workspace").mcp_servers)
-        for invalid in (
+        invalid_servers: tuple[object, ...] = (
             {},
             {"": server},
             {"bad name": server},
@@ -353,7 +353,8 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             {"steward": {}},
             {"steward": "not-a-mapping"},
             ["steward"],
-        ):
+        )
+        for invalid in invalid_servers:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 SessionRequest(
                     working_directory="/workspace",
