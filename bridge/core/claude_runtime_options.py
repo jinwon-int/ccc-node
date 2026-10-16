@@ -117,6 +117,21 @@ class ClaudeRuntimeOptionsMixin:
                     **(dict(options.env) if options.env is not None else {}),
                     "CCC_BRIDGE_DISTILL_MANAGED": "1",
                 }
+        if request.mcp_servers:
+            # Caller-scoped servers (#372 P4: the native-mls responder's
+            # steward tools). Merged after every execution-profile bundle so a
+            # name that collides with a fleet bundle fails closed in
+            # merge_mcp_bundle instead of shadowing it. Tool allow/deny lists
+            # are untouched: the SDK permission mode / can_use_tool still gate
+            # every call, which is exactly the approval round trip callers rely on.
+            merge_mcp_bundle(
+                options,
+                {
+                    "mcp_servers": dict(request.mcp_servers),
+                    "allowed_tools": [],
+                    "disallowed_tools": [],
+                },
+            )
         # Ownership marker for the orphan reaper. PPID==1 alone does not say a
         # `node claude` process is *ours* — the node also runs claude under
         # `setsid` from the distill/skill-review hooks, and an operator may have
