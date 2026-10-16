@@ -17,6 +17,13 @@
 #                     "could not determine". Such a node reports KIND=danso,
 #                     a RUNTIME that is a binary path rather than a checkout
 #                     root, and the GENERATION (sha256) of that binary.
+#                     A node with no bridge at all that carries a retirement
+#                     marker (`~/.claude/state/telegram-retire-<YYYYMMDD>/` in
+#                     the probing account's home — the rollback backup the
+#                     2026-10-16 fleet retirement left behind, Wiki DOC-4014,
+#                     #2343) reports RETIRED <node> marker=<name>: absent on
+#                     purpose, not a failure. A running bridge is judged on
+#                     its answer regardless of the marker.
 #   2. canonical    — the checkout it serves from is one the fleet installs at,
 #                     not a PR/issue work tree
 #   3. boot path    — the systemd unit that would restart the bridge points at
@@ -114,8 +121,8 @@ if [ -n "$STATE_FILE" ] && [ "$PRINT_PROBE" = 0 ]; then
   echo "fleet-bridge-watch: state tracking failed (exit $state_rc); reporting raw verdicts" >&2
   echo "UNVERIFIED watcher state-file=unusable"
   if [ -n "$raw" ]; then
-    printf '%s\n' "$raw" | grep -v '^OK '
-    printf '%s\n' "$raw" | grep '^OK '
+    printf '%s\n' "$raw" | grep -vE '^(OK|RETIRED) '
+    printf '%s\n' "$raw" | grep -E '^(OK|RETIRED) '
   fi
   exit 1
 fi
@@ -330,6 +337,23 @@ if [ -z "$line" ]; then
     echo "PREPARED=-"
     echo "PROBE_COMPLETE=1"
     exit 0
+  fi
+  # Neither runtime. Before calling that DOWN, ask whether the node retired its
+  # Telegram bridge on purpose. The fleet-wide retirement of 2026-10-16 (Wiki
+  # DOC-4014, #2343) stopped and disabled the bridge on 11 nodes and left each
+  # node's rollback backups in `~/.claude/state/telegram-retire-<YYYYMMDD>/`;
+  # the watch then paged NEW-DOWN for all 11 and would have re-paged daily. That
+  # directory is the node's own declaration, read from the probing account's
+  # home, so no node table lives in the watcher (the stale-table defect named in
+  # the header). Only ABSENCE is softened by it: a bridge that is running is
+  # judged on its answer, so a rollback (TM-4018) needs no marker cleanup. The
+  # newest marker is reported when several exist.
+  retired=""
+  for _m in "$HOME"/.claude/state/telegram-retire-*; do
+    [ -d "$_m" ] && retired=${_m##*/}
+  done
+  if [ -n "$retired" ]; then
+    echo "RUNTIME=-"; echo "AVAIL=retired"; echo "RETIRED=$retired"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
   fi
   echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
 fi
@@ -693,6 +717,15 @@ judge_node() {
   if [ "$avail" = "degraded" ]; then
     reason=$(printf '%s\n' "$out" | sed -n 's/^AVAIL_REASON=//p' | head -1)
     echo "DEGRADED $node runtime=$runtime reason=${reason:-unknown}$degraded_note"; fail=1; return
+  fi
+
+  # A retired bridge is absent on purpose (DOC-4014, #2343): the node said so
+  # with its marker, and nobody should be paged to restore it. It is reported
+  # under its own name rather than as OK, so the report still shows which
+  # nodes no longer serve the channel, and it is not a failure.
+  if [ "$avail" = retired ]; then
+    marker=$(printf '%s\n' "$out" | sed -n 's/^RETIRED=//p' | head -1)
+    echo "RETIRED $node marker=${marker:-unknown}"; return
   fi
 
   if [ "$avail" != yes ] && [ "$avail" != no ]; then

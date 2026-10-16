@@ -16,6 +16,12 @@ SCRIPT = Path(__file__).resolve().parent / 'fleet_watch_state.py'
 OK_A = 'OK node-a (/opt/ccc-node)\nOK node-a channel=matrix reason=available\n'
 DEG_A = ('DEGRADED node-a runtime=/opt/ccc-node reason=health-stale\n'
          'OK node-a channel=matrix reason=available\n')
+DOWN_A = 'DOWN node-a\nOK node-a channel=matrix reason=available\n'
+# Absent on purpose (#2343): the node carries a retirement marker.
+RET_A = ('RETIRED node-a marker=telegram-retire-20261016\n'
+         'OK node-a channel=matrix reason=available\n')
+QUIET_RETIRED = ('SUMMARY checked=2 ok=1 retired=1 new=0 still=0 recovered=0 '
+                 'pending=0 known=0 recovering=0 page=no')
 
 
 class StateRun(unittest.TestCase):
@@ -166,6 +172,59 @@ class StateRun(unittest.TestCase):
         rc, out, _ = self.run_watch(OK_A, '2026-10-01T00:45:00Z', **env)
         self.assertEqual(rc, 0)
         self.assertTrue(out[0].startswith('RECOVERED node-a'), out)
+
+    # --- retirement (#2343) -------------------------------------------------
+
+    def test_retired_pair_closes_its_alert_once_then_stays_quiet(self):
+        # The 2026-10-16 shape: a pair alerted DOWN, then the node retires it.
+        self.run_watch(DOWN_A, '2026-10-01T00:00:00Z')
+        rc, _, _ = self.run_watch(DOWN_A, '2026-10-01T00:15:00Z')
+        self.assertEqual(rc, 1)
+        rc, out, _ = self.run_watch(RET_A, '2026-10-01T10:00:00Z')
+        self.assertEqual(rc, 0)
+        self.assertEqual(out[0], 'RECOVERING node-a channel=telegram was=DOWN now=RETIRED confirm=1/2')
+        rc, out, _ = self.run_watch(RET_A, '2026-10-01T10:15:00Z')
+        self.assertEqual(rc, 1)
+        self.assertEqual(out[0], 'RECOVERED node-a channel=telegram was=DOWN now=RETIRED '
+                                 'since=2026-10-01T00:00:00Z for=10h15m')
+        rc, out, _ = self.run_watch(RET_A, '2026-10-01T10:30:00Z')
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, [QUIET_RETIRED])
+        entry = self.entries()['node-a/telegram']
+        self.assertEqual(entry['verdict'], 'RETIRED')
+        self.assertEqual(entry['detail'], 'marker=telegram-retire-20261016')
+        self.assertIsNone(entry['alerted'])
+        # Still due for a re-alert by the clock, but there is no alert left.
+        rc, out, _ = self.run_watch(RET_A, '2026-10-02T12:00:00Z')
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, [QUIET_RETIRED])
+
+    def test_retired_pair_never_alerted_is_silent_from_the_start(self):
+        rc, out, _ = self.run_watch(RET_A, '2026-10-01T00:00:00Z')
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, [QUIET_RETIRED])
+        rc, out, _ = self.run_watch(RET_A, '2026-10-01T00:15:00Z')
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, [QUIET_RETIRED])
+        self.assertEqual(self.entries()['node-a/telegram']['streak'], 2)
+
+    def test_summary_shape_is_unchanged_without_retired_pairs(self):
+        _, out, _ = self.run_watch(OK_A, '2026-10-01T00:00:00Z')
+        self.assertEqual(out, ['SUMMARY checked=2 ok=2 new=0 still=0 recovered=0 pending=0 '
+                               'known=0 recovering=0 page=no'])
+
+    def test_retirement_rolled_back_into_an_outage_is_new_again(self):
+        # TM-4018 rollback leaves the marker in place; a bridge that then runs
+        # and fails is judged on its answer, and the pair pages like any other.
+        self.run_watch(RET_A, '2026-10-01T00:00:00Z')
+        self.run_watch(DOWN_A, '2026-10-01T00:15:00Z')
+        rc, out, _ = self.run_watch(DOWN_A, '2026-10-01T00:30:00Z')
+        self.assertEqual(rc, 1)
+        self.assertEqual(out[0], 'NEW DOWN node-a channel=telegram since=2026-10-01T00:15:00Z')
+
+    def test_abnormal_row_wins_over_retired_for_the_same_pair(self):
+        rows = fws.parse_verdicts('RETIRED node-a marker=x\nDOWN node-a\nRETIRED node-a marker=x\n')
+        self.assertEqual(rows['node-a/telegram'][0], 'DOWN')
 
     def test_unseen_pairs_are_left_alone_and_eventually_pruned(self):
         self.run_watch(DEG_A, '2026-10-01T00:00:00Z')

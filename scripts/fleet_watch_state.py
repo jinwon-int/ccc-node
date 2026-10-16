@@ -22,7 +22,16 @@ changed in a way a person needs to hear about:
 Everything else is context and never pages: PENDING (abnormal, not yet
 confirmed), KNOWN (already alerted, re-alert not due), RECOVERING (alerted pair
 answering OK, not yet confirmed). OK rows are dropped from the report; a
-SUMMARY line keeps the totals. On 2026-10-01 a node lost DNS for ten hours and
+SUMMARY line keeps the totals.
+
+``RETIRED <node> marker=<name>`` (fleet-bridge-watch.sh, #2343) is a bridge
+that is absent on purpose: the node carries a retirement marker. It is folded
+like OK — it closes an open alert through RECOVERING/RECOVERED (``now=RETIRED``)
+exactly once, is otherwise silent, and is counted apart in the SUMMARY
+(``retired=N``) so an operator can still see which pairs no longer serve.
+On 2026-10-16 the fleet retired its Telegram bridges on 11 of 12 nodes (Wiki
+DOC-4014); without this the watch paged NEW-DOWN for all 11 and would have
+re-paged every day, which is the chronic-noise state this helper exists to end. On 2026-10-01 a node lost DNS for ten hours and
 the daily watch's alert looked like every other day's, because another node had
 been DEGRADED for days and the run failed every day (#2086). Tracking state per
 pair is what lets a chronic issue stay quiet without hiding a new one.
@@ -50,7 +59,10 @@ import ccc_secure_fs as _secure_fs  # noqa: E402
 SCHEMA = 'ccc.fleet-watch-state.v1'
 ABNORMAL = ('DOWN', 'UNREACHABLE', 'DRIFT', 'BOOTPATH', 'DUALDOMAIN',
             'NONCANONICAL', 'DEGRADED', 'UNVERIFIED')
-VERDICTS = ('OK',) + ABNORMAL
+# Verdicts that close an alert and never page. RETIRED is absence on purpose
+# (a node-side retirement marker, see fleet-bridge-watch.sh and #2343).
+NORMAL = ('OK', 'RETIRED')
+VERDICTS = NORMAL + ABNORMAL
 TS_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 DETAIL_MAX = 200
 MAX_STATE_BYTES = 512 * 1024
@@ -128,7 +140,7 @@ def parse_verdicts(text):
     """Return ``{key: (verdict, node, channel, detail)}`` in first-seen order.
 
     Telegram rows carry no channel token; Matrix rows say ``channel=matrix``.
-    If a pair is reported twice, an abnormal row wins over an OK one.
+    If a pair is reported twice, an abnormal row wins over an OK or RETIRED one.
     """
     rows = {}
     for raw in (text or '').splitlines():
@@ -142,7 +154,7 @@ def parse_verdicts(text):
             detail = detail[:channel_match.start()] + ' ' + detail[channel_match.end():]
         detail = ' '.join(detail.split())[:DETAIL_MAX]
         key = f'{node}/{channel}'
-        if key in rows and rows[key][0] != 'OK':
+        if key in rows and rows[key][0] not in NORMAL:
             continue
         rows[key] = (verdict, node, channel, detail)
     return rows
@@ -286,11 +298,16 @@ def _close_alert(entry):
     entry['alertCount'] = 0
 
 
-def observe_ok(prev, detail, now, cfg):
-    """Fold one OK row into its entry; return (entry, kind or None)."""
+def observe_normal(prev, verdict, detail, now, cfg):
+    """Fold one OK or RETIRED row into its entry; return (entry, kind or None).
+
+    Both close an open alert the same way: a retired pair is no longer
+    something to restore. OK -> RETIRED (or back) starts a new streak, so a
+    retirement confirms over RECOVER_AFTER runs like any recovery.
+    """
     stamp = fmt_ts(now)
-    same = prev is not None and prev['verdict'] == 'OK'
-    entry = dict(prev or {}, verdict='OK', detail=detail, lastSeen=stamp)
+    same = prev is not None and prev['verdict'] == verdict
+    entry = dict(prev or {}, verdict=verdict, detail=detail, lastSeen=stamp)
     entry['streak'] = prev['streak'] + 1 if same else 1
     entry['since'] = prev['since'] if same else stamp
     if not entry.get('alerted'):
@@ -313,7 +330,9 @@ def describe(kind, row, entry, prev, now, cfg):
     verdict, node, channel, detail = row
     if kind in ('RECOVERED', 'RECOVERING'):
         was = prev.get('alerted') or prev.get('verdict')
-        line = _row_text(kind, '', node, channel, f'was={was}')
+        # A retirement closes the alert, but it is not a restored service: say so.
+        now_tag = ' now=RETIRED' if verdict == 'RETIRED' else ''
+        line = _row_text(kind, '', node, channel, f'was={was}{now_tag}')
         since = parse_ts(prev.get('abnormalSince'))
         if kind == 'RECOVERED' and since is not None:
             line += f' since={fmt_ts(since)} for={fmt_age(now - since)}'
@@ -337,35 +356,42 @@ REPORT_ORDER = ('NEW', 'STILL', 'RECOVERED', 'PENDING', 'KNOWN', 'RECOVERING')
 
 
 def evaluate(entries, rows, now, cfg):
-    """Apply one run's rows. Returns (new_entries, {kind: [line, ...]}, ok_count)."""
+    """Apply one run's rows.
+
+    Returns ``(new_entries, {kind: [line, ...]}, quiet)`` where ``quiet`` counts
+    the rows that produced no report line, per verdict (``{'OK': n, 'RETIRED': m}``).
+    """
     updated = dict(entries)
     report = {kind: [] for kind in REPORT_ORDER}
-    ok_count = 0
+    quiet = {verdict: 0 for verdict in NORMAL}
     for key, row in rows.items():
         prev = entries.get(key)
         verdict, _node, _channel, detail = row
-        if verdict == 'OK':
-            entry, kind = observe_ok(prev, detail, now, cfg)
+        if verdict in NORMAL:
+            entry, kind = observe_normal(prev, verdict, detail, now, cfg)
         else:
             entry, kind = observe_abnormal(prev, verdict, detail, now, cfg)
         if kind is None:
-            ok_count += 1
+            quiet[verdict] += 1
         else:
             report[kind].append(describe(kind, row, entry, prev or {}, now, cfg))
         if kind == 'RECOVERED':
             _close_alert(entry)
         updated[key] = entry
-    return prune(updated, now), report, ok_count
+    return prune(updated, now), report, quiet
 
 
 def should_page(report, cfg):
     return bool(report['NEW'] or report['STILL'] or (report['RECOVERED'] and cfg.page_recovery))
 
 
-def render(report, ok_count, checked, page):
+def render(report, quiet, checked, page):
     lines = [line for kind in REPORT_ORDER for line in report[kind]]
     counts = ' '.join(f'{kind.lower()}={len(report[kind])}' for kind in REPORT_ORDER)
-    lines.append(f'SUMMARY checked={checked} ok={ok_count} {counts} page={"yes" if page else "no"}')
+    # `retired=` appears only when there is something to count, so a fleet
+    # without retired pairs keeps the SUMMARY shape it always had.
+    retired = f' retired={quiet["RETIRED"]}' if quiet.get('RETIRED') else ''
+    lines.append(f'SUMMARY checked={checked} ok={quiet["OK"]}{retired} {counts} page={"yes" if page else "no"}')
     return '\n'.join(lines)
 
 
@@ -391,10 +417,10 @@ def run(state_path, text, raw_exit, now, cfg):
         if not acquired:
             warn('state file is locked by another run')
             return 2
-        entries, report, ok_count = evaluate(load_state(state_path), rows, now, cfg)
+        entries, report, quiet = evaluate(load_state(state_path), rows, now, cfg)
         save_state(state_path, entries, now)
     page = should_page(report, cfg)
-    print(render(report, ok_count, len(rows), page))
+    print(render(report, quiet, len(rows), page))
     return 1 if page else 0
 
 
