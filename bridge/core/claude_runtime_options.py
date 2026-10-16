@@ -121,14 +121,16 @@ class ClaudeRuntimeOptionsMixin:
             # Caller-scoped servers (#372 P4: the native-mls responder's
             # steward tools). Merged after every execution-profile bundle so a
             # name that collides with a fleet bundle fails closed in
-            # merge_mcp_bundle instead of shadowing it. Tool allow/deny lists
-            # are untouched: the SDK permission mode / can_use_tool still gate
-            # every call, which is exactly the approval round trip callers rely on.
+            # merge_mcp_bundle instead of shadowing it. Only the caller's own
+            # pre-approved tools (SessionRequest validates they belong to one
+            # of these servers, #2345) join the allow-list; every other call
+            # still goes through the SDK permission mode / can_use_tool, which
+            # is exactly the approval round trip callers rely on.
             merge_mcp_bundle(
                 options,
                 {
                     "mcp_servers": dict(request.mcp_servers),
-                    "allowed_tools": [],
+                    "allowed_tools": list(request.mcp_allowed_tools or ()),
                     "disallowed_tools": [],
                 },
             )
