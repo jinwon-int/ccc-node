@@ -1451,7 +1451,7 @@ def verbatim_excerpts(query, n=3):
     opts in. `both` interleaves the two backends under a per-backend cap, so
     the shadow comparison actually sees both: the first cut appended gotgan
     after MemPalace and then truncated at 40 lines, and MemPalace alone fills
-    40 lines on most queries (seoseo 2026-10-16 smoke: 40/0), so `both` was
+    40 lines on most queries (shadow-node smoke 2026-10-16: 40/0), so `both` was
     silently a MemPalace bench.
     """
     backend = os.environ.get("CCC_NUNCHI_VERBATIM_BACKEND", "mempalace").strip().lower()
