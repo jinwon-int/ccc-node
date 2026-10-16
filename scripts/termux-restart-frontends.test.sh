@@ -17,7 +17,7 @@ TMP="$(ccc_test_tmpdir)" || exit 1
 cleanup() { [ -n "${LIVE1:-}" ] && kill "$LIVE1" 2>/dev/null; [ -n "${LIVE2:-}" ] && kill "$LIVE2" 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME/.claude/state" "$HOME/.ccc-node/scripts" "$HOME/.ccc-node/preparations/gen-A" "$HOME/.ccc-node/preparations/gen-B" "$HOME/.ccc-matrix"
-unset CCC_BRIDGE_RESTART_DEADLINE_EPOCH SVDIR PREFIX
+unset CCC_BRIDGE_RESTART_DEADLINE_EPOCH SVDIR PREFIX CCC_FRONTENDS CCC_FRONTENDS_FILE
 export CCC_MATRIX_SURVIVE_SECONDS=2 CCC_MATRIX_START_SECONDS=3 CCC_MATRIX_POLL_SECONDS=1 CCC_MATRIX_BUSY_POLL_SECONDS=1
 export CCC_MATRIX_MIN_WINDOW_SECONDS=2 CCC_TERMUX_FOLLOWER_WAIT_SECONDS=1
 LOG="$HOME/.claude/state/restart-frontends.log"
@@ -238,6 +238,34 @@ out="$(CCC_TERMUX_LAUNCHER="$TMP/custom-launcher.sh" run)"; rc=$?
 ok "CCC_TERMUX_LAUNCHER overrides the launcher" '[ "$rc" = 0 ] && grep -q "^custom --path $HOME --restart -d" "$CALLS"'
 mv "$TMP/bridge-current.sh.keep" "$HOME/.ccc-node/scripts/bridge-current.sh"
 rm -f "$HOME/.telegram_bot/health.json"
+
+# ---------------------------------------------------------------- Telegram-retired node (#2342)
+reset; point gen-A; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; setfake
+printf '# telegram retired here\nmatrix\n' > "$HOME/.claude/frontends"
+out="$(run)"; rc=$?
+ok "retired: Telegram launcher never called, Matrix still followed, exit 0" '[ "$rc" = 0 ] && ! grep -q bridge-current "$CALLS" && grep -q "telegram retired on this node" "$LOG" && grep -q "matrix up to date (gen-A)" "$LOG"'
+reset; setfake "FAKE_TG_RC=7"
+out="$(run)"; rc=$?
+ok "retired: a failing Telegram launcher cannot fail the restart" '[ "$rc" = 0 ] && ! grep -q bridge-current "$CALLS"'
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_NEW_PID=$LIVE2" "FAKE_NEW_GEN=gen-B"
+out="$(run)"; rc=$?
+ok "retired: pointer moved → Matrix restarted and verified, Telegram untouched" '[ "$rc" = 0 ] && grep -q "sv restart ccc-matrix-bridge" "$CALLS" && grep -q "matrix verified: gen=gen-B pid=$LIVE2" "$LOG" && ! grep -q bridge-current "$CALLS"'
+out="$(run --dry-run)"
+ok "dry-run reports telegram=retired" '[[ "$out" == *"telegram=retired"* ]]'
+reset; setfake
+printf 'matrix\ntelegram   # both frontends\n' > "$HOME/.claude/frontends"
+out="$(run)"; rc=$?
+ok "a list naming telegram keeps the Telegram restart" '[ "$rc" = 0 ] && grep -q "bridge-current --path $HOME --restart -d" "$CALLS"'
+out="$(run --dry-run)"
+ok "dry-run reports telegram=enabled" '[[ "$out" == *"telegram=enabled"* ]]'
+rm -f "$HOME/.claude/frontends"
+reset
+out="$(CCC_FRONTENDS=matrix run)"; rc=$?
+ok "CCC_FRONTENDS env (no file) marks Telegram retired" '[ "$rc" = 0 ] && ! grep -q bridge-current "$CALLS"'
+reset
+out="$(CCC_FRONTENDS="matrix,telegram" run)"; rc=$?
+ok "CCC_FRONTENDS comma list naming telegram keeps it" '[ "$rc" = 0 ] && grep -q "bridge-current --path $HOME --restart -d" "$CALLS"'
 
 # ---------------------------------------------------------------- usage
 out="$(run --bogus)"; rc=$?
