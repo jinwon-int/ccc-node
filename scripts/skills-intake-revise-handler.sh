@@ -167,6 +167,13 @@ def die(message):
     sys.exit(3)
 
 
+def _try_json(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 candidates = []
 depth = 0
 start = None
@@ -209,7 +216,27 @@ for cand in candidates:
     if isinstance(obj, dict) and str(obj.get("outcome", "")).lower() in ("revised", "drop_recommendation"):
         outcome_objs.setdefault(json.dumps(obj, sort_keys=True, ensure_ascii=False), obj)
 if not outcome_objs:
-    die("no parseable revise result JSON in reviser output")
+    # Diagnostic parity with the review handler (#1619) and with the
+    # agent-crash branch above, which logs 300 chars of each stream. Without
+    # an excerpt this failure is a dead end: the temp dir takes model-out.txt
+    # with it, the PR comment says only "ended as failed", and nobody can tell
+    # a prose wrapper from a refusal, a truncation or a misspelled `outcome`.
+    # Three such failures on 2026-10-15/16 (two reviser nodes) were exactly
+    # that dead end (#2354). Head+tail only — never the full transcript.
+    seen = sorted({str(o.get("outcome")) for c in candidates
+                   for o in [_try_json(c)] if isinstance(o, dict) and "outcome" in o})
+    excerpt_head = " ".join(raw[:240].split())
+    excerpt_tail = " ".join(raw[-240:].split()) if len(raw) > 240 else ""
+    print(
+        "HANDLER_FAIL: no parseable revise result JSON in reviser output "
+        f"(bytes={len(raw)}, json_objects_found={len(candidates)}, "
+        f"outcomes_seen={seen or '-'})",
+        file=sys.stderr,
+    )
+    print(f"HANDLER_FAIL_HEAD: {excerpt_head}", file=sys.stderr)
+    if excerpt_tail:
+        print(f"HANDLER_FAIL_TAIL: {excerpt_tail}", file=sys.stderr)
+    sys.exit(3)
 if len(outcome_objs) > 1:
     die(f"ambiguous reviser output: {len(outcome_objs)} distinct outcome objects")
 result_obj = next(iter(outcome_objs.values()))
