@@ -14,6 +14,81 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ccc_doctor import USAGE_BUDGET_TOKENS_DEFAULT, Doctor  # noqa: E402
 
 
+class TelegramRetiredNodeTest(unittest.TestCase):
+    """#2342: an operator frontend list without `telegram` retires the probe."""
+
+    DEAD = "🔴 Bot status: unavailable\n   Process: dead (no PID file)\n   Claude: unavailable (process not running)\n"
+    ALIVE = "🟢 Bot status: available\n   Process: alive (PID: 4242)\n   Telegram: healthy\n   Claude: healthy\n"
+
+    def _doctor(self, tmp: Path, start_output: str | None) -> Doctor:
+        repo = tmp / "repo"
+        (repo / "bridge").mkdir(parents=True)
+        if start_output is not None:
+            start = repo / "bridge/start.sh"
+            start.write_text("#!/usr/bin/env bash\ncat <<'OUT'\n" + start_output + "OUT\n")
+            start.chmod(0o755)
+        claude = tmp / ".claude"
+        claude.mkdir()
+        doctor = Doctor(repo, claude, "settings")
+        doctor.running_bridge_home = lambda: str(tmp)  # type: ignore[method-assign]
+        return doctor
+
+    def _row(self, doctor: Doctor):
+        rows = [row for row in doctor.rows if row.item == "bridge status"]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_frontend_list_parsing(self) -> None:
+        with TemporaryDirectory() as raw, patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("CCC_FRONTENDS", None)
+            doctor = self._doctor(Path(raw), None)
+            self.assertIsNone(doctor.frontends())
+            self.assertFalse(doctor.telegram_retired())
+            (doctor.claude_dir / "frontends").write_text("# retired 2026-10-16\nmatrix   # main\n\n")
+            self.assertEqual(doctor.frontends(), {"matrix"})
+            self.assertTrue(doctor.telegram_retired())
+            (doctor.claude_dir / "frontends").write_text("matrix\ntelegram\n")
+            self.assertFalse(doctor.telegram_retired())
+            with patch.dict("os.environ", {"CCC_FRONTENDS": "matrix"}):
+                self.assertTrue(doctor.telegram_retired())
+            with patch.dict("os.environ", {"CCC_FRONTENDS": "matrix, telegram"}):
+                self.assertFalse(doctor.telegram_retired())
+
+    def test_retired_and_stopped_is_normal(self) -> None:
+        with TemporaryDirectory() as raw, patch.dict("os.environ", {"CCC_FRONTENDS": "matrix"}):
+            doctor = self._doctor(Path(raw), self.DEAD)
+            doctor.check_bridge_status()
+            row = self._row(doctor)
+            self.assertEqual((row.klass, row.status), ("정상", "telegram retired (frontend list)"))
+            # provider detection is unchanged by the retired branch
+            self.assertEqual(doctor.provider, "claude")
+
+    def test_retired_but_running_is_drift_warning(self) -> None:
+        with TemporaryDirectory() as raw, patch.dict("os.environ", {"CCC_FRONTENDS": "matrix"}):
+            doctor = self._doctor(Path(raw), self.ALIVE)
+            doctor.check_bridge_status()
+            row = self._row(doctor)
+            self.assertEqual((row.klass, row.status), ("경고", "telegram retired but running"))
+
+    def test_retired_without_start_sh_is_normal(self) -> None:
+        with TemporaryDirectory() as raw, patch.dict("os.environ", {"CCC_FRONTENDS": "matrix"}):
+            doctor = self._doctor(Path(raw), None)
+            doctor.check_bridge_status()
+            self.assertEqual(self._row(doctor).klass, "정상")
+
+    def test_no_frontend_list_keeps_legacy_warning(self) -> None:
+        with TemporaryDirectory() as raw, patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("CCC_FRONTENDS", None)
+            doctor = self._doctor(Path(raw), self.DEAD)
+            doctor.check_bridge_status()
+            row = self._row(doctor)
+            self.assertEqual((row.klass, row.status), ("경고", "unavailable"))
+
+
 class BridgeStatusVerdictTest(unittest.TestCase):
     def test_available_is_normal(self) -> None:
         klass, status = Doctor.bridge_status_verdict(

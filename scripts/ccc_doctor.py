@@ -720,6 +720,46 @@ class Doctor:
         except (OSError, UnicodeDecodeError):
             return ""
 
+    def frontends(self) -> set[str] | None:
+        """Operator-owned frontend list (#2342), or None when not declared.
+
+        ``CCC_FRONTENDS`` (comma/space separated) wins over
+        ``~/.claude/frontends`` (one name per line, ``#`` comments). None keeps
+        the legacy assumption that this node runs the Telegram bridge.
+        """
+        env = os.environ.get("CCC_FRONTENDS", "").strip()
+        if env:
+            text = env
+        else:
+            try:
+                text = (self.claude_dir / "frontends").read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return None
+        names: set[str] = set()
+        for line in text.splitlines():
+            names.update(re.split(r"[\s,]+", line.split("#", 1)[0].strip()))
+        names.discard("")
+        return names
+
+    def telegram_retired(self) -> bool:
+        declared = self.frontends()
+        return declared is not None and "telegram" not in declared
+
+    @staticmethod
+    def retired_bridge_status_verdict(returncode: int, output: str) -> tuple[str, str, str]:
+        """Verdict for a node whose frontend list retires Telegram (#2342).
+
+        The Telegram probe still runs: a retired bridge that is alive again
+        (a watchdog, boot script or restart command revived it) is drift.
+        """
+        if returncode == 0 and "Process: alive" in output:
+            return (
+                "경고",
+                "telegram retired but running",
+                "stop/disable the Telegram bridge, or add `telegram` to ~/.claude/frontends",
+            )
+        return "정상", "telegram retired (frontend list)", "none"
+
     def managed_tree_files(self) -> list[tuple[Path, str]]:
         """(repo source, installed relative path) for commands/agents/skills.
 
@@ -1726,11 +1766,17 @@ class Doctor:
                 if detected_provider is not None:
                     self._bridge_provider_state = detected_provider
                     self.provider = detected_provider[0]
+                if self.telegram_retired():
+                    klass, status, action = self.retired_bridge_status_verdict(out.returncode, output)
+                    self.add(klass, "bridge status", status, action)
+                    return
                 klass, status = self.bridge_status_verdict(out.returncode, output)
                 action = "none" if klass == "정상" else "inspect bridge service and body-free health diagnostics"
                 self.add(klass, "bridge status", status, action)
             except Exception:
                 self.add("경고", "bridge status", "no status output", "check bridge/start.sh manually if this node owns Telegram bridge")
+        elif self.telegram_retired():
+            self.add("정상", "bridge status", "telegram retired (frontend list)", "none")
         else:
             self.add("경고", "bridge status", "bridge/start.sh missing or not executable", "not all nodes run the Telegram bridge; install/check only if needed")
 

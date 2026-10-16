@@ -321,6 +321,62 @@ Cutover from the pilot bot:
 Rollback: stop `ccc-matrix-bridge`, start `family-matrix` — the pilot's
 config, state and crypto store are untouched by the frontend.
 
+## Retiring the Telegram bridge on a node (Matrix-only, #2342)
+
+A node that keeps only the Matrix frontend declares it in the operator-owned
+frontend list **`~/.claude/frontends`** — one name per line, `#` comments —
+or `CCC_FRONTENDS` (comma/space separated; wins over the file). With no list
+the harness keeps the legacy assumption that Telegram runs.
+
+```
+# Telegram retired <date> (operator decision)
+matrix
+```
+
+What reads it:
+
+- `ccc-doctor` `bridge status`: a list without `telegram` reports
+  `정상 / telegram retired (frontend list)` instead of the Telegram probe's
+  `unavailable`; if the retired Telegram bridge is alive again
+  (`Process: alive`) it reports `경고 / telegram retired but running` — a
+  watchdog, boot script or restart command revived it.
+- `scripts/termux-restart-frontends.sh` (Termux self-update `restart-cmd`):
+  the default mode skips the Telegram restart and recovery arming and only
+  makes the Matrix frontend follow `bridge-current` (with the survive check
+  and the busy follower). `--dry-run` prints `telegram=enabled|retired`.
+
+Retiring Telegram is more than stopping the process — every path that starts
+it again must be closed, or the next tick revives it:
+
+1. Wait until the Telegram bridge is idle (`start.sh --status` →
+   `Turn occupancy: idle`).
+2. systemd: comment the `ccc-telegram-bridge.service` line out of
+   `~/.claude/self-update.services` (otherwise every self-update restarts it),
+   then `systemctl disable --now ccc-telegram-bridge.service`. `mask` fails
+   while the unit file lives in `/etc/systemd/system`; disable is enough once
+   the allowlist line is gone.
+3. Termux: point `~/.claude/self-update.restart-cmd` at
+   `scripts/termux-restart-frontends.sh` (it now honours the list) and
+   `~/.claude/self-update.health-cmd` at
+   `scripts/termux-restart-frontends.sh --verify 10`. A health-cmd that still
+   greps the Telegram `Bot status: available` makes every up-to-date tick
+   "recover" — i.e. restart — the retired bridge.
+4. Termux: move every `~/.termux/boot/start-telegram-bridge.sh*` (including
+   executable `.before-*` backups — Termux:Boot runs every executable file in
+   the directory) into `~/.termux/boot/disabled/`, and comment any crontab
+   watchdog that restarts the Telegram bridge.
+5. Stop it (`start.sh --stop` / the node's `bridge-current.sh --stop`), write
+   `~/.claude/frontends`, and confirm `ccc-doctor` shows the retired row.
+
+Push notifications are unaffected when the fleet alert relay (or a
+Matrix-only spool) already carries them. The bot token is left in place by
+these steps so the node can be rolled back immediately; revoking the bot and
+deleting the token is a separate, credential-handling step.
+
+Rollback: remove the list (or add `telegram`), restore the allowlist line,
+`systemctl enable --now ccc-telegram-bridge.service` / restore the Termux boot
+script, cron line and restart/health commands.
+
 ## Provisioning a bot account for another node (e.g. `@jingun` on jingun)
 
 Every node gets its own Matrix account, device and private room with the

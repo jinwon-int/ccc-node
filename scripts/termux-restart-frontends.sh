@@ -38,6 +38,12 @@
 #      `activated`. The pointer is NOT rolled back here (Telegram is serving the
 #      same generation; that call is the operator's — the previous target is in
 #      ~/.ccc-node/bridge-current.prev-<ts>).
+#   Telegram-retired nodes (#2342): when the operator-owned frontend list
+#      (CCC_FRONTENDS, else ~/.claude/frontends — one name per line, `#`
+#      comments) exists and does NOT name `telegram`, step 1 is skipped
+#      entirely (no restart, no recovery arming) so a self-update never
+#      revives a retired Telegram bridge; steps 2–3 run unchanged. No list at
+#      all keeps the legacy behaviour (Telegram runs).
 #
 # Usage: termux-restart-frontends.sh            (default: both frontends)
 #        termux-restart-frontends.sh --matrix-only [wait_seconds]
@@ -55,7 +61,8 @@
 #        (15), CCC_MATRIX_MIN_WINDOW_SECONDS (20), CCC_TERMUX_FOLLOWER_WAIT_SECONDS
 #        (3600), CCC_BRIDGE_RESTART_DEADLINE_EPOCH (set by self-update; the Matrix
 #        step keeps 30 s of it in reserve and truncates the survival window to
-#        what is left, never below 20 s).
+#        what is left, never below 20 s), CCC_FRONTENDS / CCC_FRONTENDS_FILE
+#        (~/.claude/frontends; see "Telegram-retired nodes").
 # Exit:  0 ok (or Matrix busy → follower detached) · <telegram rc> when the
 #        Telegram restart failed · 3 Matrix did not come up / did not survive
 #        the window on the wanted generation · 2 usage.
@@ -76,6 +83,20 @@ POLL="${CCC_MATRIX_POLL_SECONDS:-5}"
 BUSY_POLL="${CCC_MATRIX_BUSY_POLL_SECONDS:-15}"
 MIN_WINDOW="${CCC_MATRIX_MIN_WINDOW_SECONDS:-20}"
 FOLLOWER_WAIT="${CCC_TERMUX_FOLLOWER_WAIT_SECONDS:-3600}"
+FRONTENDS_FILE="${CCC_FRONTENDS_FILE:-$H/.claude/frontends}"
+
+# Operator-owned frontend list (#2342). Absent = legacy default: Telegram runs.
+telegram_enabled() {
+  local list
+  if [ -n "${CCC_FRONTENDS:-}" ]; then
+    list="$CCC_FRONTENDS"
+  elif [ -f "$FRONTENDS_FILE" ]; then
+    list="$(sed 's/#.*//' "$FRONTENDS_FILE" 2>/dev/null)"
+  else
+    return 0
+  fi
+  printf '%s\n' "$list" | tr -s ' \t,' '\n' | grep -qx telegram
+}
 
 now() { date +%s; }
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || :; printf '%s %s\n' "$(date -Is)" "$*" 2>/dev/null >> "$LOG" || :; }
@@ -254,7 +275,7 @@ case "${1:-}" in
   --dry-run)
     w="$(want)"; h="$(have)"
     read -r spid sup < <(sv_run)
-    echo "bridge-current=$w matrix_running=${h:-none} matrix_busy=$(busy) sv_pid=${spid:--} sv_uptime=${sup:--}s survive=${SURVIVE}s -> $([ "$h" = "$w" ] && echo no-op || echo would-restart-matrix-then-verify)"
+    echo "bridge-current=$w matrix_running=${h:-none} matrix_busy=$(busy) sv_pid=${spid:--} sv_uptime=${sup:--}s survive=${SURVIVE}s telegram=$(telegram_enabled && echo enabled || echo retired) -> $([ "$h" = "$w" ] && echo no-op || echo would-restart-matrix-then-verify)"
     exit 0 ;;
   --verify)
     [ -z "${2:-}" ] || SURVIVE="$2"
@@ -267,10 +288,15 @@ case "${1:-}" in
   *) echo "termux-restart-frontends: unknown argument $1" >&2; exit 2 ;;
 esac
 
-arm_recovery
-bash "$(launcher)" --path "$H" --restart -d ${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}; rc=$?
-log "telegram restart rc=$rc${RECOVERY_GEN:+ (recovery armed to $(basename "$RECOVERY_GEN"))}"
-[ "$rc" = 7 ] && [ -n "$RECOVERY_GEN" ] && rollback_pointer
+if telegram_enabled; then
+  arm_recovery
+  bash "$(launcher)" --path "$H" --restart -d ${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}; rc=$?
+  log "telegram restart rc=$rc${RECOVERY_GEN:+ (recovery armed to $(basename "$RECOVERY_GEN"))}"
+  [ "$rc" = 7 ] && [ -n "$RECOVERY_GEN" ] && rollback_pointer
+else
+  rc=0
+  log "telegram retired on this node (frontend list has no telegram): restart skipped"
+fi
 deadline_m=$(( ${CCC_BRIDGE_RESTART_DEADLINE_EPOCH:-$(( $(now) + 300 ))} - 30 ))
 matrix_follow "$deadline_m"; m=$?
 if [ "$m" = 2 ]; then
