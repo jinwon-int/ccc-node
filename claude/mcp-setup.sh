@@ -31,24 +31,36 @@
 #          is not run. Use this to repoint fleet-browser on a node that gets its
 #          other servers another way (e.g. the bridge bundle) — a full run would
 #          add them to ~/.claude.json, Firecrawl key included (#2044).
+#        CCC_REA_MCP=on|off ./claude/mcp-setup.sh --rea-only
+#          Register (on) or remove (off) only the opt-in REA reverse-engineering
+#          server. Every other user-scope server is left exactly as it is and
+#          `claude mcp list` is not run — same repoint-without-churn use as
+#          --browser-only (a full run would add the others, Firecrawl key
+#          included). REA ships 170 tools, so it is never registered by default.
 set -uo pipefail
 
 FAMILY_ONLY=0
 BROWSER_ONLY=0
+REA_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --family-only) FAMILY_ONLY=1 ;;
     --browser-only) BROWSER_ONLY=1 ;;
+    --rea-only) REA_ONLY=1 ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "mcp-setup.sh: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
-if [ "$FAMILY_ONLY" = 1 ] && [ "$BROWSER_ONLY" = 1 ]; then
-  echo "mcp-setup.sh: --family-only and --browser-only are mutually exclusive" >&2
+if [ $((FAMILY_ONLY + BROWSER_ONLY + REA_ONLY)) -gt 1 ]; then
+  echo "mcp-setup.sh: --family-only, --browser-only and --rea-only are mutually exclusive" >&2
   exit 2
 fi
 if [ "$BROWSER_ONLY" = 1 ] && [ -z "${CCC_BROWSER_MCP_HOST:-}" ]; then
   echo "mcp-setup.sh: --browser-only needs CCC_BROWSER_MCP_HOST=<ssh destination> (or =off to remove); nothing changed" >&2
+  exit 2
+fi
+if [ "$REA_ONLY" = 1 ] && [ -z "${CCC_REA_MCP:-}" ]; then
+  echo "mcp-setup.sh: --rea-only needs CCC_REA_MCP=on (or =off to remove); nothing changed" >&2
   exit 2
 fi
 
@@ -162,6 +174,59 @@ register_browser() {
   fi
 }
 
+# rea — opt-in reverse-engineering MCP server (REA "Reverse Engineer Anything",
+# MIT; morluto/rea, repackaged from the NousResearch Hermes plugin). Inspects
+# native binaries, .NET, Electron/JavaScript apps, Android packages, firmware
+# and captures. It ships ~170 tools, so it is NEVER registered by default
+# (context cost) — CCC_REA_MCP=on opts a node in, =off removes it, unset leaves
+# any existing registration untouched. Global-install + `node <cli> mcp`, the
+# Termux/Linux launch rule from #663 (the package bin is /usr/bin/env node).
+# No env override is set here: REA's native-decompiler timeout only matters on
+# nodes that supply their own Ghidra/Hopper/IDA, and setting an (otherwise
+# inert) env would defeat add_if_changed's no-churn re-run. Such nodes export
+# REA_GHIDRA_STARTUP_TIMEOUT_MS for their own engine. Not pre-allowed in
+# settings.json: like fleet-browser, the governed (non-bypass) path asks the
+# owner before each call, which runs/reads local binaries. On arm64 the
+# lightweight ELF layout provider is x64-only and decompilation needs an engine,
+# so there REA is useful mainly for JS/Electron/ASAR/archive static analysis and
+# binary identity (format/arch/sha256).
+REA_PKG="rea-agents@6.4.0"
+register_rea() {
+  local mode="${CCC_REA_MCP:-}"
+  if [ -z "$mode" ]; then
+    echo "  - rea: SKIPPED (set CCC_REA_MCP=on to opt in)"
+    return 0
+  elif [ "$mode" = off ]; then
+    claude mcp remove rea -s user >/dev/null 2>&1 || true
+    echo "  - rea: removed (CCC_REA_MCP=off)"
+    return 0
+  elif [ "$mode" != on ]; then
+    echo "  ! rea: SKIPPED — CCC_REA_MCP must be 'on' or 'off'" >&2
+    return 1
+  elif [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
+    echo "  - rea: SKIPPED (external isolation)"
+    return 0
+  fi
+  local pkgname="${REA_PKG%@*}" cli
+  npm ls -g "$pkgname" >/dev/null 2>&1 || npm install -g "$REA_PKG" >/dev/null 2>&1 || true
+  cli="$(global_cli "$pkgname")"
+  if [ -n "$cli" ] && [ -f "$cli" ]; then
+    add_if_changed rea node "$cli" mcp
+    echo "  - rea: node $cli mcp"
+  else
+    echo "  ! rea: SKIPPED — could not install/resolve $REA_PKG globally"
+    return 1
+  fi
+}
+
+if [ "$REA_ONLY" = 1 ]; then
+  # No `claude mcp list`: it health-checks every server, including networked ones.
+  echo "==> Registering rea only (user scope)…"
+  register_rea; rc=$?
+  echo "==> Done (rea-only: family-skills, family-ops, family-wiki, searxng, context7, firecrawl, fleet-browser untouched)."
+  exit "$rc"
+fi
+
 if [ "$BROWSER_ONLY" = 1 ]; then
   # No `claude mcp list`: it health-checks every server, including networked ones.
   echo "==> Registering fleet-browser only (user scope)…"
@@ -233,6 +298,10 @@ unset FCKEY
 # fleet-browser (see register_browser above). A full run keeps its old
 # behaviour: a rejected host is reported but does not fail the whole run.
 register_browser || true
+
+# rea (see register_rea above). Opt-in via CCC_REA_MCP; a full run reports its
+# skip/add but never fails the whole run on a bad value or install miss.
+register_rea || true
 
 echo "==> Done. Verifying:"
 claude mcp list
