@@ -570,3 +570,36 @@ def test_request_mcp_server_name_collision_fails_closed(tmp_path: Path) -> None:
             SessionRequest(working_directory=str(tmp_path), mcp_servers={"firecrawl": _STEWARD_SERVER}),
             _reject,
         )
+
+
+def test_request_mcp_allowed_tools_join_the_sdk_allow_list(tmp_path: Path) -> None:
+    # #2345: the caller's own read-only tools skip can_use_tool; nothing else widens.
+    runtime = ClaudeRuntime()
+    options = runtime._build_options(
+        SessionRequest(
+            working_directory=str(tmp_path),
+            mcp_servers={"steward": _STEWARD_SERVER},
+            mcp_allowed_tools=["mcp__steward__room_status", "mcp__steward__room_members"],
+        ),
+        _reject,
+    )
+    assert options.mcp_servers == {"steward": _STEWARD_SERVER}
+    assert options.allowed_tools == ["mcp__steward__room_status", "mcp__steward__room_members"]
+    assert not options.disallowed_tools
+
+
+def test_request_mcp_allowed_tools_compose_with_profile_allow_list(tmp_path: Path) -> None:
+    runtime = ClaudeRuntime(
+        settings=_settings(tmp_path, bridge_web_mcp_mode="searxng-firecrawl")
+    )
+    options = runtime._build_options(
+        SessionRequest(
+            working_directory=str(tmp_path),
+            mcp_servers={"steward": _STEWARD_SERVER},
+            mcp_allowed_tools=["mcp__steward__room_status"],
+        ),
+        _reject,
+    )
+    assert FIRECRAWL_SEARCH_TOOL in options.allowed_tools
+    assert "mcp__steward__room_status" in options.allowed_tools
+    assert "mcp__steward__room_members" not in options.allowed_tools

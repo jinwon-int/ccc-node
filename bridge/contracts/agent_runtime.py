@@ -167,6 +167,50 @@ def _freeze_mcp_servers(value: object) -> Mapping[str, object]:
     return MappingProxyType(servers)
 
 
+# ``mcp__<server>__<tool>`` — the only shape a caller may pre-approve (#2345).
+_MCP_TOOL_NAME_RE = re.compile(r"mcp__([A-Za-z0-9_-]{1,64})__([A-Za-z0-9_-]{1,64})")
+
+
+def _freeze_mcp_allowed_tools(value: object, servers: Mapping[str, object] | None) -> tuple[str, ...]:
+    """Validate and snapshot ``SessionRequest.mcp_allowed_tools`` (#2345).
+
+    Every entry must name a tool of one of the caller's *own* MCP servers
+    (``mcp_servers``). A caller can therefore skip the approval round trip for
+    its read-only tools, but can never widen the allow-list to built-in tools
+    (``Bash``, ``Write``) or to another bundle's ``mcp__<other>__*`` tools —
+    those stay governed by the adapter's execution profile.
+    """
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or not value:
+        raise ValueError("mcp allowed tools must be a non-empty sequence")
+    if not servers:
+        raise ValueError("mcp allowed tools require mcp servers")
+    tools: list[str] = []
+    for name in value:
+        match = _MCP_TOOL_NAME_RE.fullmatch(name) if isinstance(name, str) else None
+        if match is None:
+            raise ValueError("mcp allowed tool name is invalid")
+        if match.group(1) not in servers:
+            raise ValueError("mcp allowed tool does not belong to a caller mcp server")
+        if name not in tools:
+            tools.append(name)
+    return tuple(tools)
+
+
+def _freeze_mcp(
+    servers: object, allowed_tools: object
+) -> tuple[Mapping[str, object] | None, tuple[str, ...] | None]:
+    """Snapshot both caller MCP fields together (the allow-list is bound to the servers)."""
+
+    frozen_servers = _freeze_mcp_servers(servers) if servers is not None else None
+    frozen_tools = (
+        _freeze_mcp_allowed_tools(allowed_tools, frozen_servers)
+        if allowed_tools is not None
+        else None
+    )
+    return frozen_servers, frozen_tools
+
+
 def approval_target_kind(arguments: object) -> str:
     """Body-free shape hint for an approval request (#889 observability).
 
@@ -413,12 +457,19 @@ class SessionRequest:
     # Provider-neutral in intent; adapters that cannot express it must refuse
     # the request rather than drop it silently.
     mcp_servers: Mapping[str, object] | None = None
+    # Tools of the caller's own ``mcp_servers`` that may run without the
+    # per-call approval round trip (#2345): ``mcp__<server>__<tool>`` names
+    # only, and ``<server>`` must be one of ``mcp_servers``. Built-in tools and
+    # other bundles' tools can never be allowed through this field.
+    mcp_allowed_tools: Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         if not self.working_directory:
             raise ValueError("working directory must not be empty")
-        if self.mcp_servers is not None:
-            object.__setattr__(self, "mcp_servers", _freeze_mcp_servers(self.mcp_servers))
+        if self.mcp_servers is not None or self.mcp_allowed_tools is not None:
+            servers, tools = _freeze_mcp(self.mcp_servers, self.mcp_allowed_tools)
+            object.__setattr__(self, "mcp_servers", servers)
+            object.__setattr__(self, "mcp_allowed_tools", tools)
         if self.effort is not None and not self.effort:
             raise ValueError("effort must not be empty")
         if self.approval_policy is not None and not self.approval_policy:

@@ -361,6 +361,42 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                     mcp_servers=cast(Any, invalid),
                 )
 
+    async def test_session_request_mcp_allowed_tools_bind_to_caller_servers(self) -> None:
+        # #2345: a caller may pre-approve only tools of its own MCP servers.
+        server = {"type": "stdio", "command": "/opt/steward/bin/mcp"}
+        allowed = ["mcp__steward__room_status", "mcp__steward__room_members", "mcp__steward__room_status"]
+        request = SessionRequest(
+            working_directory="/workspace",
+            mcp_servers={"steward": server},
+            mcp_allowed_tools=allowed,
+        )
+        allowed.append("mcp__steward__room_remove")
+        self.assertEqual(
+            request.mcp_allowed_tools,
+            ("mcp__steward__room_status", "mcp__steward__room_members"),
+        )
+        self.assertIsNone(SessionRequest(working_directory="/workspace").mcp_allowed_tools)
+        invalid_lists: tuple[object, ...] = (
+            [],
+            ["Bash"],
+            ["Write"],
+            ["mcp__firecrawl__firecrawl_scrape"],  # another bundle's server
+            ["mcp__steward__"],
+            ["mcp__steward__room status"],
+            ["mcp__steward__" + "x" * 65],
+            "mcp__steward__room_status",  # bare string, not a sequence
+            [7],
+        )
+        for invalid in invalid_lists:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                SessionRequest(
+                    working_directory="/workspace",
+                    mcp_servers={"steward": server},
+                    mcp_allowed_tools=cast(Any, invalid),
+                )
+        with self.assertRaises(ValueError):
+            SessionRequest(working_directory="/workspace", mcp_allowed_tools=["mcp__steward__room_status"])
+
     async def test_tool_lifecycle_events_are_typed_immutable_snapshots(self) -> None:
         arguments: dict[str, JsonValue] = {"command": "pwd", "paths": ["."]}
         output: dict[str, JsonValue] = {"exitCode": 0, "lines": ["/workspace"]}
