@@ -392,5 +392,99 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["code"], "input_not_a_node_report")
 
 
+class LifecycleTableTests(unittest.TestCase):
+    """#2283 (DOC-3903 TM-3906): node lifecycle counters + fleet lifecycle table."""
+
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.node = NodeFixture(Path(self.tmp.name))
+        self.node.skill("user-one")
+        pending = self.node.state / "pending-skills"
+        pending.mkdir(mode=0o700)
+        rows = [
+            # new-style rows carry lifecycle
+            {"id": "a", "dir": "a", "status": "pending", "lifecycle": "drafted", "staged_at": iso(10)},
+            {"id": "b", "dir": "b", "status": "pending", "lifecycle": "prescreened:revise", "staged_at": iso(30)},
+            # legacy rows (before #2283): derived from status / prescreen
+            {"id": "c", "dir": "c", "status": "pending", "prescreen": "approve", "staged_at": iso(2)},
+            {"id": "d", "dir": "d.installed-1", "status": "installed", "staged_at": iso(50)},
+            {"id": "e", "dir": "e.rejected-1", "status": "rejected"},
+            {"id": "f", "dir": "f", "status": "archived:pending-90d"},
+            {"id": "g", "dir": "g", "status": "archived:draft-rejected"},
+            # duplicate key: the later row wins (staged a, then reindexed as approved)
+            {"id": "a2", "dir": "a2", "status": "pending", "lifecycle": "drafted", "staged_at": iso(5)},
+            {"id": "a2", "dir": "a2", "status": "approved", "lifecycle": "approved", "staged_at": iso(5)},
+        ]
+        (pending / "index.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows) + "not json\n", encoding="utf-8"
+        )
+        fleet = self.node.state / "fleet-skills"
+        fleet.mkdir(mode=0o700)
+        self.node.private_json(
+            fleet / "installed.json",
+            {"schema_version": 1, "commit": "0" * 40, "skills": [{"name": "x"}, {"name": "y"}]},
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def node_report(self) -> dict:
+        proc = self.node.run("node", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_node_counts_stages_dwell_and_receipt(self) -> None:
+        lc = self.node_report()["lifecycle"]
+        self.assertEqual(lc["index"], "ok")
+        self.assertEqual(lc["malformed_rows"], 1)
+        self.assertEqual(lc["rows"], 8)
+        self.assertEqual(
+            lc["stages"],
+            {
+                "approved": 1, "archived:draft-rejected": 1, "archived:expired": 1, "drafted": 1,
+                "installed": 1, "prescreened:approve": 1, "prescreened:revise": 1, "verdict:reject": 1,
+            },
+        )
+        # undecided drafts only: a (10d), b (30d), c (2d); a2 became approved
+        self.assertEqual(lc["pending_dwell_days"], [2, 10, 30])
+        self.assertEqual(lc["fleet_installed"], {"receipt": "ok", "skills": 2})
+
+    def test_missing_index_is_reported_not_guessed(self) -> None:
+        (self.node.state / "pending-skills" / "index.jsonl").unlink()
+        lc = self.node_report()["lifecycle"]
+        self.assertEqual(lc["index"], "missing")
+        self.assertEqual(lc["stages"], {})
+        self.assertEqual(lc["pending_dwell_days"], [])
+
+    def test_report_stays_body_free(self) -> None:
+        out = self.node.run("node", "--json").stdout
+        self.assertNotIn(BODY, out)
+
+    def test_aggregate_merges_nodes_and_renders_the_table(self) -> None:
+        one = self.node_report()
+        two = json.loads(json.dumps(one))
+        two["node"] = "node-b"
+        two["lifecycle"]["pending_dwell_days"] = [40]
+        two["lifecycle"]["stages"] = {"drafted": 1, "archived:expired": 2}
+        legacy = json.loads(json.dumps(one))
+        legacy["node"] = "node-old"
+        del legacy["lifecycle"]  # a report from before #2283
+        agg = report_mod.build_aggregate(
+            [one, two, legacy], stale_days=30, min_nodes=2, min_uses=3, dwell_days=14
+        )
+        lc = agg["lifecycle"]
+        self.assertEqual(lc["stages"]["archived:expired"], 3)
+        self.assertEqual(lc["stages"]["drafted"], 2)
+        self.assertEqual(lc["archive_reasons"], {"archived:draft-rejected": 1, "archived:expired": 3})
+        self.assertEqual(lc["pending_dwell_days"], {"count": 4, "median": 20.0, "p90": 40, "max": 40})
+        self.assertEqual(lc["nodes_without_index"], ["node-old"])
+        self.assertEqual(lc["nodes"]["node-a"]["fleet_installed"], 2)
+        text = report_mod.render_aggregate(agg)
+        self.assertIn("skill lifecycle (#2283, DOC-3903)", text)
+        self.assertIn("pending dwell: 4 undecided draft(s)  median 20.0d  p90 40d  max 40d", text)
+        self.assertIn("archive reasons: 4", text)
+        self.assertIn("nodes without a readable pending index: node-old", text)
+
+
 if __name__ == "__main__":
     unittest.main()
