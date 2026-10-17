@@ -343,8 +343,14 @@ class PromoteDedupeTests(unittest.TestCase):
         return out, calls, ledger
 
     @staticmethod
-    def view(state="OPEN", *, draft=True, commits=1) -> dict:
-        return {"state": state, "isDraft": draft, "commits": [{}] * commits}
+    def view(state="OPEN", *, draft=True, commits=1, head="h" * 40) -> dict:
+        return {"state": state, "isDraft": draft, "commits": [{}] * commits,
+                "headRefOid": head}
+
+    @staticmethod
+    def readied(pr: str, head: str = "h" * 40) -> dict:
+        """The row `_sweep_promote_merge` writes after its own `gh pr ready`."""
+        return {"ts": iso(days_ago=1), "kind": "a2a-promote-ready", "pr": pr, "head": head}
 
     @staticmethod
     def gh(calls, verb):
@@ -455,6 +461,42 @@ class PromoteDedupeTests(unittest.TestCase):
             out, calls, _ = self.run_promote(rows, views={"314": view}, autoclose=True)
             self.assertEqual(self.gh(calls, "close"), [], view)
             self.assertEqual(out["superseded"][0]["reason"], "human-edited")
+
+    def test_autoclose_closes_a_batch_the_publisher_itself_marked_ready(self) -> None:
+        """#2360: the merge sweep readies every green batch, so fleet-skills
+        #464/#470/#493/#494/#495 — one generator commit, never touched — were
+        all called human-edited and left open. Its own ready row at the same
+        head makes the batch untouched again."""
+        rows = self.two_candidates() + [promote_row("314", staged=["140"]),
+                                        self.readied("314")]
+        out, calls, ledger = self.run_promote(
+            rows, views={"314": self.view(draft=False)}, autoclose=True)
+        self.assertEqual([c[3] for c in self.gh(calls, "close")], ["314"])
+        self.assertEqual(out["superseded"][0]["outcome"], "promote-pr-superseded-closed")
+        marker = [r for r in ledger if r.get("pr") == "314"][-1]
+        self.assertEqual((marker["state"], marker["superseded_by"]), ("CLOSED", "999"))
+
+    def test_publisher_ready_row_does_not_cover_a_later_human_change(self) -> None:
+        """The ready row is bound to its head: a push, a force-push to a single
+        rewritten commit, or a ready row for another PR leaves the batch open."""
+        cases = (
+            (self.view(draft=False, commits=2, head="h" * 40), self.readied("314")),
+            (self.view(draft=False, head="f" * 40), self.readied("314")),
+            (self.view(draft=False), self.readied("315")),
+            (self.view(draft=False, head=""), self.readied("314")),
+        )
+        for view, ready in cases:
+            rows = self.two_candidates() + [promote_row("314", staged=["140"]), ready]
+            out, calls, _ = self.run_promote(rows, views={"314": view}, autoclose=True)
+            self.assertEqual(self.gh(calls, "close"), [], (view, ready))
+            self.assertEqual(out["superseded"][0]["reason"], "human-edited")
+
+    def test_publisher_ready_row_alone_never_closes_without_the_opt_in(self) -> None:
+        rows = self.two_candidates() + [promote_row("314", staged=["140"]),
+                                        self.readied("314")]
+        out, calls, _ = self.run_promote(rows, views={"314": self.view(draft=False)})
+        self.assertEqual(self.gh(calls, "close"), [])
+        self.assertEqual(out["superseded"][0]["reason"], "autoclose-off")
 
     def test_unreadable_open_pr_opens_nothing(self) -> None:
         rows = self.two_candidates() + [promote_row("314", staged=["140"])]

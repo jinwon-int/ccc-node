@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -178,3 +179,86 @@ def test_existing_archive_directory_must_be_owner_private(tmp_path: Path) -> Non
         session_id="private-directory",
     ) is None
     assert tuple(archive_dir.iterdir()) == ()
+
+
+def test_session_end_dedupes_identical_state_across_sessions(tmp_path: Path) -> None:
+    """#2361: one unchanged working state is stored once, not once per session."""
+
+    state_dir = tmp_path / "state"
+    payload = b"objective: unchanged\n"
+    _private_file(state_dir / "working-state.md", payload)
+    environment = {"CCC_STATE_DIR": str(state_dir)}
+
+    paths = {
+        archive_working_state(
+            "session_end", environment=environment, session_id=f"session-{index}"
+        )
+        for index in range(25)
+    }
+
+    assert len(paths) == 1
+    (only,) = paths
+    assert only is not None
+    expected = hashlib.sha256(b"session_end\0" + payload).hexdigest()[:24]
+    # Byte-identical to notify.sh `ccc_lifecycle_file_digest session_end`.
+    assert only.name == f"working-state-{expected}.md"
+    assert len(tuple(only.parent.iterdir())) == 1
+
+
+def test_session_end_restamps_an_identical_snapshot(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    _private_file(state_dir / "working-state.md", b"objective: same\n")
+    environment = {"CCC_STATE_DIR": str(state_dir)}
+
+    first = archive_working_state("session_end", environment=environment, session_id="a")
+    assert first is not None
+    os.utime(first, (1_000_000_000, 1_000_000_000))
+    second = archive_working_state("session_end", environment=environment, session_id="b")
+
+    assert second == first
+    assert first.stat().st_mtime > 1_000_000_000
+
+
+def test_session_end_keeps_only_the_newest_snapshots(tmp_path: Path) -> None:
+    """#2361: bounded retention; the snapshot just written always survives."""
+
+    state_dir = tmp_path / "state"
+    working_state = state_dir / "working-state.md"
+    environment = {"CCC_STATE_DIR": str(state_dir), "CCC_SESSION_ARCHIVE_KEEP": "3"}
+    written = []
+    for index in range(6):
+        _private_file(working_state, f"objective: step {index}\n".encode())
+        path = archive_working_state(
+            "session_end", environment=environment, session_id=f"s{index}"
+        )
+        assert path is not None
+        os.utime(path, (1_700_000_000 + index, 1_700_000_000 + index))
+        written.append(path)
+
+    remaining = sorted(p.name for p in (state_dir / "session-archive").iterdir())
+    assert remaining == sorted(p.name for p in written[-3:])
+
+
+def test_session_end_retention_defaults_and_opt_out(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    working_state = state_dir / "working-state.md"
+    archive_dir = state_dir / "session-archive"
+
+    for index in range(4):
+        _private_file(working_state, f"objective: keep {index}\n".encode())
+        archive_working_state(
+            "session_end",
+            environment={"CCC_STATE_DIR": str(state_dir), "CCC_SESSION_ARCHIVE_KEEP": "0"},
+            session_id=f"k{index}",
+        )
+    assert len(tuple(archive_dir.iterdir())) == 4  # "0" disables pruning
+
+    for raw in ("", "not-a-number", "-5"):
+        _private_file(working_state, f"objective: default {raw!r}\n".encode())
+        archive_working_state(
+            "session_end",
+            environment={"CCC_STATE_DIR": str(state_dir), "CCC_SESSION_ARCHIVE_KEEP": raw},
+            session_id="d",
+        )
+    # Invalid/blank fall back to the default (200), so nothing is pruned here.
+    assert len(tuple(archive_dir.iterdir())) == 7

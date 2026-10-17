@@ -5009,6 +5009,37 @@ def _latest_promote_prs(rows: list[dict[str, object]]) -> dict[str, dict[str, ob
     return latest
 
 
+_PROMOTE_READY_KIND = "a2a-promote-ready"
+
+
+def _record_promote_ready(config: Config, pr: str, head: str) -> None:
+    """Note that this publisher, not a human, marked promote PR `pr` ready (#2360).
+
+    Best effort: a missing row only makes the supersede sweep treat the PR as
+    human-edited and leave it open — the safe direction.
+    """
+    if not pr or not head:
+        return
+    try:
+        _append_ledger(
+            config, {"ts": _utc_now(), "kind": _PROMOTE_READY_KIND, "pr": pr, "head": head}
+        )
+    except PromotionError:
+        pass
+
+
+def _promote_ready_heads(rows: list[dict[str, object]]) -> dict[str, str]:
+    """PR number -> head this publisher last marked ready (#2360)."""
+    heads: dict[str, str] = {}
+    for row in rows:
+        if row.get("kind") != _PROMOTE_READY_KIND:
+            continue
+        pr, head = str(row.get("pr") or ""), str(row.get("head") or "")
+        if pr and head:
+            heads[pr] = head
+    return heads
+
+
 def _checks_green(rollup: object) -> bool | None:
     """True if every reported check succeeded; None if still running; False on fail."""
     if not isinstance(rollup, list) or not rollup:
@@ -5095,6 +5126,12 @@ def _sweep_promote_merge(
             except PromotionError as error:
                 processed.append({"outcome": "ready-failed", "pr": pr, "code": error.code})
                 continue
+            # #2360: a PR this sweep marked ready is still generator output.
+            # Without this row the supersede sweep saw "not a draft" and took
+            # the publisher's own `gh pr ready` for a human edit, so no
+            # superseded promote batch was ever auto-closed. The head binds
+            # the claim: any later push (or force-push) changes it.
+            _record_promote_ready(config, pr, str(payload.get("headRefOid") or ""))
         green = _checks_green(payload.get("statusCheckRollup"))
         if green is False:
             processed.append({"outcome": "promote-pr-checks-failed", "pr": pr})
@@ -5693,7 +5730,7 @@ def _promote_pr_view(config: Config, pr: str) -> dict[str, object] | None:
     try:
         viewed = _run([
             "gh", "pr", "view", pr, "--repo", config.repo,
-            "--json", "state,isDraft,commits",
+            "--json", "state,isDraft,commits,headRefOid",
         ])
         payload = json.loads(viewed.stdout.decode("utf-8"))
     except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
@@ -5706,6 +5743,7 @@ def _promote_pr_view(config: Config, pr: str) -> dict[str, object] | None:
         "state": state,
         "is_draft": payload.get("isDraft") is True,
         "commits": len(commits) if isinstance(commits, list) else -1,
+        "head": str(payload.get("headRefOid") or ""),
     }
 
 
@@ -5737,6 +5775,7 @@ def _open_promote_prs(
     active: list[dict[str, object]] = []
     unreadable: list[str] = []
     latest = _latest_promote_prs(rows)
+    readied = _promote_ready_heads(rows)
     for pr in sorted(latest, key=lambda value: int(value) if value.isdigit() else -1):
         row = latest[pr]
         if str(row.get("state") or "OPEN") != "OPEN" or row.get("superseded_by"):
@@ -5749,7 +5788,14 @@ def _open_promote_prs(
             if not dry_run:
                 _append_ledger(config, _promote_row_record(row, state=view["state"]))
             continue
-        active.append({**row, "_is_draft": view["is_draft"], "_commits": view["commits"]})
+        active.append({
+            **row,
+            "_is_draft": view["is_draft"],
+            "_commits": view["commits"],
+            # True only when this publisher readied exactly the head GitHub
+            # reports now (#2360) — a human ready-mark or any push is False.
+            "_publisher_readied": bool(view["head"]) and readied.get(pr) == view["head"],
+        })
     return active, unreadable
 
 
@@ -5761,8 +5807,11 @@ def _supersede_promote_prs(
     Mirrors the intake supersede convention: the newer batch is authoritative,
     closing is opt-in (`supersede_autoclose_enabled`, default OFF), and without
     it the old PR is left open for the human with a pointer to its successor.
-    Even with the opt-in, only untouched generator output is closed — still a
-    draft with the generator's single commit. A PR a human marked ready or
+    Even with the opt-in, only untouched generator output is closed — the
+    generator's single commit, still a draft or marked ready by this
+    publisher's own merge sweep at the same head (#2360: that sweep readies
+    every green batch, so "not a draft" alone was never evidence of a human).
+    A PR a human marked ready or
     edited (audience moves, generalization fixes) is never auto-closed: those
     edits are the non-mechanical half of promotion and must not be discarded.
     """
@@ -5772,7 +5821,11 @@ def _supersede_promote_prs(
         pr = str(row.get("pr") or "")
         if not pr:
             continue
-        untouched = row.get("_is_draft") is True and row.get("_commits") == 1
+        # Untouched = the generator's single commit, still a draft or marked
+        # ready by this publisher at the head it still has (#2360).
+        untouched = row.get("_commits") == 1 and (
+            row.get("_is_draft") is True or row.get("_publisher_readied") is True
+        )
         if autoclose and untouched:
             body = (
                 "새 승격 배치로 대체되어 종료합니다.\n\n"

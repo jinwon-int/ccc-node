@@ -31,6 +31,10 @@ ArchiveEvent = Literal["pre_compact", "session_end"]
 _DEFAULT_MAX_BYTES = 65_536
 _HARD_MAX_BYTES = 1_048_576
 _CHECKPOINT_KEEP = 30
+# #2361: session-archive used to grow without bound (one file per session end,
+# 416k files / 18 GB on one node). Keep the newest N distinct snapshots.
+_SESSION_ARCHIVE_KEEP_DEFAULT = 200
+_SESSION_ARCHIVE_KEEP_MAX = 100_000
 _OFF = frozenset({"0", "false", "off", "no"})
 _ENVIRONMENT_KEYS = frozenset(
     {
@@ -39,6 +43,7 @@ _ENVIRONMENT_KEYS = frozenset(
         "CCC_WORKING_STATE",
         "CCC_CHECKPOINT_DIR",
         "CCC_SESSION_ARCHIVE",
+        "CCC_SESSION_ARCHIVE_KEEP",
         "CCC_WORKING_STATE_ARCHIVE",
         "CCC_WORKING_STATE_ARCHIVE_MAX_BYTES",
         "CCC_MEMORY_AUDIENCE_SCOPED",
@@ -84,6 +89,21 @@ def _max_bytes(environment: Mapping[str, str]) -> int:
     except ValueError:
         value = _DEFAULT_MAX_BYTES
     return min(_HARD_MAX_BYTES, max(1, value))
+
+
+def _session_archive_keep(environment: Mapping[str, str]) -> int | None:
+    """Newest snapshots to keep; ``None`` disables pruning (explicit ``0``)."""
+
+    raw = environment.get("CCC_SESSION_ARCHIVE_KEEP", "").strip()
+    try:
+        value = int(raw) if raw else _SESSION_ARCHIVE_KEEP_DEFAULT
+    except ValueError:
+        value = _SESSION_ARCHIVE_KEEP_DEFAULT
+    if value == 0:
+        return None
+    if value < 0:
+        value = _SESSION_ARCHIVE_KEEP_DEFAULT
+    return min(_SESSION_ARCHIVE_KEEP_MAX, value)
 
 
 def _read_private_regular(path: Path, *, max_bytes: int) -> bytes | None:
@@ -175,14 +195,17 @@ def _destination_directory(
     return Path(configured).expanduser() if configured else state_dir / "session-archive"
 
 
-def _archive_name(event: ArchiveEvent, session_id: str, payload: bytes) -> str:
+def _archive_name(event: ArchiveEvent, payload: bytes) -> str:
     if event == "pre_compact":
         # Match checkpoint.sh's portable local-time filename contract.
         return f"working-state-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    # #2361: content-addressed. The session id used to be part of the digest,
+    # so the same unchanged working state was stored once per session end.
+    # Must stay byte-identical to notify.sh's
+    # `ccc_lifecycle_file_digest session_end <file>` so Claude and Piri/Codex
+    # writers on one node share names.
     digest = hashlib.sha256()
     digest.update(event.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(session_id.encode("utf-8", errors="replace"))
     digest.update(b"\0")
     digest.update(payload)
     return f"working-state-{digest.hexdigest()[:24]}.md"
@@ -214,7 +237,7 @@ def _open_private_directory(directory: Path) -> int:
     return descriptor
 
 
-def _prune_checkpoints(directory: Path) -> None:
+def _prune_keep_newest(directory: Path, keep: int) -> None:
     candidates: list[tuple[int, str, Path]] = []
     try:
         entries = tuple(directory.iterdir())
@@ -231,11 +254,20 @@ def _prune_checkpoints(directory: Path) -> None:
             continue
         candidates.append((metadata.st_mtime_ns, path.name, path))
     candidates.sort(reverse=True)
-    for _mtime, _name, path in candidates[_CHECKPOINT_KEEP:]:
+    for _mtime, _name, path in candidates[keep:]:
         try:
             path.unlink()
         except OSError:
             continue
+
+
+def _touch_at(dir_fd: int, name: str) -> None:
+    """Mark an existing identical snapshot as recently seen (for retention)."""
+
+    try:
+        os.utime(name, dir_fd=dir_fd, follow_symlinks=False)
+    except (OSError, NotImplementedError):
+        pass
 
 
 def archive_working_state(
@@ -261,17 +293,24 @@ def archive_working_state(
     if payload is None:
         return None
     directory = _destination_directory(event, environment, state_dir)
-    name = _archive_name(event, session_id, payload)
+    del session_id  # #2361: not part of the name; kept for the call contract.
+    name = _archive_name(event, payload)
     try:
         dir_fd = _open_private_directory(directory)
         try:
-            if not _existing_archive_is_safe(directory, name, payload):
+            if _existing_archive_is_safe(directory, name, payload):
+                _touch_at(dir_fd, name)
+            else:
                 atomic_write_bytes_at(dir_fd, name, payload)
         finally:
             os.close(dir_fd)
         destination = directory / name
         if event == "pre_compact":
-            _prune_checkpoints(directory)
+            _prune_keep_newest(directory, _CHECKPOINT_KEEP)
+        else:
+            keep = _session_archive_keep(environment)
+            if keep is not None:
+                _prune_keep_newest(directory, keep)
         return destination
     except OSError:
         return None

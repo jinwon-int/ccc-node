@@ -109,11 +109,33 @@ if [ "$EVENT" = "SessionEnd" ]; then
      && command -v ccc_lifecycle_prepare_private_dir >/dev/null 2>&1 \
      && ccc_lifecycle_prepare_private_dir "$ARCH_DIR"; then
     tmp="$(mktemp "$ARCH_DIR/.working-state.XXXXXX" 2>/dev/null || true)"
-    fname="$ARCH_DIR/working-state-${event_digest:0:24}.md"
-    if [ -n "$tmp" ] && cp "$WS" "$tmp" 2>/dev/null; then
+    content_digest=""
+    if [ -n "$tmp" ] && cp "$WS" "$tmp" 2>/dev/null \
+       && command -v ccc_lifecycle_file_digest >/dev/null 2>&1; then
+      content_digest="$(ccc_lifecycle_file_digest session_end "$tmp" 2>/dev/null || true)"
+    fi
+    if [ -n "$content_digest" ]; then
+      # #2361: content-addressed (shared with working_state_archive.py). An
+      # identical snapshot is only re-stamped as recently seen; a different
+      # body under the same name (tampered) is atomically replaced.
+      fname="$ARCH_DIR/working-state-${content_digest:0:24}.md"
       chmod 600 "$tmp" 2>/dev/null || true
-      ln "$tmp" "$fname" 2>/dev/null || true
-      rm -f "$tmp"
+      if [ -f "$fname" ] && [ ! -L "$fname" ] && cmp -s "$tmp" "$fname" 2>/dev/null; then
+        touch -c "$fname" 2>/dev/null || true
+        rm -f "$tmp"
+      elif ! ln "$tmp" "$fname" 2>/dev/null; then
+        mv -f "$tmp" "$fname" 2>/dev/null || rm -f "$tmp"
+      else
+        rm -f "$tmp"
+      fi
+      # Keep the newest N distinct snapshots (default 200; 0 disables).
+      keep="${CCC_SESSION_ARCHIVE_KEEP:-200}"
+      case "$keep" in ''|*[!0-9]*) keep=200 ;; esac
+      if [ "$keep" != 0 ]; then
+        [ -r "$HERE/lib/mtime-prune.sh" ] && . "$HERE/lib/mtime-prune.sh"
+        command -v prune_keep_newest >/dev/null 2>&1 \
+          && prune_keep_newest "$ARCH_DIR" 'working-state-*.md' "$keep" || true
+      fi
     else
       [ -z "${tmp:-}" ] || rm -f "$tmp"
     fi
