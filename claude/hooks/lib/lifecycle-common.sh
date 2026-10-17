@@ -21,6 +21,25 @@ ccc_lifecycle_digest() { # <raw-value> -> sha256("ccc-lifecycle:" + value)
   printf '%s' "$digest"
 }
 
+ccc_lifecycle_file_digest() { # <domain> <file> -> sha256(domain + NUL + file bytes)
+  # #2361: content address for session-archive snapshots. Must match
+  # bridge/core/working_state_archive.py `_archive_name` byte-for-byte.
+  local domain="${1:-}" file="${2:-}" digest=""
+  [ -n "$domain" ] && [ -f "$file" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$( { printf '%s\0' "$domain"; cat -- "$file"; } | sha256sum 2>/dev/null)"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$( { printf '%s\0' "$domain"; cat -- "$file"; } | shasum -a 256 2>/dev/null)"
+  elif command -v openssl >/dev/null 2>&1; then
+    digest="$( { printf '%s\0' "$domain"; cat -- "$file"; } | openssl dgst -sha256 -r 2>/dev/null)"
+  fi
+  digest="${digest%% *}"
+  case "$digest" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+  esac
+  printf '%s' "$digest"
+}
+
 ccc_lifecycle_ref() { # <raw-id> -> first 16 chars of the lifecycle digest
   local digest=""
   digest="$(ccc_lifecycle_digest "${1:-}" 2>/dev/null)" || return 1

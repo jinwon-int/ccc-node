@@ -76,6 +76,21 @@ ok "SessionEnd archives ws"        'ls "$TMP/arch"/working-state-*.md >/dev/null
 echo '{}' | bash "$HERE/notify.sh" SessionEnd
 ok "SessionEnd archive is atomic and retry-deduped" \
   '[ "$(find "$TMP/arch" -maxdepth 1 -type f -name "working-state-*.md" | wc -l | tr -d "[:space:]")" = 1 ] && [ "$(stat -c "%a" "$TMP/arch"/working-state-*.md)" = 600 ]'
+# #2361: content-addressed across sessions + bounded retention
+echo '{"session_id":"other-session"}' | bash "$HERE/notify.sh" SessionEnd
+ok "SessionEnd dedupes the same state across sessions" \
+  '[ "$(find "$TMP/arch" -maxdepth 1 -type f -name "working-state-*.md" | wc -l | tr -d "[:space:]")" = 1 ]'
+expected_ws_digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(b"session_end\0"+open(sys.argv[1],"rb").read()).hexdigest()[:24])' "$CCC_WORKING_STATE")"
+ok "SessionEnd name matches working_state_archive.py" \
+  '[ -f "$TMP/arch/working-state-$expected_ws_digest.md" ]'
+for step in 1 2 3; do
+  printf 'objective: step %s\n' "$step" > "$CCC_WORKING_STATE"
+  echo "{\"session_id\":\"keep-$step\"}" | CCC_SESSION_ARCHIVE_KEEP=2 bash "$HERE/notify.sh" SessionEnd
+  sleep 1
+done
+newest_ws_digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(b"session_end\0"+open(sys.argv[1],"rb").read()).hexdigest()[:24])' "$CCC_WORKING_STATE")"
+ok "SessionEnd keeps only the newest N snapshots" \
+  '[ "$(find "$TMP/arch" -maxdepth 1 -type f -name "working-state-*.md" | wc -l | tr -d "[:space:]")" = 2 ] && [ -f "$TMP/arch/working-state-$newest_ws_digest.md" ]'
 
 # --- audit.sh stores an opaque session_ref; evidence-gate.sh still scopes by it ---
 echo '{"session_id":"sX","tool_name":"Write","tool_input":{"file_path":"/x/a.py"}}' | bash "$HERE/audit.sh"
