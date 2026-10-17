@@ -39,6 +39,7 @@ import socket
 import stat
 import sys
 from datetime import datetime, timedelta, timezone
+import statistics
 from types import ModuleType
 from typing import Any, Iterable, TextIO
 
@@ -51,6 +52,13 @@ DEFAULT_GRADUATION_MIN_NODES = 2
 DEFAULT_GRADUATION_MIN_USES = 3
 DEFAULT_DWELL_DAYS = 14
 MAX_REPORT_BYTES = 16 * 1024 * 1024
+# #2283 lifecycle table: cap the per-node dwell sample list (body-free ints).
+MAX_DWELL_SAMPLES = 5000
+_ARCHIVE_KIND_STAGE = {
+    "pending-90d": "archived:expired",
+    "prescreen-reject": "archived:prescreen-reject",
+    "draft-rejected": "archived:draft-rejected",
+}
 
 # ownership.py base classification -> report origin.
 ORIGINS = {
@@ -241,6 +249,103 @@ def _node_skill(
     }
 
 
+def _row_lifecycle(row: dict[str, Any]) -> str | None:
+    """Lifecycle stage of one pending-skills index row (#2283).
+
+    Rows written since #2283 carry ``lifecycle``; older rows are derived from
+    ``status`` with the same rules ``skill-review.sh reindex`` uses."""
+    stage = row.get("lifecycle")
+    if isinstance(stage, str) and stage:
+        return stage
+    status = row.get("status")
+    if not isinstance(status, str):
+        return None
+    if status == "pending":
+        verdict = row.get("prescreen")
+        return f"prescreened:{verdict}" if isinstance(verdict, str) and verdict else "drafted"
+    if status in ("approved", "installed"):
+        return status
+    if status == "rejected":
+        return "verdict:reject"
+    if status.startswith("archived:"):
+        return _ARCHIVE_KIND_STAGE.get(status.split(":", 1)[1], status)
+    return None
+
+
+def _is_pending_stage(stage: str) -> bool:
+    return stage == "drafted" or stage.startswith("prescreened:")
+
+
+def _read_small_regular(path: Path) -> tuple[str, str | None]:
+    """("ok", text) for a regular non-symlink file under the size cap."""
+    try:
+        meta = path.lstat()
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unreadable", None
+    if not stat.S_ISREG(meta.st_mode) or meta.st_size > MAX_REPORT_BYTES:
+        return "unreadable", None
+    try:
+        return "ok", path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "unreadable", None
+
+
+def _node_lifecycle(state_dir: Path, now: datetime) -> dict[str, Any]:
+    """Body-free skill lifecycle counters for this node (#2283, DOC-3903).
+
+    Reads ``pending-skills/index.jsonl`` (rebuilt by every autosave sweep) and
+    the fleet-skills ``installed.json`` receipt. Stage counts are per draft id
+    (last row wins), pending dwell is whole days since ``staged_at`` for the
+    drafts still undecided."""
+    status, text = _read_small_regular(state_dir / "pending-skills" / "index.jsonl")
+    latest: dict[str, dict[str, Any]] = {}
+    malformed = 0
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            malformed += 1
+            continue
+        if not isinstance(row, dict):
+            malformed += 1
+            continue
+        key = str(row.get("dir") or row.get("id") or "")
+        if key:
+            latest[key] = row
+    stages: dict[str, int] = {}
+    dwell: list[int] = []
+    for row in latest.values():
+        stage = _row_lifecycle(row)
+        if stage is None:
+            continue
+        stages[stage] = stages.get(stage, 0) + 1
+        if _is_pending_stage(stage):
+            staged = _parse_ts(row.get("staged_at"))
+            if staged is not None and len(dwell) < MAX_DWELL_SAMPLES:
+                dwell.append(max(0, (now - staged).days))
+    fleet_dir = Path(os.environ.get("CCC_FLEET_SKILLS_STATE_DIR", str(state_dir / "fleet-skills")))
+    receipt_status, receipt_text = _read_small_regular(fleet_dir / "installed.json")
+    installed = 0
+    if receipt_status == "ok":
+        try:
+            receipt = json.loads(receipt_text or "")
+            installed = len(receipt.get("skills") or []) if isinstance(receipt, dict) else 0
+        except ValueError:
+            receipt_status = "unreadable"
+    return {
+        "index": status,
+        "rows": len(latest),
+        "malformed_rows": malformed,
+        "stages": dict(sorted(stages.items())),
+        "pending_dwell_days": sorted(dwell),
+        "fleet_installed": {"receipt": receipt_status, "skills": installed},
+    }
+
+
 def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, Any]:
     curator = _load_curator()
     now = _now()
@@ -248,6 +353,7 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
     skills: list[dict[str, Any]] = []
     ledgers: dict[str, Any] = {}
     roots: dict[str, str] = {}
+    state_dir: Path | None = None
     for provider in providers:
         try:
             context = _provider_context(curator, provider)
@@ -255,6 +361,8 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
             ledgers[provider] = {"error": error.code}
             continue
         roots[provider] = str(context.skills_dir)
+        # The pending queue is node-global (ownership.py state anchor).
+        state_dir = state_dir or Path(context.state_dir)
         tool_status, usage = _skill_tool_usage(curator, context)
         ledger_status, ledger = _ledger_rows(curator, context)
         evidence = curator._usage_evidence(usage, ledger_status)
@@ -285,6 +393,7 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
         "skills_roots": roots,
         "usage_ledgers": ledgers,
         "skills": skills,
+        "lifecycle": _node_lifecycle(state_dir, now) if state_dir is not None else {"index": "no-context"},
     }
 
 
@@ -475,6 +584,60 @@ def _origin_totals(by_skill: dict[str, dict[str, dict[str, Any]]]) -> dict[str, 
     return totals
 
 
+def _percentile(values: list[int], pct: float) -> int | None:
+    """Nearest-rank percentile of a sorted list."""
+    if not values:
+        return None
+    rank = max(1, -(-len(values) * pct // 100))
+    return values[int(rank) - 1]
+
+
+def _lifecycle_aggregate(latest: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Fleet lifecycle table (#2283): stage counts, pending dwell, archive reasons."""
+    stages: dict[str, int] = {}
+    dwell: list[int] = []
+    per_node: dict[str, Any] = {}
+    missing: list[str] = []
+    for node, report in sorted(latest.items()):
+        section = report.get("lifecycle")
+        if not isinstance(section, dict) or section.get("index") != "ok":
+            missing.append(node)
+            if isinstance(section, dict):
+                per_node[node] = {"index": section.get("index")}
+            continue
+        node_stages = {
+            k: v for k, v in (section.get("stages") or {}).items()
+            if isinstance(k, str) and isinstance(v, int) and v >= 0
+        }
+        node_dwell = sorted(
+            d for d in (section.get("pending_dwell_days") or []) if isinstance(d, int) and d >= 0
+        )
+        for stage, count in node_stages.items():
+            stages[stage] = stages.get(stage, 0) + count
+        dwell.extend(node_dwell)
+        installed = section.get("fleet_installed") if isinstance(section.get("fleet_installed"), dict) else {}
+        per_node[node] = {
+            "index": "ok",
+            "drafts": sum(node_stages.values()),
+            "pending": len(node_dwell),
+            "pending_dwell_median_days": statistics.median(node_dwell) if node_dwell else None,
+            "fleet_installed": installed.get("skills") if installed.get("receipt") == "ok" else None,
+        }
+    dwell.sort()
+    return {
+        "stages": dict(sorted(stages.items())),
+        "archive_reasons": {k: v for k, v in sorted(stages.items()) if k.startswith("archived:")},
+        "pending_dwell_days": {
+            "count": len(dwell),
+            "median": statistics.median(dwell) if dwell else None,
+            "p90": _percentile(dwell, 90),
+            "max": dwell[-1] if dwell else None,
+        },
+        "nodes": per_node,
+        "nodes_without_index": missing,
+    }
+
+
 def build_aggregate(
     reports: list[dict[str, Any]],
     *,
@@ -534,6 +697,7 @@ def build_aggregate(
         "unused": unused,
         "totals": {"by_origin": _origin_totals(by_skill), "skills": len(by_skill), "nodes": len(latest)},
         "evidence_gaps": evidence_gaps,
+        "lifecycle": _lifecycle_aggregate(latest),
     }
 
 
@@ -619,6 +783,35 @@ def render_aggregate(agg: dict[str, Any]) -> str:
                 [[u["name"], ",".join(u["origins"]), ",".join(u["nodes"])] for u in agg["unused"]],
             )
         )
+    lc = agg.get("lifecycle")
+    if isinstance(lc, dict):
+        d = lc["pending_dwell_days"]
+        out += [
+            "",
+            "skill lifecycle (#2283, DOC-3903)",
+            f"pending dwell: {d['count']} undecided draft(s)  median {d['median'] if d['median'] is not None else '-'}d"
+            f"  p90 {d['p90'] if d['p90'] is not None else '-'}d  max {d['max'] if d['max'] is not None else '-'}d",
+            _table(["stage", "drafts"], [[k, v] for k, v in lc["stages"].items()]) if lc["stages"] else "(no index rows)",
+            "",
+            f"archive reasons: {sum(lc['archive_reasons'].values())}",
+        ]
+        if lc["archive_reasons"]:
+            out.append(_table(["reason", "drafts"], [[k, v] for k, v in lc["archive_reasons"].items()]))
+        if lc["nodes"]:
+            out += ["", "per node"]
+            out.append(
+                _table(
+                    ["node", "index", "drafts", "pending", "dwell_median_d", "fleet_installed"],
+                    [
+                        [n, v.get("index"), v.get("drafts", "-"), v.get("pending", "-"),
+                         v.get("pending_dwell_median_days") if v.get("pending_dwell_median_days") is not None else "-",
+                         v.get("fleet_installed") if v.get("fleet_installed") is not None else "-"]
+                        for n, v in lc["nodes"].items()
+                    ],
+                )
+            )
+        if lc["nodes_without_index"]:
+            out.append(f"nodes without a readable pending index: {', '.join(lc['nodes_without_index'])}")
     if agg["evidence_gaps"]:
         out += ["", "evidence gaps (these nodes' skills are excluded from archive/unused lists):"]
         for gap in agg["evidence_gaps"]:

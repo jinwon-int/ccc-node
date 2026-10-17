@@ -118,9 +118,17 @@ result.
 | `unused` | installed on at least one node and never used on any node. Every holder must have `ok` evidence. | none |
 | `totals.by_origin` | distinct `skills`, `installs` (node × skill) and `used_installs` per origin | none |
 | `evidence_gaps` | node/provider pairs whose ledgers cannot support idleness | none |
+| `lifecycle` | skill lifecycle table (#2283, Wiki DOC-3903 TM-3906): `stages` (draft count per lifecycle stage, summed over nodes), `archive_reasons` (the `archived:*` stages), `pending_dwell_days` (`count`/`median`/`p90`/`max` whole days since `staged_at` for drafts still undecided — `drafted` or `prescreened:*`), `nodes` (per-node drafts, pending, dwell median, fleet `installed.json` rows) and `nodes_without_index` (reports without a readable `pending-skills/index.jsonl`, including reports from before #2283) | none |
 
 The window comes from the node reports (`node --window-days`). The aggregate
 echoes the distinct values it saw.
+
+The lifecycle table reads each node's `pending-skills/index.jsonl` (rebuilt by
+every autosave sweep, `skill-review.sh reindex`) with the last row per draft
+winning. Rows written before #2283 have no `lifecycle` field; their stage is
+derived from `status`/`prescreen` with the same rules `reindex` uses, so the
+table works on today's indexes. Counters and day counts only — no names,
+paths or bodies.
 
 A listed candidate is evidence, not an action. The #1648 retirement
 precondition still applies: at least 30 days of post-activation records on
