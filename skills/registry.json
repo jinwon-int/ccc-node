@@ -406,7 +406,7 @@
       "name": "skillsuggest",
       "source": "skills/skillsuggest",
       "status": "active",
-      "tree_sha256": "eb6f77549e8bf9c02da60d1de7cc18705f28ce5ecb2f5f875b3e9b6df102b1d2"
+      "tree_sha256": "8c180c166ea0a12245f66a23a45224ac93837698f372c036c1db2752f0c3e981"
     },
     {
       "audience": "shared",

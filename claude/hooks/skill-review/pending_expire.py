@@ -222,6 +222,7 @@ def _move_eligible(
                 "staged_at": _now_iso(ts),
                 "age_days": int((now - ts) // 86400),
                 "reason": f"pending draft older than {days}d (automatic expiry, #2184)",
+                "lifecycle": "archived:expired",  # #2283 vocabulary
             },
         )
         result["moved"].append(entry.name)

@@ -4,6 +4,11 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# #2283 (found running this suite on a danso node): the danso lane resolves its
+# install root from CCC_DANSO_STATE_DIR / DANSO_SKILLS_DIR (#1659), which an
+# operator shell exports, so a fixture without an explicit root installed into
+# the node's live danso skills dir. Fixtures that need one set it per command.
+unset CCC_DANSO_STATE_DIR DANSO_SKILLS_DIR
 AUTO="$HERE/autoinstall.sh"
 OWNERSHIP="$HERE/ownership.py"
 TMP="$(mktemp -d)"
@@ -149,6 +154,8 @@ ok "render exposes owner-review fields without mutation" \
 out="$(run_auto bash "$AUTO" apply write-draft)"
 ok "explicit owner apply routes write_file and archives approval" \
   'jq -e ".changed == true and .action == \"write_file\"" >/dev/null <<<"$out" && grep -q "Verify routed apply" "$SKILLS/routed-skill/references/checklist.md" && ls -d "$PENDING/write-draft.approved-"* >/dev/null 2>&1'
+ok "#2283 lifecycle: owner apply records lifecycle=approved; incremental install records installed" \
+  'jq -e ".lifecycle == \"approved\" and .status == \"approved\"" "$(ls -d "$PENDING/write-draft.approved-"*)/meta.json" >/dev/null && jq -e ".lifecycle == \"installed\" and .status == \"installed\"" "$(ls -d "$PENDING/patch-draft.installed-"*)/meta.json" >/dev/null'
 
 stage_legacy_create a-create legacy-created
 stage_patch z-patch routed-skill "2. Verify." "2. Verify after cap." "$(printf 'f%.0s' {1..64})"

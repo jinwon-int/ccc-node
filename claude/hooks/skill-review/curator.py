@@ -796,6 +796,7 @@ def _archive_skill(context, usage, name: str, now: datetime, *, manual: bool) ->
             "target_id": classification["target_id"],
             "archived_at": _ts(now),
             "skill_sha256": classification["skill_sha256"],
+            "lifecycle": "archived:curated",  # #2283 vocabulary
         }
         try:
             ownership._write_private_atomic(
@@ -825,6 +826,7 @@ def _archive_skill(context, usage, name: str, now: datetime, *, manual: bool) ->
     record["state"] = "archived"
     record["archived_at"] = _ts(now)
     record["archive_name"] = archive_name
+    record["lifecycle"] = "archived:curated"  # #2283 vocabulary (additive)
     _save_usage(context, usage)
     ownership._finish_transaction(
         context,
@@ -934,6 +936,7 @@ def _restore_skill(context, usage, name: str, now: datetime) -> dict[str, Any]:
     record["state"] = "active"
     record["archived_at"] = None
     record["archive_name"] = None
+    record.pop("lifecycle", None)  # #2283: a restored skill is no longer archived
     _save_usage(context, usage)
     ownership._finish_transaction(
         context,

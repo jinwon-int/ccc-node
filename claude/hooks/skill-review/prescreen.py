@@ -367,6 +367,8 @@ class _Run:
                 "reviewer_node": out.get("reviewer_node"), "source": "reviewer",
             }
         result.update(verdict)
+        # #2283: additive lifecycle field (Wiki DOC-3903 TM-3906 vocabulary).
+        result["lifecycle"] = "prescreened:" + str(result.get("verdict", ""))
         self.seen_names.add(name)
         result["max_severity"] = _max_severity(result.get("findings", []))
         self.summary["reviewed"] += 1
@@ -399,6 +401,7 @@ def _archive(state: Path, entry: Path, *, now: float, node: str, result: dict[st
         "skill_name": result.get("skill_name", ""), "tree_sha256": result.get("tree_sha256", ""),
         "verdict": result.get("verdict"), "blockers": blockers[:5],
         "reason": "prescreen reject with blocker finding (rubric " + RUBRIC_VERSION + ", #2183)",
+        "lifecycle": "archived:prescreen-reject",
     })
     summary["archived"].append(entry.name)
     return True

@@ -68,12 +68,15 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    [ -n "$name" ] || name="$(awk 'NR>1 && /^---/{exit} /^name:/ {sub(/^name:[[:space:]]*/,""); print; exit}' "$STATE/pending-skills/$id/SKILL.md")"
    mkdir -p "$HOME/.claude/skills/$name"
    cp "$STATE/pending-skills/$id/SKILL.md" "$HOME/.claude/skills/$name/SKILL.md"
-   jq '.status="approved"' "$STATE/pending-skills/$id/meta.json" > "$STATE/pending-skills/$id/meta.approved.json"
+   jq '.status="approved" | .lifecycle="approved"' "$STATE/pending-skills/$id/meta.json" > "$STATE/pending-skills/$id/meta.approved.json"
    mv "$STATE/pending-skills/$id" "$STATE/pending-skills/$id.approved-$(date -u +%Y%m%d%H%M%S)"
    ```
    Reject by archiving rather than deleting:
    ```bash
    STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
+   # record the owner's verdict on the draft (#2283 lifecycle; additive field)
+   m="$STATE/pending-skills/<id>/meta.json"
+   [ -f "$m" ] && jq '.status="rejected" | .lifecycle="verdict:reject"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
    mv "$STATE/pending-skills/<id>" "$STATE/pending-skills/<id>.rejected-$(date -u +%Y%m%d%H%M%S)"
    ```
    A pending draft with an `autosave-block.json` file was machine-rejected by

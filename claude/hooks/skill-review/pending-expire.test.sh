@@ -89,6 +89,8 @@ ok "old drafts are in the archive intact" '[ -f "$ADIR/20260610-000000-aaaa-old-
 ok "fresh/decided/approved/proposal entries untouched" \
   '[ -d "$PENDING/20260711-000000-cccc-fresh-89d" ] && [ -d "$PENDING/20261005-000000-dddd-fresh-3d" ] && [ -d "$PENDING/20260601-000000-eeee-done.approved-20260603120000" ] && [ -d "$PENDING/20260601-000000-ffff-approved-wait" ] && [ -d "$PENDING/20260601-000000-gggg-proposal" ] && [ -d "$PENDING/no-stamp-dir" ]'
 ok "manifest has one row per move" '[ "$(wc -l < "$ADIR/manifest.jsonl" | tr -d " ")" = 2 ]'
+ok "#2283 lifecycle: expiry manifest rows carry lifecycle=archived:expired" \
+  '[ "$(jq -c "select(.reason | test(\"older than\")) | select(.lifecycle == \"archived:expired\")" "$ADIR/manifest.jsonl" | wc -l | tr -d " ")" = 2 ]'
 ok "manifest is owner-only" '[ "$(stat -c %a "$ADIR/manifest.jsonl")" = 600 ]'
 ok "manifest row carries the 4c fields" \
   'jq -e "select(.name == \"20260610-000000-aaaa-old-meta\") | .node == \"testnode\" and (.from | endswith(\"/pending-skills\")) and .age_days == 120 and (.reason | test(\"older than 90d\"))" "$ADIR/manifest.jsonl" >/dev/null'

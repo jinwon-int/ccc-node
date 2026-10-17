@@ -149,6 +149,8 @@ ok "#2283: direct index row id equals the draft directory name" \
   'jq -r ".id" "$STATE_IDX/pending-skills/index.jsonl" 2>/dev/null | grep -qx "$(basename "$idx_direct_dir")"'
 ok "#2283: direct index row came from the staging site (status=pending, provider set, not a rebuild)" \
   'jq -e "select(.status == \"pending\" and (.provider // \"\") != \"\" and (has(\"reindexed_at\") | not))" "$STATE_IDX/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2283 lifecycle: staging writes lifecycle=drafted to the index row and meta.json" \
+  'jq -e "select(.lifecycle == \"drafted\")" "$STATE_IDX/pending-skills/index.jsonl" >/dev/null 2>&1 && jq -e ".lifecycle == \"drafted\" and .status == \"pending\"" "$idx_direct_dir/meta.json" >/dev/null 2>&1'
 
 # Sweep path: one row per staged draft whose id is the draft directory name,
 # and the rebuild step ran.
@@ -171,6 +173,18 @@ printf '{"verdict":"revise","status":"ok"}\n' > "$STATE/pending-skills/$IDX_INST
 mkdir -p "$STATE/skill-autosave-archive/pending-90d-20260401"
 printf '{"ts":"2026-04-01T00:00:00Z","node":"testnode","from":"%s","name":"20260101-000000-sess-idx-expired-skill","reason":"test expiry"}\n' "$STATE/pending-skills" \
   > "$STATE/skill-autosave-archive/pending-90d-20260401/manifest.jsonl"
+# #2283 lifecycle: an owner-approved draft whose meta.json still says "drafted"
+# (the manual approve writes meta.approved.json), a rejected one, and a pending
+# one with only a prescreen verdict.
+IDX_APPR="20260104-000000-sess-idx-approved-skill.approved-20260105000000"
+IDX_REJ="20260106-000000-sess-idx-rejected-skill.rejected-20260107000000"
+IDX_PRE="20260108-000000-sess-idx-prescreened-skill"
+for d in "$IDX_APPR" "$IDX_REJ" "$IDX_PRE"; do
+  mkdir -p "$STATE/pending-skills/$d"
+  printf -- '---\nname: x\ndescription: Use when testing reindex.\n---\n# x\n' > "$STATE/pending-skills/$d/SKILL.md"
+  printf '{"name":"x","status":"pending","lifecycle":"drafted"}\n' > "$STATE/pending-skills/$d/meta.json"
+done
+printf '{"verdict":"approve","status":"ok"}\n' > "$STATE/pending-skills/$IDX_PRE/prescreen.json"
 # shellcheck disable=SC2034  # read inside the ok() eval strings below
 reindex_rc=0
 # shellcheck disable=SC2034  # read inside the ok() eval strings below
@@ -181,8 +195,14 @@ ok "#2283: installed draft row has status=installed, id without the suffix and t
 ok "#2283: archived draft row has status=archived:pending-90d" \
   'jq -e "select(.status == \"archived:pending-90d\" and .id == \"20260101-000000-sess-idx-expired-skill\")" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
 ok "#2283: previous non-empty index kept as .bak" 'ls "$STATE/pending-skills/index.jsonl.bak-"* >/dev/null 2>&1'
+ok "#2283 lifecycle: installed row -> installed, expired archive row -> archived:expired" \
+  'jq -e "select(.dir == \"$IDX_INST\") | .lifecycle == \"installed\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1 && jq -e "select(.id == \"20260101-000000-sess-idx-expired-skill\") | .lifecycle == \"archived:expired\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2283 lifecycle: the directory suffix wins over a stale meta.json lifecycle" \
+  'jq -e "select(.dir == \"$IDX_APPR\") | .lifecycle == \"approved\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1 && jq -e "select(.dir == \"$IDX_REJ\") | .lifecycle == \"verdict:reject\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2283 lifecycle: a pending draft with a prescreen verdict -> prescreened:<verdict>" \
+  'jq -e "select(.dir == \"$IDX_PRE\") | .lifecycle == \"prescreened:approve\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
 ok "#2283: no temp file left behind" '! ls "$STATE/pending-skills/.index.jsonl."* >/dev/null 2>&1'
-rm -rf "$STATE/pending-skills/$IDX_INST" "$STATE/skill-autosave-archive/pending-90d-20260401"
+rm -rf "$STATE/pending-skills/$IDX_INST" "$STATE/pending-skills/$IDX_APPR" "$STATE/pending-skills/$IDX_REJ" "$STATE/pending-skills/$IDX_PRE" "$STATE/skill-autosave-archive/pending-90d-20260401"
 
 # --- 1b) #2184: the sweep expires a 90-day-old undecided draft, keeps the fresh one
 OLD_DRAFT="20260101-000000-00000000-0000-0000-0000-000000000000-ancient-draft"
