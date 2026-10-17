@@ -34,6 +34,9 @@ Safety contract:
 * the budget is computed for the context window from ``--context-tokens``,
   env ``CCC_SKILL_LISTING_CONTEXT_TOKENS``, else the ``settings.json`` ``model``
   (1M for Fable/Mythos and Opus/Sonnet 4.6+, 200k for Haiku or unknown; #2108);
+  when that model is absent or unrecognised, the bridge's ``ANTHROPIC_MODEL``
+  (process env, then the bridge systemd unit's environment; #2358) is used
+  before the 200k default;
 * ``settings.json`` is backed up and replaced atomically, only when the
   rendered result differs (a second ``apply`` is a no-op).
 
@@ -51,7 +54,9 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -99,6 +104,16 @@ CONTEXT_1M_TOKENS = 1_000_000
 CONTEXT_1M_ALIASES = frozenset({"opus", "sonnet", "fable", "opusplan"})
 _MODEL_VERSION_RE = re.compile(r"^(opus|sonnet)-(\d+)(?:-(\d{1,2}))?(?=$|[-@])")
 CHARS_PER_TOKEN = 4
+# #2358: nodes that pin the bridge model with ``ANTHROPIC_MODEL`` in a systemd
+# drop-in (and leave ``settings.json`` without ``model``) were budgeted at the
+# 200k default although the bridge runs a 1M model. Only that one key is read
+# from the unit's environment; nothing else is retained.
+MODEL_ENV_KEY = "ANTHROPIC_MODEL"
+BRIDGE_UNITS = ("ccc-matrix-bridge.service", "ccc-telegram-bridge.service")
+SYSTEMCTL_ENV = "CCC_SKILL_LISTING_SYSTEMCTL"  # path to systemctl, or "off"
+SYSTEMCTL_TIMEOUT_SECONDS = 5
+MAX_ENV_FILE_BYTES = 256 * 1024
+_ENV_FILE_SUFFIX_RE = re.compile(r"\s+\(ignore_errors=(?:yes|no)\)$")
 REASON_OVER_BUDGET = "recent, over budget"
 
 MAX_SETTINGS_BYTES = 4 * 1024 * 1024
@@ -416,8 +431,116 @@ def context_tokens_for_model(model: Any) -> int | None:
     return None
 
 
+def env_file_model(path: Path) -> str | None:
+    """Last ``ANTHROPIC_MODEL`` assignment in a systemd EnvironmentFile, or None.
+
+    Parsed the way systemd reads it: only a line starting with ``#``/``;`` is a
+    comment, an optional ``export`` prefix is dropped, one level of matching
+    quotes is stripped. Every other key is ignored and never retained. An
+    unreadable or oversized file contributes nothing.
+    """
+    try:
+        if path.stat().st_size > MAX_ENV_FILE_BYTES:
+            return None
+    except OSError:
+        return None
+    raw = _read_bounded(path, MAX_ENV_FILE_BYTES)
+    if raw is None:
+        return None
+    found: str | None = None
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        key, sep, value = stripped.partition("=")
+        if not sep or key.strip() != MODEL_ENV_KEY:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        found = value
+    return found
+
+
+def unit_model_from_show(output: str) -> str | None:
+    """``ANTHROPIC_MODEL`` a unit's process receives, from ``systemctl show`` output.
+
+    ``EnvironmentFile=`` values override ``Environment=`` and later files
+    override earlier ones (systemd.exec), so the last assignment wins.
+    """
+    if not any(line == "LoadState=loaded" for line in output.splitlines()):
+        return None
+    model: str | None = None
+    files: list[Path] = []
+    for line in output.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        if key == "Environment":
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                words = []
+            for word in words:
+                name, eq, val = word.partition("=")
+                if eq and name == MODEL_ENV_KEY:
+                    model = val
+        elif key == "EnvironmentFiles":
+            path = _ENV_FILE_SUFFIX_RE.sub("", value).strip()
+            if path.startswith("/"):
+                files.append(Path(path))
+    for path in files:
+        value = env_file_model(path)
+        if value is not None:
+            model = value
+    return model.strip() if model and model.strip() else None
+
+
+def bridge_unit_model() -> tuple[str, str] | None:
+    """(model, "<scope> <unit>") for the first bridge unit that pins a model.
+
+    Read-only ``systemctl show``; a missing systemctl, bus or unit (Termux, a
+    container, a node without the unit) yields None. ``CCC_SKILL_LISTING_SYSTEMCTL``
+    names the binary, ``off`` disables the lookup.
+    """
+    systemctl = os.environ.get(SYSTEMCTL_ENV, "").strip() or "systemctl"
+    if systemctl.lower() in {"off", "0", "false", "no"}:
+        return None
+    env = dict(os.environ)
+    runtime_dir = f"/run/user/{os.getuid()}"
+    if not env.get("XDG_RUNTIME_DIR") and os.path.isdir(runtime_dir):
+        env["XDG_RUNTIME_DIR"] = runtime_dir  # cron has no user-bus address
+    scopes = ("--system", "--user") if os.geteuid() == 0 else ("--user", "--system")
+    for scope in scopes:
+        for unit in BRIDGE_UNITS:
+            try:
+                proc = subprocess.run(
+                    [systemctl, scope, "show", unit,
+                     "-p", "LoadState", "-p", "Environment", "-p", "EnvironmentFiles"],
+                    capture_output=True, text=True, env=env, timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+                    check=False)
+            except OSError:
+                return None  # no systemctl (Termux, container): nothing to ask
+            except subprocess.SubprocessError:
+                continue  # a hung bus must not stall setup/cron; try the next one
+            if proc.returncode != 0:
+                continue
+            model = unit_model_from_show(proc.stdout)
+            if model:
+                return model, f"{scope.lstrip('-')} {unit}"
+    return None
+
+
 def resolve_context_tokens(args: argparse.Namespace, settings_path: Path) -> None:
-    """Fill ``args.context_tokens``/``context_source``: flag > env > settings model > 200k."""
+    """Fill ``args.context_tokens``/``context_source``.
+
+    Order: flag > env > settings model > bridge ``ANTHROPIC_MODEL`` (process
+    env, then bridge unit; #2358) > 200k. The bridge model is consulted only
+    when the settings model is missing or unrecognised, so a node that pins
+    ``settings.json`` ``model`` keeps its previous budget.
+    """
     if args.context_tokens is not None:
         return
     if args.env_context_tokens is not None:
@@ -426,11 +549,19 @@ def resolve_context_tokens(args: argparse.Namespace, settings_path: Path) -> Non
     _, settings = load_settings(settings_path)
     model = settings.get("model") if isinstance(settings, dict) else None
     tokens = context_tokens_for_model(model)
-    if tokens is None:
-        args.context_tokens = DEFAULT_CONTEXT_TOKENS
-        args.context_source = f"default (model {model!r} not recognised)" if model else "default (no model in settings)"
-    else:
+    if tokens is not None:
         args.context_tokens, args.context_source = tokens, f"model {model}"
+        return
+    env_model = os.environ.get(MODEL_ENV_KEY, "").strip()
+    if env_model and (tokens := context_tokens_for_model(env_model)) is not None:
+        args.context_tokens, args.context_source = tokens, f"env {MODEL_ENV_KEY} {env_model}"
+        return
+    found = bridge_unit_model()
+    if found is not None and (tokens := context_tokens_for_model(found[0])) is not None:
+        args.context_tokens, args.context_source = tokens, f"bridge {found[1]} {MODEL_ENV_KEY} {found[0]}"
+        return
+    args.context_tokens = DEFAULT_CONTEXT_TOKENS
+    args.context_source = f"default (model {model!r} not recognised)" if model else "default (no model in settings)"
 
 
 def budget_chars_for(fraction: float, context_tokens: int) -> int:
@@ -907,7 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="context window the budget (and the recent-skill fit) is computed "
                             "for (default: env CCC_SKILL_LISTING_CONTEXT_TOKENS, else inferred "
                             "from the settings.json model — 1M for Fable/Mythos/Opus/Sonnet "
-                            "4.6+ — else 200000)")
+                            "4.6+ — else from the bridge ANTHROPIC_MODEL (env, then the bridge "
+                            "systemd unit), else 200000)")
         p.add_argument("--quiet", action="store_true", help="apply/release: one status line only")
         if name == "plan":
             p.add_argument("--summary", action="store_true", help="omit per-skill decision lines")

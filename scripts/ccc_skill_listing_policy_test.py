@@ -105,9 +105,11 @@ class PolicyCase(unittest.TestCase):
         return json.loads((self.claude / "state" / "skill-listing-policy.json").read_text(encoding="utf-8"))
 
     def run_cli(self, *args: str, env: dict | None = None, core: bool = True) -> subprocess.CompletedProcess:
-        full_env = {k: v for k, v in os.environ.items() if not k.startswith("CCC_")}
+        full_env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("CCC_") and k != "ANTHROPIC_MODEL"}
+        # #2358: never let the host's bridge unit or model env leak into a case.
         full_env.update({"CCC_CLAUDE_DIR": str(self.claude), "CCC_SKILL_LISTING_POLICY_NOW": NOW,
-                         "HOME": str(self.root / "home")})
+                         "HOME": str(self.root / "home"), "CCC_SKILL_LISTING_SYSTEMCTL": "off"})
         full_env.update(env or {})
         argv = [sys.executable, str(SCRIPT), *args]
         if core:
@@ -509,6 +511,122 @@ class ContextWindowTests(PolicyCase):
         proc = self.apply()
         self.assertIn("context window: 1000k (model claude-opus-5-5)", proc.stdout)
         self.assertEqual(self.apply("--quiet").stdout.count("\n"), 1)
+
+
+class BridgeModelWindowTests(PolicyCase):
+    """#2358: without a settings.json model, the bridge's ANTHROPIC_MODEL sets the window."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_settings({"theme": "dark"})
+        self.shows = self.root / "shows"
+        self.shows.mkdir()
+        self.fake = self.root / "fake-systemctl"
+        # Answers `<scope> show <unit> -p ...` from shows/<unit>; unknown units
+        # are not-found, like systemctl. Every call is logged.
+        self.fake.write_text(
+            "#!/bin/sh\n"
+            f'echo "$*" >> "{self.root}/calls"\n'
+            f'f="{self.shows}/$3"\n'
+            'if [ -f "$f" ]; then cat "$f"; else echo "LoadState=not-found"; fi\n',
+            encoding="utf-8")
+        self.fake.chmod(0o755)
+        self.scope = "system" if os.geteuid() == 0 else "user"
+
+    def show(self, unit: str, *lines: str) -> None:
+        (self.shows / unit).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def envfile(self, name: str, text: str) -> Path:
+        path = self.root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def plan(self, env: dict | None = None) -> dict:
+        full = {"CCC_SKILL_LISTING_SYSTEMCTL": str(self.fake)}
+        full.update(env or {})
+        proc = self.run_cli("plan", "--json", env=full)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_process_env_model(self) -> None:
+        plan = self.plan({"ANTHROPIC_MODEL": "claude-opus-5-5"})
+        self.assertEqual((plan["context_tokens"], plan["context_source"]),
+                         (1_000_000, "env ANTHROPIC_MODEL claude-opus-5-5"))
+        self.assertEqual(plan["after"]["budget_chars"], int(0.02 * 1_000_000 * 4))
+        self.assertFalse((self.root / "calls").exists(), "env model must not ask systemd")
+
+    def test_settings_model_still_wins(self) -> None:
+        self.write_settings({"model": "claude-haiku-4-5"})
+        self.show("ccc-matrix-bridge.service", "LoadState=loaded",
+                  "Environment=ANTHROPIC_MODEL=claude-opus-5-5")
+        plan = self.plan({"ANTHROPIC_MODEL": "claude-fable-5-1"})
+        self.assertEqual((plan["context_tokens"], plan["context_source"]),
+                         (200_000, "model claude-haiku-4-5"))
+
+    def test_bridge_unit_environment_files_last_wins(self) -> None:
+        first = self.envfile("a.env", "ANTHROPIC_MODEL=claude-haiku-4-5\nOTHER_TOKEN=x\n")
+        last = self.envfile("b.env", "# ANTHROPIC_MODEL=claude-haiku-4-5\n; comment\n"
+                                     "export ANTHROPIC_MODEL=\"claude-opus-5-5\"\n"
+                                     "CCC_MODEL_LABEL=Claude Opus 5.5 (high)\n")
+        self.show("ccc-matrix-bridge.service", "LoadState=loaded",
+                  'Environment=HOME=/x ANTHROPIC_MODEL=claude-haiku-4-5 "CCC_MODEL_LABEL=Some label"',
+                  f"EnvironmentFiles={first} (ignore_errors=no)",
+                  f"EnvironmentFiles={self.root}/missing.env (ignore_errors=yes)",
+                  f"EnvironmentFiles={last} (ignore_errors=no)")
+        plan = self.plan()
+        self.assertEqual(plan["context_tokens"], 1_000_000)
+        self.assertEqual(plan["context_source"],
+                         f"bridge {self.scope} ccc-matrix-bridge.service ANTHROPIC_MODEL claude-opus-5-5")
+        self.assertEqual(self.settings(), {"theme": "dark"}, "plan stays read-only")
+
+    def test_unit_environment_without_files(self) -> None:
+        self.show("ccc-matrix-bridge.service", "LoadState=loaded",
+                  'Environment="CCC_MODEL_LABEL=Claude Fable 5.1 (high)" ANTHROPIC_MODEL=claude-fable-5-1')
+        plan = self.plan()
+        self.assertEqual(plan["context_tokens"], 1_000_000)
+        self.assertIn("ANTHROPIC_MODEL claude-fable-5-1", plan["context_source"])
+
+    def test_telegram_unit_when_matrix_has_no_model(self) -> None:
+        self.show("ccc-matrix-bridge.service", "LoadState=loaded", "Environment=HOME=/x")
+        self.show("ccc-telegram-bridge.service", "LoadState=loaded",
+                  "Environment=ANTHROPIC_MODEL=claude-opus-5-5")
+        plan = self.plan()
+        self.assertEqual(plan["context_source"],
+                         f"bridge {self.scope} ccc-telegram-bridge.service ANTHROPIC_MODEL claude-opus-5-5")
+
+    def test_not_loaded_unrecognised_or_missing_systemctl_keep_default(self) -> None:
+        self.show("ccc-matrix-bridge.service", "LoadState=not-found",
+                  "Environment=ANTHROPIC_MODEL=claude-opus-5-5")
+        plan = self.plan()
+        self.assertEqual((plan["context_tokens"], plan["context_source"]),
+                         (200_000, "default (no model in settings)"))
+        self.show("ccc-matrix-bridge.service", "LoadState=loaded",
+                  "Environment=ANTHROPIC_MODEL=glm-5.3")
+        plan = self.plan({"ANTHROPIC_MODEL": "kimi-k3"})
+        self.assertEqual((plan["context_tokens"], plan["context_source"]),
+                         (200_000, "default (no model in settings)"))
+        plan = self.plan({"CCC_SKILL_LISTING_SYSTEMCTL": str(self.root / "no-such-systemctl")})
+        self.assertEqual(plan["context_tokens"], 200_000)
+
+    def test_off_switch_never_runs_systemctl(self) -> None:
+        self.show("ccc-matrix-bridge.service", "LoadState=loaded",
+                  "Environment=ANTHROPIC_MODEL=claude-opus-5-5")
+        plan = self.plan({"CCC_SKILL_LISTING_SYSTEMCTL": "off"})
+        self.assertEqual(plan["context_tokens"], 200_000)
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_show_parser_reads_only_the_model_key(self) -> None:
+        mod = load_module(SCRIPT, "ccc_skill_listing_policy_bridge")
+        env = self.envfile("c.env", "SECRET_TOKEN=abc\nANTHROPIC_MODEL='claude-sonnet-5'\n")
+        self.assertEqual(mod.env_file_model(env), "claude-sonnet-5")
+        self.assertIsNone(mod.env_file_model(self.envfile("d.env", "SECRET_TOKEN=abc\n")))
+        self.assertIsNone(mod.env_file_model(self.root / "absent.env"))
+        self.assertIsNone(mod.unit_model_from_show("Environment=ANTHROPIC_MODEL=claude-opus-5-5\n"))
+        self.assertIsNone(mod.unit_model_from_show(
+            'LoadState=loaded\nEnvironment="unterminated ANTHROPIC_MODEL=claude-opus-5-5\n'))
+        self.assertEqual(mod.unit_model_from_show(
+            "LoadState=loaded\nEnvironmentFiles=relative.env (ignore_errors=no)\n"
+            "Environment=ANTHROPIC_MODEL=claude-opus-5-5\n"), "claude-opus-5-5")
 
 
 class RepoCoreDescriptionTests(unittest.TestCase):

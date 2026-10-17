@@ -53,8 +53,16 @@ by that same run) for the node's context window, resolved in this order:
 `--context-tokens`, then env `CCC_SKILL_LISTING_CONTEXT_TOKENS`, then the
 window implied by `settings.json` `model` (#2108) — 1M for Fable / Mythos,
 Opus and Sonnet 4.6+, any `[1m]` id and the `opus` / `sonnet` / `fable` /
-`opusplan` aliases; 200000 for Haiku — and 200000 when the model is missing or
-unrecognised (a too-small budget only name-only's more, it never overflows).
+`opusplan` aliases; 200000 for Haiku. When `settings.json` has no `model` (or
+an unrecognised one), the bridge's `ANTHROPIC_MODEL` is used instead (#2358):
+first from the policy's own environment, then from the bridge systemd unit
+(`ccc-matrix-bridge.service`, then `ccc-telegram-bridge.service`, read-only
+`systemctl show`; `Environment=` then each `EnvironmentFiles=` entry in order,
+so the value the bridge process actually receives wins; only that one key is
+read). This covers nodes that pin the bridge model in a drop-in env file.
+`CCC_SKILL_LISTING_SYSTEMCTL` names the systemctl binary, `off` disables the
+lookup. Otherwise the window is 200000 (a too-small budget only name-only's
+more, it never overflows).
 `plan` / `apply` print the window and its source (`plan --json`:
 `context_tokens`, `context_source`). Before #2108 the default was always
 200000, so 1M-context nodes were held to a fifth of their real budget and had
