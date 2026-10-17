@@ -2563,6 +2563,35 @@ def _stall_handler(
     return handler, stalled
 
 
+def _pin_terminal_stall_bound(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make the terminal-stall bound independent of first-event processing time.
+
+    #2349: the terminal-stall grace (0.05 s here) counts from the first text
+    event, so when applying that event takes longer on a loaded runner the
+    bound is already spent before the next read is scheduled. The consumer
+    then takes its expired-bound branch (interrupt -> abort, no read to
+    cancel) and an order assertion that expects a pending read fails — the
+    3.12-only full-suite failure. Pin the selected TERMINAL_STALL bound to a
+    fixed value so each test exercises exactly one branch deterministically:
+    ``seconds > 0`` schedules a read that then times out (pending-read path);
+    ``0.0`` forces the expired-bound path. Other bounds are left untouched.
+    """
+
+    # Patch the exact module generation the handler executes (see
+    # _stall_handler): project_chat_process -> consume_turn_stream globals.
+    process_globals = ProjectChatHandler._process_agent_message.__globals__
+    consumer_globals = process_globals["consume_turn_stream"].__globals__
+    select = consumer_globals["_select_timeout"]
+
+    def pinned(**kwargs: object) -> object:
+        selection = select(**kwargs)
+        if selection is None or getattr(selection.outcome, "value", None) != "terminal-stall":
+            return selection
+        return type(selection)(seconds, selection.outcome)
+
+    monkeypatch.setitem(consumer_globals, "_select_timeout", pinned)
+
+
 @pytest.mark.anyio
 async def test_unbounded_events_keep_the_project_chat_consumer_task_identity(
     tmp_path: Path,
@@ -2586,6 +2615,7 @@ async def test_terminal_stall_preserves_interrupt_cancel_abort_close_order(
 ) -> None:
     session = OrderedStallSession("thread-1")
     handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+    _pin_terminal_stall_bound(monkeypatch, 0.05)
 
     response = await asyncio.wait_for(
         handler.process_message("ordered", 7, 70),
@@ -2599,11 +2629,35 @@ async def test_terminal_stall_preserves_interrupt_cancel_abort_close_order(
 
 
 @pytest.mark.anyio
+async def test_expired_terminal_stall_bound_interrupts_and_aborts_without_a_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2349: an already-spent bound takes the no-read branch, same outcome."""
+
+    session = OrderedStallSession("thread-1")
+    handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+    _pin_terminal_stall_bound(monkeypatch, 0.0)
+
+    response = await asyncio.wait_for(
+        handler.process_message("ordered", 7, 70),
+        timeout=5,
+    )
+
+    assert response.success is False
+    assert response.error == "Agent stopped before terminal completion"
+    # No read was scheduled, so there is nothing pending to cancel.
+    assert session.order == ["interrupt", "abort", "aclose"]
+    assert session.iterator.close_calls == 1
+
+
+@pytest.mark.anyio
 async def test_cancellation_during_interrupt_reaps_read_before_iterator_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session = BlockingOrderedInterruptSession("thread-1")
     handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+    # Asserts the pending read is reaped, so the read must exist (#2349).
+    _pin_terminal_stall_bound(monkeypatch, 0.05)
     handler._agent_interrupt_timeout_seconds = 0.01
     task = asyncio.create_task(handler.process_message("cancel", 7, 70))
     await session.interrupt_started.wait()
