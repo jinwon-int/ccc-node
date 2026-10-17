@@ -74,9 +74,10 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    Reject by archiving rather than deleting:
    ```bash
    STATE="${CCC_SKILL_REVIEW_STATE_DIR:-$HOME/.claude/state}"
-   # record the owner's verdict on the draft (#2283 lifecycle; additive field)
+   # record the owner's decision on the draft (#2283 lifecycle, #2373: an owner
+   # reject is an archive reason, not the P6 fleet review `verdict:*`)
    m="$STATE/pending-skills/<id>/meta.json"
-   [ -f "$m" ] && jq '.status="rejected" | .lifecycle="verdict:reject"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+   [ -f "$m" ] && jq '.status="rejected" | .lifecycle="archived:owner-rejected"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
    mv "$STATE/pending-skills/<id>" "$STATE/pending-skills/<id>.rejected-$(date -u +%Y%m%d%H%M%S)"
    ```
    A pending draft with an `autosave-block.json` file was machine-rejected by

@@ -59,6 +59,13 @@ _ARCHIVE_KIND_STAGE = {
     "prescreen-reject": "archived:prescreen-reject",
     "draft-rejected": "archived:draft-rejected",
 }
+# #2373: an owner `/skillsuggest` reject (P3 human gate) is its own archive
+# reason. `verdict:*` belongs to the P6 fleet intake review (publisher ledger),
+# which never writes a node pending-skills index, so a node-index
+# `verdict:reject` (written by #2283 before this fix, or reported by a node that
+# has not updated yet) is the owner reject under its old name.
+OWNER_REJECTED_STAGE = "archived:owner-rejected"
+_NODE_INDEX_STAGE_ALIASES = {"verdict:reject": OWNER_REJECTED_STAGE}
 
 # ownership.py base classification -> report origin.
 ORIGINS = {
@@ -256,7 +263,7 @@ def _row_lifecycle(row: dict[str, Any]) -> str | None:
     ``status`` with the same rules ``skill-review.sh reindex`` uses."""
     stage = row.get("lifecycle")
     if isinstance(stage, str) and stage:
-        return stage
+        return _NODE_INDEX_STAGE_ALIASES.get(stage, stage)
     status = row.get("status")
     if not isinstance(status, str):
         return None
@@ -266,7 +273,7 @@ def _row_lifecycle(row: dict[str, Any]) -> str | None:
     if status in ("approved", "installed"):
         return status
     if status == "rejected":
-        return "verdict:reject"
+        return OWNER_REJECTED_STAGE
     if status.startswith("archived:"):
         return _ARCHIVE_KIND_STAGE.get(status.split(":", 1)[1], status)
     return None
@@ -605,10 +612,11 @@ def _lifecycle_aggregate(latest: dict[str, dict[str, Any]]) -> dict[str, Any]:
             if isinstance(section, dict):
                 per_node[node] = {"index": section.get("index")}
             continue
-        node_stages = {
-            k: v for k, v in (section.get("stages") or {}).items()
-            if isinstance(k, str) and isinstance(v, int) and v >= 0
-        }
+        node_stages: dict[str, int] = {}
+        for k, v in (section.get("stages") or {}).items():
+            if isinstance(k, str) and isinstance(v, int) and v >= 0:
+                k = _NODE_INDEX_STAGE_ALIASES.get(k, k)
+                node_stages[k] = node_stages.get(k, 0) + v
         node_dwell = sorted(
             d for d in (section.get("pending_dwell_days") or []) if isinstance(d, int) and d >= 0
         )

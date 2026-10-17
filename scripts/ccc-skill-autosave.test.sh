@@ -179,12 +179,16 @@ printf '{"ts":"2026-04-01T00:00:00Z","node":"testnode","from":"%s","name":"20260
 IDX_APPR="20260104-000000-sess-idx-approved-skill.approved-20260105000000"
 IDX_REJ="20260106-000000-sess-idx-rejected-skill.rejected-20260107000000"
 IDX_PRE="20260108-000000-sess-idx-prescreened-skill"
-for d in "$IDX_APPR" "$IDX_REJ" "$IDX_PRE"; do
+# #2373: an owner reject recorded before #2373 carries meta lifecycle
+# verdict:reject; reindex must read it as archived:owner-rejected.
+IDX_REJ_OLD="20260109-000000-sess-idx-rejected-old-skill.rejected-20260110000000"
+for d in "$IDX_APPR" "$IDX_REJ" "$IDX_PRE" "$IDX_REJ_OLD"; do
   mkdir -p "$STATE/pending-skills/$d"
   printf -- '---\nname: x\ndescription: Use when testing reindex.\n---\n# x\n' > "$STATE/pending-skills/$d/SKILL.md"
   printf '{"name":"x","status":"pending","lifecycle":"drafted"}\n' > "$STATE/pending-skills/$d/meta.json"
 done
 printf '{"verdict":"approve","status":"ok"}\n' > "$STATE/pending-skills/$IDX_PRE/prescreen.json"
+printf '{"name":"x","status":"rejected","lifecycle":"verdict:reject"}\n' > "$STATE/pending-skills/$IDX_REJ_OLD/meta.json"
 # shellcheck disable=SC2034  # read inside the ok() eval strings below
 reindex_rc=0
 # shellcheck disable=SC2034  # read inside the ok() eval strings below
@@ -198,11 +202,15 @@ ok "#2283: previous non-empty index kept as .bak" 'ls "$STATE/pending-skills/ind
 ok "#2283 lifecycle: installed row -> installed, expired archive row -> archived:expired" \
   'jq -e "select(.dir == \"$IDX_INST\") | .lifecycle == \"installed\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1 && jq -e "select(.id == \"20260101-000000-sess-idx-expired-skill\") | .lifecycle == \"archived:expired\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
 ok "#2283 lifecycle: the directory suffix wins over a stale meta.json lifecycle" \
-  'jq -e "select(.dir == \"$IDX_APPR\") | .lifecycle == \"approved\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1 && jq -e "select(.dir == \"$IDX_REJ\") | .lifecycle == \"verdict:reject\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+  'jq -e "select(.dir == \"$IDX_APPR\") | .lifecycle == \"approved\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1 && jq -e "select(.dir == \"$IDX_REJ\") | .lifecycle == \"archived:owner-rejected\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2373 lifecycle: a pre-#2373 owner reject (meta verdict:reject) -> archived:owner-rejected" \
+  'jq -e "select(.dir == \"$IDX_REJ_OLD\") | .lifecycle == \"archived:owner-rejected\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
+ok "#2373 lifecycle: the node index never carries the P6 verdict:* vocabulary" \
+  '! jq -e "select((.lifecycle // \"\") | startswith(\"verdict:\"))" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
 ok "#2283 lifecycle: a pending draft with a prescreen verdict -> prescreened:<verdict>" \
   'jq -e "select(.dir == \"$IDX_PRE\") | .lifecycle == \"prescreened:approve\"" "$STATE/pending-skills/index.jsonl" >/dev/null 2>&1'
 ok "#2283: no temp file left behind" '! ls "$STATE/pending-skills/.index.jsonl."* >/dev/null 2>&1'
-rm -rf "$STATE/pending-skills/$IDX_INST" "$STATE/pending-skills/$IDX_APPR" "$STATE/pending-skills/$IDX_REJ" "$STATE/pending-skills/$IDX_PRE" "$STATE/skill-autosave-archive/pending-90d-20260401"
+rm -rf "$STATE/pending-skills/$IDX_INST" "$STATE/pending-skills/$IDX_APPR" "$STATE/pending-skills/$IDX_REJ" "$STATE/pending-skills/$IDX_PRE" "$STATE/pending-skills/$IDX_REJ_OLD" "$STATE/skill-autosave-archive/pending-90d-20260401"
 
 # --- 1b) #2184: the sweep expires a 90-day-old undecided draft, keeps the fresh one
 OLD_DRAFT="20260101-000000-00000000-0000-0000-0000-000000000000-ancient-draft"

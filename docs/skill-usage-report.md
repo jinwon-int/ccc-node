@@ -130,6 +130,12 @@ derived from `status`/`prescreen` with the same rules `reindex` uses, so the
 table works on today's indexes. Counters and day counts only — no names,
 paths or bodies.
 
+An owner `/skillsuggest` reject is the archive reason `archived:owner-rejected`
+(#2373). `verdict:{approve|revise|reject}` is reserved for the P6 fleet intake
+review recorded in the publisher ledger, which never writes a node index, so a
+node-index or node-report `verdict:reject` (written before #2373, or reported
+by a node that has not updated yet) is counted as `archived:owner-rejected`.
+
 A listed candidate is evidence, not an action. The #1648 retirement
 precondition still applies: at least 30 days of post-activation records on
 more than 3 measured nodes. Archive moves remain PR-first with owner approval.
