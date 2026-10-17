@@ -177,5 +177,61 @@ echo k > "$REPO/k.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm K
 out="$(CCC_TERMUX_PREPARE_PATH="/only/this:$FAKEBIN:/usr/bin:/bin" run)"; rc=$?
 ok "CCC_TERMUX_PREPARE_PATH replaces the build PATH verbatim" '[ "$rc" = 0 ] && grep -q "PATH=/only/this:$FAKEBIN:/usr/bin:/bin$" "$FAKE_CALLS.env"'
 
+# 12) prune (#2362): serving, newest N rollback targets, live, <24h and
+#     hand-made generations survive; only old script-built ones go.
+gen_for() { ls -d "$PREP"/main-"${1:0:7}"-* 2>/dev/null | head -1; }
+sha_of() { git -C "$REPO" log --all --format=%H --grep="^$1\$" -1; }
+J="$(sha_of J)"; K="$(git -C "$REPO" rev-parse HEAD)"
+GA="$SERV"; GB="$(gen_for "$B")"; GC="$(gen_for "$C")"; GD="$(gen_for "$D")"
+GG="$(gen_for "$G")"; GJ="$(gen_for "$J")"; GK="$(gen_for "$K")"
+HAND="$PREP/self-update-c1058258-20260917"; mkdir -p "$HAND/job"
+for g in "$PREP"/*; do find "$g" -maxdepth 2 -exec touch -h -d '3 days ago' {} + 2>/dev/null; done
+rm -f "$CN"/bridge-current.prev-*
+printf 'preparations/%s\n' "$(basename "$GC")" > "$CN/bridge-current.prev-20990101T000000"
+printf 'preparations/%s\n' "$(basename "$GG")" > "$CN/bridge-current.prev-20990101T000001"
+printf 'preparations/%s\n' "$(basename "$GJ")" > "$CN/bridge-current.prev-20990101T000002"
+( cd "$GB/source" && exec sleep 300 ) & LIVE_PID=$!
+sleep 0.3
+touch "$GD/prepare.log"
+EXPECT_PRUNE="$(for g in "$PREP"/main-*; do case "$g" in "$GK"|"$GJ"|"$GG"|"$GB"|"$GD") ;; *) basename "$g" ;; esac; done | sort)"
+EXPECT_N="$(grep -c . <<<"$EXPECT_PRUNE")"
+ok "prune fixture: serving is K and every generation exists" \
+  '[ "$(readlink -e "$CN/bridge-current")" = "$(readlink -e "$GK")" ] && ( for g in "$GA" "$GB" "$GC" "$GD" "$GG" "$GJ" "$GK" "$HAND"; do [ -d "$g" ] || exit 1; done )'
+
+out="$(CCC_TERMUX_PREPARE_PRUNE=0 run)"; rc=$?
+ok "CCC_TERMUX_PREPARE_PRUNE=0 removes nothing" '[ "$rc" = 0 ] && grep -q "prune: disabled" <<<"$out" && [ -d "$GA" ] && [ -d "$GC" ]'
+
+out="$(run --dry-run)"; rc=$?
+ok "dry-run lists exactly the old generations and removes nothing" \
+  '[ "$rc" = 0 ] && [ "$(grep -o "would prune [^ ]*" <<<"$out" | awk "{print \$3}" | sort)" = "$EXPECT_PRUNE" ] && grep -qx "$(basename "$GA")" <<<"$EXPECT_PRUNE" && grep -qx "$(basename "$GC")" <<<"$EXPECT_PRUNE" && [ -d "$GA" ] && [ -d "$GC" ]'
+
+echo l > "$REPO/l.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm L
+out="$(FAKE_PREPARE_FAIL=1 run)"; rc=$?
+ok "a failed build never prunes" '[ "$rc" = 3 ] && [ -d "$GA" ] && [ -d "$GC" ] && ! grep -q "prune:" <<<"$out"'
+git -C "$REPO" checkout -q "$K"
+
+# Dangling pointer + a target with no generation yet: nothing can be built
+# (no serving .env to inherit) and nothing may be pruned.
+echo m > "$REPO/m.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm M
+mv "$CN/bridge-current" "$CN/bridge-current.saved"; ln -sfn preparations/missing "$CN/bridge-current"
+out="$(run)"; rc=$?
+ok "an unresolvable serving generation never prunes" '[ "$rc" = 2 ] && [ -d "$GA" ] && [ -d "$GC" ] && ! grep -q "prune:" <<<"$out"'
+rm -f "$CN/bridge-current"; mv "$CN/bridge-current.saved" "$CN/bridge-current"
+git -C "$REPO" checkout -q "$K"
+
+out="$(run)"; rc=$?
+ok "already-serving run prunes exactly the old generations" \
+  '[ "$rc" = 0 ] && [ "$EXPECT_N" -ge 2 ] && grep -q "prune: removed $EXPECT_N generation" <<<"$out" && ( for n in $EXPECT_PRUNE; do [ -e "$PREP/$n" ] && exit 1; done; exit 0 )'
+ok "serving and the newest two rollback targets survive" '[ -d "$GK" ] && [ -d "$GJ" ] && [ -d "$GG" ]'
+ok "a generation used by a live process survives" '[ -d "$GB" ] && grep -q "keep $(basename "$GB") (referenced by a live process)" <<<"$out"'
+ok "a generation changed in the last 24h survives" '[ -d "$GD" ]'
+ok "hand-made (non main-*) generations are never candidates" '[ -d "$HAND" ]'
+ok "pruned worktrees are gone from git" '! git -C "$REPO" worktree list | grep -qF -e "$GA/source" -e "$GC/source"'
+kill "$LIVE_PID" 2>/dev/null; wait "$LIVE_PID" 2>/dev/null
+
+out="$(CCC_TERMUX_GENERATIONS_KEEP=0 run --dry-run)"; rc=$?
+ok "KEEP=0 is clamped to 1: the newest rollback target is still kept" \
+  '[ "$rc" = 0 ] && ! grep -q "would prune $(basename "$GJ")" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

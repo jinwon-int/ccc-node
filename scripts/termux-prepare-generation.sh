@@ -15,7 +15,7 @@
 #   printf 'exec bash %s/ccc-node/scripts/termux-prepare-generation.sh\n' "$HOME" \
 #     > ~/.claude/self-update.prepare-cmd
 #
-# What it does (nothing is deleted, ever):
+# What it does:
 #   1. target = CCC_SELF_UPDATE_TARGET_SHA (set by self-update) or the repo HEAD.
 #   2. If the serving generation's source is already at target → exit 0.
 #   3. If a ready generation for target exists → repoint only.
@@ -37,6 +37,18 @@
 #      recorded in <ccc-node>/bridge-current.prev-<ts> and the symlink moves.
 #   The restart is NOT done here — self-update's restart-cmd (restart-frontends)
 #   or the operator does it; the pointer is what every launcher reads.
+#   6. Prune (#2361/#2362 — each generation is ~1 GB and nothing removed them:
+#      23 generations / 12 GB on one node). Runs only after a successful
+#      repoint or on the already-serving path, never after a failure. Only
+#      script-built `main-*` generations are candidates; KEPT always: the
+#      serving generation, the targets of the newest
+#      CCC_TERMUX_GENERATIONS_KEEP (2, min 1) bridge-current.prev-* records
+#      (the operator's rollback targets), any generation a live process
+#      references (cmdline/exe/cwd), and any generation changed in the last
+#      24 h (a build in progress or a fresh failure kept for diagnosis).
+#      Removal = `git worktree remove --force` + rm -rf + `git worktree prune`.
+#      Fail-closed: no resolvable serving generation → nothing is removed.
+#      --dry-run reports `would prune`; CCC_TERMUX_PREPARE_PRUNE=0 disables.
 #
 # Usage: termux-prepare-generation.sh [--dry-run] [--status] [--target <sha>]
 # Env:   CCC_SELF_UPDATE_TARGET_SHA, CCC_SELF_UPDATE_REPO_DIR (else
@@ -46,7 +58,8 @@
 #        CCC_TERMUX_PREPARE_TIMEOUT (3300 s, passed to the tool),
 #        CCC_TERMUX_PREPARE_JOBS (1), CCC_TERMUX_PREPARE_LOG
 #        (~/.claude/state/termux-prepare.log), CCC_TERMUX_MATRIX_FRONTEND
-#        (1/0 — override the Matrix-frontend detection).
+#        (1/0 — override the Matrix-frontend detection),
+#        CCC_TERMUX_GENERATIONS_KEEP (2), CCC_TERMUX_PREPARE_PRUNE (1; 0 = off).
 # Exit:  0 ok (serving or repointed) · 2 usage/precondition · 3 build failed ·
 #        4 receipt not ready or Matrix extra missing · 5 pointer switch failed.
 set -euo pipefail
@@ -133,6 +146,64 @@ gate_generation() { # <gen-dir> — refuse to promote a generation this node's f
   fi
 }
 
+# --- prune old generations (#2362) -------------------------------------------
+KEEP_PREV="${CCC_TERMUX_GENERATIONS_KEEP:-2}"
+case "$KEEP_PREV" in ''|*[!0-9]*) KEEP_PREV=2 ;; esac
+[ "$KEEP_PREV" -ge 1 ] || KEEP_PREV=1   # the last rollback target always survives
+
+live_process_paths() { # cmdline/exe/cwd of every visible process, one per line
+  local p
+  for p in /proc/[0-9]*; do
+    { tr '\0' ' ' < "$p/cmdline"; printf ' %s %s\n' "$(readlink "$p/exe")" "$(readlink "$p/cwd")"; } 2>/dev/null || :
+  done
+}
+
+prune_generations() { # best-effort: never changes the exit status of the run
+  case "${CCC_TERMUX_PREPARE_PRUNE:-1}" in 0|off|false|no) say "prune: disabled (CCC_TERMUX_PREPARE_PRUNE)"; return 0 ;; esac
+  [ -d "$PREP" ] || return 0
+  local serving rec t d name live removed=0
+  serving="$(readlink -e "$POINTER" 2>/dev/null || true)"
+  if [ -z "$serving" ] || [ ! -d "$serving" ]; then
+    say "prune: skipped — serving generation unresolved (fail-closed)"; return 0
+  fi
+  local -A keep=()
+  keep["$serving"]=1
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    t="$(head -n 1 "$rec" 2>/dev/null || true)"
+    [ -n "$t" ] || continue
+    case "$t" in /*) ;; *) t="$CN/$t" ;; esac
+    t="$(readlink -e "$t" 2>/dev/null || true)"
+    [ -n "$t" ] && keep["$t"]=1
+  done < <(compgen -G "$CN/bridge-current.prev-*" | sort -r | head -n "$KEEP_PREV")
+  live="$(live_process_paths)"
+  for d in "$PREP"/main-*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    name="$(basename "$d")"
+    d="$(readlink -e "$d" 2>/dev/null || true)"
+    [ -n "$d" ] || continue
+    [ -n "${keep[$d]:-}" ] && continue
+    if grep -qF -e "$PREP/$name/" -e "$PREP/$name " -e "$d/" -e "$d " <<<"$live"; then
+      say "prune: keep $name (referenced by a live process)"; continue
+    fi
+    if [ -n "$(find "$d" -maxdepth 2 -mmin -1440 2>/dev/null | head -n 1)" ]; then
+      continue
+    fi
+    if [ "$DRY" = 1 ]; then say "dry-run: would prune $name"; continue; fi
+    if [ -e "$d/source/.git" ]; then
+      git -C "$REPO" worktree remove --force --force "$d/source" >/dev/null 2>&1 || :
+    fi
+    if rm -rf -- "$d" 2>/dev/null && [ ! -e "$d" ]; then
+      removed=$((removed + 1)); say "prune: removed $name"
+    else
+      say "prune: could not remove $name"
+    fi
+  done
+  [ "$DRY" = 1 ] || git -C "$REPO" worktree prune >/dev/null 2>&1 || :
+  [ "$DRY" = 1 ] || say "prune: removed $removed generation(s); kept serving + ${KEEP_PREV} rollback target(s), live and <24h generations"
+  return 0
+}
+
 REPO="$(resolve_repo)"
 [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die 2 "checkout not found: $REPO"
 [ -n "$TARGET" ] || TARGET="$(git -C "$REPO" rev-parse HEAD)"
@@ -153,6 +224,7 @@ fi
 
 if [ -n "$SERVING_HEAD" ] && [ "$SERVING_HEAD" = "$TARGET" ]; then
   say "already serving $SHORT ($(basename "$SERVING")); nothing to do"
+  prune_generations
   exit 0
 fi
 
@@ -182,6 +254,7 @@ if [ -n "$GEN" ]; then
   [ "$DRY" = 1 ] && { say "dry-run: would repoint to existing ready generation $(basename "$GEN")"; exit 0; }
   gate_generation "$GEN"
   switch_pointer "$GEN"
+  prune_generations
   exit 0
 fi
 
@@ -235,3 +308,4 @@ status="$(receipt_status "$GEN/job")"
 say "built $(basename "$GEN") in $((SECONDS - started))s (receipt ready)"
 gate_generation "$GEN"
 switch_pointer "$GEN"
+prune_generations
