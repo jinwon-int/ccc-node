@@ -176,5 +176,52 @@ class Backfill(unittest.TestCase):
         self.assertEqual(appended[0]["url"], f"{REPO}/pull/284")
 
 
+class LedgerLifecycle(unittest.TestCase):
+    """#2283: ledger rows carry an additive Wiki DOC-3903 lifecycle stage."""
+
+    def test_stage_mapping(self) -> None:
+        cases = [
+            ({"outcome": "staged", "transport_id": "t"}, "staged"),
+            ({"outcome": "pr-opened", "url": "u"}, "published"),
+            ({"outcome": "existing-pr", "url": "u"}, "published"),
+            ({"kind": "a2a-verdict", "status": "consumed", "verdict": "approve"}, "verdict:approve"),
+            ({"kind": "a2a-verdict", "status": "consumed", "verdict": "revise"}, "verdict:revise"),
+            ({"kind": "a2a-verdict", "status": "consumed", "verdict": "reject"}, "verdict:reject"),
+            ({"kind": promotion._PROMOTED_KIND, "pr": "1"}, "approved"),
+            ({"kind": promotion._SUPERSEDED_KIND, "pr": "1"}, "archived:superseded"),
+        ]
+        for row, stage in cases:
+            with self.subTest(row=row):
+                self.assertEqual(promotion._ledger_lifecycle(row), stage)
+
+    def test_operational_rows_carry_no_stage(self) -> None:
+        for row in (
+            {"outcome": "would-open-pr"},
+            {"kind": "a2a-verdict", "status": "malformed"},
+            {"kind": "a2a-verdict", "status": "consumed", "verdict": "bogus"},
+            {"kind": "a2a-dispatch", "pr_url": "u"},
+            {"kind": promotion._DISPATCH_SKIPPED_KIND},
+            {"kind": "a2a-revise-result", "status": "republished"},
+        ):
+            with self.subTest(row=row):
+                self.assertIsNone(promotion._ledger_lifecycle(row))
+
+    def test_append_adds_stage_without_mutating_the_caller_row(self) -> None:
+        written: list[dict[str, object]] = []
+        row = {"outcome": "staged", "transport_id": "t"}
+        with patch.object(promotion, "_append_jsonl", side_effect=lambda _c, _f, r, **_k: written.append(r)):
+            promotion._append_ledger(types.SimpleNamespace(), row)
+        self.assertEqual(written, [{"outcome": "staged", "transport_id": "t", "lifecycle": "staged"}])
+        self.assertNotIn("lifecycle", row)
+
+    def test_explicit_lifecycle_wins_and_unstaged_rows_pass_through(self) -> None:
+        written: list[dict[str, object]] = []
+        with patch.object(promotion, "_append_jsonl", side_effect=lambda _c, _f, r, **_k: written.append(r)):
+            promotion._append_ledger(types.SimpleNamespace(), {"outcome": "staged", "lifecycle": "candidate"})
+            promotion._append_ledger(types.SimpleNamespace(), {"kind": "a2a-dispatch"})
+        self.assertEqual(written[0]["lifecycle"], "candidate")
+        self.assertNotIn("lifecycle", written[1])
+
+
 if __name__ == "__main__":
     unittest.main()

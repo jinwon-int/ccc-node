@@ -934,6 +934,9 @@ def apply_operations(cfg: Config, rows: list[Operation], retired: list[Retiremen
                     "name": row.skill.name,
                     "audience": row.skill.audience,
                     "tree_sha256": row.skill.tree_sha256,
+                    # #2283: self-contained per row (duplicates the top-level
+                    # commit on purpose; --ref is an exact 40-hex SHA).
+                    "lifecycle": f"installed@{cfg.ref}",
                 }
                 for row in rows
             ],

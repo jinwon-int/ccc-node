@@ -84,6 +84,8 @@ ok "installed copies carry owner-only exact-commit provenance" \
   '[ "$(stat -c %a "$CLAUDE_ROOT/release-checklist/.ccc-fleet-skill.json")" = 600 ] && jq -e --arg ref "$REF" ".manager == \"ccc-node-fleet-skills\" and .commit == \$ref and .provider == \"claude\"" "$CLAUDE_ROOT/release-checklist/.ccc-fleet-skill.json" >/dev/null'
 ok "receipt is body-free and owner-only" \
   '[ "$(stat -c %a "$STATE/installed.json")" = 600 ] && jq -e --arg ref "$REF" ".commit == \$ref and (.skills | length) == 2" "$STATE/installed.json" >/dev/null && ! grep -q "Inspect the intended" "$STATE/installed.json"'
+ok "#2283 lifecycle: every installed.json row is self-contained installed@<commit>" \
+  'jq -e --arg l "installed@$REF" "[.skills[].lifecycle] | length == 2 and all(. == \$l)" "$STATE/installed.json" >/dev/null'
 
 out="$(env "${base_env[@]}" python3 "$SYNC" plan --ref "$REF")"; rc=$?
 ok "exact-commit rerun converges to noops" \

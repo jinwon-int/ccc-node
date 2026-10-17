@@ -1630,7 +1630,39 @@ def _append_jsonl(
         raise PromotionError(code) from None
 
 
+def _ledger_lifecycle(record: dict[str, object]) -> str | None:
+    """#2283: the skill-lifecycle stage a ledger row records, if any.
+
+    Wiki DOC-3903 TM-3906 vocabulary, derived from the row's existing
+    kind/outcome/status so every write site stays as it is. Operational rows
+    (dispatch, skipped, receipts, revise bookkeeping, ...) carry no stage.
+    """
+    kind = record.get("kind")
+    if kind is None:
+        outcome = record.get("outcome")
+        if outcome == "staged":
+            return "staged"
+        if outcome in ("pr-opened", "existing-pr"):
+            return "published"
+        return None
+    if kind == "a2a-verdict" and record.get("status") == "consumed":
+        verdict = record.get("verdict")
+        if verdict in ("approve", "revise", "reject"):
+            return f"verdict:{verdict}"
+        return None
+    if kind == _PROMOTED_KIND:
+        return "approved"
+    if kind == _SUPERSEDED_KIND:
+        return "archived:superseded"
+    return None
+
+
 def _append_ledger(config: Config, record: dict[str, object]) -> None:
+    # #2283: additive `lifecycle` field; an explicit value from the caller wins.
+    if "lifecycle" not in record:
+        stage = _ledger_lifecycle(record)
+        if stage is not None:
+            record = {**record, "lifecycle": stage}
     _append_jsonl(config, "ledger.jsonl", record)
 
 
