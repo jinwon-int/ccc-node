@@ -103,14 +103,23 @@ run_autosave() {
 }
 
 # --- 1) full sweep: scan + draft + ledger + spool notification ---------------
+# Staging runs in a detached setsid child: it moves SKILL.md into place, then
+# writes meta.json, appends the index row, and only then logs `staged id=`.
+# Waiting for SKILL.md alone raced the index append on loaded runners (#2283
+# flake: 0 index rows read). Wait for the post-append log line instead.
+wait_staged() { # <state-dir>
+  for _ in $(seq 1 80); do
+    find "$1/pending-skills" -name SKILL.md 2>/dev/null | grep -q . \
+      && grep -q "staged id=" "$1/skill-review.log" 2>/dev/null && return 0
+    sleep 0.25
+  done
+  return 1
+}
 run_autosave; rc=$?
 ok "autosave exits 0" '[ "$rc" = 0 ]'
 ok "scanner invoked" '[ -f "$TMP/scan.touched" ]'
 ok "active sweep invokes central promoter in live mode" 'grep -qx "run --lock-wait 120" "$TMP/promotion.touched"'
-for _ in $(seq 1 40); do
-  find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q . && break
-  sleep 0.25
-done
+ok "#2283: sweep staging finished (staged id= logged after the index append)" 'wait_staged "$STATE"'
 ok "draft staged from bridge transcript" 'find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | grep -q .'
 ok "draft not installed as live skill" '[ ! -e "$TMP/skills/release-checklist/SKILL.md" ]'
 ok "ledger records session" 'grep -q "^bridge-sess-1	" "$STATE/skill-autosave.seen"'
@@ -131,10 +140,7 @@ mkdir -p "$STATE_IDX"
 make_transcript "$PROJECTS/-root--idx/direct-sess-1.jsonl" 6
 jq -nc --arg tp "$PROJECTS/-root--idx/direct-sess-1.jsonl" '{session_id:"direct-sess-1", transcript_path:$tp}' \
   | CCC_SKILL_REVIEW_STATE_DIR="$STATE_IDX" CLAUDE_SKILLS_DIR="$TMP/skills" bash "$REVIEW" manual >/dev/null 2>&1
-for _ in $(seq 1 40); do
-  find "$STATE_IDX/pending-skills" -name SKILL.md 2>/dev/null | grep -q . && break
-  sleep 0.25
-done
+ok "#2283: direct staging finished (staged id= logged after the index append)" 'wait_staged "$STATE_IDX"'
 # shellcheck disable=SC2034  # read inside the ok() eval strings below
 idx_direct_dir="$(find "$STATE_IDX/pending-skills" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | head -1)"
 ok "#2283: direct staging appends exactly one index row" \
