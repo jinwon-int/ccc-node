@@ -235,6 +235,32 @@ class PromoteMergeSweepTests(unittest.TestCase):
         self.assertIn("--squash", merge)
         self.assertNotIn("--admin", merge)
 
+    def test_publisher_ready_is_recorded_with_its_head(self) -> None:
+        """#2360: the supersede sweep needs to know this ready-mark was ours."""
+        head = "a" * 40
+        view = {
+            "isDraft": True, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "state": "OPEN", "headRefOid": head,
+        }
+        out, written, _ = self.sweep([self.open_promote()], view=view,
+                                     after_merge={"state": "OPEN", "autoMergeRequest": None})
+        self.assertEqual([r["outcome"] for r in out], ["promote-pr-merge-pending"])
+        ready = [r for r in written if r.get("kind") == "a2a-promote-ready"]
+        self.assertEqual([(r["pr"], r["head"]) for r in ready], [("999", head)])
+        self.assertFalse([r for r in written if r.get("kind") == "a2a-promote-pr"],
+                         "the batch row itself stays untouched (still OPEN)")
+
+    def test_no_ready_row_when_the_pr_was_already_ready(self) -> None:
+        view = {
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "state": "OPEN", "headRefOid": "a" * 40,
+        }
+        _, written, calls = self.sweep([self.open_promote()], view=view)
+        self.assertNotIn("ready", [c[2] for c in calls if c[:2] == ["gh", "pr"]])
+        self.assertEqual([r for r in written if r.get("kind") == "a2a-promote-ready"], [])
+
     def test_auto_merge_enabled_is_not_recorded_as_merged(self) -> None:
         # fleet-skills allows auto-merge: on a PR that cannot land yet, `gh pr
         # merge` enables auto-merge and exits 0. That used to be written to the
