@@ -107,6 +107,18 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("possible-token", re.compile(r"[A-Za-z0-9+/]{40,}")),
 )
+# #2371: `possible-token` allows `/`, so a long slash-joined URL path reads as
+# a token. OOXML/XML namespace URIs (`http://schemas.openxmlformats.org/
+# officeDocument/2006/relationships/officeDocument`) are public constants every
+# docx/xlsx/pptx generator must carry, so they are masked before that one
+# pattern runs. Only these public schema hosts are masked — never URLs in
+# general (a webhook path can carry a real secret) — and only when every path
+# segment is shorter than the token threshold, so a 40+ run hidden under one of
+# these hosts is still caught.
+_PUBLIC_NAMESPACE_URI_RE = re.compile(
+    r"https?://(?:schemas\.openxmlformats\.org|schemas\.microsoft\.com|www\.w3\.org|purl\.org)"
+    r"(?:/[A-Za-z0-9._~-]{1,39}(?![A-Za-z0-9._~+-]))+/?"
+)
 _HOME_PATH_RE = re.compile(r"(?:^|[^A-Za-z0-9_])/(?:root|home|Users)/[^\s`'\"<>]+")
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -1127,7 +1139,10 @@ def _scan_text(payload: bytes) -> None:
     except UnicodeDecodeError:
         raise PromotionError("source_not_utf8") from None
     for label, pattern in _CREDENTIAL_PATTERNS:
-        if pattern.search(text):
+        haystack = (
+            _PUBLIC_NAMESPACE_URI_RE.sub(" ", text) if label == "possible-token" else text
+        )
+        if pattern.search(haystack):
             raise PromotionError(f"secret_{label}")
     if _HOME_PATH_RE.search(text):
         raise PromotionError("node_specific_home_path")

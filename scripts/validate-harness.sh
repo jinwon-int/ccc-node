@@ -606,6 +606,12 @@ else
   err "skill-promotion revise path-rule tests failed"
   tail -10 "$TMP/skill-promotion-support-dirs-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_namespace_uri_test.py >"$TMP/skill-promotion-namespace-uri-test.out" 2>&1; then
+  say "  ok skill-promotion possible-token namespace-URI tests (#2371)"
+else
+  err "skill-promotion possible-token namespace-URI tests failed"
+  tail -10 "$TMP/skill-promotion-namespace-uri-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_fairness_test.py >"$TMP/skill-promotion-fairness-test.out" 2>&1; then
   say "  ok skill-promotion collect fairness tests (#1617)"
 else
