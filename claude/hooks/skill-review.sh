@@ -61,6 +61,14 @@ skill_review_reindex() {
     return 1
   }
   now="$(ts)"
+  # #2283 lifecycle vocabulary (Wiki DOC-3903 TM-3906). The directory suffix is
+  # authoritative for decided drafts; a meta.json `lifecycle` is only adopted
+  # when it agrees with it (an owner approve writes meta.approved.json and
+  # leaves meta.json at "drafted").
+  local lc_jq='def lc: if $status == "pending" then (if $verdict != "" then "prescreened:" + $verdict else "drafted" end)
+    elif $status == "approved" then ((.lifecycle? // "") | if type == "string" and startswith("approved") then . else "approved" end)
+    elif $status == "installed" then ((.lifecycle? // "") | if type == "string" and startswith("installed") then . else "installed" end)
+    else ((.lifecycle? // "") | if type == "string" and (startswith("verdict:") or startswith("archived:")) then . else "verdict:reject" end) end;'
   for entry in "$dir"/*/; do
     [ -d "$entry" ] || continue
     base="$(basename "$entry")"
@@ -76,15 +84,15 @@ skill_review_reindex() {
     [ -f "$entry/prescreen.json" ] && verdict="$(jq -r '.verdict // empty' "$entry/prescreen.json" 2>/dev/null)"
     if [ -f "$entry/meta.json" ] && jq -e 'type == "object"' "$entry/meta.json" >/dev/null 2>&1; then
       jq -c --arg id "$id" --arg dir "$base" --arg status "$status" --arg verdict "$verdict" --arg at "$now" \
-        '{id:$id, name:(.name // $id), status:$status, session_id:(.session_id // null), trigger:(.trigger // null),
+        "$lc_jq"'{id:$id, name:(.name // $id), status:$status, lifecycle:lc, session_id:(.session_id // null), trigger:(.trigger // null),
           staged_at:(.staged_at // null), provider:(.provider // null), dir:$dir,
           prescreen:(if $verdict == "" then null else $verdict end), reindexed_at:$at}' \
         "$entry/meta.json" >> "$tmp" 2>/dev/null \
-        || jq -nc --arg id "$id" --arg dir "$base" --arg status "$status" --arg at "$now" \
-             '{id:$id,name:$id,status:$status,dir:$dir,reindexed_at:$at,meta:"unreadable"}' >> "$tmp"
+        || jq -nc --arg id "$id" --arg dir "$base" --arg status "$status" --arg verdict "$verdict" --arg at "$now" \
+             "$lc_jq"'{id:$id,name:$id,status:$status,lifecycle:(null | lc),dir:$dir,reindexed_at:$at,meta:"unreadable"}' >> "$tmp"
     else
-      jq -nc --arg id "$id" --arg dir "$base" --arg status "$status" --arg at "$now" \
-        '{id:$id,name:$id,status:$status,dir:$dir,reindexed_at:$at,meta:"missing"}' >> "$tmp"
+      jq -nc --arg id "$id" --arg dir "$base" --arg status "$status" --arg verdict "$verdict" --arg at "$now" \
+        "$lc_jq"'{id:$id,name:$id,status:$status,lifecycle:(null | lc),dir:$dir,reindexed_at:$at,meta:"missing"}' >> "$tmp"
     fi
     rows=$((rows + 1))
   done
@@ -97,7 +105,13 @@ skill_review_reindex() {
     if jq -c --arg kind "$kind" --arg at "$now" \
          'select(type == "object" and (.name // "") != "" and (.restored_to // "") == "")
           | {id:(.name | sub("\\.(approved|installed|rejected)-[0-9]+$"; "")), name:(.name | sub("^[0-9]{8}-[0-9]{6}-"; "") | sub("\\.(approved|installed|rejected)-[0-9]+$"; "")),
-             status:("archived:" + $kind), dir:.name, archived_at:(.ts // null), reason:(.reason // null), reindexed_at:$at}' \
+             status:("archived:" + $kind),
+             lifecycle:(if (.lifecycle | type) == "string" then .lifecycle
+                        elif $kind == "pending-90d" then "archived:expired"
+                        elif $kind == "prescreen-reject" then "archived:prescreen-reject"
+                        elif $kind == "draft-rejected" then "archived:draft-rejected"
+                        else "archived:" + $kind end),
+             dir:.name, archived_at:(.ts // null), reason:(.reason // null), reindexed_at:$at}' \
          "$manifest" >> "$tmp" 2>/dev/null; then
       n_archived=$((n_archived + $(jq -c 'select(type == "object" and (.name // "") != "" and (.restored_to // "") == "")' "$manifest" 2>/dev/null | wc -l | tr -d '[:space:]')))
     fi
@@ -283,13 +297,13 @@ run_skill_review_bg() {
       --arg staged_at "$(ts)" \
       --arg skill_path "${CLAUDE_SKILLS_DIR%/}/$name/SKILL.md" \
       --arg provider "$STAGE_PROVIDER" \
-      'del(.skill_md) + {id:$id,status:"pending",session_id:$session,trigger:$trigger,source_cwd:$source_cwd,source_project:$source_project,staged_at:$staged_at,target_skill_path:$skill_path,provider:$provider}' \
+      'del(.skill_md) + {id:$id,status:"pending",lifecycle:"drafted",session_id:$session,trigger:$trigger,source_cwd:$source_cwd,source_project:$source_project,staged_at:$staged_at,target_skill_path:$skill_path,provider:$provider}' \
       > "$dest/meta.json" 2>/dev/null || true
     # #2283: `-n` is load-bearing. Without it jq reads stdin, which the hook
     # entry already drained (HOOK_INPUT="$(cat)"), so it emitted nothing and
     # index.jsonl stayed 0 bytes on every node from #183 (2026-06-26) on.
     jq -nc --arg id "$safe_id" --arg name "$name" --arg session "$SESSION_ID" --arg trigger "$TRIGGER" --arg at "$(ts)" --arg provider "$STAGE_PROVIDER" \
-      '{id:$id,name:$name,status:"pending",session_id:$session,trigger:$trigger,staged_at:$at,provider:$provider}' \
+      '{id:$id,name:$name,status:"pending",lifecycle:"drafted",session_id:$session,trigger:$trigger,staged_at:$at,provider:$provider}' \
       >> "$PENDING_DIR/index.jsonl" 2>/dev/null || true
     staged=$((staged + 1))
     log "staged id=$safe_id name=$name trigger=$TRIGGER pid=$PIPE_PID"
@@ -403,7 +417,7 @@ skill_review_reject_draft() {
   printf '%s' "$item" | jq -c \
     --arg id "$id" --arg session "${SESSION_ID:-unknown}" --arg trigger "${TRIGGER:-}" \
     --arg at "$now" --arg provider "${STAGE_PROVIDER:-}" --arg reason "$reason" \
-    'del(.skill_md) + {id:$id,status:"rejected",reject_reason:$reason,session_id:$session,trigger:$trigger,staged_at:$at,provider:$provider}' \
+    'del(.skill_md) + {id:$id,status:"rejected",lifecycle:"archived:draft-rejected",reject_reason:$reason,session_id:$session,trigger:$trigger,staged_at:$at,provider:$provider}' \
     > "$dir/meta.json" 2>/dev/null || true
   jq -nc --arg reason "$reason" --arg session "${SESSION_ID:-unknown}" --arg ts "$now" \
     --arg name "$name" --arg id "$id" --arg trigger "${TRIGGER:-}" --arg provider "${STAGE_PROVIDER:-}" \
@@ -413,7 +427,7 @@ skill_review_reject_draft() {
     > "$dir/reject.json" 2>/dev/null || true
   jq -nc --arg ts "$now" --arg name "$id" --arg reason "$reason" --arg skill "$name" \
     --arg session "${SESSION_ID:-unknown}" --arg matched "$matched" --arg node "${CCC_NODE:-}" \
-    '{ts:$ts, node:$node, name:$name, reason:("draft-gate:" + $reason), skill:$skill, session:$session}
+    '{ts:$ts, node:$node, name:$name, reason:("draft-gate:" + $reason), lifecycle:"archived:draft-rejected", skill:$skill, session:$session}
      + (if $matched != "" then {matched:$matched} else {} end)' \
     >> "$REJECT_ROOT/manifest.jsonl" 2>/dev/null || true
   chmod 600 "$dir/meta.json" "$dir/reject.json" "$REJECT_ROOT/manifest.jsonl" 2>/dev/null || true

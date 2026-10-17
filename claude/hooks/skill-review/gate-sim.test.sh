@@ -2,6 +2,11 @@
 # Tests for skill-review/gate-sim.sh — hermetic, no network, no installs.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# #2283 (found running this suite on a danso node): the danso lane resolves its
+# install root from CCC_DANSO_STATE_DIR / DANSO_SKILLS_DIR (#1659), which an
+# operator shell exports, so a fixture without an explicit root installed into
+# the node's live danso skills dir. Fixtures that need one set it per command.
+unset CCC_DANSO_STATE_DIR DANSO_SKILLS_DIR
 SIM="$HERE/gate-sim.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"

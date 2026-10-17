@@ -5,6 +5,11 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# #2283 (found running this suite on a danso node): the danso lane resolves its
+# install root from CCC_DANSO_STATE_DIR / DANSO_SKILLS_DIR (#1659), which an
+# operator shell exports, so a fixture without an explicit root installed into
+# the node's live danso skills dir. Fixtures that need one set it per command.
+unset CCC_DANSO_STATE_DIR DANSO_SKILLS_DIR
 TOOL="$HERE/curator.py"
 OWN="$HERE/ownership.py"
 TMP="$(mktemp -d)"
@@ -96,6 +101,8 @@ ok "100d idle → archived with pre-run backup" 'jq -e ".counts.archived == 1 an
 ok "archived skill left the live dir" '[ ! -e "$SKILLS/alpha" ]'
 ok "archive root holds exactly one entry" '[ "$(ls "$STATE/skill-autosave-archive" | wc -l)" = "1" ]'
 ok "archive root is owner-only" '[ "$(stat -c %a "$STATE/skill-autosave-archive")" = "700" ]'
+ok "#2283 lifecycle: archive marker and usage record carry archived:curated" \
+  'jq -e ".lifecycle == \"archived:curated\"" "$STATE"/skill-autosave-archive/*/.curator-archive.json >/dev/null && jq -e ".records[\"claude:alpha\"].lifecycle == \"archived:curated\"" "$STATE/skill-autosave-usage.json" >/dev/null'
 out="$(at 100 list-archived)"
 ok "list-archived tracks the entry" 'jq -e ".archived | length == 1 and .[0].name == \"alpha\" and .[0].tracked" >/dev/null <<<"$out"'
 out="$(at 100 run)"
@@ -105,6 +112,8 @@ ok "rerun after archive is a no-op" 'jq -e ".counts.archived == 0 and (.changed 
 out="$(at 100 restore alpha)"
 ok "restore moves the skill back" 'jq -e ".changed == true" >/dev/null <<<"$out" && [ -f "$SKILLS/alpha/SKILL.md" ]'
 ok "restored skill keeps its autosave marker" '[ -f "$SKILLS/alpha/.autosave-meta.json" ]'
+ok "#2283 lifecycle: restore drops the archived lifecycle from the usage record" \
+  'jq -e ".records[\"claude:alpha\"] | has(\"lifecycle\") | not" "$STATE/skill-autosave-usage.json" >/dev/null'
 out="$(at 100 status alpha)"
 ok "restored skill is active" 'jq -e ".skills[0].telemetry.state == \"active\"" >/dev/null <<<"$out"'
 out="$(at 100 restore alpha)"; rc=$?

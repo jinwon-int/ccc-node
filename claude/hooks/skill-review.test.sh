@@ -318,6 +318,8 @@ ok "#2239 trigger gate: archive is owner-only (dir 700, files 600)" \
   '[ "$(stat -c %a "$rej1")" = 700 ] && [ "$(stat -c %a "$rej1/SKILL.md")" = 600 ] && [ "$(stat -c %a "$rej1/reject.json")" = 600 ]'
 ok "#2239 trigger gate: archived meta.json keeps the candidate record" \
   'jq -e ".status == \"rejected\" and .reject_reason == \"description-trigger\" and (.skill_md | not)" "$rej1/meta.json" >/dev/null'
+ok "#2283 lifecycle: draft-rejected meta and archive manifest row carry archived:draft-rejected" \
+  'jq -e ".lifecycle == \"archived:draft-rejected\"" "$rej1/meta.json" >/dev/null && jq -e "select(.name == \"$(basename "$rej1")\") | .lifecycle == \"archived:draft-rejected\"" "$(dirname "$rej1")/manifest.jsonl" >/dev/null'
 ok "#2239 trigger gate: review log line" \
   'grep -q "candidate rejected reason=description-trigger name=no-trigger-skill" "$STATE_G1/skill-review.log"'
 ok "#2239 trigger gate: manifest row (pending-expire shape)" \

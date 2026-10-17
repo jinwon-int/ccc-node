@@ -4,6 +4,11 @@
 # no provider/network calls (the gates are pure shell/jq).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# #2283 (found running this suite on a danso node): the danso lane resolves its
+# install root from CCC_DANSO_STATE_DIR / DANSO_SKILLS_DIR (#1659), which an
+# operator shell exports, so a fixture without an explicit root installed into
+# the node's live danso skills dir. Fixtures that need one set it per command.
+unset CCC_DANSO_STATE_DIR DANSO_SKILLS_DIR
 AUTO="$HERE/autoinstall.sh"
 pass=0; fail=0
 TMP="$(mktemp -d)"
@@ -77,6 +82,8 @@ ok "v2 install marker written owner-only" 'jq -e ".schema_version == 2 and .inst
 ok "ledger records installed-by=autosave" 'jq -e "select(.event==\"install\") | .installed_by == \"autosave\" and .name == \"clean-one\" and .trigger == \"test\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "#1823: install ledger row carries the provider" 'jq -e "select(.event==\"install\" and .name==\"clean-one\") | .provider == \"claude\"" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "draft archived as installed" 'ls -d "$PENDING/20260101-000000-a-clean-one.installed-"* >/dev/null 2>&1'
+ok "#2283 lifecycle: installed draft meta and ledger row carry installed@<sha12>" \
+  'm="$(ls -d "$PENDING/20260101-000000-a-clean-one.installed-"*)/meta.json"; sha="$(jq -r "select(.event==\"install\" and .name==\"clean-one\") | .sha256" "$STATE/skill-autosave-install.jsonl" | head -1)"; [ -n "$sha" ] && jq -e --arg l "installed@${sha:0:12}" ".lifecycle == \$l and .status == \"installed\"" "$m" >/dev/null && jq -e --arg l "installed@${sha:0:12}" "select(.event==\"install\" and .name==\"clean-one\") | .lifecycle == \$l" "$STATE/skill-autosave-install.jsonl" >/dev/null'
 ok "summary lists installed name" 'jq -e ".installed == [\"clean-one\"]" >/dev/null <<<"$out"'
 ok "post-hoc notification queued" 'ls "$SPOOL"/*SkillAutoInstall*.json >/dev/null 2>&1'
 ok "notification is a notice, not an approval request" 'jq -r ".text" "$SPOOL"/*SkillAutoInstall*.json | grep -q "자동 설치 1건"'

@@ -697,7 +697,8 @@ do_run() {
           fi
           name="$(jq -r '.proposal.target_skill' "$proposal_file" 2>/dev/null)"
           if [ -f "$dir/meta.json" ]; then
-            jq --arg at "$(ts)" '.status="installed" | .installed_by="autosave" | .installed_at=$at' \
+            # #2283: no per-iteration content sha on this path -> plain "installed".
+            jq --arg at "$(ts)" '.status="installed" | .lifecycle="installed" | .installed_by="autosave" | .installed_at=$at' \
               "$dir/meta.json" > "$dir/meta.json.tmp" 2>/dev/null \
               && mv "$dir/meta.json.tmp" "$dir/meta.json" 2>/dev/null || rm -f "$dir/meta.json.tmp"
           fi
@@ -808,10 +809,11 @@ do_run() {
       --arg provider "$SKILL_PROVIDER" \
       '{event:"install", ts:$ts, id:$id, name:$name, path:$path,
         session_id:$sid, sha256:$sha, installed_by:"autosave", trigger:$trg,
-        provider:$provider}')"
+        provider:$provider,
+        lifecycle:(if $sha == "" then "installed" else "installed@" + $sha[0:12] end)}')"
     printf '%s\n' "$rec" >> "$LEDGER" 2>/dev/null || true
     if [ -f "$dir/meta.json" ]; then
-      jq --arg at "$(ts)" '.status="installed" | .installed_by="autosave" | .installed_at=$at' \
+      jq --arg at "$(ts)" --arg sha "$sha" '.status="installed" | .lifecycle=(if $sha == "" then "installed" else "installed@" + $sha[0:12] end) | .installed_by="autosave" | .installed_at=$at' \
         "$dir/meta.json" > "$dir/meta.json.tmp" 2>/dev/null \
         && mv "$dir/meta.json.tmp" "$dir/meta.json" 2>/dev/null || rm -f "$dir/meta.json.tmp"
     fi
@@ -1132,7 +1134,7 @@ do_apply() {
   esac
   if [ -f "$dir/meta.json" ]; then
     if jq --arg at "$(ts)" \
-      '.status="approved" | .installed_by="owner-approved" | .installed_at=$at' \
+      '.status="approved" | .lifecycle="approved" | .installed_by="owner-approved" | .installed_at=$at' \
       "$dir/meta.json" > "$dir/meta.json.tmp" 2>/dev/null; then
       mv "$dir/meta.json.tmp" "$dir/meta.json" 2>/dev/null \
         || rm -f "$dir/meta.json.tmp"

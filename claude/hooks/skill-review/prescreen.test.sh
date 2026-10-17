@@ -107,6 +107,8 @@ ok "reject+blocker left the queue" '[ ! -e "$PENDING/20260902-000000-bbbb-bad" ]
 ADIR="$ARCHIVE/prescreen-reject-20261008"
 ok "reject+blocker archived intact with its prescreen.json" '[ -f "$ADIR/20260902-000000-bbbb-bad/SKILL.md" ] && jq -e ".verdict == \"reject\" and .max_severity == \"blocker\"" "$ADIR/20260902-000000-bbbb-bad/prescreen.json" >/dev/null'
 ok "manifest row names the blocker" 'jq -e "select(.name == \"20260902-000000-bbbb-bad\") | .verdict == \"reject\" and (.blockers[0] | test(\"token\")) and (.reason | test(\"#2183\"))" "$ADIR/manifest.jsonl" >/dev/null'
+ok "#2283 lifecycle: prescreen.json and the archive manifest row carry lifecycle" \
+  'jq -e ".lifecycle == \"prescreened:approve\"" "$PENDING/20260901-000000-aaaa-good/prescreen.json" >/dev/null && jq -e ".lifecycle == \"prescreened:reject\"" "$ADIR/20260902-000000-bbbb-bad/prescreen.json" >/dev/null && jq -e "select(.name == \"20260902-000000-bbbb-bad\") | .lifecycle == \"archived:prescreen-reject\"" "$ADIR/manifest.jsonl" >/dev/null'
 ok "revise stays with findings" 'jq -e ".verdict == \"revise\" and .max_severity == \"major\" and (.findings | length) == 1" "$PENDING/20260903-000000-cccc-meh/prescreen.json" >/dev/null'
 ok "summary counts kept verdicts" 'printf "%s" "$out" | jq -e ".kept.approve == 1 and .kept.revise == 1 and (.archived | length) == 1" >/dev/null'
 ok "prescreen-last.json written owner-only" '[ -f "$STATE/prescreen-last.json" ] && [ "$(stat -c %a "$STATE/prescreen-last.json")" = 600 ]'
