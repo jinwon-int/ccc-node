@@ -667,6 +667,27 @@ class PromoteAutoApproveTests(unittest.TestCase):
         self.assertNotIn("--match-head-commit", merge)
         self.assertNotIn("--admin", merge)
 
+    def test_pretty_printed_relay_output_is_a_verified_approval(self) -> None:
+        # #2378: approve-via-relay.sh ends with `jq -n` (no -c), so the real
+        # verdict spans lines and its last line is just `}`.
+        pretty = "relay: exact-head review recorded\n" + json.dumps(
+            {"ok": True, "approved": True, "already_approved": False,
+             "head": AA_HEAD, "pr": 999}, indent=2)
+        out, written, calls, _ = self.sweep(approve_out=pretty)
+        self.assertEqual(out[0]["outcome"], "promote-autoapproved")
+        aa = [r for r in written if r["kind"] == "a2a-promote-autoapprove"]
+        self.assertEqual([r["mode"] for r in aa], ["approved"])
+        self.assertIn("--match-head-commit", self.merge_call(calls))
+
+    def test_pretty_printed_relay_output_still_binds_the_head(self) -> None:
+        pretty = json.dumps({"ok": True, "approved": True, "head": "0" * 40}, indent=2)
+        out, _, _, _ = self.sweep(approve_out=pretty)
+        self.assertEqual(out[0]["code"], "approve_output_invalid")
+
+    def test_non_json_relay_output_is_a_failure(self) -> None:
+        out, _, _, _ = self.sweep(approve_out="ok\n}")
+        self.assertEqual(out[0]["code"], "approve_output_invalid")
+
     def test_unverifiable_relay_output_is_a_failure(self) -> None:
         out, _, _, _ = self.sweep(approve_out=json.dumps({"ok": True, "approved": True, "head": "0" * 40}))
         self.assertEqual(out[0]["outcome"], "approve-failed")

@@ -5503,6 +5503,22 @@ def _promote_autoapprove(
     return {"outcome": "promote-autoapproved", "pr": pr, "head_sha": head, "new": True}
 
 
+def _relay_result_json(text: str) -> object:
+    """The helper's trailing JSON object, or None. approve-via-relay.sh ends
+    with a pretty-printed `jq -n` object (#2378) — the last line alone is
+    just `}` — so parse from the last line that opens an object to the end;
+    compact single-line output and any preceding log lines still work."""
+    lines = text.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if not lines[index].startswith("{"):
+            continue
+        try:
+            return json.loads("\n".join(lines[index:]))
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _run_relay_approval(
     config: Config, payload: dict[str, object], *, pr: str, head: str, profile: str
 ) -> str | None:
@@ -5532,9 +5548,8 @@ def _run_relay_approval(
     if returncode != 0:
         return f"approve_exit_{returncode}"
     try:
-        lines = [line for line in completed.stdout.decode("utf-8").splitlines() if line.strip()]
-        result = json.loads(lines[-1])
-    except (UnicodeDecodeError, json.JSONDecodeError, IndexError):
+        result = _relay_result_json(completed.stdout.decode("utf-8"))
+    except UnicodeDecodeError:
         return "approve_output_invalid"
     if (
         not isinstance(result, dict)
