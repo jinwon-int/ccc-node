@@ -413,6 +413,10 @@ class LifecycleTableTests(unittest.TestCase):
             {"id": "g", "dir": "g", "status": "archived:draft-rejected"},
             # #2373: an owner reject reindexed before #2373 kept the P6 name
             {"id": "h", "dir": "h.rejected-1", "status": "rejected", "lifecycle": "verdict:reject"},
+            # #2374: a pre-#2374 autosave install kept the P7-shaped name
+            {"id": "i", "dir": "i.installed-1", "status": "installed", "lifecycle": "installed@0123456789ab"},
+            # #2374: reindexed after #2374 — the owner/manual split comes from reindex
+            {"id": "j", "dir": "j.approved-1", "status": "approved", "lifecycle": "local-installed:manual"},
             # duplicate key: the later row wins (staged a, then reindexed as approved)
             {"id": "a2", "dir": "a2", "status": "pending", "lifecycle": "drafted", "staged_at": iso(5)},
             {"id": "a2", "dir": "a2", "status": "approved", "lifecycle": "approved", "staged_at": iso(5)},
@@ -439,13 +443,14 @@ class LifecycleTableTests(unittest.TestCase):
         lc = self.node_report()["lifecycle"]
         self.assertEqual(lc["index"], "ok")
         self.assertEqual(lc["malformed_rows"], 1)
-        self.assertEqual(lc["rows"], 9)
+        self.assertEqual(lc["rows"], 11)
         self.assertEqual(
             lc["stages"],
             {
-                "approved": 1, "archived:draft-rejected": 1, "archived:expired": 1,
+                "archived:draft-rejected": 1, "archived:expired": 1,
                 "archived:owner-rejected": 2, "drafted": 1,
-                "installed": 1, "prescreened:approve": 1, "prescreened:revise": 1,
+                "local-installed:auto": 2, "local-installed:manual": 1, "local-installed:owner": 1,
+                "prescreened:approve": 1, "prescreened:revise": 1,
             },
         )
         # undecided drafts only: a (10d), b (30d), c (2d); a2 became approved
@@ -469,7 +474,10 @@ class LifecycleTableTests(unittest.TestCase):
         two["node"] = "node-b"
         two["lifecycle"]["pending_dwell_days"] = [40]
         # a node that has not picked up #2373 yet still reports verdict:reject
-        two["lifecycle"]["stages"] = {"drafted": 1, "archived:expired": 2, "verdict:reject": 1}
+        two["lifecycle"]["stages"] = {
+            "drafted": 1, "archived:expired": 2, "verdict:reject": 1,
+            "approved": 1, "installed": 2, "installed@0123456789ab": 1,
+        }
         legacy = json.loads(json.dumps(one))
         legacy["node"] = "node-old"
         del legacy["lifecycle"]  # a report from before #2283
@@ -484,7 +492,13 @@ class LifecycleTableTests(unittest.TestCase):
             {"archived:draft-rejected": 1, "archived:expired": 3, "archived:owner-rejected": 3},
         )
         self.assertNotIn("verdict:reject", lc["stages"])
-        self.assertEqual(lc["nodes"]["node-b"]["drafts"], 4)
+        # #2374: node-local installs never surface under the P6/P7 names
+        for p6_p7 in ("approved", "installed", "installed@0123456789ab"):
+            self.assertNotIn(p6_p7, lc["stages"])
+        self.assertEqual(lc["stages"]["local-installed:auto"], 5)
+        self.assertEqual(lc["stages"]["local-installed:owner"], 2)
+        self.assertEqual(lc["stages"]["local-installed:manual"], 1)
+        self.assertEqual(lc["nodes"]["node-b"]["drafts"], 8)
         self.assertEqual(lc["pending_dwell_days"], {"count": 4, "median": 20.0, "p90": 40, "max": 40})
         self.assertEqual(lc["nodes_without_index"], ["node-old"])
         self.assertEqual(lc["nodes"]["node-a"]["fleet_installed"], 2)
