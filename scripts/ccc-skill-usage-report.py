@@ -65,7 +65,26 @@ _ARCHIVE_KIND_STAGE = {
 # `verdict:reject` (written by #2283 before this fix, or reported by a node that
 # has not updated yet) is the owner reject under its old name.
 OWNER_REJECTED_STAGE = "archived:owner-rejected"
-_NODE_INDEX_STAGE_ALIASES = {"verdict:reject": OWNER_REJECTED_STAGE}
+# #2374: an approved/installed draft is a node-local install. `approved` and
+# `installed@<sha>` name the P6 promote merge / P7 fleet install, so the node
+# index says local-installed:{auto|owner|manual}. `skill-review.sh reindex`
+# tells owner (`autosave apply`) from manual (hand copy) by the draft's meta;
+# a row or node report from before #2374 cannot, and counts as owner until
+# that node's next reindex.
+LOCAL_INSTALLED_AUTO = "local-installed:auto"
+LOCAL_INSTALLED_OWNER = "local-installed:owner"
+_NODE_INDEX_STAGE_ALIASES = {
+    "verdict:reject": OWNER_REJECTED_STAGE,
+    "approved": LOCAL_INSTALLED_OWNER,
+    "installed": LOCAL_INSTALLED_AUTO,
+}
+
+
+def _node_index_stage(stage: str) -> str:
+    """Map a pre-#2373/#2374 node-index stage name to its current name."""
+    if stage.startswith("installed@"):
+        return LOCAL_INSTALLED_AUTO
+    return _NODE_INDEX_STAGE_ALIASES.get(stage, stage)
 
 # ownership.py base classification -> report origin.
 ORIGINS = {
@@ -263,7 +282,7 @@ def _row_lifecycle(row: dict[str, Any]) -> str | None:
     ``status`` with the same rules ``skill-review.sh reindex`` uses."""
     stage = row.get("lifecycle")
     if isinstance(stage, str) and stage:
-        return _NODE_INDEX_STAGE_ALIASES.get(stage, stage)
+        return _node_index_stage(stage)
     status = row.get("status")
     if not isinstance(status, str):
         return None
@@ -271,7 +290,7 @@ def _row_lifecycle(row: dict[str, Any]) -> str | None:
         verdict = row.get("prescreen")
         return f"prescreened:{verdict}" if isinstance(verdict, str) and verdict else "drafted"
     if status in ("approved", "installed"):
-        return status
+        return _node_index_stage(status)
     if status == "rejected":
         return OWNER_REJECTED_STAGE
     if status.startswith("archived:"):
@@ -615,7 +634,7 @@ def _lifecycle_aggregate(latest: dict[str, dict[str, Any]]) -> dict[str, Any]:
         node_stages: dict[str, int] = {}
         for k, v in (section.get("stages") or {}).items():
             if isinstance(k, str) and isinstance(v, int) and v >= 0:
-                k = _NODE_INDEX_STAGE_ALIASES.get(k, k)
+                k = _node_index_stage(k)
                 node_stages[k] = node_stages.get(k, 0) + v
         node_dwell = sorted(
             d for d in (section.get("pending_dwell_days") or []) if isinstance(d, int) and d >= 0

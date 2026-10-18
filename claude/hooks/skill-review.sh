@@ -67,10 +67,16 @@ skill_review_reindex() {
   # leaves meta.json at "drafted"). An owner reject (`.rejected-<ts>`) is
   # `archived:owner-rejected` (#2373): `verdict:*` is the P6 fleet intake
   # review and never describes a node draft, so a meta `verdict:reject`
-  # written before #2373 is read as the owner reject it was.
+  # written before #2373 is read as the owner reject it was. Approved and
+  # installed drafts are node-local installs (#2374): `approved` /
+  # `installed@<sha>` name the P6/P7 fleet stages, so the node index says
+  # local-installed:{auto|owner|manual} — owner = `autosave apply` (meta
+  # installed_by=owner-approved, autosave marker, promotable), manual = the
+  # hand-copied legacy approve (no marker, never promoted).
   local lc_jq='def lc: if $status == "pending" then (if $verdict != "" then "prescreened:" + $verdict else "drafted" end)
-    elif $status == "approved" then ((.lifecycle? // "") | if type == "string" and startswith("approved") then . else "approved" end)
-    elif $status == "installed" then ((.lifecycle? // "") | if type == "string" and startswith("installed") then . else "installed" end)
+    elif $status == "approved" then ((.installed_by? // "") as $by | (.lifecycle? // "") | if type == "string" and startswith("local-installed:") then .
+        elif $by == "owner-approved" then "local-installed:owner" else "local-installed:manual" end)
+    elif $status == "installed" then ((.lifecycle? // "") | if type == "string" and startswith("local-installed:") then . else "local-installed:auto" end)
     else ((.lifecycle? // "") | if type == "string" and (startswith("archived:")) then . else "archived:owner-rejected" end) end;'
   for entry in "$dir"/*/; do
     [ -d "$entry" ] || continue

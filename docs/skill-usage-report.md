@@ -136,6 +136,18 @@ review recorded in the publisher ledger, which never writes a node index, so a
 node-index or node-report `verdict:reject` (written before #2373, or reported
 by a node that has not updated yet) is counted as `archived:owner-rejected`.
 
+An approved or installed draft is a node-local install, written
+`local-installed:{auto|owner|manual}` (#2374): `auto` = the autosave
+installer, `owner` = an owner `autosave apply` (autosave marker, promotable to
+the fleet), `manual` = the hand-copied legacy approve (no marker, never
+promoted). `approved` and `installed@<sha>` are reserved for the P6 promote
+merge and the P7 fleet install (`installed.json`, shown as `fleet_installed`).
+A node-index `installed` / `installed@<sha12>` is read as
+`local-installed:auto`; a node-index `approved` is read as
+`local-installed:owner`, because a row or node report from before #2374 cannot
+tell owner from manual — `reindex` recomputes the split from each draft's meta
+on that node's next sweep.
+
 A listed candidate is evidence, not an action. The #1648 retirement
 precondition still applies: at least 30 days of post-activation records on
 more than 3 measured nodes. Archive moves remain PR-first with owner approval.
