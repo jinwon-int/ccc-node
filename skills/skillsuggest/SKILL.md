@@ -68,7 +68,9 @@ Two autosave modes change what "review" means here (`docs/skill-autosave.md`):
    [ -n "$name" ] || name="$(awk 'NR>1 && /^---/{exit} /^name:/ {sub(/^name:[[:space:]]*/,""); print; exit}' "$STATE/pending-skills/$id/SKILL.md")"
    mkdir -p "$HOME/.claude/skills/$name"
    cp "$STATE/pending-skills/$id/SKILL.md" "$HOME/.claude/skills/$name/SKILL.md"
-   jq '.status="approved" | .lifecycle="approved"' "$STATE/pending-skills/$id/meta.json" > "$STATE/pending-skills/$id/meta.approved.json"
+   # #2374: a hand-copied SKILL.md has no autosave marker, so it is a node-local
+   # install that is never promoted (local-installed:manual, Wiki TM-3906)
+   jq '.status="approved" | .lifecycle="local-installed:manual"' "$STATE/pending-skills/$id/meta.json" > "$STATE/pending-skills/$id/meta.approved.json"
    mv "$STATE/pending-skills/$id" "$STATE/pending-skills/$id.approved-$(date -u +%Y%m%d%H%M%S)"
    ```
    Reject by archiving rather than deleting:
