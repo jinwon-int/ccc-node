@@ -64,11 +64,14 @@ skill_review_reindex() {
   # #2283 lifecycle vocabulary (Wiki DOC-3903 TM-3906). The directory suffix is
   # authoritative for decided drafts; a meta.json `lifecycle` is only adopted
   # when it agrees with it (an owner approve writes meta.approved.json and
-  # leaves meta.json at "drafted").
+  # leaves meta.json at "drafted"). An owner reject (`.rejected-<ts>`) is
+  # `archived:owner-rejected` (#2373): `verdict:*` is the P6 fleet intake
+  # review and never describes a node draft, so a meta `verdict:reject`
+  # written before #2373 is read as the owner reject it was.
   local lc_jq='def lc: if $status == "pending" then (if $verdict != "" then "prescreened:" + $verdict else "drafted" end)
     elif $status == "approved" then ((.lifecycle? // "") | if type == "string" and startswith("approved") then . else "approved" end)
     elif $status == "installed" then ((.lifecycle? // "") | if type == "string" and startswith("installed") then . else "installed" end)
-    else ((.lifecycle? // "") | if type == "string" and (startswith("verdict:") or startswith("archived:")) then . else "verdict:reject" end) end;'
+    else ((.lifecycle? // "") | if type == "string" and (startswith("archived:")) then . else "archived:owner-rejected" end) end;'
   for entry in "$dir"/*/; do
     [ -d "$entry" ] || continue
     base="$(basename "$entry")"
