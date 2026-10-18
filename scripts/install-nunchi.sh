@@ -21,6 +21,11 @@
 #   install-nunchi.sh --apply --wiki-promote-apply # + queue APPLY — MUTATES the
 #                                            # wiki-candidates queue; implies
 #                                            # --wiki-promote, needs fresh approval
+#   install-nunchi.sh --apply --verbatim-backend both
+#                                            # + hourly gotgan refresh beside the
+#                                            # MemPalace sweep (#2331 P3-2);
+#                                            # `gotgan` drops the MemPalace sweep,
+#                                            # `mempalace` (default) is unchanged
 #   install-nunchi.sh --apply --target-user gongmyoung
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
@@ -80,6 +85,11 @@ WIKI_PROMOTE="${CCC_NUNCHI_WIKI_PROMOTE:-0}"
 WIKI_PROMOTE_APPLY="${CCC_NUNCHI_WIKI_PROMOTE_APPLY:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
 AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
+# #2331 P3-2 — which verbatim store the hourly refresh keeps current and the
+# SessionStart/bench paths read. `mempalace` is the pre-#2331 default and
+# changes nothing; `gotgan` drops the MemPalace sweep in favour of nunchi's own
+# store; `both` runs the two side by side (shadow comparison).
+VERBATIM_BACKEND="${CCC_NUNCHI_VERBATIM_BACKEND:-mempalace}"
 ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -103,6 +113,9 @@ while [ $# -gt 0 ]; do
     # Same implication contract as --judge-apply: an apply-mode wiki-promote
     # cron without the batch cron is not a state the installer can express.
     --wiki-promote-apply) WIKI_PROMOTE=1; WIKI_PROMOTE_APPLY=1 ;;
+    --verbatim-backend)
+      [ $# -ge 2 ] || { echo "--verbatim-backend requires mempalace|gotgan|both" >&2; exit 2; }
+      VERBATIM_BACKEND="$2"; shift ;;
     --help|-h)
       sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -112,6 +125,10 @@ done
 case "$PROVIDER" in
   codex|claude|piri|danso|auto) ;;
   *) echo "invalid provider: $PROVIDER" >&2; exit 2 ;;
+esac
+case "$VERBATIM_BACKEND" in
+  mempalace|gotgan|both) ;;
+  *) echo "invalid verbatim backend: $VERBATIM_BACKEND (mempalace|gotgan|both)" >&2; exit 2 ;;
 esac
 
 # A bridge may run as a non-root service user even when the operator connects
@@ -141,6 +158,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     CCC_NUNCHI_TARGET_USER="$TARGET_USER" CCC_NUNCHI_PROVIDER="$PROVIDER" \
     CCC_NUNCHI_AUDIENCE_SCOPED="$AUDIENCE_SCOPED" \
     CCC_NUNCHI_AUDIENCE_ROOT="$AUDIENCE_ROOT" \
+    CCC_NUNCHI_VERBATIM_BACKEND="$VERBATIM_BACKEND" \
     CCC_CLAUDE_DIR="$target_claude_dir" CODEX_HOME="$target_codex_home" CCC_STATE_DIR="$target_state_dir" \
     NUNCHI_HOME="$target_nunchi_home" NUNCHI_DB="${NUNCHI_DB:-$target_nunchi_home/facts.db}" \
     NUNCHI_SNAPSHOT="${NUNCHI_SNAPSHOT:-$target_nunchi_home/snapshot.md}" \
@@ -165,6 +183,12 @@ NUNCHI_DB_PATH="${NUNCHI_DB:-$NUNCHI_DIR/facts.db}"
 NUNCHI_SNAPSHOT_PATH="${NUNCHI_SNAPSHOT:-$NUNCHI_DIR/snapshot.md}"
 MEMPALACE_STATUS="${CCC_NUNCHI_MEMPALACE_STATUS:-$NUNCHI_DIR/mempalace-refresh.status.json}"
 MEMPALACE_TIMEOUT="${CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC:-3300}"
+GOTGAN_STATUS="${CCC_NUNCHI_GOTGAN_STATUS:-$NUNCHI_DIR/gotgan-refresh.status.json}"
+GOTGAN_TIMEOUT="${CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC:-1500}"
+GOTGAN_DB_PATH="${GOTGAN_DB:-$NUNCHI_DIR/gotgan.db}"
+# Read by nunchi.py (verbatim_backend) when no CCC_NUNCHI_VERBATIM_BACKEND env
+# is present — the SessionStart hook path. Absent file == mempalace.
+BACKEND_FILE="$NUNCHI_DIR/verbatim-backend"
 MODE_FILE="$STATE/nunchi.mode"
 MARK="# nunchi:#816"
 # nunchi_runtime_provider (#1698). Prefer the installed hooks so the installer
@@ -413,6 +437,8 @@ status() {
   echo "source: $(_status_source "$cron")"
   echo "mempalace: binary=${mp_path:-missing} version=$mp_ver"
   echo "collection: $collection_line"
+  # Managed lines only: a leftover hand-installed shadow line must not read as wired.
+  echo "verbatim_backend: $(cat "$BACKEND_FILE" 2>/dev/null || echo mempalace) gotgan_cron=$(grep -F "$MARK" <<<"$cron" | grep -c 'gotgan-refresh.sh' || true) gotgan_db=$(ls -la "$GOTGAN_DB_PATH" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
   echo "audience_scoped: $audience_line"
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
@@ -430,6 +456,29 @@ write_mode() {  # atomic owner-local marker; replacing a stale link never follow
   chmod 600 "$tmp"
   printf '%s' "$value" > "$tmp"
   mv -f -- "$tmp" "$MODE_FILE"
+}
+
+write_backend_file() {  # <mempalace|gotgan|both> — same atomic discipline as write_mode
+  local value="$1" tmp
+  if [ "$value" = mempalace ]; then
+    rm -f -- "$BACKEND_FILE"; return 0   # absent file is the default, keep it absent
+  fi
+  mkdir -p "$NUNCHI_DIR"
+  tmp="$(mktemp "$NUNCHI_DIR/.verbatim-backend.XXXXXX")"
+  chmod 600 "$tmp"
+  printf '%s' "$value" > "$tmp"
+  mv -f -- "$tmp" "$BACKEND_FILE"
+}
+
+strip_gotgan_shadow() {  # retire the hand-installed shadow lane the managed line replaces
+  local tmp n
+  n="$("$CRONTAB" -l 2>/dev/null | grep -c 'nunchi:gotgan-shadow' || true)"
+  [ "$n" -gt 0 ] || return 0
+  tmp="$(mktemp)"
+  "$CRONTAB" -l 2>/dev/null | grep -v 'nunchi:gotgan-shadow' > "$tmp" || true
+  "$CRONTAB" "$tmp"
+  rm -f "$tmp"
+  echo "hand-installed gotgan-shadow cron line(s) replaced by the managed lane ($n removed)"
 }
 
 strip_cron() {  # remove managed and legacy hand-deploy nunchi lines
@@ -738,6 +787,29 @@ case "$ACTION" in
         || { echo "flock command missing or unsafe — nunchi not enabled" >&2; exit 2; }
       refresh_ready=1
     fi
+    # gotgan lane (#2331 P3-2): same inputs as the MemPalace sweep (whole
+    # transcript tree, no per-session router), so the audience-scoped
+    # fail-closed rule above applies to it unchanged. No external CLI: the
+    # store is gotgan.py beside the hooks, so readiness is hooks + tree only.
+    gotgan_refresh="$HOOKS/gotgan-refresh.sh"
+    gotgan_ready=0
+    if [ "$VERBATIM_BACKEND" != mempalace ] && [ "$claude_scoped" != 1 ]; then
+      if [ "$resolved_provider" = danso ]; then
+        echo "gotgan has no danso transcript parser — verbatim backend '$VERBATIM_BACKEND' needs claude|codex|piri" >&2; exit 2
+      fi
+      if [ -f "$HOOKS/gotgan.py" ] && [ -x "$gotgan_refresh" ] && [ -d "$sweep_dir" ]; then
+        timeout_bin="${timeout_bin:-${CCC_NUNCHI_TIMEOUT_CLI:-$(command -v timeout || true)}}"
+        flock_bin="${flock_bin:-${CCC_NUNCHI_FLOCK_CLI:-$(command -v flock || true)}}"
+        [ -n "$timeout_bin" ] && [ -f "$timeout_bin" ] && [ -x "$timeout_bin" ] \
+          || { echo "timeout command missing or unsafe — nunchi not enabled" >&2; exit 2; }
+        [ -n "$flock_bin" ] && [ -f "$flock_bin" ] && [ -x "$flock_bin" ] \
+          || { echo "flock command missing or unsafe — nunchi not enabled" >&2; exit 2; }
+        gotgan_ready=1
+      else
+        echo "gotgan hooks or transcript dir missing — verbatim backend '$VERBATIM_BACKEND' cannot be wired (need $HOOKS/gotgan.py, $gotgan_refresh, $sweep_dir)" >&2
+        exit 2
+      fi
+    fi
     retire_legacy
     warn_ghost_markers apply  # ghosts in OUR crontab are removed by strip_cron below
     strip_cron
@@ -747,7 +819,9 @@ case "$ACTION" in
       scoped_env="CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$(cron_quote "$AUDIENCE_ROOT") "
     fi
     append_cron_line "*/10 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${piri_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$feed") >> $(cron_quote "$NUNCHI_DIR/cron.log") 2>&1 $MARK gen=$GEN"
-    if [ "$refresh_ready" = 1 ]; then
+    if [ "$VERBATIM_BACKEND" = gotgan ]; then
+      echo "verbatim backend gotgan: MemPalace refresh cron not installed (store stays on disk, untouched)"
+    elif [ "$refresh_ready" = 1 ]; then
       append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK gen=$GEN"
       echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
     elif [ "$claude_scoped" = 1 ]; then
@@ -755,6 +829,23 @@ case "$ACTION" in
     else
       echo "mempalace CLI, refresh hook or transcript dir missing — verbatim refresh cron skipped"
     fi
+    # :27 — offset from the MemPalace :17 sweep so a `both` node never runs
+    # the two transcript readers at once. GOTGAN_RUN_BYTES is passed through
+    # only when the operator set it (Termux nodes pin a smaller budget).
+    if [ "$gotgan_ready" = 1 ]; then
+      strip_gotgan_shadow
+      gotgan_budget_env=""
+      if [ -n "${GOTGAN_RUN_BYTES:-}" ]; then gotgan_budget_env="GOTGAN_RUN_BYTES=$(cron_quote "$GOTGAN_RUN_BYTES") "; fi
+      gotgan_py_env=""
+      if [ -n "${CCC_NUNCHI_GOTGAN_PYTHON:-}" ]; then gotgan_py_env="CCC_NUNCHI_GOTGAN_PYTHON=$(cron_quote "$CCC_NUNCHI_GOTGAN_PYTHON") "; fi
+      append_cron_line "27 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${gotgan_budget_env}${gotgan_py_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") GOTGAN_DB=$(cron_quote "$GOTGAN_DB_PATH") CCC_NUNCHI_GOTGAN_STATUS=$(cron_quote "$GOTGAN_STATUS") CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC=$(cron_quote "$GOTGAN_TIMEOUT") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$gotgan_refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/gotgan-refresh.cron.log") 2>&1 $MARK gen=$GEN"
+      echo "gotgan hourly refresh cron added (:27, $resolved_provider: $sweep_dir, backend=$VERBATIM_BACKEND)"
+    fi
+    write_backend_file "$VERBATIM_BACKEND"
+    # Bench must score the backend the node actually reads at SessionStart;
+    # stamping the env keeps the weekly sheet comparable to the hook path.
+    backend_env=""
+    if [ "$VERBATIM_BACKEND" != mempalace ]; then backend_env="CCC_NUNCHI_VERBATIM_BACKEND=$VERBATIM_BACKEND "; fi
     # ${scoped_env} must be present here for the same reason as the feed and
     # refresh lines above: without it bench.sh scores the unscoped
     # $NUNCHI_DIR, which on a scoped node stops receiving facts as soon as
@@ -765,7 +856,7 @@ case "$ACTION" in
     # produced contaminated sheets on nosuk/gongyung (2026-08-24 and 08-31,
     # #1210). The claude→codex→piri fallback chain (#1385) limits the damage,
     # but a post-reset slot keeps the primary backend consistent week to week.
-    append_cron_line "7 11 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
+    append_cron_line "7 11 * * 1 CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${backend_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$bash_bin") $(cron_quote "$HOOKS/bench.sh") >> $(cron_quote "$NUNCHI_DIR/bench.cron.log") 2>&1 $MARK gen=$GEN"
     echo "weekly bench cron added (Mon 11:07, post-quota-reset)"
     if [ "$JUDGE" = 1 ]; then
       # #1204 daily review-queue triage. Dry-run unless --judge-apply is passed:
@@ -839,6 +930,9 @@ case "$ACTION" in
     # --wiki-promote-apply supersedes --wiki-promote in the record.
     if [ "$WIKI_PROMOTE_APPLY" = 1 ]; then record_argv+=(--wiki-promote-apply)
     elif [ "$WIKI_PROMOTE" = 1 ]; then record_argv+=(--wiki-promote); fi
+    # --verbatim-backend is opt-in like --judge: a replay that omits it would
+    # drop the gotgan lane and silently fall back to MemPalace.
+    if [ "$VERBATIM_BACKEND" != mempalace ]; then record_argv+=(--verbatim-backend "$VERBATIM_BACKEND"); fi
     ccc_installer_record_write "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" "$MARK" "$GEN" -- \
       "${record_argv[@]}" \
       || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
@@ -852,6 +946,7 @@ case "$ACTION" in
     ;;
   remove)
     write_mode off
+    write_backend_file mempalace   # drop the per-node choice with the lanes
     strip_cron
     warn_ghost_markers remove  # reports only cross-account residue at this point
     set_sessionstart_hook remove

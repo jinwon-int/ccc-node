@@ -1442,6 +1442,28 @@ def gotgan_verbatim(query, n=3):
 
 VERBATIM_BACKENDS = ("mempalace", "gotgan", "both")
 VERBATIM_BOTH_CAP_PER_BACKEND = 20   # both: each backend keeps its own share of the 40-line budget
+VERBATIM_BACKEND_FILE = "verbatim-backend"   # $NUNCHI_HOME/<file>, written by install-nunchi.sh
+
+
+def verbatim_backend():
+    """Resolve the verbatim backend: env, then the installer's per-node file.
+
+    `CCC_NUNCHI_VERBATIM_BACKEND` wins (cron lines stamp it; shadow runs set
+    it ad hoc). Otherwise `$NUNCHI_HOME/verbatim-backend` — written by
+    `install-nunchi.sh --verbatim-backend` so the SessionStart hook, which
+    runs with no installer env, follows the node's recorded choice (#2331
+    P3-2). Anything unreadable or unknown is `mempalace`, the pre-#2331
+    behaviour.
+    """
+    backend = os.environ.get("CCC_NUNCHI_VERBATIM_BACKEND", "").strip().lower()
+    if not backend:
+        home = os.environ.get("NUNCHI_HOME") or os.path.expanduser("~/.nunchi")
+        try:
+            with open(os.path.join(home, VERBATIM_BACKEND_FILE), encoding="utf-8") as fh:
+                backend = fh.read(64).strip().lower()
+        except OSError:
+            backend = ""
+    return backend if backend in VERBATIM_BACKENDS else "mempalace"
 
 
 def verbatim_excerpts(query, n=3):
@@ -1454,9 +1476,7 @@ def verbatim_excerpts(query, n=3):
     40 lines on most queries (shadow-node smoke 2026-10-16: 40/0), so `both` was
     silently a MemPalace bench.
     """
-    backend = os.environ.get("CCC_NUNCHI_VERBATIM_BACKEND", "mempalace").strip().lower()
-    if backend not in VERBATIM_BACKENDS:
-        backend = "mempalace"
+    backend = verbatim_backend()
     if backend == "gotgan":
         return gotgan_verbatim(query, n)
     if backend == "mempalace":
