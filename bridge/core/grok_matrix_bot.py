@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from dataclasses import dataclass
 import hashlib
 import logging
 import os
@@ -20,6 +19,8 @@ from pathlib import Path
 import signal
 import socket
 from typing import Any, Callable
+
+from telegram_bot.contracts.transport import TurnResult
 
 from .agent_runtime import CompletionEvent, ErrorEvent, ResultEvent, SessionRequest
 from .grok_protocol import MAX_PROMPT, MAX_REPLY, ProtocolError, check_idle
@@ -61,21 +62,9 @@ class _TransportLogFilter(logging.Filter):
         return True
 
 
-@dataclass(frozen=True)
-class _TurnResult:
-    """Mirror of ``matrix.transport.TurnResult`` (same field order/defaults)."""
+def _turn_result(text: str) -> TurnResult:
+    """One Grok reply as the channel-neutral ``TurnResult`` (#2380 PR-1 dropped the local mirror)."""
 
-    text: str
-    session_id: str | None
-    streamed: bool = False
-    status: str = "complete"
-
-
-def _turn_result(text: str) -> Any:
-    try:
-        from telegram_bot.core.matrix.transport import TurnResult
-    except ImportError:
-        return _TurnResult(text=text, session_id=None)
     return TurnResult(text=text, session_id=None)
 
 

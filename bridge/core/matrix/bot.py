@@ -16,16 +16,17 @@ map is what unsolicited/async deliveries use to find the room again; the DM
 room for a user is remembered separately (persisted, private file) because
 the id map only knows the *user* for a direct conversation.
 
-Transport contract (``telegram_bot.core.matrix.transport``, written in
-parallel) is consumed through lazy imports and local ``Protocol`` mirrors so
-this module and its tests do not depend on that file being present.
+Transport contract shapes (``TurnSink``/``TurnRunner``/``TurnResult``/
+``TransportPort``) come from the channel-neutral
+``telegram_bot.contracts.transport`` (#2380 PR-1); the Matrix transport itself
+(``core.matrix.transport``) is still only imported lazily, so this module and
+its tests do not depend on ``nio`` being installed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import functools
 import hashlib
@@ -40,8 +41,13 @@ import signal
 import subprocess
 import time
 import tomllib
-from typing import Any, Awaitable, Callable, Coroutine, Mapping, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Coroutine, Mapping, Optional, Sequence
 
+from telegram_bot.contracts.transport import (  # noqa: F401 (TransportPort re-exported)
+    TransportPort,
+    TurnResult,
+    TurnSink,
+)
 from telegram_bot.core import restart_handoff, session_resume, tool_policy
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 from telegram_bot.memory.distill_types import DistillTrigger
@@ -239,55 +245,19 @@ class MatrixConfigError(RuntimeError):
     """The Matrix frontend cannot start because its configuration is missing."""
 
 
-# --- transport contract mirrors (see module docstring) -----------------------
-
-
-class TurnSink(Protocol):
-    async def typing(self) -> None: ...
-
-    async def interim(self, text: str) -> None: ...
-
-    async def status(self, text: Optional[str]) -> None:
-        """Progress bubble: created once per turn, edited in place, redacted when done."""
-        ...
-
-    async def approval(self, description: str, arguments: Any) -> bool: ...
-
-
-class TransportPort(Protocol):
-    async def open(self, initialize: bool = False) -> None: ...
-
-    async def run(self) -> None: ...
-
-    async def close(self) -> None: ...
-
-    def enqueue_notice(
-        self, room_id: str, text: str, *, key: str | None = None, msgtype: str = "m.text"
-    ) -> None: ...
-
-    def room_kind(self, room_id: str) -> str: ...
-
-
-@dataclass(frozen=True)
-class TurnResult:
-    """Local mirror of ``transport.TurnResult`` (same field order/defaults)."""
-
-    text: str
-    session_id: str | None
-    streamed: bool = False
-    status: str = "complete"
+# --- transport contract (channel-neutral, ``telegram_bot.contracts.transport``) --
+# Until #2380 PR-1 this module carried duck-typed mirrors of these shapes so it
+# could import without ``core.matrix.transport`` (and its ``nio`` dependency).
+# The contract module has no third-party imports, so the mirrors are gone and
+# the names below are the single definition.
 
 
 def _turn_result(
     text: str, session_id: str | None, *, streamed: bool = False, status: str = "complete"
-) -> Any:
-    """Build the transport's ``TurnResult`` when importable, else the mirror."""
+) -> TurnResult:
+    """Build the transport's ``TurnResult`` (kept as the call sites' one constructor)."""
 
-    try:
-        from telegram_bot.core.matrix.transport import TurnResult as TransportTurnResult
-    except ImportError:
-        return TurnResult(text=text, session_id=session_id, streamed=streamed, status=status)
-    return TransportTurnResult(text=text, session_id=session_id, streamed=streamed, status=status)
+    return TurnResult(text=text, session_id=session_id, streamed=streamed, status=status)
 
 
 TransportFactory = Callable[[Mapping[str, Any], Any], Any]
