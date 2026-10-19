@@ -271,6 +271,18 @@ set is not something a re-pin can clear (there is nothing to re-pin); the
 failed batch stays in `meta.pending_sync` and needs a deliberate operator
 decision to discard it after the device has been investigated.
 
+## Transport contract (#2380 PR-1)
+
+The shapes the transport and the frontend meet on — `TurnRunner`, `TurnSink`,
+`TurnResult`, `TransportPort` — are defined once in
+`telegram_bot.contracts.transport` (see `bridge/contracts/README.md`).
+`core/matrix/transport.py` re-exports them, so nothing here changed in
+behaviour; the point is that the next channel (the family messenger's native
+relay, family-messenger#420) implements the same seam rather than a copy of
+it. Matrix-specific meanings (typing = `PUT /typing`, status = the edited and
+then redacted progress bubble, approval = `/approve <turn> <nonce>`) stay
+documented in `core/matrix/transport.py`.
+
 ## Identity mapping
 
 `ProjectChatHandler` keys conversations by `(user_id: int, chat_id: int)`.

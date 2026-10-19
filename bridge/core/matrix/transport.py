@@ -42,9 +42,10 @@ import secrets
 import stat
 import time
 import traceback
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping
 from urllib.parse import quote
 
+from telegram_bot.contracts.transport import TurnResult, TurnRunner, TurnSink  # noqa: F401 (re-export)
 from telegram_bot.core.matrix.state import (
     FILE_JOB_BODY,
     MAX_REPLY_BYTES,
@@ -320,55 +321,12 @@ def message_content(text: str, *, msgtype: str = "m.text") -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Runner contract
+# Runner contract — channel-neutral since #2380 PR-1; re-exported here so
+# ``telegram_bot.core.matrix.transport.TurnRunner`` keeps working. In Matrix
+# terms: ``TurnSink.typing`` is PUT /typing (8s), ``interim`` goes through the
+# outbox, ``status`` is the edited-then-redacted progress bubble, ``approval``
+# is answered by ``/approve <turn> <nonce>``.
 # --------------------------------------------------------------------------- #
-
-
-class TurnSink(Protocol):
-    """What a running turn may do to its room while it runs."""
-
-    async def typing(self) -> None:
-        """Best-effort typing indicator (PUT /typing, 8s); errors are swallowed."""
-        ...
-
-    async def interim(self, text: str) -> None:
-        """Durable progress notice, delivered by the outbox like any reply."""
-        ...
-
-    async def status(self, text: str | None) -> None:
-        """Progress bubble: created once per turn, edited in place, redacted when done."""
-        ...
-
-    async def approval(self, description: str, arguments: Any) -> bool:
-        """Ask the room; True only when ``/approve <turn> <nonce>`` arrives in time."""
-        ...
-
-
-@dataclass(frozen=True)
-class TurnResult:
-    text: str
-    session_id: str | None
-    streamed: bool = False
-    status: str = "complete"  # or "uncertain"
-
-
-class TurnRunner(Protocol):
-    """``run``/``cancel`` are required. Optional hooks, looked up with ``getattr``:
-    ``stop_idle(job)``, and (#2088) ``turn_closed(job)`` once a turn's reply
-    row is queued and ``delivered(job)`` after an outbox row went out — both
-    run in the background and fail open.
-    """
-
-    async def run(
-        self,
-        job: Mapping[str, Any],
-        *,
-        sink: TurnSink,
-        session_id: str | None,
-        room_kind: str,
-    ) -> TurnResult: ...
-
-    async def cancel(self, job: Mapping[str, Any]) -> bool: ...
 
 
 def unique_key(prefix: str) -> str:

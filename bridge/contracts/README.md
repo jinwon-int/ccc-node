@@ -116,3 +116,27 @@ Hoisting `bot_ports` into `contracts` would drag a hard `telegram` dependency
 into the one package that must not have one, and would advertise the bot's
 internal wiring as a stable external surface it was never meant to be. It
 stays in `core` next to the mixins it serves.
+
+## `contracts/transport.py` — the channel-neutral turn transport seam (#2380 PR-1)
+
+The second contract in this package describes the *other* side of a turn: not
+the provider that runs it, but the chat channel that admitted the message and
+will carry the reply. It was relocated from `core/matrix/transport.py`
+unchanged (same methods, signatures, fields and defaults), the way
+`agent_runtime.py` was carved out in #1756, so that a second channel — the
+family messenger's native relay (family-messenger#420 ⑥) — implements the same
+seam instead of a fourth duck-typed copy.
+
+| Name | Role |
+| --- | --- |
+| `TurnRunner` | What a frontend hands to the transport: `run(job, sink=, session_id=, room_kind=) -> TurnResult`, `cancel(job)`; optional `stop_idle`, `turn_closed`, `delivered` hooks looked up with `getattr` |
+| `TurnSink` | What a running turn may do to its conversation: `typing`, `interim`, `status`, `approval` (fail closed) |
+| `TurnResult` | `text`, `session_id`, `streamed=False`, `status="complete"|"uncertain"` — frozen |
+| `TransportPort` | The transport's lifecycle (`open`/`run`/`close`) plus `enqueue_notice` and `room_kind` |
+
+Rules, same as above: no `nio`, `telegram` or bridge configuration imports;
+a job is an opaque `Mapping` and channel identities never appear in a
+signature. `core/matrix/transport.py` re-exports the three runner names and
+`core/matrix/bot.py` re-exports `TransportPort`, so existing import paths keep
+working; a new channel imports from `telegram_bot.contracts.transport`
+directly.
