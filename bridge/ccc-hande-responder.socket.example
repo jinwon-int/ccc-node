@@ -1,0 +1,22 @@
+# Optional socket activation for the 「한데」 frontend (#2380).
+#
+# systemd owns the listening socket and hands it to ccc-hande-bridge.service as
+# fd 3 (LISTEN_FDS=1); the bridge then ignores CCC_HANDE_SOCKET_PATH. The bot can
+# connect before the bridge is up, and the socket survives bridge restarts.
+# Install as /etc/systemd/system/ccc-hande-bridge.socket (the .socket must share
+# the service's unit name) and `systemctl enable --now ccc-hande-bridge.socket`.
+# Unlike native-responder.socket this is Accept=no: one long-lived bridge serves
+# every connection in turn, one client at a time.
+[Unit]
+Description=ccc-node hande frontend responder socket
+
+[Socket]
+ListenStream=/run/ccc-hande/responder.sock
+SocketUser=root
+SocketGroup=native-relay-bot
+SocketMode=0660
+DirectoryMode=0750
+Accept=no
+
+[Install]
+WantedBy=sockets.target

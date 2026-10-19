@@ -232,10 +232,27 @@ class Config(
     # runs the same ProjectChatHandler behind the E2EE Matrix transport
     # (family messenger). The channel name also namespaces private memory
     # audiences (ProjectChatHandler.memory_route).
-    channel: Literal["telegram", "matrix"] = Field(
+    channel: Literal["telegram", "matrix", "hande"] = Field(
         default="telegram",
         alias="CCC_CHANNEL",
-        description="Chat frontend: Telegram bot (default) or the E2EE Matrix frontend.",
+        description=(
+            "Chat frontend: Telegram bot (default), the E2EE Matrix frontend, or the "
+            "「한데」 native-relay responder frontend (#2380)."
+        ),
+    )
+    # 「한데」 frontend (#2380 PR-2): the bridge serves the native relay bot's
+    # responder socket (FLEET-WORKER port). Private JSON config, see
+    # docs/hande-frontend.md. CCC_HANDE_SOCKET_PATH overrides the config's
+    # socket_path (systemd LISTEN_FDS wins over both).
+    hande_config_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_HANDE_CONFIG_PATH",
+        description="Private (0600) JSON config for CCC_CHANNEL=hande.",
+    )
+    hande_socket_path: Optional[Path] = Field(
+        default=None,
+        alias="CCC_HANDE_SOCKET_PATH",
+        description="Unix socket the native relay bot connects to (overrides the config).",
     )
     matrix_config_path: Optional[Path] = Field(
         default=None,
@@ -275,6 +292,8 @@ class Config(
     def validate_matrix_channel(self):
         if self.channel == "matrix" and self.matrix_config_path is None:
             raise ValueError("CCC_CHANNEL=matrix requires CCC_MATRIX_CONFIG_PATH.")
+        if self.channel == "hande" and self.hande_config_path is None:
+            raise ValueError("CCC_CHANNEL=hande requires CCC_HANDE_CONFIG_PATH.")
         return self
     grok_ssh_destination: Optional[str] = Field(default=None, alias="CCC_GROK_SSH_DESTINATION")
     grok_bot_id: Optional[str] = Field(default=None, alias="CCC_GROK_BOT_ID")

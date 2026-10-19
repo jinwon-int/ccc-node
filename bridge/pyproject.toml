@@ -36,6 +36,7 @@ packages = [
   "telegram_bot.contracts",
   "telegram_bot.core",
   "telegram_bot.core.matrix",
+  "telegram_bot.core.hande",
   "telegram_bot.memory",
   "telegram_bot.session",
   "telegram_bot.utils",
