@@ -340,14 +340,21 @@ class HandeTransport:
         return key or f"dropped-{time.time_ns()}"
 
     def health_signals(self, now: float | None = None) -> dict[str, Any]:
+        del now
         now_mono = time.monotonic()
         client = self._client
-        connected = client is not None and not client.closed
+        sync_age: float | None = None
+        client_age: float | None = None
+        connected = False
+        if client is not None and not client.closed:
+            connected = True
+            sync_age = now_mono - client.last_frame_at
+            client_age = now_mono - client.connected_at
         return {
             "protocol": PROTOCOL,
             "connected": connected,
-            "sync_age_s": (now_mono - client.last_frame_at) if connected else None,
-            "client_age_s": (now_mono - client.connected_at) if connected else None,
+            "sync_age_s": sync_age,
+            "client_age_s": client_age,
             "clients_seen": self._clients_seen,
             "active_turn": self._active.turn_id if self._active else None,
             "turns_served": self._turns_served,

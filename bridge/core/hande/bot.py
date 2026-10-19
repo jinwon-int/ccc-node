@@ -29,6 +29,9 @@ class HandeBot(MatrixBot):
     """``TurnRunner`` over ``ProjectChatHandler`` for the 「한데」 relay bot."""
 
     channel_name = "hande"
+    # Re-declared for mypy: MatrixBot sets it in __init__, which mypy cannot
+    # see through from a subclass method (has-type).
+    _config: Mapping[str, Any] | None
 
     # -- configuration -------------------------------------------------------
 
@@ -42,9 +45,11 @@ class HandeBot(MatrixBot):
         return Path(str(raw)).expanduser()
 
     def load_config(self) -> Mapping[str, Any]:
-        if self._config is None:
-            self._config = load_config(self.config_path())
-        return self._config
+        config = self._config
+        if config is None:
+            config = load_config(self.config_path())
+            self._config = config
+        return config
 
     def validate_runtime_paths(self) -> None:
         """Fail fast on a missing/invalid config or corrupt persisted maps (no writes)."""
