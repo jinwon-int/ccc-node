@@ -1,0 +1,51 @@
+# ccc-node 「한데」 frontend (family messenger native relay) — systemd unit example (#2380).
+#
+# Runs the SAME ProjectChatHandler as the Telegram/Matrix bridges, serving the
+# native relay bot (native-mls-bot) as its responder over a unix socket.
+# Install: copy to /etc/systemd/system/ccc-hande-bridge.service, adjust the
+# paths, `systemctl daemon-reload && systemctl enable --now ccc-hande-bridge`.
+#
+# Prerequisites on the node:
+#   - private 0600 config JSON (see docs/hande-frontend.md)
+#   - the bot's drop-in points NATIVE_MLS_BOT_RESPONDER_UNIX at the socket below
+#     (replacing native-responder.socket); restarting the bot is an operator change
+#   - socket directory owned by the bridge user, group = the bot's group:
+#       install -d -m 0750 -o root -g native-relay-bot /run/ccc-hande
+#     (or use ccc-hande-responder.socket.example and let systemd own the socket)
+#
+# Provider / auth env: same rule as the Matrix unit — provider selection and
+# every secret live in the shared owner-only EnvironmentFile, never in
+# Environment= lines; never put HOME, PATH, PROJECT_ROOT, BOT_DATA_DIR,
+# CCC_CHANNEL or CCC_HANDE_* in the shared file.
+[Unit]
+Description=ccc-node hande frontend (family messenger native relay, CCC_CHANNEL=hande)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccc-node/bridge
+Environment=HOME=/root
+Environment=PROJECT_ROOT=/root
+# Separate runtime data so pid/health/session files never collide with the other bridges.
+Environment=BOT_DATA_DIR=/root/.ccc-hande
+Environment=CCC_CHANNEL=hande
+Environment=CCC_HANDE_CONFIG_PATH=/etc/ccc-hande/config.json
+Environment=CCC_HANDE_SOCKET_PATH=/run/ccc-hande/responder.sock
+RuntimeDirectory=ccc-hande
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+# Shared with the Telegram/Matrix units; optional ("-") until the node's file is placed.
+EnvironmentFile=-/root/.config/ccc-node/bridge.env
+ExecStart=/opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /root
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=70
+MemoryHigh=50%
+MemoryMax=75%
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

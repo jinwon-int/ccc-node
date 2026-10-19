@@ -780,6 +780,8 @@ def _build_standard_context(
 def create_app(context: AppContext):
     """Create the chat frontend from an already-built application context."""
     if context.settings.agent_provider == "grok":
+        if getattr(context.settings, "channel", "telegram") == "hande":
+            raise ValueError("CCC_CHANNEL=hande does not serve the Grok provider (#2380)")
         if getattr(context.settings, "channel", "telegram") == "matrix":
             # Same restricted Grok contract (owner only, text only, one turn),
             # served through the E2EE Matrix transport in the owner's direct room.
@@ -789,11 +791,16 @@ def create_app(context: AppContext):
         from telegram_bot.core.grok_bot import GrokTelegramBot
 
         return GrokTelegramBot(context.settings, context.agent_runtime, context.telegram_port)
-    if getattr(context.settings, "channel", "telegram") == "matrix":
-        # Same ProjectChatHandler, E2EE Matrix transport instead of Telegram (#1780).
-        from telegram_bot.core.matrix.bot import MatrixBot
+    channel = getattr(context.settings, "channel", "telegram")
+    if channel in ("matrix", "hande"):
+        # Same ProjectChatHandler behind the E2EE Matrix transport (#1780) or,
+        # for 「한데」, behind the native relay bot's responder socket (#2380).
+        if channel == "hande":
+            from telegram_bot.core.hande.bot import HandeBot as FrontendBot
+        else:
+            from telegram_bot.core.matrix.bot import MatrixBot as FrontendBot
 
-        return MatrixBot(
+        return FrontendBot(
             context.settings,
             project_chat=context.project_chat,
             session_manager=context.session_manager,
