@@ -44,7 +44,13 @@ def contaminated() -> dict:
 
 
 class SessionScopeRows(unittest.TestCase):
-    def run_check(self, telegram: dict | None, matrix: dict | None = None, raw: bytes | None = None):
+    def run_check(
+        self,
+        telegram: dict | None,
+        matrix: dict | None = None,
+        raw: bytes | None = None,
+        hande: dict | None = None,
+    ):
         with TemporaryDirectory() as temp:
             home = Path(temp)
             payloads = {}
@@ -57,6 +63,8 @@ class SessionScopeRows(unittest.TestCase):
                 os.close(fd)
             if matrix is not None:
                 payloads["mx"] = write_store(home / ".ccc-matrix" / "sessions.json", matrix)
+            if hande is not None:
+                payloads["hd"] = write_store(home / ".ccc-hande" / "sessions.json", hande)
             doctor = Doctor(Path(__file__).resolve().parents[1], home / ".claude", "settings")
             env = {"HOME": temp, "CCC_DOCTOR_BRIDGE_PROJECT_ROOT": temp}
             with patch.dict("os.environ", env, clear=True), patch.object(
@@ -97,6 +105,13 @@ class SessionScopeRows(unittest.TestCase):
             self.assertNotIn("-100", text)
             self.assertNotIn("-200", text)
         self.assertEqual(doctor.report_exit_code(), 0)
+
+    def test_hande_store_is_one_of_the_project_stores(self):
+        # #2380: the hande frontend keeps its own BOT_DATA_DIR (~/.ccc-hande).
+        doctor = self.run_check({"telegram_session:7": {"session_id": "a"}}, hande=contaminated())
+        row = self.row(doctor)
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("stores=2", row.status)
 
     def test_bot_data_dir_adds_to_the_project_stores(self):
         with TemporaryDirectory() as temp:

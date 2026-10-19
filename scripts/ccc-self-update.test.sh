@@ -44,6 +44,7 @@ unset CLAUDE_PROCESS_TIMEOUT CCC_DELEGATED_TASK_STALL_SECONDS
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
 # Same for the Matrix frontend's health file (never the node's real ~/.ccc-matrix).
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
+export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
 # And for the A2A worker gate (#2138): never read the node's real unit cgroups,
 # or a fixture run on a worker node mid-task would defer.
 export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
@@ -827,6 +828,23 @@ out="$(run_selfup run 2>&1)"; rc=$?
 ok "idle matrix proceeds when allowlisted" '[ "$rc" = 0 ]'
 clr_defer; rm -f "$MHFILE" "$CLAUDE/self-update.services"
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
+
+# hande frontend (#2380): same gate, keyed on ccc-hande-bridge being allowlisted.
+HHFILE="$TMP/hande-health.json"
+export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$HHFILE"
+mk_health "$(now_iso)" 0 0
+printf '{"updated_at":"%s","workload":{"active_requests":1,"oldest_request_age_seconds":30}}' "$(now_iso)" > "$HHFILE"
+clr_defer; rm -f "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy hande ignored when its unit is not allowlisted" '[ "$rc" = 0 ]'
+clr_defer; printf '%s\n' 'system:ccc-hande-bridge.service' > "$CLAUDE/self-update.services"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "busy hande defers when ccc-hande-bridge is allowlisted" '[ "$rc" = 8 ] && grep -q "bridge busy (hande active=1" <<<"$out"'
+clr_defer; printf '{"updated_at":"%s","workload":{"active_requests":0,"oldest_request_age_seconds":0}}' "$(now_iso)" > "$HHFILE"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "idle hande proceeds when allowlisted" '[ "$rc" = 0 ]'
+clr_defer; rm -f "$HHFILE" "$CLAUDE/self-update.services"
+export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
 
 # A2A worker gate (#2138): an allowlisted a2a-*worker* unit whose cgroup holds a
 # handler child besides the worker defers; the worker alone proceeds.

@@ -857,6 +857,9 @@ HEALTH_FILE="${CCC_SELF_UPDATE_HEALTH_FILE:-${HOME:-/root}/.telegram_bot/health.
 # is allowlisted: a busy Matrix turn is only at risk when the Matrix unit itself
 # is in the restart set. Allowlisted A2A worker units get their own gate below.
 MATRIX_HEALTH_FILE="${CCC_SELF_UPDATE_MATRIX_HEALTH_FILE:-${HOME:-/root}/.ccc-matrix/health.json}"
+# The hande frontend (ccc-hande-bridge, BOT_DATA_DIR=~/.ccc-hande, #2380) writes
+# the same snapshot; consulted under the same allowlist rule.
+HANDE_HEALTH_FILE="${CCC_SELF_UPDATE_HANDE_HEALTH_FILE:-${HOME:-/root}/.ccc-hande/health.json}"
 FRESH_SECONDS="${CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS:-90}"
 BUSY_MAX_SECONDS="${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}"
 MAX_DEFER_SECONDS="${CCC_SELF_UPDATE_MAX_DEFER_SECONDS:-3600}"
@@ -903,6 +906,10 @@ bridge_is_busy() {
   fi
   if service_allowlisted ccc-matrix-bridge && r="$(health_file_busy "$MATRIX_HEALTH_FILE")"; then
     printf 'matrix %s\n' "$r"
+    return 0
+  fi
+  if service_allowlisted ccc-hande-bridge && r="$(health_file_busy "$HANDE_HEALTH_FILE")"; then
+    printf 'hande %s\n' "$r"
     return 0
   fi
   return 1

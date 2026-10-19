@@ -29,6 +29,13 @@ MATRIX_SCOPED = {
     "SESSION_STORE_PATH": "/nonexistent/.ccc-matrix/sessions.json",
     "CCC_MATRIX_CONFIG_PATH": "/nonexistent/family-matrix/config.json",
 }
+# The hande frontend (#2380) is the same kind of thing: its own unit, its own
+# data dir, never started through start.sh.
+HANDE_SCOPED = {
+    "CCC_CHANNEL": "hande",
+    "SESSION_STORE_PATH": "/nonexistent/.ccc-hande/sessions.json",
+    "CCC_HANDE_CONFIG_PATH": "/nonexistent/ccc-hande/config.json",
+}
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "uses /proc + pgrep")
@@ -54,7 +61,7 @@ class InheritedChannelGuardTests(unittest.TestCase):
         env = dict(os.environ)
         for key in list(env):
             if key in ("CCC_CHANNEL", "PROJECT_ROOT", "CCC_AGENT_PROVIDER", "BOT_DATA_DIR",
-                       "LOGS_DIR", "SESSION_STORE_PATH", "CCC_BOT_ENV_FILE") or key.startswith("CCC_MATRIX_"):
+                       "LOGS_DIR", "SESSION_STORE_PATH", "CCC_BOT_ENV_FILE") or key.startswith(("CCC_MATRIX_", "CCC_HANDE_")):
                 env.pop(key)
         return env
 
@@ -77,10 +84,14 @@ class InheritedChannelGuardTests(unittest.TestCase):
         time.sleep(0.5)
         return p
 
-    def _start_sh(self, *args: str, inherit_matrix: bool) -> subprocess.CompletedProcess:
+    def _start_sh(
+        self, *args: str, inherit_matrix: bool, inherit: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
         env = self._clean_env()
         if inherit_matrix:
             env.update(MATRIX_SCOPED)
+        if inherit:
+            env.update(inherit)
         return subprocess.run(
             ["bash", str(self.start_script), "--path", self.root, *args],
             cwd=self.repo_root, text=True, capture_output=True, check=False,
@@ -265,6 +276,55 @@ class InheritedChannelGuardTests(unittest.TestCase):
         self.assertIn("   Telegram: healthy", r.stdout)
         self.assertNotIn("Channel: matrix", r.stdout)
 
+    # -- the hande frontend follows the Matrix rules (#2380) ------------------
+
+    def test_stop_from_hande_shell_is_refused_and_hande_survives(self):
+        hande = self._decoy(HANDE_SCOPED)
+        r = self._start_sh("--stop", inherit_matrix=False, inherit=HANDE_SCOPED)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("target-channel=hande (inherited CCC_CHANNEL=hande)", r.stdout)
+        self.assertIn("systemctl restart ccc-hande-bridge", r.stdout)
+        time.sleep(0.3)
+        self.assertIsNone(hande.poll(), "hande frontend was stopped by a Telegram --stop")
+
+    def test_explicit_hande_channel_is_refused_and_telegram_survives(self):
+        telegram = self._telegram_bridge()
+        r = self._start_sh("--stop", "--channel", "hande", inherit_matrix=False)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("(--channel hande)", r.stdout)
+        time.sleep(0.3)
+        self.assertIsNone(telegram.poll(), "--channel hande --stop killed the Telegram bridge")
+
+    def test_explicit_telegram_from_hande_shell_drops_hande_settings(self):
+        telegram = self._telegram_bridge()
+        hande = self._decoy(HANDE_SCOPED)
+        r = self._start_sh("--stop", "--channel", "telegram", inherit_matrix=False, inherit=HANDE_SCOPED)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("inherited hande -> requested telegram", r.stdout)
+        time.sleep(0.5)
+        self.assertIsNotNone(telegram.poll(), "--channel telegram --stop left the Telegram bridge running")
+        self.assertIsNone(hande.poll(), "--channel telegram --stop killed the hande frontend")
+
+    def test_hande_status_renders_the_frontend_health_with_its_own_label(self):
+        self._telegram_idle()
+        data_dir = Path(self.root) / ".ccc-hande"
+        hande = self._decoy({**HANDE_SCOPED, "BOT_DATA_DIR": str(data_dir)})
+        self._write_health(data_dir, hande.pid, "occupied")
+        r = self._start_sh("--status", "--channel", "hande", inherit_matrix=False)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("Channel: hande (health: " + str(data_dir) + "/health.json)", r.stdout)
+        self.assertIn(f"Process: alive (PID: {hande.pid})", r.stdout)
+        self.assertIn("Turn occupancy: occupied (1 active turn;", r.stdout)
+        self.assertIn("   Hande: healthy", r.stdout)
+        self.assertNotIn("   Telegram:", r.stdout)
+        hande.kill()
+        hande.wait(timeout=5)
+        time.sleep(0.3)
+        r = self._start_sh("--status", "--channel", "hande", inherit_matrix=False)
+        self.assertIn("no Hande frontend for this --path", r.stdout, r.stdout + r.stderr)
+        self.assertIn("ccc-hande-bridge", r.stdout)
+
     def test_telegram_shell_is_unaffected(self):
         r = self._start_sh("--stop", inherit_matrix=False)
         self.assertNotEqual(r.returncode, 10, r.stdout + r.stderr)
@@ -273,7 +333,7 @@ class InheritedChannelGuardTests(unittest.TestCase):
     def test_invalid_channel_value_is_rejected(self):
         r = self._start_sh("--stop", "--channel", "slack", inherit_matrix=False)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("--channel must be telegram or matrix", r.stderr)
+        self.assertIn("--channel must be telegram, matrix or hande", r.stderr)
 
 
 class RestartSpawnCarriesChannelTests(unittest.TestCase):
