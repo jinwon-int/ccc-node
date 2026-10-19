@@ -2777,6 +2777,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             extra["resume_task"] = True
         if dispatch_guard is not None:
             extra["dispatch_guard"] = dispatch_guard
+        # Frontend-specific request options (#2380 PR-4: the hande frontend's
+        # steward MCP server). Empty here; a subclass may add kwargs that
+        # ``process_message`` forwards into ``SessionRequest``.
+        extra.update(self._turn_request_extras())
         response = await self._record_turn_health(self._project_chat.process_message(
             user_message=body,
             user_id=user_id,
@@ -2802,6 +2806,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 user_id=user_id, chat_id=chat_id,
             )
         return response
+
+    def _turn_request_extras(self) -> dict[str, Any]:
+        """Extra ``process_message`` kwargs for every turn of this frontend (none for Matrix)."""
+
+        return {}
 
     async def _record_turn_health(self, turn: Awaitable[ChatResponse]) -> ChatResponse:
         """Await one agent turn and mark ``agent`` in health.json by its outcome (#1820).

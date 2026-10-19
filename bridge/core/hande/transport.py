@@ -126,7 +126,13 @@ class _ActiveTurn:
         self.job = job
         self.task: asyncio.Task[Any] | None = None
         self.approvals: dict[str, asyncio.Future[bool]] = {}
+        # One steward tool call at a time per turn (the bot's rule): tool_id -> outcome.
+        self.tool: tuple[str, asyncio.Future[Mapping[str, Any]]] | None = None
         self.cancelled = False
+
+    def settle_tool(self, outcome: Mapping[str, Any]) -> None:
+        if self.tool is not None and not self.tool[1].done():
+            self.tool[1].set_result(dict(outcome))
 
 
 class _HandeSink:
@@ -210,6 +216,40 @@ class _HandeSink:
         del arguments  # MatrixBot passes the redacted snapshot as the description
         return await self.approval_outcome(description) == "allow"
 
+    async def tool(self, name: str, arguments: Mapping[str, str]) -> Mapping[str, Any]:
+        """One steward ``tool`` frame round trip (#2380 PR-4); returns the bot's outcome.
+
+        The bot validates the name/arguments again, enforces owner-only and
+        executes; ``tool-result`` settles the future. Outcomes mirror the Rust
+        responder's error codes: ``no_active_turn``, ``busy``,
+        ``steward_timeout``, ``cancelled``, ``steward_error``.
+        """
+
+        if not self._live():
+            return {"ok": False, "error": "no_active_turn"}
+        if self._turn.tool is not None and not self._turn.tool[1].done():
+            return {"ok": False, "error": "busy"}
+        tool_id = secrets.token_urlsafe(18)
+        future: asyncio.Future[Mapping[str, Any]] = asyncio.get_running_loop().create_future()
+        self._turn.tool = (tool_id, future)
+        frame = {
+            "type": "tool",
+            "turn_id": self._turn.turn_id,
+            "tool_id": tool_id,
+            "name": name,
+            "arguments": dict(arguments),
+        }
+        try:
+            if not await self._client.send(frame):
+                return {"ok": False, "error": "steward_error"}
+            try:
+                return await asyncio.wait_for(future, self._transport.tool_timeout_s)
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": "steward_timeout"}
+        finally:
+            if self._turn.tool is not None and self._turn.tool[0] == tool_id:
+                self._turn.tool = None
+
 
 class HandeTransport:
     """FLEET-WORKER port server; see the module docstring for the frame mapping."""
@@ -229,6 +269,7 @@ class HandeTransport:
         self.allowed_users = frozenset([self.c["owner"], *(self.c.get("family_users") or ())])
         self.account = str(self.c["account"])
         self.approval_timeout_s = int(self.c.get("approval_timeout_s") or 120)
+        self.tool_timeout_s = int(self.c.get("tool_timeout_s") or 90)
         self.interim_frames = bool(self.c.get("interim_frames"))
         self.notice_frames = bool(self.c.get("notice_frames"))
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
@@ -431,8 +472,7 @@ class HandeTransport:
         if kind == "cancel":
             return await self._on_cancel(client, frame)
         if kind == "tool-result":
-            await client.send({"type": "control", "turn_id": turn_id or "", "accepted": False})
-            return True
+            return await self._on_tool_result(client, frame)
         await client.send(
             {"type": "rejected", "turn_id": turn_id or "", "reason": "unknown-command"}
         )
@@ -496,6 +536,7 @@ class HandeTransport:
             for future in list(turn.approvals.values()):
                 if not future.done():
                     future.set_result(False)
+            turn.settle_tool({"ok": False, "error": "cancelled"})
             if self._active is turn:
                 self._active = None
         self._turns_served += 1
@@ -571,6 +612,37 @@ class HandeTransport:
             )
         return True
 
+    async def _on_tool_result(self, client: _Client, frame: Mapping[str, Any]) -> bool:
+        turn_id = str(frame.get("turn_id") or "")
+        tool_id = frame.get("tool_id")
+        turn = self._active
+        found = (
+            turn is not None
+            and turn.turn_id == turn_id
+            and turn.tool is not None
+            and isinstance(tool_id, str)
+            and turn.tool[0] == tool_id
+            and not turn.tool[1].done()
+        )
+        await client.send({"type": "control", "turn_id": turn_id, "accepted": bool(found)})
+        if found:
+            assert turn is not None
+            if frame.get("ok") is True:
+                result = frame.get("result")
+                outcome: dict[str, Any] = {"ok": True}
+                if isinstance(result, Mapping):
+                    outcome.update({k: v for k, v in result.items() if k != "ok"})
+                else:
+                    outcome["result"] = result
+            else:
+                error = frame.get("error")
+                outcome = {
+                    "ok": False,
+                    "error": error if isinstance(error, str) and error else "steward_error",
+                }
+            turn.settle_tool(outcome)
+        return True
+
     async def _on_cancel(self, client: _Client, frame: Mapping[str, Any]) -> bool:
         turn_id = str(frame.get("turn_id") or "")
         turn = self._active
@@ -582,6 +654,13 @@ class HandeTransport:
             for future in turn.approvals.values():
                 if not future.done():
                     future.set_result(False)
+            if turn.tool is not None and not turn.tool[1].done():
+                # Let the model see ``cancelled`` for its pending tool call
+                # before the turn task itself is cancelled (two loop turns:
+                # the future's waiter wakes, then wait_for returns).
+                turn.settle_tool({"ok": False, "error": "cancelled"})
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
             try:
                 await self.runner.cancel(turn.job)
             except Exception:
@@ -598,6 +677,7 @@ class HandeTransport:
         for future in turn.approvals.values():
             if not future.done():
                 future.set_result(False)
+        turn.settle_tool({"ok": False, "error": "cancelled"})
         try:
             await self.runner.cancel(turn.job)
         except Exception:

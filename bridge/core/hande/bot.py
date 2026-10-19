@@ -19,6 +19,7 @@ from typing import Any, Mapping
 from telegram_bot.core.matrix.bot import MatrixBot
 
 from .state import HandeConfigError, load_config
+from .steward import STEWARD_SERVER, allowed_tool_names, build_steward_server
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,44 @@ class HandeBot(MatrixBot):
             return "wait", "", 0
         seen = int(signals.get("clients_seen") or 0)
         return "error", "hande responder socket: no bot connected", max(1, 1 if seen else 2)
+
+    # -- steward room tools (#2380 PR-4) ---------------------------------------
+
+    _steward_server: Any = None
+    _steward_checked = False
+
+    def _steward_enabled(self) -> bool:
+        config = self.load_config()
+        if not config.get("steward_tools", True):
+            return False
+        if self._active_provider() != "claude":
+            if not self._steward_checked:
+                logger.warning("hande steward tools need the claude provider; disabled")
+            return False
+        return True
+
+    async def _steward_call(self, name: str, arguments: Mapping[str, str]) -> Mapping[str, Any]:
+        """Forward one tool call to the turn being served (the sink owns the frame)."""
+
+        sink = self._active_sink
+        call = getattr(sink, "tool", None)
+        if not callable(call):
+            return {"ok": False, "error": "no_active_turn"}
+        return await call(name, arguments)
+
+    def _turn_request_extras(self) -> dict[str, Any]:
+        if not self._steward_enabled():
+            return {}
+        if not self._steward_checked:
+            self._steward_checked = True
+            self._steward_server = build_steward_server(self._steward_call)
+        if self._steward_server is None:
+            return {}
+        extras: dict[str, Any] = {"mcp_servers": {STEWARD_SERVER: self._steward_server}}
+        allowed = allowed_tool_names(bool(self.load_config().get("steward_tools_approve_all")))
+        if allowed:
+            extras["mcp_allowed_tools"] = allowed
+        return extras
 
     def startup_banner(self) -> str:
         # The native bot does not speak the ``notice`` frame yet, so a banner
