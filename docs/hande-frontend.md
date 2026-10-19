@@ -40,7 +40,7 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `TurnSink.interim` | dropped and counted unless `interim_frames: true` (then an `interim` frame the bot must know) |
 | `TurnResult` | `result{status complete\|uncertain, text, session_id[, reason]}`; a cancelled, timed-out or failed turn is `uncertain` and never re-run automatically |
 | `enqueue_notice` (restart receipt, waits status, push spool, async completion) | needs the `notice` frame (family-messenger#423). Until then **counted and dropped** — `health_signals().notices_dropped` — never claimed delivered. Alerts stay on the Telegram fallback (owner decision ②) |
-| steward `tool` frames | not served here (those belong to the Rust responder's MCP wiring); a `tool-result` is answered `control accepted:false` |
+| steward room tools (`room_create/join/invite/remove/close/members/mode/status`) | served (PR-4): `HandeBot` exposes the bot's tool table as an in-process Claude Agent SDK MCP server (`mcp__steward__*`, `core/hande/steward.py`); each call is a `tool` frame → the bot validates, enforces owner-only, executes → `tool-result`. Read-only `room_status`/`room_members` are pre-allowed (no per-call approval, as #378); the rest go through the approval round trip first. Claude provider only; `steward_tools: false` turns it off, `steward_tools_approve_all: true` makes every call ask. One call at a time (`busy`), `tool_timeout_s` (default 90) → `steward_timeout`, cancel → `cancelled` |
 
 Limits follow the port: 64 KiB per inbound line, 512 KiB per outbound line, turn ids
 `[A-Za-z0-9_-]{1,128}`; a malformed or oversize frame closes the connection (the bot
@@ -64,7 +64,10 @@ inbox is the duplicate guard (it re-offers the seq after marking it uncertain).
   "socket_group": "native-relay-bot",
   "approval_timeout_s": 120,
   "interim_frames": false,
-  "notice_frames": false
+  "notice_frames": false,
+  "tool_timeout_s": 90,
+  "steward_tools": true,
+  "steward_tools_approve_all": false
 }
 ```
 
@@ -118,6 +121,5 @@ Rollback: point the bot back at `native-responder.socket`, stop `ccc-hande-bridg
 | Multi-room per node | the bot serves one agent room and sends no `room` | family-messenger#423 (bridge already keys by `(user, room)` when `room` is present) |
 | Progress lines / live preview | no `interim`/edit frame | family-messenger#423 (`interim_frames`) |
 | Attachments, voice | the bot drops `file-v1-*` messages before the responder | family-messenger#354 follow-up |
-| Steward room tools | MCP wiring lives in the Rust responder | out of scope for the bridge |
 | Termux restart script (`termux-restart-frontends.sh`) | Matrix-only; Termux nodes are last in the rollout | #2380 follow-up |
 | doctor bridge-status probe for the hande unit | doctor reads `.ccc-hande` session/journal paths (PR-3) but has no hande-specific health verdict yet | #2380 follow-up |

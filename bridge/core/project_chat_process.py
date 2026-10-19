@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import logging
 import re
 import traceback
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
@@ -470,6 +470,8 @@ class ProjectChatProcessMixin:
         resume_task: bool = False,
         dispatch_guard: Callable[[], bool] | None = None,
         streaming_sink: Optional[Any] = None,
+        mcp_servers: Optional[Mapping[str, Any]] = None,
+        mcp_allowed_tools: Optional[Sequence[str]] = None,
     ) -> ChatResponse:
         del message_id
         # The legacy permission seam (perm: buttons) belonged to the removed
@@ -564,6 +566,8 @@ class ProjectChatProcessMixin:
             resume_task=resume_task,
             dispatch_guard=dispatch_guard,
             streaming_sink=streaming_sink,
+            mcp_servers=mcp_servers,
+            mcp_allowed_tools=mcp_allowed_tools,
         )
 
         # One bounded second attempt when the provider never spoke. Retrying is
@@ -623,6 +627,8 @@ class ProjectChatProcessMixin:
             dispatch_guard=dispatch_guard,
             admission_timeout_override=retry_grace,
             streaming_sink=streaming_sink,
+            mcp_servers=mcp_servers,
+            mcp_allowed_tools=mcp_allowed_tools,
         )
         if retried.success:
             logger.info(
@@ -920,6 +926,8 @@ class ProjectChatProcessMixin:
         loop: asyncio.AbstractEventLoop,
         progress_request: Any,
         slot: "_TurnSessionSlot",
+        mcp_servers: Optional[Mapping[str, Any]] = None,
+        mcp_allowed_tools: Optional[Sequence[str]] = None,
     ) -> Optional[ChatResponse]:
         """Start or resume the conversation's agent session under the guard lock.
 
@@ -1013,6 +1021,11 @@ class ProjectChatProcessMixin:
                         approvals_reviewer=approvals_reviewer,
                         sandbox_policy=sandbox_policy,
                         memory_environment=memory_environment,
+                        # Caller-scoped MCP servers (#372 P4 / #2380 PR-4): only
+                        # bound when the session is created; a resumed
+                        # session keeps the servers it was started with.
+                        mcp_servers=mcp_servers,
+                        mcp_allowed_tools=mcp_allowed_tools,
                     )
                 )
                 slot.session = session
@@ -2032,6 +2045,8 @@ class ProjectChatProcessMixin:
         resume_task: bool = False,
         dispatch_guard: Callable[[], bool] | None = None,
         streaming_sink: Optional[Any] = None,
+        mcp_servers: Optional[Mapping[str, Any]] = None,
+        mcp_allowed_tools: Optional[Sequence[str]] = None,
     ) -> ChatResponse:
         """Run one provider-neutral turn without changing the Claude SDK path.
 
@@ -2099,6 +2114,8 @@ class ProjectChatProcessMixin:
                         approval_policy=approval_policy,
                         approvals_reviewer=approvals_reviewer,
                         sandbox_policy=sandbox_policy,
+                        mcp_servers=mcp_servers,
+                        mcp_allowed_tools=mcp_allowed_tools,
                         new_session=new_session,
                         dispatch_guard=dispatch_guard,
                         notification_bot=notification_bot,

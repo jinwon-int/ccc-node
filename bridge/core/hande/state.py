@@ -15,7 +15,10 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "socket_group": "native-relay-bot",
       "approval_timeout_s": 120,
       "interim_frames": false,
-      "notice_frames": false
+      "notice_frames": false,
+      "tool_timeout_s": 90,
+      "steward_tools": true,
+      "steward_tools_approve_all": false
     }
 
 Identities are ``@<actor>:hande``: the bot already sends ``@<device>:hande``
@@ -39,6 +42,7 @@ ACTOR_PATTERN = re.compile(r"[A-Za-z0-9_]{1,32}")
 ROOM_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 IDENTITY_PATTERN = re.compile(r"@([A-Za-z0-9_]{1,32}):hande")
 DEFAULT_APPROVAL_TIMEOUT_S = 120
+DEFAULT_TOOL_TIMEOUT_S = 90
 MAX_APPROVAL_TIMEOUT_S = 600
 DEFAULT_SOCKET_MODE = 0o660
 
@@ -137,9 +141,12 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         raise HandeConfigError(
             f"hande config 'approval_timeout_s' must be 1..{MAX_APPROVAL_TIMEOUT_S}"
         )
-    knobs: dict[str, Any] = {"approval_timeout_s": timeout_raw}
-    for key in ("interim_frames", "notice_frames"):
-        value = config.get(key, False)
+    tool_raw = config.get("tool_timeout_s", DEFAULT_TOOL_TIMEOUT_S)
+    if type(tool_raw) is not int or not 1 <= tool_raw <= MAX_APPROVAL_TIMEOUT_S:
+        raise HandeConfigError(f"hande config 'tool_timeout_s' must be 1..{MAX_APPROVAL_TIMEOUT_S}")
+    knobs: dict[str, Any] = {"approval_timeout_s": timeout_raw, "tool_timeout_s": tool_raw}
+    for key in ("interim_frames", "notice_frames", "steward_tools", "steward_tools_approve_all"):
+        value = config.get(key, key == "steward_tools")  # steward tools default on
         if type(value) is not bool:
             raise HandeConfigError(f"hande config {key!r} must be true or false")
         knobs[key] = value
