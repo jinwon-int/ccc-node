@@ -99,6 +99,23 @@ Self-update's idle gate reads `~/.ccc-hande/health.json`
 `~/.claude/self-update.services`. Doctor reads `.ccc-hande` session stores and distill
 journals. Add `hande` to `~/.claude/frontends` on nodes that run it.
 
+## Operational notes
+
+- **Restarting the bridge bounces the bot once.** The bot connects to the responder
+  socket once per process; when `ccc-hande-bridge` restarts (self-update, `/restart`,
+  crash) the socket closes, the bot logs `agent_worker_gone (worker stdout closed)`,
+  exits, and systemd restarts it (~10 s, `Restart=on-failure`), after which it
+  reconnects and logs `agent_started`. Expected; the self-update idle gate keeps it off
+  a running turn. A turn that was in flight at that moment is reported `uncertain` by
+  the bot's inbox rule, never re-run.
+- **health.json wording.** The transport block is still named `telegram` (shared
+  schema, #2312); the service reason names the channel (`Hande: hande responder socket:
+  no bot connected` until the bot connects, then `available`). `start.sh --path <root>
+  --channel hande --status` renders it with the `Hande:` label.
+- **Notices are counted, not delivered**, until the bot speaks the `notice` frame
+  (`health_signals().notices_dropped`); keep `CCC_PUSH_ENABLED=false` on the hande unit
+  so the node's push spool keeps exactly one consumer.
+
 ## Deployment (per node)
 
 1. `bridge/service-systemd-hande.service.example` → `/etc/systemd/system/ccc-hande-bridge.service`;

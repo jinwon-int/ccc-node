@@ -81,6 +81,16 @@ def _pid_is_alive(pid_text: Optional[str]) -> bool:
     return True
 
 
+_TRANSPORT_LABELS = {"telegram": "Telegram", "matrix": "Matrix", "hande": "Hande"}
+
+
+def transport_label(channel: str | None = None) -> str:
+    """Human label of this process's chat transport (``CCC_CHANNEL``; default Telegram)."""
+
+    value = (channel if channel is not None else os.environ.get("CCC_CHANNEL", "")).strip().lower()
+    return _TRANSPORT_LABELS.get(value, "Telegram")
+
+
 class RuntimeHealthReporter:
     SCHEMA_VERSION = 1
 
@@ -254,8 +264,12 @@ class RuntimeHealthReporter:
 
         reasons: list[str] = []
         if telegram_state != "healthy":
-            detail = self._state["telegram"].get("last_error") or "telegram unavailable"
-            reasons.append(f"Telegram: {detail}")
+            # The ``telegram`` block is the chat transport whatever the channel
+            # (#2312): name it by the frontend this process runs (#2380 PR-6)
+            # so a hande/Matrix node's health.json does not blame "Telegram".
+            label = transport_label()
+            detail = self._state["telegram"].get("last_error") or f"{label.lower()} unavailable"
+            reasons.append(f"{label}: {detail}")
         if agent_state != "healthy":
             provider = str(agent.get("provider") or self._agent_provider).lower()
             label = _AGENT_PROVIDER_LABELS.get(provider, "Claude")

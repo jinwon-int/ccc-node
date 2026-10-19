@@ -760,3 +760,39 @@ class RuntimeHealthReporterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TransportLabelTests(unittest.TestCase):
+    """Service reason names the frontend's transport by CCC_CHANNEL (#2380 PR-6)."""
+
+    def _reporter(self, project_root: Path):
+        # Same isolated module load as RuntimeHealthReporterTests (env-bound config).
+        module = RuntimeHealthReporterTests._load_health_module(self, project_root)
+        return module, module.RuntimeHealthReporter(project_root / ".telegram_bot")
+
+    def test_transport_label_defaults_to_telegram(self):
+        import telegram_bot.utils.health as health_module
+
+        self.assertEqual(health_module.transport_label("telegram"), "Telegram")
+        self.assertEqual(health_module.transport_label(""), "Telegram")
+        self.assertEqual(health_module.transport_label("matrix"), "Matrix")
+        self.assertEqual(health_module.transport_label("HANDE"), "Hande")
+        self.assertEqual(health_module.transport_label("slack"), "Telegram")
+
+    def test_service_reason_uses_the_channel_label(self):
+        for channel, expected in (("", "Telegram"), ("matrix", "Matrix"), ("hande", "Hande")):
+            with self.subTest(channel=channel), tempfile.TemporaryDirectory() as tmpdir:
+                project_root = Path(tmpdir)
+                module, reporter = self._reporter(project_root)
+                env = {"CCC_CHANNEL": channel} if channel else {}
+                with patch.dict(os.environ, env, clear=False):
+                    if not channel:
+                        os.environ.pop("CCC_CHANNEL", None)
+                    reporter.initialize_process()
+                    reporter.record_telegram_error("responder socket: no bot connected")
+                    health = json.loads(reporter.health_file.read_text(encoding="utf-8"))
+                    self.assertEqual(health["service"]["state"], "degraded")
+                    self.assertTrue(
+                        health["service"]["reason"].startswith(f"{expected}: responder socket"),
+                        health["service"]["reason"],
+                    )
