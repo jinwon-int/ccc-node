@@ -1,0 +1,1 @@
+- health.json service reason names the process's chat transport by `CCC_CHANNEL` (`Hande:`/`Matrix:` instead of `Telegram:` on those frontends; Telegram unchanged) (#2380 PR-6). `docs/hande-frontend.md` gains operational notes: the bot bounces once when the hande bridge restarts, health wording, notices counted-not-delivered.
