@@ -147,6 +147,11 @@ JSON 객체 하나만 출력. 설명/마크다운 금지.
 
 대화:
 '
+# #2388: session-tail.py marks every cut with the shared render-truncation
+# marker; tell the extraction model the marker is the renderer's, not the agent's.
+MARKER_NOTE="$(python3 "$HERE/../lib/trajectory_render.py" marker-note 2>/dev/null)"
+[ -n "$MARKER_NOTE" ] && PROMPT_PREFIX="${MARKER_NOTE}
+${PROMPT_PREFIX}"
 
 (
   flock -n 9 || exit 0

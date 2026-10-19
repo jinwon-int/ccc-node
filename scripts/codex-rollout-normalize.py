@@ -9,6 +9,11 @@ with a different record shape — {"timestamp","type","payload"} — so their
 procedures never reach the drafting brain. This projector translates ONE rollout
 file into that Claude shape so the entire downstream pipeline runs unmodified.
 
+Since #2388 this script is a thin wrapper: record parsing and the mapping below
+live in claude/hooks/lib/trajectory_render.py (codex_events → claude_rows), the
+same adapter the prompt renderer uses, so projection and rendering cannot drift.
+This file keeps the session metadata, exclusion, cap and file-layout policy.
+
 Mapping (issue #1353, verified against live rollout samples):
 
   response_item / payload.type=="message" / role=="assistant"
@@ -33,7 +38,8 @@ Mapping (issue #1353, verified against live rollout samples):
         fallback: when the rollout carries no response_item message records
         at all (headless runs), these events are the only transcript of the
         conversation; when real messages exist, emitting both would duplicate
-        every turn.
+        every turn. Fallback rows keep session order relative to the command
+        rows (before #2388 they were appended after all of them).
   session_meta / turn_context / world_state / token_count / event_msg(*) /
   reasoning / anything else
       → discarded (issue: noise and bulk — base_instructions alone is several
@@ -59,14 +65,33 @@ Exit codes: 0 = projected (including excluded/empty — they are outcomes),
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import sys
 
 MAX_OUT_BYTES_DEFAULT = 512 * 1024
-COMMAND_TOOLS = {"shell", "exec_command", "apply_patch"}
 PROJECT_ENC_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _load_renderer():
+    """Import the shared trajectory adapters (#2388): installed beside this
+    script under hooks/lib/, or at claude/hooks/lib/ in a repo checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for lib_dir in (os.path.join(here, "lib"), os.path.join(here, "..", "claude", "hooks", "lib")):
+        path = os.path.join(lib_dir, "trajectory_render.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("trajectory_render", path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module  # importable by name (type introspection, pickling)
+                spec.loader.exec_module(module)
+                return module
+    raise ImportError("trajectory_render.py not found beside the normalizer (hooks/lib/)")
+
+
+tr = _load_renderer()
 
 
 def encode_project_dir(cwd: str) -> str:
@@ -74,156 +99,23 @@ def encode_project_dir(cwd: str) -> str:
     return PROJECT_ENC_RE.sub("-", cwd)
 
 
-def iter_records(fh):
-    """Yield parsed JSON-object lines; malformed lines are skipped."""
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            yield record
+def read_records(source: str) -> list[dict]:
+    """Parsed JSON-object lines of one rollout; malformed lines are skipped."""
+    with open(source, encoding="utf-8", errors="replace") as fh:
+        return list(tr.iter_records(fh))
 
 
-def content_items(payload: dict) -> list[dict[str, str]]:
-    """Codex text content items → Claude {"type":"text","text":…} items."""
-    items: list[dict[str, str]] = []
-    content = payload.get("content")
-    if not isinstance(content, list):
-        return items
-    for item in content:
-        if isinstance(item, dict) and isinstance(item.get("text"), str):
-            items.append({"type": "text", "text": item["text"]})
-    return items
-
-
-def command_string(name: str, arguments: object) -> str | None:
-    """Extract the procedure payload from a codex function_call arguments blob."""
-    if isinstance(arguments, str):
-        try:
-            args: object = json.loads(arguments)
-        except ValueError:
-            return None
-    else:
-        args = arguments
-    if not isinstance(args, dict):
-        return None
-    if name in ("shell", "exec") and "command" in args:
-        command = args["command"]
-        if isinstance(command, list):
-            parts = [str(part) for part in command]
-            if len(parts) == 3 and parts[1] in ("lc", "-lc") and parts[0] in ("bash", "sh"):
-                return parts[2]
-            return " ".join(parts)
-        if isinstance(command, str):
-            return command
-        return None
-    if name == "exec_command":
-        command = args.get("cmd", args.get("command"))
-        if isinstance(command, list):
-            return " ".join(str(part) for part in command)
-        if isinstance(command, str):
-            return command
-        return None
-    if name == "apply_patch":
-        patch = args.get("input", args.get("patch"))
-        return patch if isinstance(patch, str) else None
-    return None
-
-
-def message_row(role: str, payload: dict) -> dict:
-    return {"type": role, "message": {"role": role, "content": content_items(payload)}}
-
-
-def tool_use_row(command: str) -> dict:
-    return {
-        "type": "assistant",
-        "message": {
-            "role": "assistant",
-            "content": [{"type": "tool_use", "name": "Bash", "input": {"command": command}}],
-        },
-    }
-
-
-def event_row(payload: dict, role: str) -> dict:
-    return {
-        "type": role,
-        "message": {"role": role, "content": [{"type": "text", "text": payload.get("message")}]},
-    }
-
-
-def response_row(payload: dict) -> dict | None:
-    """Map one response_item payload to a Claude row, or None to discard."""
-    ptype = payload.get("type")
-    if ptype == "message":
-        role = payload.get("role")
-        if role in ("assistant", "user"):
-            return message_row(str(role), payload)
-        return None  # developer/system: injected instruction noise
-    if ptype == "function_call":
-        name = payload.get("name")
-        if name in COMMAND_TOOLS:
-            command = command_string(str(name), payload.get("arguments"))
-            if command:
-                return tool_use_row(command)
-    return None
-
-
-def scan_meta_and_message_presence(source: str) -> tuple[dict[str, str], bool, int]:
-    """Pass 1: session metadata, message presence, and record count."""
+def session_meta(records: list[dict]) -> dict[str, str]:
+    """First non-empty session_id/cwd/originator from session_meta records."""
     meta: dict[str, str] = {"session_id": "", "cwd": "", "originator": ""}
-    has_response_message = False
-    records_in = 0
-    with open(source, encoding="utf-8", errors="replace") as fh:
-        for record in iter_records(fh):
-            records_in += 1
-            payload = record.get("payload")
-            if record.get("type") == "response_item" and isinstance(payload, dict):
-                if payload.get("type") == "message" and payload.get("role") in ("user", "assistant"):
-                    has_response_message = True
-            elif record.get("type") == "session_meta" and isinstance(payload, dict):
-                for key in meta:
-                    value = payload.get(key)
-                    if value and not meta[key]:
-                        meta[key] = str(value)
-    return meta, has_response_message, records_in
-
-
-def response_rows(source: str) -> list[dict]:
-    """Pass 2: project response_item records (messages + command tool calls)."""
-    rows: list[dict] = []
-    with open(source, encoding="utf-8", errors="replace") as fh:
-        for record in iter_records(fh):
-            if record.get("type") != "response_item":
-                continue
-            payload = record.get("payload")
-            if isinstance(payload, dict):
-                row = response_row(payload)
-                if row is not None:
-                    rows.append(row)
-    return rows
-
-
-def event_fallback_rows(source: str) -> list[dict]:
-    """File-level fallback (#1353): headless rollouts record the conversation
-    only as event_msg; project those when real response_item messages are absent."""
-    rows: list[dict] = []
-    with open(source, encoding="utf-8", errors="replace") as fh:
-        for record in iter_records(fh):
-            if record.get("type") != "event_msg":
-                continue
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            ptype = payload.get("type")
-            if ptype in ("user_message", "agent_message") and isinstance(
-                payload.get("message"), str
-            ):
-                rows.append(event_row(payload, "user" if ptype == "user_message" else "assistant"))
-    return rows
+    for record in records:
+        payload = record.get("payload")
+        if record.get("type") == "session_meta" and isinstance(payload, dict):
+            for key in meta:
+                value = payload.get(key)
+                if value and not meta[key]:
+                    meta[key] = str(value)
+    return meta
 
 
 def write_projection(rows: list[dict], out_path: str, max_out_bytes: int) -> tuple[int, int, bool]:
@@ -247,11 +139,12 @@ def write_projection(rows: list[dict], out_path: str, max_out_bytes: int) -> tup
 
 
 def project_rollout(source: str, out_dir: str, max_out_bytes: int, include_exec: bool) -> dict:
-    meta, has_response_message, records_in = scan_meta_and_message_presence(source)
-
-    rows = response_rows(source)
-    if not has_response_message:
-        rows.extend(event_fallback_rows(source))
+    records = read_records(source)
+    meta = session_meta(records)
+    records_in = len(records)
+    # Shared adapter (#2388): messages, command tool calls, and the file-level
+    # event_msg fallback for headless rollouts, in session order.
+    rows = tr.claude_rows(tr.codex_events(records))
 
     excluded = bool(meta["originator"] == "codex_exec" and not include_exec)
     project_enc = encode_project_dir(meta["cwd"]) if meta["cwd"] else "_unknown"

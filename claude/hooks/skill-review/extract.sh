@@ -15,6 +15,7 @@ SKILLS_DIR="${CLAUDE_SKILLS_DIR:-${HOME:-/root}/.claude/skills}"
 # shellcheck source=claude/hooks/lib/skill-frontmatter.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/../lib/skill-frontmatter.sh" 2>/dev/null \
   || CCC_YAML_UNQUOTE_AWK='function ccc_yaml_unquote(s) { return s }'
+TRAJECTORY_RENDER="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/../lib/trajectory_render.py"
 MAX_TURNS="${CCC_SKILL_REVIEW_MAX_TURNS:-80}"
 MAX_BYTES="${CCC_SKILL_REVIEW_MAX_BYTES:-60000}"
 MODEL="${CCC_SKILL_REVIEW_MODEL:-haiku}"
@@ -64,24 +65,15 @@ fi
 build_redacted() {
   local max_turns="$1" max_bytes="$2"
   local raw redacted
-  raw="$(tail -n 500 "$TRANSCRIPT" 2>/dev/null | jq -r '
-    select(.type == "user" or .type == "assistant")
-    | . as $e
-    | (.message.content // .content // "") as $c
-    | if ($c | type) == "string" then
-        "[\($e.type)] \($c)"
-      elif ($c | type) == "array" then
-        "[\($e.type)] " + (
-          $c | map(
-            if .type == "text" then .text
-            elif .type == "tool_use" then "[tool:\(.name // "?")]"
-            elif .type == "tool_result" then "[tool_result:\(.tool_use_id // "?" | .[0:8])]"
-            else "[\(.type // "?")]"
-            end
-          ) | join("\n")
-        )
-      else "" end
-  ' 2>/dev/null | tail -n "$max_turns")"
+  # Shared trajectory grammar (#2388, lib/trajectory_render.py): one renderer
+  # for every provider, every cut marked `…(+N chars — render truncation)`.
+  # Observation bodies are omitted (the marker reports their size): the byte
+  # window cannot hold one >=10k-char observation plus the conversation, and
+  # a shorter partial observation is what the obs_trunc guard forbids.
+  # Command arguments (<=400 chars, marked) are the procedure a skill draft
+  # reuses; the redact pass below scrubs key=value secrets from them.
+  raw="$(python3 "$TRAJECTORY_RENDER" render --format claude --obs-trunc omit \
+    --args-trunc 400 --max-lines "$max_turns" "$TRANSCRIPT" 2>/dev/null)"
   [ -z "$raw" ] && return 1
   redacted="$(printf '%s' "$raw" | sed -E \
     -e 's/(ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}/[REDACTED:gh-token]/g' \
@@ -90,15 +82,10 @@ build_redacted() {
     -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/[REDACTED:pem-begin]/g' \
     -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
     -e 's/((password|passwd|secret|token|api[_-]?key|authorization)[=:[:space:]"'"'"']+)[^[:space:]"'"'"'&|;]+/\1[REDACTED]/gI')"
-  # Measure BYTES, not characters (same fix as distill/extract.sh): the
-  # character comparison let Korean-heavy content grow ~3x past the budget.
-  local byte_len
-  byte_len="$(printf '%s' "$redacted" | wc -c | tr -d '[:space:]')"
-  if [ "$byte_len" -gt "$max_bytes" ]; then
-    redacted="...[truncated $((byte_len - max_bytes)) bytes]...
-$(printf '%s' "$redacted" | tail -c "$max_bytes")"
-  fi
-  printf '%s' "$redacted"
+  # Byte cap — keep the tail so the most recent context wins. The renderer
+  # measures UTF-8 bytes (Korean is ~3 bytes/char) and marks the cut with the
+  # same render-truncation marker, merged with any line-window marker.
+  printf '%s' "$redacted" | python3 "$TRAJECTORY_RENDER" clip --max-bytes "$max_bytes"
 }
 
 existing_skills() {
@@ -118,9 +105,12 @@ REDACTED="$(build_redacted "$MAX_TURNS" "$MAX_BYTES")"
 EXISTING="$(existing_skills | head -80)"
 
 PROVIDER="${CCC_SKILL_PROVIDER:-claude}"
+# #2388: transcript grammar + render-truncation marker contract, from the renderer.
+TRAJECTORY_NOTE="$(python3 "$TRAJECTORY_RENDER" prompt-note 2>/dev/null)"
 PROMPT="$(cat <<EOF
 You are the Hermes-style skill self-improvement reviewer for a coding agent node.
 You will receive a redacted session transcript and a list of existing skills.
+${TRAJECTORY_NOTE}
 Return STRICT JSON only.
 
 Goal: propose reusable skills worth staging for human approval.

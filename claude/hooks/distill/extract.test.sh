@@ -141,7 +141,7 @@ run_extract() {
   export CLAUDE_DISTILL_SOURCE_CWD="/root/project-a"
   export CLAUDE_DISTILL_SOURCE_PROJECT="-root-project-a"
   export CLAUDE_DISTILL_TIMEOUT="$timeout_s"
-  export CLAUDE_DISTILL_MAX_TURNS=20
+  export CLAUDE_DISTILL_MAX_TURNS="${EXTRACT_TEST_MAX_TURNS:-20}"
   export CLAUDE_DISTILL_MAX_BYTES=20000
   out="$(bash "$EXTRACT" 2>"$TMP/stderr-$mode")"; rc=$?
 }
@@ -228,6 +228,38 @@ ok "nologin extract exits 1" '[ "$rc" = 1 ]'
 ok "nologin extract classifies not_logged_in" 'grep -q "extract_error_class=not_logged_in" "$TMP/stderr-nologin"'
 ok "nologin extract writes last-error" 'jq -e ".class == \"not_logged_in\"" "$TMP/state/distill-last-error.json" >/dev/null'
 ok "nologin extract sets node cooldown" 'jq -e ".class == \"not_logged_in\" and .until" "$TMP/state/distill.cooldown" >/dev/null'
+
+# #2388: reproduction fixture for "a render cut read as an agent failure". A
+# session whose tool output and length exceed the window must reach the model
+# with the shared grammar, only the renderer's own marker, and the sentence
+# that says the marker is the renderer's — never the old bare cut headers.
+TRUNC_TRANSCRIPT="$TMP/transcript-trunc.jsonl"
+python3 - "$TRUNC_TRANSCRIPT" <<'PY'
+import json, sys
+rows = [{"type": "user", "message": {"content": "배포 상태 점검"}}]
+rows.append({"type": "assistant", "message": {"content": [
+    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "journalctl -u app"}}]}})
+rows.append({"type": "user", "message": {"content": [
+    {"type": "tool_result", "tool_use_id": "t1", "content": "log line\n" * 4000}]}})
+for i in range(30):
+    rows.append({"type": "assistant", "message": {"content": [{"type": "text", "text": f"step {i}"}]}})
+with open(sys.argv[1], "w") as fh:
+    fh.write("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+PY
+run_extract "$TRUNC_TRANSCRIPT" valid
+ok "truncated session still extracts" '[ "$rc" = 0 ]'
+ok "prompt explains the transcript grammar and that markers are the renderer's" \
+  'grep -qF "Transcript grammar: every block starts with one tag" "$TMP/input-valid.txt" && grep -qF "they are not agent, tool, or runtime behavior" "$TMP/input-valid.txt"'
+ok "the line-window cut is marked with the shared render-truncation marker" \
+  'grep -q "^…(+[0-9]* chars — render truncation)$" "$TMP/input-valid.txt"'
+ok "rendered turns use the shared tags, not the legacy [user]/[tool_result:] words" \
+  'grep -q "^\[ASSISTANT\] step 29$" "$TMP/input-valid.txt" && ! grep -q "^\[assistant\]\|^\[user\]\|\[tool_result:\|\[tool:" "$TMP/input-valid.txt"'
+ok "the legacy unexplained cut header is gone" '! grep -qF "...[truncated" "$TMP/input-valid.txt"'
+EXTRACT_TEST_MAX_TURNS=80 run_extract "$TRUNC_TRANSCRIPT" valid
+ok "an observation reaches distill as its error-free tag + size marker, body omitted" \
+  'grep -qx "\[OBSERVATION\] …(+36000 chars — render truncation)" "$TMP/input-valid.txt" && ! grep -q "^log line" "$TMP/input-valid.txt"'
+ok "distill omits tool arguments (marked) — it never showed commands" \
+  'grep -qx "\[ACTION\] Bash(…(+17 chars — render truncation))" "$TMP/input-valid.txt" && ! grep -q "journalctl" "$TMP/input-valid.txt"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -11,6 +11,11 @@ This projector translates ONE piri session file into the Claude shape so the
 entire downstream pipeline runs unmodified — the same discipline the Codex
 branch introduced (codex-rollout-normalize.py, #1353).
 
+Since #2388 this script is a thin wrapper: record parsing and the mapping below
+live in claude/hooks/lib/trajectory_render.py (piri_events → claude_rows), the
+same adapter the prompt renderer uses. This file keeps the metadata, lock
+probe, cap and file-layout policy.
+
 Mapping (verified against live piri session samples, pi session version 3):
 
   {"type":"session"}                          → session metadata (id, cwd)
@@ -52,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -61,101 +67,42 @@ MAX_OUT_BYTES_DEFAULT = 512 * 1024
 PROJECT_ENC_RE = re.compile(r"[^A-Za-z0-9_]")
 
 
+def _load_renderer():
+    """Import the shared trajectory adapters (#2388): installed beside this
+    script under hooks/lib/, or at claude/hooks/lib/ in a repo checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for lib_dir in (os.path.join(here, "lib"), os.path.join(here, "..", "claude", "hooks", "lib")):
+        path = os.path.join(lib_dir, "trajectory_render.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("trajectory_render", path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module  # importable by name (type introspection, pickling)
+                spec.loader.exec_module(module)
+                return module
+    raise ImportError("trajectory_render.py not found beside the normalizer (hooks/lib/)")
+
+
+tr = _load_renderer()
+
+
 def encode_project_dir(cwd: str) -> str:
     """Same encoding as skill-review.sh's encode_project_dir()."""
     return PROJECT_ENC_RE.sub("-", cwd)
 
 
-def iter_records(fh):
-    """Yield parsed JSON-object lines; malformed lines are skipped."""
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            yield record
-
-
-def text_items(content: object) -> list[dict[str, str]]:
-    """Piri text content items → Claude {"type":"text","text":…} items."""
-    items: list[dict[str, str]] = []
-    if not isinstance(content, list):
-        return items
-    for item in content:
-        if isinstance(item, dict) and item.get("type") == "text" and isinstance(
-            item.get("text"), str
-        ):
-            items.append({"type": "text", "text": item["text"]})
-    return items
-
-
-def bash_command(arguments: object) -> str | None:
-    """Extract the runnable command from a bash toolCall arguments blob."""
-    if not isinstance(arguments, dict):
-        return None
-    command = arguments.get("command")
-    if isinstance(command, str) and command.strip():
-        return command
-    if isinstance(command, list):
-        parts = [str(part) for part in command]
-        return " ".join(parts) if parts else None
-    return None
-
-
-def rows_from_session(source: str, meta: dict[str, str]) -> list[dict]:
-    """Project message records: user/assistant text + bash tool calls."""
-    rows: list[dict] = []
+def rows_from_session(source: str) -> list[dict]:
+    """Project message records: user/assistant text + bash tool calls, via the
+    shared piri adapter (#2388)."""
     with open(source, encoding="utf-8", errors="replace") as fh:
-        for record in iter_records(fh):
-            if record.get("type") != "message":
-                continue
-            message = record.get("message")
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role")
-            content = message.get("content")
-            if role in ("user", "assistant"):
-                items = text_items(content)
-                if items:
-                    rows.append(
-                        {"type": str(role), "message": {"role": str(role), "content": items}}
-                    )
-            if role == "assistant" and isinstance(content, list):
-                for item in content:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("type") == "toolCall"
-                        and item.get("name") == "bash"
-                    ):
-                        command = bash_command(item.get("arguments"))
-                        if command:
-                            rows.append(
-                                {
-                                    "type": "assistant",
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": [
-                                            {
-                                                "type": "tool_use",
-                                                "name": "Bash",
-                                                "input": {"command": command},
-                                            }
-                                        ],
-                                    },
-                                }
-                            )
-    return rows
+        return tr.claude_rows(tr.piri_events(list(tr.iter_records(fh))))
 
 
 def scan_meta(source: str) -> dict[str, str]:
     """Pass 1: session metadata from the session record."""
     meta: dict[str, str] = {"session_id": "", "cwd": ""}
     with open(source, encoding="utf-8", errors="replace") as fh:
-        for record in iter_records(fh):
+        for record in tr.iter_records(fh):
             if record.get("type") == "session":
                 for key in meta:
                     value = record.get(key)
@@ -220,7 +167,7 @@ def project_session(source: str, out_dir: str, max_out_bytes: int, *, lock: bool
         finally:
             os.close(descriptor)
 
-    rows = rows_from_session(source, meta)
+    rows = rows_from_session(source)
     if project_enc_override:
         project_enc = project_enc_override
     else:

@@ -32,6 +32,7 @@ EXTRACT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" 
 . "$EXTRACT_LIB_DIR/provider-guard.sh" 2>/dev/null || true
 # shellcheck disable=SC2034  # read at call time by provider-guard.sh (ccc_distill_state_dir fallback)
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
+TRAJECTORY_RENDER="$EXTRACT_LIB_DIR/../lib/trajectory_render.py"
 
 fail_extract() {
   local ec="${1:-1}"
@@ -57,24 +58,15 @@ is_disabled "$WIKI_ENABLED" && WIKI_ENABLED_JSON=false
 build_redacted() {
   local max_turns="$1" max_bytes="$2"
   local raw redacted
-  raw="$(tail -n 400 "$TRANSCRIPT" 2>/dev/null | jq -r '
-    select(.type == "user" or .type == "assistant")
-    | . as $e
-    | (.message.content // .content // "") as $c
-    | if ($c | type) == "string" then
-        "[\($e.type)] \($c)"
-      elif ($c | type) == "array" then
-        "[\($e.type)] " + (
-          $c | map(
-            if .type == "text" then .text
-            elif .type == "tool_use" then "[tool:\(.name // "?")]"
-            elif .type == "tool_result" then "[tool_result:\(.tool_use_id // "?" | .[0:8])]"
-            else "[\(.type // "?")]"
-            end
-          ) | join("\n")
-        )
-      else "" end
-  ' 2>/dev/null | tail -n "$max_turns")"
+  # Shared trajectory grammar (#2388, lib/trajectory_render.py): one renderer
+  # for every provider, every cut marked `…(+N chars — render truncation)`.
+  # Observation bodies are omitted (the marker reports their size): the byte
+  # window cannot hold one >=10k-char observation plus the conversation, and
+  # a shorter partial observation is what the obs_trunc guard forbids.
+  # Tool arguments are omitted too: distill has never shown commands (they
+  # were `[tool:Bash]`) and its redact pass lacks the generic key=value rule.
+  raw="$(python3 "$TRAJECTORY_RENDER" render --format claude --obs-trunc omit \
+    --args-trunc omit --max-lines "$max_turns" "$TRANSCRIPT" 2>/dev/null)"
   [ -z "$raw" ] && return 1
 
   # FW-03 redact pass — mirrors ~/.claude/hooks/redact.sh + ghp/gho/ghs/sk-/AKIA/PEM.
@@ -86,18 +78,10 @@ build_redacted() {
     -e 's/Bearer [A-Za-z0-9._-]{20,}/Bearer [REDACTED]/g' \
   )"
 
-  # byte cap — keep the tail so most-recent context wins. Measure BYTES:
-  # ${#var} counts characters, and the fleet's Korean-heavy transcripts are
-  # ~3 bytes/char, so the character comparison let prompts grow ~3x past the
-  # byte budget before triggering (tail -c already cuts bytes).
-  local byte_len
-  byte_len="$(printf '%s' "$redacted" | wc -c | tr -d '[:space:]')"
-  if [ "$byte_len" -gt "$max_bytes" ]; then
-    redacted="...[truncated $((byte_len - max_bytes)) bytes]...
-$(printf '%s' "$redacted" | tail -c "$max_bytes")"
-  fi
-
-  printf '%s' "$redacted"
+  # Byte cap — keep the tail so the most recent context wins. The renderer
+  # measures UTF-8 bytes (Korean is ~3 bytes/char) and marks the cut with the
+  # same render-truncation marker, merged with any line-window marker.
+  printf '%s' "$redacted" | python3 "$TRAJECTORY_RENDER" clip --max-bytes "$max_bytes"
 }
 
 REDACTED="$(build_redacted "$MAX_TURNS" "$MAX_BYTES")"
@@ -203,7 +187,11 @@ OUTPUT CONTRACT — READ TWICE:
 - If you have nothing to extract, emit exactly: {"honcho":[],"wiki_candidates":[],"resume":{"last_activity":"","pending_action":"","awaiting_user":false,"open_question":"","next_step":"","evidence":[]}}
 EOF
 )"
+# #2388: the transcript grammar + render-truncation marker contract, from the
+# renderer itself so prompt and output cannot drift.
+TRAJECTORY_NOTE="$(python3 "$TRAJECTORY_RENDER" prompt-note 2>/dev/null)"
 PROMPT="Configured identity: USER (${USER_LABEL}) and ASSISTANT (${ASSISTANT_LABEL}).
+${TRAJECTORY_NOTE}
 ${PROMPT}"
 if is_disabled "$WIKI_ENABLED"; then
   PROMPT="${PROMPT}
