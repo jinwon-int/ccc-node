@@ -6,9 +6,13 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/install-hande-bridge.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$HERE/../claude/hooks/lib/test-stub.sh"
+ccc_test_reset_hook_env
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(ccc_test_tmpdir)" || exit 1
+trap 'rm -rf "$TMP"' EXIT
 
 ROOT="$TMP/root"; CLAUDE="$TMP/home/.claude"; CCCNODE="$TMP/opt/ccc-node"; CALLS="$TMP/calls"
 mkdir -p "$ROOT/etc/systemd/system/ccc-matrix-bridge.service.d" "$ROOT/run" "$CLAUDE" "$CCCNODE/bridge/core/hande"
