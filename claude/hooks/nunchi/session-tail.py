@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Read only a bounded tail of an owned native session, excluding tool messages."""
+"""Read only a bounded tail of an owned native session, excluding tool messages.
 
+Every cut this reader makes to the conversation (per-message, message window,
+total size) carries the shared render-truncation marker from
+lib/trajectory_render.py (#2388), so the extraction model never reads a cut
+message as an unfinished one. The 4 MiB read bound is a reader limit, not a
+render cut.
+"""
+
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,6 +16,23 @@ import stat
 import sys
 
 CAP = 4 * 1024 * 1024
+MESSAGE_CHARS = 800
+MESSAGE_WINDOW = 60
+TOTAL_CHARS = 40000
+
+
+def _load_renderer():
+    path = Path(__file__).resolve().parent.parent / "lib" / "trajectory_render.py"
+    spec = importlib.util.spec_from_file_location("trajectory_render", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # importable by name (type introspection, pickling)
+    spec.loader.exec_module(module)
+    return module
+
+
+tr = _load_renderer()
 
 
 def read_tail(provider, path, root):
@@ -89,10 +114,15 @@ def read(provider, path, root):
         else:
             raise ValueError("provider")
         if role and isinstance(text, str) and text.strip():
-            (messages if modern else legacy).append(role + ": " + text[:800])
+            (messages if modern else legacy).append(role + ": " + tr.truncate(text, MESSAGE_CHARS))
     # Older Codex duplicates messages as event_msg; prefer the native message
     # representation when present, never tool results or hidden reasoning.
-    return "\n".join((messages or legacy)[-60:])[:40000]
+    chosen = messages or legacy
+    window = "\n".join(chosen[-MESSAGE_WINDOW:])
+    if len(chosen) > MESSAGE_WINDOW:
+        older = "\n".join(chosen[:-MESSAGE_WINDOW])
+        window = tr.marker(len(older) + 1) + "\n" + window
+    return tr.truncate(window, TOTAL_CHARS)
 
 
 if __name__ == "__main__":

@@ -159,6 +159,9 @@ in, the sweep runs a **codex branch** right after the Claude draft loop:
    Headless rollouts that record the conversation only as `event_msg` fall
    back to those events; when real `response_item` messages exist they are
    skipped so turns are not duplicated.
+   The record mapping lives in the shared trajectory adapters
+   (`claude/hooks/lib/trajectory_render.py`, #2388); see
+   [`trajectory-render.md`](trajectory-render.md).
 2. The projected transcript is pushed through the SAME `skill-review.sh`
    pipeline with `CCC_SKILL_PROVIDER=codex` and
    `CLAUDE_PROJECTS_DIR=<normalized tree>` — provider.sh routes installs to

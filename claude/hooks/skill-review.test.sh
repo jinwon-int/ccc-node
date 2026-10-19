@@ -219,6 +219,13 @@ ok "prompt requires a trigger-first description" \
   'grep -q "MUST START with the trigger" "$LLM_SNAPSHOT" && grep -q "\"Use when <situation> ...\"" "$LLM_SNAPSHOT" && grep -q "할 때 사용" "$LLM_SNAPSHOT" && grep -q "at most 300 characters" "$LLM_SNAPSHOT"'
 ok "prompt asks for a general name and an overlap check against existing skills" \
   'grep -q "general, reusable capability name" "$LLM_SNAPSHOT" && grep -q "Check the existing skills list" "$LLM_SNAPSHOT" && grep -q "near-duplicate" "$LLM_SNAPSHOT"'
+# #2388: the drafting brain reads the shared trajectory grammar — commands are
+# shown (they are the procedure a skill reuses) and the prompt says the
+# render-truncation marker is the renderer's, not a failed step.
+ok "prompt carries the shared transcript grammar + marker contract" \
+  'grep -qF "Transcript grammar: every block starts with one tag" "$LLM_SNAPSHOT" && grep -qF "they are not agent, tool, or runtime behavior" "$LLM_SNAPSHOT"'
+ok "transcript commands reach the drafting brain as [ACTION] Bash(<command>)" \
+  'grep -qx "\[ACTION\] Bash(git status --short)" "$LLM_SNAPSHOT" && ! grep -q "\[tool:Bash\]" "$LLM_SNAPSHOT"'
 ok "neutral fixture draft itself satisfies the trigger lint" \
   'jq -r ".skill_candidates[0].skill_md" "$TMP/llm-out.json" | grep "^description:" | sed "s/^description: //" | python3 "$HERE/skill-review/description_trigger.py" check'
 

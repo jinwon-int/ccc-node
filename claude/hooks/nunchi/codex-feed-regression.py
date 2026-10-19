@@ -45,6 +45,10 @@ class CollectorTests(unittest.TestCase):
         self.hooks.mkdir()
         for name in ('codex-feed.sh', 'session-tail.py', 'feed-receipt.py', 'feed-common.sh'):
             shutil.copy2(HERE / name, self.hooks / name)
+        # session-tail.py marks its cuts with the shared renderer (#2388),
+        # installed one level up under hooks/lib/.
+        (self.root / 'lib').mkdir()
+        shutil.copy2(HERE.parent / 'lib' / 'trajectory_render.py', self.root / 'lib' / 'trajectory_render.py')
         (self.hooks / 'nunchi.py').write_text('''import os,sys,json,pathlib
 if sys.argv[1] == 'ingest':
     data=json.load(sys.stdin)
@@ -85,6 +89,20 @@ print(json.dumps({'honcho':[{'kind':'fact','text':'A synthetic fact','subject':'
         self.assertEqual(text, 'USER: real user\nAGENT: real assistant')
         self.source.write_text(json.dumps({'type':'event_msg','payload':{'type':'user_message','message':'old format'}}))
         self.assertIn('old format', reader.read('codex', self.source, self.sessions))
+
+    def test_cuts_carry_the_shared_render_truncation_marker(self):
+        # #2388: a message cut at 800 chars or a dropped older window must say
+        # so; a silently cut message reads as an unfinished one.
+        rows = [message('x' * 900)] + [message(f'turn {i}', 'assistant') for i in range(60)]
+        self.source.write_text('\n'.join(json.dumps(r) for r in rows))
+        text = reader.read('codex', self.source, self.sessions)
+        lines = text.split('\n')
+        self.assertEqual(lines[0], '…(+840 chars — render truncation)')
+        self.assertEqual(len(lines), 61)
+        self.assertEqual(lines[-1], 'AGENT: turn 59')
+        self.source.write_text(json.dumps(message('y' * 900)))
+        self.assertEqual(reader.read('codex', self.source, self.sessions),
+                         'USER: ' + 'y' * 800 + '…(+100 chars — render truncation)')
 
     def test_growth_is_reprocessed_but_unchanged_file_is_not(self):
         self.run_feed()

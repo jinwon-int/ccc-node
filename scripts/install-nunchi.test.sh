@@ -31,6 +31,10 @@ mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
 cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,session-tail.py,feed-receipt.py,journal-feed.py,piri-feed.sh,danso-feed.sh,ingest-cron.sh,bridge-journal.py,feed-common.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
+# session-tail.py and the feed prompts use the shared trajectory renderer that
+# setup.sh's hook-tree walk deploys under hooks/lib/ (#2388).
+mkdir -p "$hooks/lib"
+cp "$ROOT/claude/hooks/lib/trajectory_render.py" "$hooks/lib/trajectory_render.py"
 # setup.sh installs bridge/utils/secure_fs.py verbatim as hooks/ccc_secure_fs.py;
 # nunchi.py/judge-batch.py/wiki-promote.py import it from the hooks root (#1508),
 # so the fixture must ship it the same way a real node does.
