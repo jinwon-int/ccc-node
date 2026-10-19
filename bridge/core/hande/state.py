@@ -5,7 +5,7 @@ A small private JSON file, the hande counterpart of the Matrix config:
 .. code-block:: json
 
     {
-      "account": "@node-a:hande",
+      "account": "@bridgenode:hande",
       "owner": "@owner:hande",
       "rooms": ["agent"],
       "family_rooms": [],

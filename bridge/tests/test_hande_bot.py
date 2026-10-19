@@ -19,7 +19,7 @@ from telegram_bot.utils.channel_environment import CHANNEL_SELECTION_KEYS, witho
 
 def _config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
-        "account": "@node-a:hande",
+        "account": "@bridgenode:hande",
         "owner": "@owner:hande",
         "rooms": ["agent"],
         "family_rooms": [],
@@ -83,7 +83,7 @@ def test_validate_config_defaults_and_normalisation() -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"account": "node-a"},
+        {"account": "bridgenode"},
         {"owner": "@owner:matrix.example"},
         {"rooms": []},
         {"rooms": ["agent", "agent"]},
@@ -123,7 +123,7 @@ def test_hande_bot_is_a_matrix_bot_with_hande_config(tmp_path: Path) -> None:
     assert isinstance(bot, MatrixBot)
     assert bot.config_path() == tmp_path / "hande.json"
     config = bot.load_config()
-    assert config["account"] == "@node-a:hande"
+    assert config["account"] == "@bridgenode:hande"
     assert bot.load_config() is config  # cached
     bot.validate_runtime_paths()
     # Owner + family resolve through the same id map MatrixBot uses.

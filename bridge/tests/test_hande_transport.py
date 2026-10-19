@@ -27,7 +27,7 @@ def anyio_backend() -> str:
 
 def _config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
-        "account": "@node-a:hande",
+        "account": "@bridgenode:hande",
         "owner": "@owner:hande",
         "rooms": ["agent", "fleet"],
         "family_rooms": ["fleet"],
