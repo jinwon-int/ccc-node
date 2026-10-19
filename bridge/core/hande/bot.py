@@ -11,15 +11,27 @@ socket instead of a sync loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 import time
 from typing import Any, Mapping
 
+import secrets
+
+from telegram_bot.contracts.agent_runtime import ApprovalRequestEvent, freeze_json
+from telegram_bot.contracts.transport import TurnSink
+from telegram_bot.core.approval_contract import build_approval_snapshot
 from telegram_bot.core.matrix.bot import MatrixBot
 
 from .state import HandeConfigError, load_config
-from .steward import STEWARD_SERVER, allowed_tool_names, build_steward_server
+from .steward import (
+    STEWARD_SERVER,
+    all_tool_names,
+    build_steward_server,
+    needs_approval,
+    qualified,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +114,87 @@ class HandeBot(MatrixBot):
             return False
         return True
 
+    # The identity of the turn being served, for the steward approval audit
+    # (MatrixBot keeps only the sink and the turn id).
+    _steward_identity: tuple[int, int] | None = None
+
+    async def run_turn(
+        self, job: Mapping[str, Any], *, sink: TurnSink, session_id: str | None, room_kind: str
+    ) -> Any:
+        try:
+            user_id, chat_id, _room_id = self._job_identity(job, room_kind)
+            self._steward_identity = (user_id, chat_id)
+        except Exception:
+            self._steward_identity = None
+        try:
+            return await super().run_turn(
+                job, sink=sink, session_id=session_id, room_kind=room_kind
+            )
+        finally:
+            self._steward_identity = None
+
+    def _steward_approve_all(self) -> bool:
+        return bool(self.load_config().get("steward_tools_approve_all"))
+
+    async def _steward_approval(
+        self, sink: Any, name: str, arguments: Mapping[str, str]
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Owner approval for one steward call through the hande ``approval`` frame.
+
+        Same redacted snapshot + audit ledger as a provider approval (#1959);
+        the model never sees the owner's reply, only the outcome.
+        """
+
+        event = ApprovalRequestEvent(
+            request_id=f"steward-{secrets.token_urlsafe(8)}",
+            action=qualified(name),
+            arguments=freeze_json(dict(arguments)),
+            description=f"steward {name}",
+        )
+        snapshot = build_approval_snapshot(event, reply_hint=None)
+        identity = self._steward_identity or (0, 0)
+        asked = self._record_approval_asked(snapshot, event, identity[0], identity[1], 0)
+        # The generic tool_use snapshot says only "tool use"; the owner must see
+        # which room operation and on what. Arguments are identifier-shaped
+        # ([A-Za-z0-9_-]{1,64}, checked before this point), so they are safe
+        # to show verbatim. The bot appends its own "승인 n / 거절 n" controls.
+        shown = " ".join(f"{key}={value}" for key, value in arguments.items()) or "(없음)"
+        prompt = f"⚠️ 한데 방 운영 도구 승인 요청\n도구: {name}\n인수: {shown}"
+        try:
+            outcome = await self._ask_approval(sink, prompt)
+        except asyncio.CancelledError:
+            self._record_approval_answered(asked, "cancelled", actor_user_id=None)
+            raise
+        except Exception:
+            self._record_approval_answered(asked, "send_failure", actor_user_id=None)
+            return "unavailable", None
+        reason = {"allow": "owner_allow", "deny": "owner_deny", "timeout": "timeout"}.get(
+            outcome, "send_failure"
+        )
+        self._record_approval_answered(
+            asked, reason, actor_user_id=identity[0] if outcome in ("allow", "deny") else None
+        )
+        return outcome, None
+
     async def _steward_call(self, name: str, arguments: Mapping[str, str]) -> Mapping[str, Any]:
-        """Forward one tool call to the turn being served (the sink owns the frame)."""
+        """Forward one tool call to the turn being served, after the owner's approval (PR-5).
+
+        Read-only tools go straight through (unless ``steward_tools_approve_all``);
+        anything with a side effect asks the owner first through the same
+        ``approval`` frame a provider approval uses, so the step does not
+        depend on the node's SDK permission mode. The bot still enforces
+        owner-only on every call.
+        """
 
         sink = self._active_sink
         call = getattr(sink, "tool", None)
         if not callable(call):
             return {"ok": False, "error": "no_active_turn"}
+        if needs_approval(name, self._steward_approve_all()):
+            outcome, _ = await self._steward_approval(sink, name, arguments)
+            if outcome != "allow":
+                logger.info("hande steward %s not approved: %s", name, outcome)
+                return {"ok": False, "error": f"approval_{outcome}"}
         return await call(name, arguments)
 
     def _turn_request_extras(self) -> dict[str, Any]:
@@ -119,11 +205,14 @@ class HandeBot(MatrixBot):
             self._steward_server = build_steward_server(self._steward_call)
         if self._steward_server is None:
             return {}
-        extras: dict[str, Any] = {"mcp_servers": {STEWARD_SERVER: self._steward_server}}
-        allowed = allowed_tool_names(bool(self.load_config().get("steward_tools_approve_all")))
-        if allowed:
-            extras["mcp_allowed_tools"] = allowed
-        return extras
+        # Every steward tool is pre-allowed at the SDK level: the bridge asks
+        # the owner itself (``_steward_call``), so a node on ``approve-each``
+        # never sees a second prompt and a node on ``auto-approve`` never
+        # skips the first one.
+        return {
+            "mcp_servers": {STEWARD_SERVER: self._steward_server},
+            "mcp_allowed_tools": all_tool_names(),
+        }
 
     def startup_banner(self) -> str:
         # The native bot does not speak the ``notice`` frame yet, so a banner
