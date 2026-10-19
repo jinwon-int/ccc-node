@@ -118,17 +118,39 @@ journals. Add `hande` to `~/.claude/frontends` on nodes that run it.
 
 ## Deployment (per node)
 
-1. `bridge/service-systemd-hande.service.example` → `/etc/systemd/system/ccc-hande-bridge.service`;
-   optionally `bridge/ccc-hande-responder.socket.example` for socket activation.
-2. Write the config (0600), create the socket directory (`/run/ccc-hande`, group =
-   the bot's group, 0750).
-3. Point the bot at the socket: `NATIVE_MLS_BOT_RESPONDER_UNIX=/run/ccc-hande/responder.sock`
-   in the bot's drop-in (replaces the `native-responder.socket` path). **Restarting the
-   bot and the Rust responder units is an operator change** — approval per node.
-4. `systemctl enable --now ccc-hande-bridge`, then check `health.json`'s transport
-   block: `connected: true` once the bot reconnected.
+Every node gets **its own bot device and its own room**: device `<node>-bot` (actor
+`<node>`, since the actor is the device id up to the first `-`), room `<node>`, and the
+node's bridge as that bot's responder. Order per node (each line an operator step with
+its own approval where marked):
 
-Rollback: point the bot back at `native-responder.socket`, stop `ccc-hande-bridge`.
+1. **Relay operator**: Cloudflare Access service token `native-relay-bot-<node>` + policy
+   on the relay's Access app; the token env file lands on the node as
+   `/root/.config/native-relay/bot-service-token.env` (0600, never printed) — approval.
+2. **Node, bot side**: family-messenger
+   `archive/native-mls/bot/deploy/install-node-bot.sh --node <node> --relay-url http://<relay-tailnet>:18921
+   --relay-public-url https://<relay-host> --binary <native-mls-bot build> --token-env <env>`
+   → user/dirs, binary, JWT refresh timer, steward unit, responder drop-in; writes the
+   enrollment candidate to `/var/lib/native-relay-bot/bot/enrollment.json` (0600).
+   The bot starts unenrolled (403 + retry) — expected.
+3. **Relay operator**: `native-devices -enroll-first -input <candidate>` on the relay host
+   (actor `<node>`, E1 with the owner's out-of-band fingerprint check) — approval.
+4. **Node, bridge side** (system-unit nodes): `scripts/install-hande-bridge.sh --node <node>
+   [--family-user @actor:hande ...]` — clones the node's `ccc-matrix-bridge.service`
+   with the channel substituted (same provider/model/effort/profile drop-ins, minus push /
+   fleet-alert relay / webhook nudge, plus `CCC_PUSH_ENABLED=false`), writes
+   `/etc/tmpfiles.d/ccc-hande.conf`, `/etc/ccc-hande/config.json`, registers `hande` in
+   `~/.claude/frontends` and the unit in `~/.claude/self-update.services`, enables it.
+   Requires the hande code on the node (self-update first) and the bot's group (step 2).
+   Nodes whose Matrix frontend is a *user* unit are set up by hand per #2380's plan v2
+   instead.
+5. **Owner, app**: make room `<node>` → the node's bot `room join <node>` → invite the bot
+   device from the room screen; bot sets the room to `agent` mode (one per bot).
+6. Verify: reply, `/new`, `/model`, a read-only steward tool (no approval), a write tool
+   (`⚠️ 한데 방 운영 도구 승인 요청` first).
+
+Rollback per node: stop/disable `ccc-hande-bridge` and `native-relay-bot`, revoke the
+device on the relay (`-revoke`, counts against the policy revision budget — prefer
+leaving it enrolled but stopped), delete the CF token.
 
 ## Not yet / gaps
 
