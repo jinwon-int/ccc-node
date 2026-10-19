@@ -108,15 +108,39 @@ def steward_tool(name: str) -> StewardTool | None:
     return _BY_NAME.get(name)
 
 
+def qualified(name: str) -> str:
+    return f"mcp__{STEWARD_SERVER}__{name}"
+
+
 def allowed_tool_names(approve_all: bool = False) -> list[str]:
     """SDK allow-list names for the approval-free read-only tools.
 
-    Empty when every call must be approved (``approve_all``).
+    Empty when every call must be approved (``approve_all``). This is the
+    Rust responder's split; the bridge (PR-5) pre-allows *every* steward tool
+    at the SDK level and asks the owner itself — see :func:`needs_approval`.
     """
 
     if approve_all:
         return []
-    return [f"mcp__{STEWARD_SERVER}__{name}" for name in STEWARD_READ_ONLY if name in _BY_NAME]
+    return [qualified(name) for name in STEWARD_READ_ONLY if name in _BY_NAME]
+
+
+def all_tool_names() -> list[str]:
+    """SDK allow-list covering the whole table (the bridge owns the approval step)."""
+
+    return [qualified(tool.name) for tool in STEWARD_TOOLS]
+
+
+def needs_approval(name: str, approve_all: bool = False) -> bool:
+    """Whether the bridge must ask the owner before forwarding ``name`` (#2380 PR-5).
+
+    Read-only tools run unasked (as #378) unless ``approve_all``; every tool
+    with an MLS/relay side effect asks first, whatever the node's SDK
+    permission mode — on a node whose bridge runs ``auto-approve`` the SDK
+    would otherwise let ``room_remove``/``room_close`` through unconfirmed.
+    """
+
+    return approve_all or name not in STEWARD_READ_ONLY
 
 
 def clean_arguments(tool: StewardTool, arguments: Any) -> dict[str, str] | None:

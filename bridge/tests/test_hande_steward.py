@@ -53,6 +53,14 @@ def test_table_matches_the_rust_responder() -> None:
         "mcp__steward__room_members",
     ]
     assert steward.allowed_tool_names(approve_all=True) == []
+    assert (
+        len(steward.all_tool_names()) == 8
+        and steward.all_tool_names()[0] == "mcp__steward__room_create"
+    )
+    assert steward.needs_approval("room_status") is False
+    assert steward.needs_approval("room_members") is False
+    assert steward.needs_approval("room_mode") is True
+    assert steward.needs_approval("room_status", approve_all=True) is True
 
 
 @pytest.mark.parametrize(
@@ -270,10 +278,8 @@ def test_turn_request_extras_carry_the_steward_server(
     extras = bot._turn_request_extras()
     assert set(extras) == {"mcp_servers", "mcp_allowed_tools"}
     assert extras["mcp_servers"]["steward"].name == "steward"
-    assert extras["mcp_allowed_tools"] == [
-        "mcp__steward__room_status",
-        "mcp__steward__room_members",
-    ]
+    # PR-5: all eight pre-allowed at the SDK level; the bridge asks the owner itself.
+    assert extras["mcp_allowed_tools"] == steward.all_tool_names()
     # Built once, reused on the next turn.
     assert bot._turn_request_extras()["mcp_servers"]["steward"] is extras["mcp_servers"]["steward"]
     assert len(built) == 1
@@ -288,7 +294,8 @@ def test_turn_request_extras_respect_config_and_provider(
     off = _bot(tmp_path, steward_tools=False)
     assert off._turn_request_extras() == {}
     approve_all = _bot(tmp_path, steward_tools_approve_all=True)
-    assert "mcp_allowed_tools" not in approve_all._turn_request_extras()
+    assert approve_all._turn_request_extras()["mcp_allowed_tools"] == steward.all_tool_names()
+    assert approve_all._steward_approve_all() is True
     codex = _bot(tmp_path)
     codex._settings.agent_provider = "codex"
     assert codex._turn_request_extras() == {}
@@ -297,19 +304,93 @@ def test_turn_request_extras_respect_config_and_provider(
     assert missing_sdk._turn_request_extras() == {}
 
 
-async def test_steward_call_forwards_to_the_active_sink(tmp_path: Path) -> None:
+class _ApprovingSink:
+    """A sink that records approval prompts and answers them as scripted."""
+
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = answers
+        self.prompts: list[str] = []
+        self.tools: list[tuple[str, dict[str, str]]] = []
+
+    async def approval_outcome(self, text: str) -> str:
+        self.prompts.append(text)
+        return self.answers.pop(0)
+
+    async def tool(self, name: str, arguments: Any) -> dict[str, Any]:
+        self.tools.append((name, dict(arguments)))
+        return {"ok": True, "op": name}
+
+
+async def test_steward_call_read_only_goes_straight_through(tmp_path: Path) -> None:
     bot = _bot(tmp_path)
     assert await bot._steward_call("room_status", {}) == {"ok": False, "error": "no_active_turn"}
-    seen: list[Any] = []
+    sink = _ApprovingSink([])
+    bot._active_sink = sink
+    assert await bot._steward_call("room_members", {"room": "r"}) == {
+        "ok": True,
+        "op": "room_members",
+    }
+    assert sink.prompts == [] and sink.tools == [("room_members", {"room": "r"})]
 
-    class Sink:
-        async def tool(self, name: str, arguments: Any) -> dict[str, Any]:
-            seen.append((name, dict(arguments)))
-            return {"ok": True}
 
-    bot._active_sink = Sink()
-    assert await bot._steward_call("room_members", {"room": "r"}) == {"ok": True}
-    assert seen == [("room_members", {"room": "r"})]
+async def test_steward_call_asks_the_owner_for_write_tools(tmp_path: Path) -> None:
+    bot = _bot(tmp_path)
+    sink = _ApprovingSink(["allow", "deny", "timeout"])
+    bot._active_sink = sink
+    bot._steward_identity = (7, 7)
+    ok = await bot._steward_call("room_mode", {"room": "family-acc", "mode": "silent"})
+    assert ok == {"ok": True, "op": "room_mode"}
+    denied = await bot._steward_call("room_remove", {"room": "family-acc", "device": "kid-1"})
+    assert denied == {"ok": False, "error": "approval_deny"}
+    timed_out = await bot._steward_call("room_close", {"room": "old"})
+    assert timed_out == {"ok": False, "error": "approval_timeout"}
+    # Only the approved call reached the bot; prompts carry the redacted snapshot.
+    assert sink.tools == [("room_mode", {"room": "family-acc", "mode": "silent"})]
+    assert len(sink.prompts) == 3
+    assert "도구: room_mode" in sink.prompts[0] and "room=family-acc mode=silent" in sink.prompts[0]
+    assert "인수: room=old" in sink.prompts[2]
+    # Audit ledger: asked/answered pairs for all three.
+    ledger_dir = Path(bot._settings.bot_data_dir) / "approval-audit"
+    rows = []
+    for f in sorted(ledger_dir.glob("*.jsonl")):
+        rows += [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+    assert [r["event"] for r in rows] == ["asked", "answered"] * 3
+    assert [r.get("decision") for r in rows if r["event"] == "answered"] == [
+        "allow",
+        "deny",
+        "timeout",
+    ]
+    assert all(r["action"] == "tool_use" for r in rows)
+
+
+async def test_steward_approve_all_asks_for_read_only_too(tmp_path: Path) -> None:
+    bot = _bot(tmp_path, steward_tools_approve_all=True)
+    sink = _ApprovingSink(["allow"])
+    bot._active_sink = sink
+    assert (await bot._steward_call("room_status", {}))["ok"] is True
+    assert len(sink.prompts) == 1
+
+
+async def test_run_turn_tracks_identity_for_the_audit(tmp_path: Path) -> None:
+    bot = _bot(tmp_path)
+    seen: dict[str, Any] = {}
+
+    async def fake_super(job: Any, *, sink: Any, session_id: Any, room_kind: str) -> Any:
+        seen["identity"] = bot._steward_identity
+        return TurnResult(text="ok", session_id=None)
+
+    import telegram_bot.core.matrix.bot as matrix_bot_module
+
+    original = matrix_bot_module.MatrixBot.run_turn
+    matrix_bot_module.MatrixBot.run_turn = lambda self, job, *, sink, session_id, room_kind: (
+        fake_super(job, sink=sink, session_id=session_id, room_kind=room_kind)
+    )
+    try:
+        job = {"event_id": "t-1", "room_id": "agent", "sender": "@owner:hande", "body": "hi"}
+        await bot.run_turn(job, sink=object(), session_id=None, room_kind="direct")
+    finally:
+        matrix_bot_module.MatrixBot.run_turn = original
+    assert seen["identity"] is not None and bot._steward_identity is None
 
 
 # -- process_message passthrough -----------------------------------------------------
