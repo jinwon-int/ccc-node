@@ -57,7 +57,7 @@ is_matrix_process() {
   [ -r "$env_file" ] || return 1
   while IFS= read -r -d '' arg; do
     case "$arg" in
-      CCC_CHANNEL=matrix) return 0 ;;
+      CCC_CHANNEL=matrix|CCC_CHANNEL=hande) return 0 ;;  # own unit, own data dir (#2176, #2380)
       CCC_CHANNEL=*) return 1 ;;
     esac
   done 2>/dev/null < "$env_file"

@@ -312,6 +312,16 @@ ok "Termux fallback excludes the Matrix process" \
   'grep -q "^RUNTIME=/opt/ccc-node$" "$sel_out"'
 ok "fallback still completes" 'tail -1 "$sel_out" | grep -q "^PROBE_COMPLETE=1$"'
 
+# hande frontend (#2380): excluded like Matrix, by unit cgroup and by channel env.
+printf '0::/system.slice/ccc-hande-bridge.service\n' > "$sel/proc/100/cgroup"
+printf 'CCC_CHANNEL=hande\0BOT_DATA_DIR=/home/x/.ccc-hande\0' > "$sel/proc/100/environ"
+PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
+ok "probe skips the hande bridge by cgroup" 'grep -q "^RUNTIME=/opt/ccc-node$" "$sel_out"'
+printf '0::/\n' > "$sel/proc/100/cgroup"
+PATH="$sel/bin:$PATH" sh "$sel/probe.sh" > "$sel_out" 2>&1
+ok "Termux fallback excludes the hande process by env" 'grep -q "^RUNTIME=/opt/ccc-node$" "$sel_out"'
+ok "hande exclusion still completes" 'tail -1 "$sel_out" | grep -q "^PROBE_COMPLETE=1$"'
+
 # A single bridge must be unaffected by the new selection path.
 cat > "$sel/bin/ps" <<'PSEOF'
 #!/bin/sh

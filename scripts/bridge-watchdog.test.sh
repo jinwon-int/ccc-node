@@ -120,9 +120,9 @@ FAKE_LAST=""
 # A single process per stand-in: python3 keeps the marker in its own cmdline
 # (`bash -c 'sleep …'` forked a sleep that outlived the kill). The pid goes to
 # a global, not stdout, so the caller's FAKE_PIDS sees it (no subshell).
-spawn_fake() { # $1 = matrix | telegram ; sets FAKE_LAST
-  if [ "$1" = matrix ]; then
-    env CCC_CHANNEL=matrix python3 -c 'import time; time.sleep(300)' "$FAKE_MARK" >/dev/null 2>&1 &
+spawn_fake() { # $1 = matrix | hande | telegram ; sets FAKE_LAST
+  if [ "$1" = matrix ] || [ "$1" = hande ]; then
+    env CCC_CHANNEL="$1" python3 -c 'import time; time.sleep(300)' "$FAKE_MARK" >/dev/null 2>&1 &
   else
     env -u CCC_CHANNEL python3 -c 'import time; time.sleep(300)' "$FAKE_MARK" >/dev/null 2>&1 &
   fi
@@ -170,6 +170,14 @@ if [ -r "/proc/$$/environ" ] && command -v python3 >/dev/null 2>&1; then
   printf '%s' "$FAKE_LAST" > "$PID_FILE"; touch -d '2000-01-01 00:00:00' "$PID_FILE"
   okc "$(run_wd_match)" "bot.pid on matrix pid: exits 0"
   ok  "bot.pid on matrix pid: Telegram is judged down and restarted" '[ -f "$MARKER" ]'
+
+  # hande frontend (#2380) alive alone: same rule as Matrix -- not the Telegram bridge.
+  reap_fakes
+  stale_pidfile
+  spawn_fake hande; sleep 0.3
+  okc "$(run_wd_match)" "hande-only alive: exits 0"
+  ok  "hande-only alive: Telegram is judged down and restarted (#2380)" '[ -f "$MARKER" ]'
+  # (the hande stand-in stays alive for the next case, as the Matrix one used to)
 
   # Unreadable environ -> conservative telegram reading, never a false "down".
   stale_pidfile

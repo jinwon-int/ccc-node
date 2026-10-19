@@ -84,7 +84,19 @@ inbox is the duplicate guard (it re-offers the seq after marking it uncertain).
 Private memory audiences are namespaced by channel (`ProjectChatHandler.memory_route`),
 so `hande` starts with an empty private digest; shared memory is unchanged.
 
-## Deployment (per node, PR-3 will automate the checks)
+## Operations tooling awareness (PR-3)
+
+`start.sh` treats `CCC_CHANNEL=hande` like `matrix`: lifecycle actions from a hande
+provider shell (or `--channel hande`) are refused (exit 10), `--channel hande --status`
+renders that frontend's health, and `--channel telegram` drops the inherited
+`CCC_HANDE_*` settings. The Telegram watchdog and fleet-watch exclude hande processes
+(`CCC_CHANNEL=hande`, `ccc-hande-bridge.service` cgroup) from the Telegram match.
+Self-update's idle gate reads `~/.ccc-hande/health.json`
+(`CCC_SELF_UPDATE_HANDE_HEALTH_FILE`) when `ccc-hande-bridge` is in
+`~/.claude/self-update.services`. Doctor reads `.ccc-hande` session stores and distill
+journals. Add `hande` to `~/.claude/frontends` on nodes that run it.
+
+## Deployment (per node)
 
 1. `bridge/service-systemd-hande.service.example` → `/etc/systemd/system/ccc-hande-bridge.service`;
    optionally `bridge/ccc-hande-responder.socket.example` for socket activation.
@@ -107,4 +119,5 @@ Rollback: point the bot back at `native-responder.socket`, stop `ccc-hande-bridg
 | Progress lines / live preview | no `interim`/edit frame | family-messenger#423 (`interim_frames`) |
 | Attachments, voice | the bot drops `file-v1-*` messages before the responder | family-messenger#354 follow-up |
 | Steward room tools | MCP wiring lives in the Rust responder | out of scope for the bridge |
-| doctor / self-update idle gate / fleet-watch / Termux restart script | hardcoded to `telegram`/`matrix` | #2380 PR-3 |
+| Termux restart script (`termux-restart-frontends.sh`) | Matrix-only; Termux nodes are last in the rollout | #2380 follow-up |
+| doctor bridge-status probe for the hande unit | doctor reads `.ccc-hande` session/journal paths (PR-3) but has no hande-specific health verdict yet | #2380 follow-up |

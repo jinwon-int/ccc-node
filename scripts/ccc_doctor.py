@@ -533,8 +533,10 @@ _SNAPSHOT_REFUSAL_MAX_FILES = 500
 _SNAPSHOT_REFUSAL_JOURNALS = (
     (".telegram_bot/distill-journal", "telegram_bot"),
     (".ccc-matrix/distill-journal", "ccc-matrix"),
+    (".ccc-hande/distill-journal", "ccc-hande"),
     (".telegram_bot/danso-distill-journal", "telegram_bot/danso"),
     (".ccc-matrix/danso-distill-journal", "ccc-matrix/danso"),
+    (".ccc-hande/danso-distill-journal", "ccc-hande/danso"),
 )
 
 
@@ -2076,11 +2078,12 @@ class Doctor:
         )
 
     def _bridge_session_stores(self) -> list[Path]:
-        """Existing Telegram + Matrix ``sessions.json`` of the served bridge home."""
+        """Existing Telegram + Matrix + hande ``sessions.json`` of the served bridge home."""
         project = self._served_project_root()
         candidates = [
             project / ".telegram_bot" / "sessions.json",
             project / ".ccc-matrix" / "sessions.json",
+            project / ".ccc-hande" / "sessions.json",
         ]
         if os.environ.get("BOT_DATA_DIR"):
             # A doctor run from inside one frontend inherits only its data dir.

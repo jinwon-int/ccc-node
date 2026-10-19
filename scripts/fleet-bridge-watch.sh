@@ -246,9 +246,9 @@ if [ -n "$_bridge_candidates" ]; then
     _cand_cgroup=$(head -1 "/proc/$_cand_pid/cgroup" 2>/dev/null)
     # Termux has no systemd cgroup. Its Matrix frontend uses the same module;
     # exclude it by the process's exact channel setting before the fallback.
-    case "$_cand_cgroup" in */ccc-matrix-bridge.service) continue ;; esac
+    case "$_cand_cgroup" in */ccc-matrix-bridge.service|*/ccc-hande-bridge.service) continue ;; esac
     if { tr '\0' '\n' < "/proc/$_cand_pid/environ"; } 2>/dev/null |
-       grep -qx 'CCC_CHANNEL=matrix'; then
+       grep -qxE 'CCC_CHANNEL=(matrix|hande)'; then
       continue
     fi
     [ -n "$_first_telegram" ] || _first_telegram=$_cand

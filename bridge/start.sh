@@ -124,10 +124,10 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         --channel)
-            [ "$#" -ge 2 ] || { echo "--channel requires telegram or matrix" >&2; exit 2; }
+            [ "$#" -ge 2 ] || { echo "--channel requires telegram, matrix or hande" >&2; exit 2; }
             case "$2" in
-                telegram|matrix) REQUESTED_CHANNEL="$2" ;;
-                *) echo "--channel must be telegram or matrix (got '$2')" >&2; exit 2 ;;
+                telegram|matrix|hande) REQUESTED_CHANNEL="$2" ;;
+                *) echo "--channel must be telegram, matrix or hande (got '$2')" >&2; exit 2 ;;
             esac
             shift 2
             ;;
@@ -208,12 +208,12 @@ Options:
   --prepared-runtime <dir>  Use a sealed preparation job without installing dependencies
   --recovery-source <dir>   Previous bridge source for one opt-in recovery attempt
   --recovery-runtime <dir>  Previous preparation job (requires prepared --restart)
-  --channel <name>    Channel this command targets: telegram | matrix. Overrides
+  --channel <name>    Channel this command targets: telegram | matrix | hande. Overrides
                       an inherited CCC_CHANNEL and drops the other channel's
-                      SESSION_STORE_PATH / CCC_BOT_ENV_FILE / CCC_MATRIX_*.
+                      SESSION_STORE_PATH / CCC_BOT_ENV_FILE / CCC_MATRIX_* / CCC_HANDE_*.
                       start.sh manages only the Telegram bridge: start/stop/
-                      restart resolving to matrix (inherited or --channel
-                      matrix) exit 10; restart the Matrix service instead.
+                      restart resolving to matrix or hande (inherited or
+                      --channel <name>) exit 10; restart that service instead.
                       --status works for both. See #2177.
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
@@ -385,7 +385,7 @@ _ps_argv_is_project_bot() {
 # BOT_DATA_DIR; they share --path but are a different service.
 _this_bridge_channel() {
     case "${CCC_CHANNEL:-telegram}" in
-        matrix) printf '%s\n' matrix ;;
+        matrix|hande) printf '%s\n' "$CCC_CHANNEL" ;;
         *) printf '%s\n' telegram ;;
     esac
 }
@@ -396,7 +396,7 @@ _environ_bridge_channel() {
     local file="$1" arg
     while IFS= read -r -d '' arg; do
         case "$arg" in
-            CCC_CHANNEL=matrix) printf '%s\n' matrix; return 0 ;;
+            CCC_CHANNEL=matrix|CCC_CHANNEL=hande) printf '%s\n' "${arg#CCC_CHANNEL=}"; return 0 ;;
             CCC_CHANNEL=*) printf '%s\n' telegram; return 0 ;;
         esac
     done 2>/dev/null < "$file"
@@ -661,30 +661,31 @@ report_unmanaged_or_dead() {
 # own BOT_DATA_DIR, which only exists in its unit environment, so read it from
 # the live process found by the channel-aware find_project_bot_pids. Never fall
 # back to the Telegram file: an unknown data dir is reported as such.
-do_status_matrix() {
-    local live_pids pid count data_dir cwd provider
+do_status_frontend() { # <channel>  (matrix | hande; #2312, #2380)
+    local channel="$1" label live_pids pid count data_dir cwd provider
+    case "$channel" in hande) label=Hande ;; *) label=Matrix ;; esac
     live_pids="$(find_project_bot_pids | tr '\n' ' ' | sed 's/ $//')"
     count=0
     for pid in $live_pids; do count=$((count + 1)); done
     if [ "$count" -eq 0 ]; then
         echo "🔴 Bot status: unavailable"
-        print_component_status "Process" "dead" "no Matrix frontend for this --path"
+        print_component_status "Process" "dead" "no $label frontend for this --path"
         print_component_status "Service" "unavailable" "process not running"
-        print_component_status "Matrix" "unavailable" "process not running"
-        echo "💡 Matrix frontend:  systemctl status ccc-matrix-bridge  (Termux: sv status ccc-matrix-bridge)"
+        print_component_status "$label" "unavailable" "process not running"
+        echo "💡 $label frontend:  systemctl status ccc-$channel-bridge  (Termux: sv status ccc-$channel-bridge)"
         return 0
     fi
     if [ "$count" -gt 1 ]; then
         echo "🟡 Bot status: degraded"
-        print_component_status "Process" "alive" "multiple Matrix frontends: $live_pids"
-        print_component_status "Service" "degraded" "ambiguous Matrix frontend; inspect each unit"
+        print_component_status "Process" "alive" "multiple $label frontends: $live_pids"
+        print_component_status "Service" "degraded" "ambiguous $label frontend; inspect each unit"
         return 0
     fi
     pid="$live_pids"
     if ! data_dir="$(_environ_value "/proc/$pid/environ" BOT_DATA_DIR)" || [ -z "$data_dir" ]; then
         echo "🟡 Bot status: degraded"
         print_component_status "Process" "alive" "PID: $pid"
-        print_component_status "Service" "degraded" "Matrix data dir unknown (BOT_DATA_DIR not readable from the frontend environment)"
+        print_component_status "Service" "degraded" "$label data dir unknown (BOT_DATA_DIR not readable from the frontend environment)"
         return 0
     fi
     case "$data_dir" in
@@ -696,15 +697,16 @@ do_status_matrix() {
     esac
     provider="$(_environ_value "/proc/$pid/environ" CCC_AGENT_PROVIDER 2>/dev/null)" \
         || provider="$(configured_agent_provider)"
-    echo "📡 Channel: matrix (health: $data_dir/health.json)"
+    echo "📡 Channel: $channel (health: $data_dir/health.json)"
     render_status_from_health \
-        "$data_dir/health.json" "$pid" "$HEALTH_STALE_SECONDS" "$(printf '%s' "${provider:-claude}" | tr '[:upper:]' '[:lower:]')" "Matrix"
+        "$data_dir/health.json" "$pid" "$HEALTH_STALE_SECONDS" "$(printf '%s' "${provider:-claude}" | tr '[:upper:]' '[:lower:]')" "$label"
 }
 
 do_status() {
-    local pid
-    if [ "$(_this_bridge_channel)" = matrix ]; then
-        do_status_matrix
+    local pid channel
+    channel="$(_this_bridge_channel)"
+    if [ "$channel" != telegram ]; then
+        do_status_frontend "$channel"
         exit 0
     fi
     pid="$(read_pid)"
@@ -1801,31 +1803,33 @@ apply_requested_channel() {
     [ -n "$REQUESTED_CHANNEL" ] || return 0
     inherited="$(_this_bridge_channel)"
     if [ "$REQUESTED_CHANNEL" != "$inherited" ]; then
-        for var in $_CHANNEL_SCOPED_VARS ${!CCC_MATRIX_@}; do
+        for var in $_CHANNEL_SCOPED_VARS ${!CCC_MATRIX_@} ${!CCC_HANDE_@}; do
             unset "$var"
         done
         echo "🔀 Channel: inherited $inherited -> requested $REQUESTED_CHANNEL (dropped inherited channel settings)"
     fi
-    if [ "$REQUESTED_CHANNEL" = matrix ]; then
-        export CCC_CHANNEL=matrix
-    else
-        unset CCC_CHANNEL   # telegram is the default; the Telegram unit never sets it
-    fi
+    case "$REQUESTED_CHANNEL" in
+        matrix|hande) export CCC_CHANNEL="$REQUESTED_CHANNEL" ;;
+        *) unset CCC_CHANNEL ;;  # telegram is the default; the Telegram unit never sets it
+    esac
 }
 guard_inherited_channel() {
-    local source="inherited CCC_CHANNEL=matrix"
+    local channel source
     [ "$INTERNAL_RUN" -eq 0 ] || return 0
     case "$ACTION" in run|stop|restart) ;; *) return 0 ;; esac
-    [ "$(_this_bridge_channel)" = matrix ] || return 0
-    [ "$REQUESTED_CHANNEL" = matrix ] && source="--channel matrix"
+    channel="$(_this_bridge_channel)"
+    [ "$channel" != telegram ] || return 0
+    source="inherited CCC_CHANNEL=$channel"
+    [ "$REQUESTED_CHANNEL" = "$channel" ] && source="--channel $channel"
     # start.sh's state is Telegram's whatever the channel (BOT_DATA_DIR is
     # always <path>/.telegram_bot: pid, supervisor and token-lock files), so
-    # acting "as matrix" would stop or shadow the Telegram bridge as well.
-    echo "❌ Refused: action=$ACTION target-channel=matrix ($source)."
-    echo "   start.sh manages only the Telegram bridge; the Matrix frontend runs under its own"
-    echo "   service. A provider shell of the Matrix bridge inherits CCC_CHANNEL=matrix."
+    # acting "as $channel" would stop or shadow the Telegram bridge as well.
+    # The same holds for the hande frontend (#2380): its own unit, its own data dir.
+    echo "❌ Refused: action=$ACTION target-channel=$channel ($source)."
+    echo "   start.sh manages only the Telegram bridge; the $channel frontend runs under its own"
+    echo "   service. A provider shell of the $channel bridge inherits CCC_CHANNEL=$channel."
     echo "💡 Telegram bridge:  $0 --path \"$PROJECT_ROOT\" --$( [ "$ACTION" = run ] && echo daemon || echo "$ACTION" ) --channel telegram"
-    echo "   Matrix frontend:  systemctl restart ccc-matrix-bridge  (Termux: sv restart ccc-matrix-bridge)"
+    echo "   $channel frontend:  systemctl restart ccc-$channel-bridge  (Termux: sv restart ccc-$channel-bridge)"
     exit 10
 }
 apply_requested_channel
