@@ -27,11 +27,11 @@ def anyio_backend() -> str:
 
 def _config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
-        "account": "@soonwook:hande",
+        "account": "@node-a:hande",
         "owner": "@owner:hande",
         "rooms": ["agent", "fleet"],
         "family_rooms": ["fleet"],
-        "family_users": ["@jungin:hande"],
+        "family_users": ["@kid:hande"],
         "approval_timeout_s": 120,
         "interim_frames": False,
         "notice_frames": False,
@@ -195,7 +195,7 @@ async def test_room_field_selects_family_room_kind(tmp_path: Path) -> None:
     served = await _serve(tmp_path)
     try:
         bot = await FakeBot.connect(served.path)
-        await bot.send(bot.turn("t-2", "hi", sender="@jungin-iphone-1b89e3:hande", room="fleet"))
+        await bot.send(bot.turn("t-2", "hi", sender="@kid-iphone-1b89e3:hande", room="fleet"))
         await bot.recv_kind("result")
         assert served.runner.jobs[0]["room_id"] == "fleet"
         assert served.runner.kinds == ["family"]
@@ -417,11 +417,11 @@ async def test_notice_is_dropped_and_counted_until_the_bot_speaks_it(tmp_path: P
     try:
         bot = await FakeBot.connect(served.path)
         await _connected(served)
-        served.transport.enqueue_notice("fleet", "[alert:soonwook] disk 91%")
+        served.transport.enqueue_notice("fleet", "[alert:node-a] disk 91%")
         assert await bot.recv() == {
             "type": "notice",
             "room": "fleet",
-            "text": "[alert:soonwook] disk 91%",
+            "text": "[alert:node-a] disk 91%",
         }
         await bot.send(bot.turn("t-16", "go"))
         assert await bot.recv_kind("interim") == {

@@ -19,11 +19,11 @@ from telegram_bot.utils.channel_environment import CHANNEL_SELECTION_KEYS, witho
 
 def _config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
-        "account": "@soonwook:hande",
+        "account": "@node-a:hande",
         "owner": "@owner:hande",
         "rooms": ["agent"],
         "family_rooms": [],
-        "family_users": ["@jungin:hande"],
+        "family_users": ["@kid:hande"],
         "socket_path": "/run/ccc-hande/responder.sock",
     }
     config.update(overrides)
@@ -65,8 +65,8 @@ def _settings(tmp_path: Path, **overrides: Any) -> SimpleNamespace:
 def test_identity_folding_matches_the_bot_actor_rule() -> None:
     assert state.actor_of_device("owner-iphone-27a879") == "owner"
     assert state.sender_identity("@owner-pc:hande") == "@owner:hande"
-    assert state.sender_identity("@jungin-iphone-1b89e3:hande") == "@jungin:hande"
-    assert state.sender_identity("@gongmyoung:hande") == "@gongmyoung:hande"
+    assert state.sender_identity("@kid-iphone-1b89e3:hande") == "@kid:hande"
+    assert state.sender_identity("@agentnode:hande") == "@agentnode:hande"
     assert state.sender_identity("@owner-pc:matrix.example") is None
     assert state.sender_identity("owner-pc") is None
     assert state.sender_identity("@bad actor:hande") is None
@@ -77,13 +77,13 @@ def test_validate_config_defaults_and_normalisation() -> None:
     assert config["approval_timeout_s"] == 120
     assert config["socket_mode"] == 0o660
     assert config["interim_frames"] is False and config["notice_frames"] is False
-    assert config["family_users"] == ["@jungin:hande"]
+    assert config["family_users"] == ["@kid:hande"]
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"account": "soonwook"},
+        {"account": "node-a"},
         {"owner": "@owner:matrix.example"},
         {"rooms": []},
         {"rooms": ["agent", "agent"]},
@@ -123,7 +123,7 @@ def test_hande_bot_is_a_matrix_bot_with_hande_config(tmp_path: Path) -> None:
     assert isinstance(bot, MatrixBot)
     assert bot.config_path() == tmp_path / "hande.json"
     config = bot.load_config()
-    assert config["account"] == "@soonwook:hande"
+    assert config["account"] == "@node-a:hande"
     assert bot.load_config() is config  # cached
     bot.validate_runtime_paths()
     # Owner + family resolve through the same id map MatrixBot uses.

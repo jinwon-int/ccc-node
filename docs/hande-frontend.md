@@ -54,7 +54,7 @@ inbox is the duplicate guard (it re-offers the seq after marking it uncertain).
 
 ```json
 {
-  "account": "@soonwook:hande",
+  "account": "@node-a:hande",
   "owner": "@owner:hande",
   "rooms": ["agent"],
   "family_rooms": [],
