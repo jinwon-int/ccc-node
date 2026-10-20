@@ -194,7 +194,8 @@ Matrix rows):
 ### Recipe: 15-minute change watch on the watcher node
 
 Use one state file per task, and do not share it between tasks. Use
-`telegram-owner-on-failure` and do **not** set `--success-exit-codes 0,1`: in
+`owner-on-failure` (alias `telegram-owner-on-failure`) and do **not** set
+`--success-exit-codes 0,1`: in
 change mode exit 1 means "a person needs to look". Every nonzero exit already
 pages, so turn the consecutive-failure alarm off for this task. The example is
 for the watcher node that already runs `adapter-fleet-watch`, with its checkout
@@ -206,7 +207,7 @@ This is an example only. Adding it is an operator decision.
   --name "fleet bridge watch (15 min, change alerts)" \
   --prompt "Fleet bridge health every 15 minutes; pages only on NEW/STILL/RECOVERED (#2086)" \
   --schedule '*/15 * * * *' --timezone Asia/Seoul \
-  --notify telegram-owner-on-failure --catch-up-policy skip \
+  --notify owner-on-failure --catch-up-policy skip \
   --failure-alert-after 0 --timeout-sec 840 \
   --argv bash --argv /root/ccc-node/scripts/fleet-bridge-watch.sh \
   --argv --light --argv --state-file \

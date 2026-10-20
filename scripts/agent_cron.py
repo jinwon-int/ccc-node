@@ -10,7 +10,7 @@ import shlex as _shlex
 import sys as _sys
 from pathlib import Path as _Path
 
-_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add [--at ISO8601] <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|telegram-owner|telegram-owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--failure-alert-after N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=telegram-owner, appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure (a prompt task's\n  auth_failed/cli_missing skips the retry and alerts at once), clears retryState on success, and releases the lock in all normal failure/success\n  paths. Failed runs get a bounded failureClass\n  (auth_failed|cli_missing|timeout|other) in failure-alarm.json next to the\n  store (never in tasks.json); after N consecutive failures (failureAlertAfter,\n  default 3, 0 disables) one owner alarm is spooled regardless of notify;\n  a failing prompt run with no prompt success for more than 7 days (CCC_AGENT_CRON_PROMPT_STALE_DAYS,\n  0 disables) spools one node stale alarm per stale stretch. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
+_USAGE = "Usage: agent-cron.sh [list|validate|status] [--store PATH] [--json]\n       agent-cron.sh add [--at ISO8601] <task-id> --schedule EXPR --prompt TEXT [--name N] [--timezone IANA] [--notify none|owner|owner-on-failure|telegram-chat|telegram-chat-on-failure] [--notify-chat-id ID] [--allowed-tools a,b] [--success-exit-codes 0,1] [--permission-mode M] [--catch-up-policy P] [--max-catchup N] [--lock-timeout-sec N] [--anchor-at ISO] [--not-before ISO] [--max-runs N] [--failure-alert-after N] [--keep-after-run] [--disabled] [--argv WORD ...] [--cwd DIR] [--model M] [--timeout-sec N] [--output-max-bytes N] [--json]\n       agent-cron.sh edit <task-id> [same flags as add; set-only partial update] [--json]\n       agent-cron.sh remove|enable|disable <task-id> [--json]\n       agent-cron.sh due [--store PATH] [--at ISO8601] [--json]\n       agent-cron.sh lock <task-id> --action acquire|release|probe --run-id ID [--scheduled-at ISO8601] [--at ISO8601] [--json]\n       agent-cron.sh run <task-id> --dry-run [--at ISO8601] [--json]\n       agent-cron.sh scheduler --dry-run|--execute [--at ISO8601] [--max-runs N] [--json]\n\nImplemented slices:\n- list/validate: inspect and validate the task definition store.\n- due: read-only dry-run schedule resolver. It reports due tasks, missed windows,\n  catch-up policy, retryEligibleAt state, and lock paths, but never executes\n  prompts or writes state.\n- lock: local atomic task-lock acquire/release/probe primitives only. It writes\n  lock files under the task store's sibling locks/ directory, but never executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- run --dry-run: read-only execution-plan preview. It combines due, lock probe,\n  task policy, and headless command metadata, but never acquires locks, executes\n  prompts, sends notifications, installs schedulers, or updates task history.\n- scheduler --dry-run: read-only single-tick scheduler plan. It reports which\n  tasks would run or skip, including retry-due tasks, but never installs timers,\n  acquires locks, executes prompts, writes task state, or sends notifications.\n- scheduler --execute: explicit one-shot scheduler executor for approved live/systemd\n  use. It runs at most --max-runs due/retry-due tasks through the existing run path;\n  it never installs timers or edits crontab/systemd.\n- run: explicit manual execution for due enabled tasks. It acquires the task lock,\n  invokes ccc-headless, records lastRunAt/lastStatus/lastRunId, writes a\n  redacted owner-only bridge spool entry when notify=owner (alias: telegram-owner), appends a\n  bounded runHistory entry, records retryState/retryEligibleAt on failure (a prompt task's\n  auth_failed/cli_missing skips the retry and alerts at once), clears retryState on success, and releases the lock in all normal failure/success\n  paths. Failed runs get a bounded failureClass\n  (auth_failed|cli_missing|timeout|other) in failure-alarm.json next to the\n  store (never in tasks.json); after N consecutive failures (failureAlertAfter,\n  default 3, 0 disables) one owner alarm is spooled regardless of notify;\n  a failing prompt run with no prompt success for more than 7 days (CCC_AGENT_CRON_PROMPT_STALE_DAYS,\n  0 disables) spools one node stale alarm per stale stretch. It still does not call Telegram\n  or provider APIs, install schedulers, mutate crontab/systemd, or touch remotes.\n\nNo direct Telegram/API send, scheduler bootstrap, systemd/crontab writes,\nprovider sends, or remote-node actions are performed by agent-cron itself.\n"
 
 
 def _die(message, code=2):
@@ -942,7 +942,8 @@ def run_dry_plan(data):
             'runLimit': run_limit_metadata(task),
             'notification': {
                 'policy': notify,
-                'delivery': 'preview-only' if notify == 'telegram-owner' else 'none',
+                'canonicalPolicy': canonical_notify(notify),
+                'delivery': 'preview-only' if canonical_notify(notify) == 'owner' else 'none',
                 'redactProfile': task.get('redactProfile', 'default'),
                 'send': False,
             },
@@ -1365,6 +1366,7 @@ def notification_base(task):
     notify = task.get('notify', 'none')
     return {
         'policy': notify,
+        'canonicalPolicy': canonical_notify(notify),
         'send': False,
         'delivery': 'none' if notify == 'none' else 'not-attempted',
         'redactProfile': task.get('redactProfile', 'default'),
@@ -1554,17 +1556,34 @@ def notify_allowed_chats():
     return {part for part in re.split(r'[,\s]+', raw.strip()) if part}
 
 
-OWNER_NOTIFY = ('telegram-owner', 'telegram-owner-on-failure')
+# #2426: owner notification is channel-neutral. agent-cron never talks to
+# Telegram itself; it writes a spool record that whichever bridge is active on
+# the node (Telegram, or Matrix via the fleet relay) delivers to the owner. The
+# canonical names are therefore `owner` / `owner-on-failure`; the historical
+# `telegram-owner*` spellings stay accepted as aliases so no stored task has to
+# be rewritten. Stored values are never mutated — normalization happens on read.
+NOTIFY_ALIASES = {
+    'telegram-owner': 'owner',
+    'telegram-owner-on-failure': 'owner-on-failure',
+}
+OWNER_NOTIFY = ('owner', 'owner-on-failure') + tuple(NOTIFY_ALIASES)
 CHAT_NOTIFY = ('telegram-chat', 'telegram-chat-on-failure')
+ON_FAILURE_NOTIFY = ('owner-on-failure', 'telegram-chat-on-failure')
+
+
+def canonical_notify(value):
+    """Map a stored notify policy to its canonical name (aliases -> canonical)."""
+    notify = value or 'none'
+    return NOTIFY_ALIASES.get(notify, notify)
 
 
 # ccc-side-effect: agent_cron.spool_notify
 def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at):
     base = notification_base(task)
-    notify = task.get('notify', 'none')
+    notify = canonical_notify(task.get('notify', 'none'))
     if notify not in OWNER_NOTIFY + CHAT_NOTIFY:
         return base
-    if notify in ('telegram-owner-on-failure', 'telegram-chat-on-failure') and status == 'success':
+    if notify in ON_FAILURE_NOTIFY and status == 'success':
         return {**base, 'delivery': 'skipped-success'}
     recipient = 'owner'
     chat_id = None

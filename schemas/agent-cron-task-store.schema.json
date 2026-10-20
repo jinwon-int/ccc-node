@@ -38,7 +38,7 @@
             "uniqueItems": true
           },
           "permissionMode": { "enum": ["default", "dontAsk", "acceptEdits"] },
-          "notify": { "enum": ["none", "telegram-owner", "telegram-owner-on-failure", "telegram-chat", "telegram-chat-on-failure"], "default": "none" },
+          "notify": { "enum": ["none", "owner", "owner-on-failure", "telegram-owner", "telegram-owner-on-failure", "telegram-chat", "telegram-chat-on-failure"], "default": "none" },
           "notifyChatId": { "type": "string", "pattern": "^(-?[0-9]{1,32}|@[A-Za-z][A-Za-z0-9_]{3,31})$", "maxLength": 64 },
           "attachMemory": { "type": "array", "items": { "type": "string" }, "default": [] },
           "attachSkills": { "type": "array", "items": { "type": "string" }, "default": [] },
