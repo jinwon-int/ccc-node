@@ -345,3 +345,122 @@ def test_timeout_invariant_is_rejected_during_settings_load(tmp_path: Path):
             },
             bot_env_file=tmp_path / "missing-package.env",
         )
+
+
+_CHANNEL_TOKEN_PROBE = r"""
+import json
+import os
+from pathlib import Path
+from pydantic import ValidationError
+from telegram_bot.utils.config import Settings
+
+environ = {"HOME": os.environ["HOME"], **json.loads(os.environ["PROBE_PROCESS_VALUES"])}
+try:
+    settings = Settings.load(
+        project_root=Path(os.environ["PROBE_PROJECT_ROOT"]),
+        environ=environ,
+        bot_env_file=Path(os.environ["PROBE_FALLBACK_ENV"]),
+    )
+except ValidationError as exc:
+    print(json.dumps({"error": str(exc)}))
+else:
+    print(json.dumps({"channel": settings.channel, "token": settings.telegram_bot_token}))
+"""
+
+
+def _load_channel_settings(
+    tmp_path: Path,
+    process_values: dict[str, str],
+    *,
+    project_env: str = "",
+    fallback_env: str = "",
+) -> dict:
+    project_root = tmp_path / "project"
+    env_file = project_root / ".telegram_bot" / ".env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text(project_env, encoding="utf-8")
+    fallback = tmp_path / "package.env"
+    fallback.write_text(fallback_env, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-c", _CHANNEL_TOKEN_PROBE],
+        cwd=tmp_path,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(PYTHONPATH_SHIM),
+            "PROBE_PROJECT_ROOT": str(project_root),
+            "PROBE_PROCESS_VALUES": json.dumps(process_values),
+            "PROBE_FALLBACK_ENV": str(fallback),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+_FRONTEND_CHANNELS = {
+    "matrix": {"CCC_CHANNEL": "matrix", "CCC_MATRIX_CONFIG_PATH": "/nonexistent/matrix.json"},
+    "hande": {"CCC_CHANNEL": "hande", "CCC_HANDE_CONFIG_PATH": "/nonexistent/hande.json"},
+}
+
+
+@pytest.mark.parametrize("channel", sorted(_FRONTEND_CHANNELS))
+def test_non_telegram_channel_loads_without_token(tmp_path: Path, channel: str):
+    # #2411: Matrix/hande never talk to the Bot API, so a node that retired
+    # its Telegram bridge may delete TELEGRAM_BOT_TOKEN from every env file.
+    assert _load_channel_settings(tmp_path, _FRONTEND_CHANNELS[channel]) == {
+        "channel": channel,
+        "token": None,
+    }
+
+
+@pytest.mark.parametrize("placeholder", ["your_bot_token_here", "", "   "])
+@pytest.mark.parametrize("channel", sorted(_FRONTEND_CHANNELS))
+def test_non_telegram_channel_treats_placeholder_token_as_absent(
+    tmp_path: Path, channel: str, placeholder: str
+):
+    process_values = {**_FRONTEND_CHANNELS[channel], "TELEGRAM_BOT_TOKEN": placeholder}
+    loaded = _load_channel_settings(
+        tmp_path,
+        process_values,
+        project_env=f"TELEGRAM_BOT_TOKEN={placeholder}\n",
+    )
+    assert loaded == {"channel": channel, "token": None}
+
+
+def test_non_telegram_channel_keeps_a_configured_token(tmp_path: Path):
+    # The Grok-on-Matrix route still binds its journal to the token's bot id.
+    loaded = _load_channel_settings(
+        tmp_path, _FRONTEND_CHANNELS["matrix"], fallback_env="TELEGRAM_BOT_TOKEN= 123456:fallback \n"
+    )
+    assert loaded == {"channel": "matrix", "token": "123456:fallback"}
+
+
+@pytest.mark.parametrize(
+    ("process_values", "project_env"),
+    [
+        ({}, ""),
+        ({"CCC_CHANNEL": "telegram"}, ""),
+        # Blank selection resolves the default channel (#2177).
+        ({"CCC_CHANNEL": ""}, ""),
+        ({}, "TELEGRAM_BOT_TOKEN=your_bot_token_here\n"),
+        ({"TELEGRAM_BOT_TOKEN": "  "}, ""),
+    ],
+)
+def test_telegram_channel_still_requires_token(
+    tmp_path: Path, process_values: dict[str, str], project_env: str
+):
+    loaded = _load_channel_settings(tmp_path, process_values, project_env=project_env)
+    assert "TELEGRAM_BOT_TOKEN is not configured" in loaded["error"]
+
+
+@pytest.mark.parametrize("process_values", [{}, {"CCC_CHANNEL": "telegram"}])
+def test_telegram_channel_loads_with_token(tmp_path: Path, process_values: dict[str, str]):
+    loaded = _load_channel_settings(
+        tmp_path, process_values, project_env="TELEGRAM_BOT_TOKEN=123456:project\n"
+    )
+    assert loaded == {"channel": "telegram", "token": "123456:project"}

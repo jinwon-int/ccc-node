@@ -577,17 +577,33 @@ class Config(
     # here: PTB's own network_retry_loop handles polling retries
     # (bot_lifecycle), and the three legacy fields that used to sit next to
     # the token were read by nothing.
-    telegram_bot_token: str = Field(..., description="Telegram Bot API Token")
+    # Required only for CCC_CHANNEL=telegram (validate_bot_token_for_channel):
+    # the Matrix and hande frontends never talk to the Telegram Bot API, so a
+    # node that retired its Telegram bridge can drop the token (#2411).
+    telegram_bot_token: Optional[str] = Field(
+        default=None,
+        description="Telegram Bot API Token (required for CCC_CHANNEL=telegram)",
+    )
 
     @field_validator("telegram_bot_token", mode="before")
     @classmethod
     def validate_bot_token(cls, v):
-        if not v or v.strip() in _PLACEHOLDER_TOKENS:
+        # Blank and placeholder values mean "not configured"; whether that is
+        # an error depends on the channel, decided once all fields are set.
+        if isinstance(v, str):
+            v = v.strip()
+        if not v or v in _PLACEHOLDER_TOKENS:
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def validate_bot_token_for_channel(self):
+        if self.channel == "telegram" and self.telegram_bot_token is None:
             raise ValueError(
                 "TELEGRAM_BOT_TOKEN is not configured. "
                 "Set it in the project .env or bot source .env file."
             )
-        return v.strip()
+        return self
 
     @field_validator("codex_cli_path", "piri_cli_path", mode="before")
     @classmethod

@@ -249,6 +249,25 @@ class VoiceHandlerHelperTests(unittest.IsolatedAsyncioTestCase):
             "https://api.telegram.org/file/bottest-token/voice/file_10.oga",
         )
 
+    async def test_build_telegram_file_url_refuses_missing_token(self):
+        # #2411: a token-less config must fail clearly, never build "botNone".
+        settings = SimpleNamespace(**{**vars(config_module.config), "telegram_bot_token": None})
+        bot = _make_bot(
+            settings=settings,
+            session_manager=session_module.session_manager,
+            project_chat=project_chat_module.project_chat_handler,
+        )
+        bot.application = SimpleNamespace(
+            bot=SimpleNamespace(
+                get_file=AsyncMock(
+                    return_value=SimpleNamespace(file_path="voice/file_10.oga")
+                )
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "TELEGRAM_BOT_TOKEN is not configured"):
+            await bot._build_telegram_file_url("voice-file-id")
+
     async def test_build_telegram_file_url_supports_absolute_url(self):
         bot = _make_bot(
             settings=config_module.config,
