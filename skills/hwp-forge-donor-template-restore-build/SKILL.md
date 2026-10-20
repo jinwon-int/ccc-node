@@ -70,8 +70,41 @@ python3 tools/verify_hwp.py 출력.hwpx \
 - ✅ 개정으로 **추가된** 문구가 존재
 - ✅ 개정으로 **제거된** 문구가 부재(요구 문구만 확인하면 반쪽 검증)
 - ✅ 표 행×열·병합 기대치 일치
-- ✅ `--render-dir` PNG 육안 검수 — 서식 어긋남은 텍스트 대조로 안 잡힌다
+- ✅ `--render-dir` 렌더 육안 검수 — 서식 어긋남은 텍스트 대조로 안 잡힌다.
+  단, 원본 PNG를 그대로 Read하지 말고 아래 **렌더 미리보기 규칙**의 축소본으로 본다
 - ✅ 검증 통과 후에만 임시 파일 → 최종 파일명 교체
+
+## 렌더 미리보기 규칙 (컨텍스트 비용, #2262)
+
+14일 실측에서 2만 자 초과 도구 출력의 대부분이 `--render-dir` 원본 PNG(794×1123)
+Read였고, 같은 `page_06.png`를 개정판마다 다시 읽었다. 이미지 토큰은 글자 수가 아니라
+해상도로 매겨지므로 절감폭은 아직 측정 중이다(`python3 ~/.claude/hooks/ccc-context-stats.py`
+로 전후 비교). 세션 jsonl 크기·distill 입력에는 바로 줄어든다.
+
+1. **레이아웃 확인은 폭 ≤ 600px 또는 JPEG q≈70.** 원본 PNG는 두고 축소본만 Read한다:
+   ```bash
+   # ImageMagick: --render-dir 의 PNG → preview/*.jpg (폭 600, q70)
+   mkdir -p /tmp/render/preview
+   mogrify -path /tmp/render/preview -resize '600x>' -format jpg -quality 70 /tmp/render/*.png
+   # PDF로 렌더할 때는 처음부터 작게: 6쪽만, 폭 600, JPEG q70
+   pdftoppm -f 6 -l 6 -scale-to-x 600 -scale-to-y -1 -jpeg -jpegopt quality=70 출력.pdf /tmp/render/p
+   ```
+   ImageMagick이 없으면 PIL: `im.thumbnail((600, 10000)); im.convert("RGB").save(out, quality=70)`.
+2. **수정 후에는 바뀐 페이지만 다시 읽는다.** 이전 렌더와 해시/픽셀이 같은 페이지는 건너뛴다:
+   ```bash
+   for p in /tmp/render-v2/*.png; do
+     cmp -s "$p" "/tmp/render-v1/${p##*/}" || echo "changed: ${p##*/}"
+   done
+   ```
+3. **버전 비교는 두 장을 읽지 말고 diff 이미지 1장.** 바뀐 픽셀 수가 0이면 아예 읽지 않는다:
+   ```bash
+   compare -metric AE -fuzz 2% /tmp/render-v1/page_06.png /tmp/render-v2/page_06.png \
+     /tmp/render/diff_06.png 2>&1; echo   # 출력 = 바뀐 픽셀 수
+   mogrify -resize '600x>' -quality 70 -format jpg /tmp/render/diff_06.png   # 이 축소본 1장만 Read
+   ```
+   PIL: `ImageChops.difference(a, b).getbbox()` — `None`이면 동일, 아니면 그 영역만 잘라 축소해 본다.
+4. **텍스트 확인이 목적이면 이미지 대신 텍스트.** 문구 존재/부재는 `verify_hwp.py --require`
+   가 이미 확인하고, PDF는 `pdftotext -layout -f 6 -l 6 출력.pdf - | grep -n '핵심문구'`로 본다.
 
 ## 안전
 

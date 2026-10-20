@@ -50,6 +50,10 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - green & mergeable → `gh pr merge <n> --repo <r> --squash --delete-branch`
 - main 직접 푸시 금지(브랜치 먼저); 커밋에 `Co-Authored-By` trailer
 
+## 문서 렌더 미리보기 (#2262 — 렌더 PNG Read가 대형 도구출력의 주원인, 절감폭은 측정 중)
+- 레이아웃 확인은 폭 ≤600px·JPEG q70(`pdftoppm -scale-to-x 600 -scale-to-y -1 -jpeg -jpegopt quality=70`), 수정 후엔 바뀐 페이지만, 버전 비교는 diff 이미지 1장(`compare`), 텍스트 확인은 `pdftotext`.
+- 측정: `python3 ~/.claude/hooks/ccc-context-stats.py --one-line`
+
 ## 진행상태 체크포인트 (멀티세션/장기 작업)
 - `$HOME/.claude/state/working-state.md`를 **목표 / 진행 / 다음 단계**로 갱신 유지
 - 이 파일은 PreCompact에서 스냅샷되고 PostCompact에서 자동 재주입됨

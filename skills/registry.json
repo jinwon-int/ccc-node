@@ -307,7 +307,7 @@
       "name": "hwp-forge-donor-template-restore-build",
       "source": "skills/hwp-forge-donor-template-restore-build",
       "status": "active",
-      "tree_sha256": "7871592f953aa4faf517f261e336edf5dd9598412304c888be0077658cab07df"
+      "tree_sha256": "9c748d23a14ef5c1e3a9ca47d15024598a3cdc136181538fd5abd8f7a6ec57ef"
     },
     {
       "audience": "shared",
