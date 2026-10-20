@@ -3,7 +3,7 @@
 
 A ``/login`` session whose refresh fails leaves ``~/.claude/.credentials.json``
 with empty tokens and ``expiresAt=0``; every Claude call then fails while every
-unit stays ``active`` (gwakga 10-17, sogyo 10-19, daegyo 10-20). These tests pin
+unit stays ``active`` (three nodes, 2026-10-17..20). These tests pin
 the verdicts against fixture credential files in a temp ``.claude`` dir — no
 real login, CLI or provider is touched — and pin that no token value ever
 reaches a rendered row.
@@ -69,7 +69,7 @@ class HostCredentialsCheck(unittest.TestCase):
     # --- the #2397 incident shape -------------------------------------------
 
     def test_wiped_login_is_manual(self) -> None:
-        # Exact shape left on gwakga/sogyo/daegyo: both tokens "", expiresAt 0.
+        # Exact shape left on the three incident nodes: both tokens "", expiresAt 0.
         self.login(first="", second="", expires_ms=0)
         row = self.run_check()
         self.assertEqual(row.klass, "수동필요")

@@ -1165,8 +1165,8 @@ class Doctor:
         and ``refreshToken`` and ``expiresAt=0``. From then on every bridge
         turn, ``claude -p`` cron and distill call fails with ``OAuth session
         expired and could not be refreshed`` while every unit stays ``active``
-        — gwakga (2026-10-17), sogyo (10-19) and daegyo (10-20) each sat
-        broken until the owner's next message. Long-lived ``claude setup-token``
+        — three nodes in four days (2026-10-17..20) each sat broken until
+        the owner's next message. Long-lived ``claude setup-token``
         tokens (no refresh token, 1-year ``expiresAt``) are the recovery, and
         they expire silently a year later (Wiki TM-3899).
 
