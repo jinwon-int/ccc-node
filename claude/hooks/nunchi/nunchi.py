@@ -1782,12 +1782,108 @@ def _constraint_key(text):
     return " ".join(str(text or "").lower().split())[:40]
 
 
+# #2384 — second-stage fold for the assembled constraint block. The 40-char
+# prefix key misses re-extractions that drift EARLY in the sentence (a
+# particle, quote style, an inserted adverb, a "Wiki" qualifier), so one rule
+# still reached SessionStart as several lines, each with its own `(+N 유사)`
+# tail. Threshold measured on a real node's open constraints (62 prefix
+# groups) plus the assemble fixtures: leader-to-member Jaccard of the three
+# re-extracted rules there was >= 0.50, distinct rules sharing an opening
+# ("근거에 없는 내용은 지어내지 말고 …") stayed <= 0.42.
+CONSTRAINT_FOLD_JACCARD_DEFAULT = 0.46
+# A candidate is compared with at most this many cluster leaders, bounding the
+# stage at O(rows x cap). The default 12 KB budget renders well under 200
+# lines, so every leader that can reach the snapshot is comparable.
+_CONSTRAINT_FOLD_MAX_LEADERS = 400
+_HANGUL_RUN = re.compile(r"[가-힣]+")
+# Parenthetical asides in extracted rules are mostly provenance/emphasis
+# notes ("(사용자 반복 강조, CLAUDE.md 지시)", "(반복 강조)") that differ per
+# extraction and outweigh the rule itself on short sentences.
+_PAREN_NOTE = re.compile(r"\([^()]*\)")
+
+
+def _constraint_fold_jaccard():
+    """CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD in [0, 1] (#2384); 0 disables the
+    Jaccard stage (prefix fold only, pre-#2384); anything else → default."""
+    raw = os.environ.get("CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return CONSTRAINT_FOLD_JACCARD_DEFAULT
+    return value if 0.0 <= value <= 1.0 else CONSTRAINT_FOLD_JACCARD_DEFAULT
+
+
+def _fold_tokens(text):
+    """Token set for the snapshot fold (#2384).
+
+    Parenthetical notes are dropped, then the constraints-triage tokens
+    (#2222: lowercased, punctuation/quotes stripped, one trailing particle
+    removed) are reduced to a light stem: each Hangul run keeps its first two
+    syllables, Latin/digit runs stay whole words. Korean content words are
+    mostly two-syllable stems followed by endings that drift between
+    re-extractions ("표기할"/"표기해야", "명시하라"/"명시할"); whole-word
+    tokens count those as different words and character bigrams over the
+    endings add noise to the union — on real re-extractions both kept
+    variants of one rule below any threshold that separated distinct rules.
+    Similarity only: the rendered line keeps the full text."""
+    out = set()
+    for word in _triage_tokens(_PAREN_NOTE.sub(" ", str(text or ""))):
+        pos = 0
+        for m in _HANGUL_RUN.finditer(word):
+            if m.start() - pos > 1:
+                out.add(word[pos:m.start()])
+            out.add(m.group()[:2])
+            pos = m.end()
+        if len(word) - pos > 1:
+            out.add(word[pos:])
+    return frozenset(out)
+
+
+def _fold_similar(groups, threshold):
+    """Stage 2 (#2384): merge prefix groups whose representative texts reach
+    token Jaccard >= `threshold`. `groups` is [(row, folded_count)] in display
+    order; the first group of a cluster stays its representative, so the
+    #2216 rule (hint match, then newest) is unchanged. Greedy leader
+    clustering like constraints-triage — not transitive, so a fuzzy pair
+    cannot chain unrelated rules — and two rules naming disjoint issue/PR
+    numbers never merge (#1890 guard). Returns [(row, total_folded)]."""
+    if not threshold:
+        return list(groups)
+    leaders = []  # [row, token_count, folded]
+    postings = {}  # token -> indices of comparable leaders holding it
+    for row, folded in groups:
+        toks = _fold_tokens(row[2])
+        shared = {}  # leader index -> |toks & leader tokens|
+        for t in toks:
+            for i in postings.get(t, ()):
+                shared[i] = shared.get(i, 0) + 1
+        home = None
+        for i in sorted(shared):  # earliest qualifying leader wins
+            inter = shared[i]
+            if (inter / (len(toks) + leaders[i][1] - inter) >= threshold
+                    and not _different_work(leaders[i][0][2], row[2])):
+                home = leaders[i]
+                break
+        if home is not None:
+            home[2] += 1 + folded
+            continue
+        if toks and len(leaders) < _CONSTRAINT_FOLD_MAX_LEADERS:
+            for t in toks:
+                postings.setdefault(t, []).append(len(leaders))
+        leaders.append([row, len(toks), folded])
+    return [(row, folded) for row, _n, folded in leaders]
+
+
 def _constraint_lines(c, hint_ids, budget):
     """Render the constraint block: hint matches first, then recency (id
     DESC), near-duplicates folded (newest kept, `(+N 유사)` appended), bounded
     to `budget` bytes with a tail line counting what was left out. The first
     constraint is always emitted so a tiny budget degrades to one rule, not
-    none. `budget` 0 keeps every open constraint (legacy)."""
+    none. `budget` 0 keeps every open constraint (legacy).
+
+    Folding is two-stage: the normalised 40-char prefix (#2216), then token
+    Jaccard across the prefix groups (#2384, _fold_similar) so one rule is
+    one line; N counts every member folded by either stage."""
     rows = c.execute(
         "SELECT id,observed,fact FROM peer_facts WHERE valid_to IS NULL"
         " AND kind = 'constraint' ORDER BY id DESC").fetchall()
@@ -1811,11 +1907,13 @@ def _constraint_lines(c, hint_ids, budget):
             continue
         by_key[k] = fid
         folded.append((fid, o, f))
+    clusters = _fold_similar([(r, extra.get(r[0], 0)) for r in folded],
+                             _constraint_fold_jaccard())
     out, used, omitted = [], 0, 0
-    for fid, o, f in folded:
+    for (_fid, o, f), n in clusters:
         line = f"- [제약/{o}] {f}"
-        if extra.get(fid):
-            line += f" (+{extra[fid]} 유사)"
+        if n:
+            line += f" (+{n} 유사)"
         b = len(line.encode()) + 1
         if budget and out and used + b > budget:
             omitted += 1
@@ -2037,7 +2135,9 @@ def assemble(budget, hint, limit=25):
          incident). Since #2216 the constraint block has its OWN byte budget
          (CCC_NUNCHI_CONSTRAINT_BUDGET, default 12000; 0 = unbounded legacy):
          hint-matched constraints first, then recency; near-duplicates fold
-         into one line; what does not fit is counted in a one-line tail that
+         into one line per cluster (40-char prefix, then token Jaccard —
+         #2384, CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD, default 0.46, 0 = prefix
+         only); what does not fit is counted in a one-line tail that
          points at `nunchi.py constraints`. Rationale: on one node the open
          constraint list reached 1,221 rows = 169 KB per SessionStart while
          the fact block stayed capped at 3,000 bytes.
