@@ -3,7 +3,7 @@
 
 Default OFF — a publisher that has not opted in must behave exactly as before.
 Reject lineages stay open (policies/REVIEW.md). Identity-hit promote batches
-stay draft for a human.
+stay with a human unless a flagged-line-only fix re-enters L3 (#2394).
 """
 
 from __future__ import annotations
@@ -737,6 +737,285 @@ class PromoteAutoApproveTests(unittest.TestCase):
             self.sweep(mode="off", spool=spool)
             self.sweep(diff=aa_diff(aa_files(support="workerx")), spool=spool)
             self.assertFalse(spool.exists() and list(spool.glob("*.json")))
+
+
+RE_CREATION = "1" * 40
+RE_SKILL = "approved/shared/s1/SKILL.md"
+# aa_files() SKILL.md at the head, numbered: 1 ---, 2 name, 3 description,
+# 4 ---, 5 "# s1", 6 "Steps." The generator flagged line 5.
+RE_HEAD_SKILL = aa_files()[RE_SKILL]
+RE_HITS = [{"name": "s1", "hits": [{"line": 5, "kind": "node-name", "match": "node-a"}]}]
+
+
+def re_patch(*, old5="# s1 on node-a", new5="# s1", tail=" Steps.") -> str:
+    """The compare patch of a flagged-line-only fix: line 5 replaced in place."""
+    return ("@@ -2,5 +2,5 @@\n name: s1\n description: Use when checking things\n ---\n"
+            f"-{old5}\n+{new5}\n{tail}")
+
+
+def re_compare(files=None, *, status="ahead", behind_by=0) -> dict:
+    if files is None:
+        files = [{"filename": RE_SKILL, "status": "modified", "additions": 1,
+                  "deletions": 1, "patch": re_patch()}]
+    return {"status": status, "ahead_by": 1, "behind_by": behind_by, "files": files}
+
+
+class IdentityReentryTests(unittest.TestCase):
+    """#2394 owner decision 2026-10-20 ("narrow re-entry"): an identity-hit
+    batch re-enters L3 only when a human replaced exactly the flagged lines
+    and the exact-head rescan is clean; every other edit stays human."""
+
+    def sweep(self, *, mode="true", rows=None, view=None, compare=None, contents=None,
+              compare_fails=False, dry_run=False, diff=None):
+        written: list[dict] = []
+        calls: list[list[str]] = []
+        payload = view or {
+            "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+            "state": "OPEN", "headRefOid": AA_HEAD, "reviewRequests": [],
+        }
+        compared = re_compare() if compare is None else compare
+        content = RE_HEAD_SKILL if contents is None else contents
+        diff_text = aa_diff(aa_files()) if diff is None else diff
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:3] == ["gh", "pr", "view"]:
+                return types.SimpleNamespace(stdout=json.dumps(payload).encode())
+            if args[:3] == ["gh", "pr", "diff"]:
+                return types.SimpleNamespace(stdout=diff_text.encode())
+            if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
+                if compare_fails:
+                    raise promotion.PromotionError("command_failed")
+                return types.SimpleNamespace(stdout=json.dumps(compared).encode())
+            if args[:2] == ["gh", "api"] and "/contents/" in args[2]:
+                encoded = promotion.base64.b64encode(content.encode()).decode()
+                return types.SimpleNamespace(stdout=json.dumps(
+                    {"type": "file", "encoding": "base64", "content": encoded}).encode())
+            if args[:2] == ["bash", AA_SCRIPT]:
+                out = json.dumps({"ok": True, "approved": True, "head": AA_HEAD, "pr": 999})
+                return types.SimpleNamespace(stdout=out.encode(), returncode=0)
+            return types.SimpleNamespace(stdout=b"", returncode=0)
+
+        cfg = types.SimpleNamespace(
+            node="publisher", repo="jinwon-int/fleet-skills", collect_window=32,
+            auto_merge_promote_enabled=True, auto_approve_mode=mode,
+            approve_cmd=("bash", AA_SCRIPT), approve_cmd_present=True,
+            approve_profile="seoseo-ai", approve_ssh_target="relay-node", push_spool=None,
+        )
+        ledger = rows if rows is not None else [self.identity_row()]
+        with patch.object(promotion, "_ledger_rows", return_value=ledger), \
+             patch.object(promotion, "_append_ledger",
+                          side_effect=lambda _c, row: written.append(row)), \
+             patch.object(promotion, "_promote_worker_nodes", return_value=["node-a"]), \
+             patch.object(promotion, "_run", side_effect=fake_run):
+            out = promotion._sweep_promote_merge(cfg, dry_run=dry_run)
+        return out, written, calls
+
+    promote_row = staticmethod(PromoteAutoApproveTests.promote_row)
+    outcomes = staticmethod(PromoteAutoApproveTests.outcomes)
+    verbs = staticmethod(PromoteAutoApproveTests.verbs)
+    merge_call = PromoteAutoApproveTests.merge_call
+
+    def identity_row(self, **extra) -> dict:
+        return self.promote_row(**{"identity_hits": RE_HITS, "creation_head": RE_CREATION, **extra})
+
+    @staticmethod
+    def rescans(written) -> list[dict]:
+        return [r for r in written if r.get("kind") == "a2a-promote-rescan"]
+
+    @staticmethod
+    def api_calls(calls) -> list[list[str]]:
+        return [c for c in calls if c[:2] == ["gh", "api"]]
+
+    def assert_held(self, out, calls, reason) -> None:
+        self.assertEqual(out[0]["outcome"], "needs-human-identity")
+        self.assertEqual(out[0]["rescan"], "not-eligible")
+        self.assertIn(reason, out[0]["reasons"])
+        self.assertEqual(len(out), 1)
+        for verb in ("merge", "bash", "ready", "diff", "edit"):
+            self.assertNotIn(verb, self.verbs(calls))
+
+    def test_flagged_line_only_fix_with_clean_rescan_reenters_l3(self) -> None:
+        out, written, calls = self.sweep()
+        self.assertEqual(self.outcomes(out), [
+            "identity-rescan-eligible", "promote-autoapproved", "promote-pr-merge-requested"])
+        self.assertTrue(out[0]["new"])
+        self.assertEqual([c[2] for c in self.api_calls(calls)], [
+            f"repos/jinwon-int/fleet-skills/compare/{RE_CREATION}...{AA_HEAD}",
+            f"repos/jinwon-int/fleet-skills/contents/{RE_SKILL}?ref={AA_HEAD}",
+        ])
+        # The existing L3 conditions still run in full on the exact head.
+        self.assertIn("diff", self.verbs(calls))
+        approve = [c for c in calls if c[:1] == ["bash"]][0]
+        self.assertEqual(approve[approve.index("--expected-head") + 1], AA_HEAD)
+        merge = self.merge_call(calls)
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], AA_HEAD)
+        [rescan] = self.rescans(written)
+        self.assertEqual(
+            {k: rescan[k] for k in ("pr", "creation_head", "head", "outcome", "reasons")},
+            {"pr": "999", "creation_head": RE_CREATION, "head": AA_HEAD,
+             "outcome": "eligible", "reasons": []})
+        self.assertNotIn("node-a", json.dumps(written) + json.dumps(out),
+                         "codes only, never a matched value")
+
+    def test_editing_another_line_stays_human(self) -> None:
+        patch_text = ("@@ -5,2 +5,2 @@\n # s1 on node-a\n-Steps.\n+Steps, rewritten.")
+        files = [{"filename": RE_SKILL, "status": "modified", "additions": 1,
+                  "deletions": 1, "patch": patch_text}]
+        out, written, calls = self.sweep(compare=re_compare(files))
+        self.assert_held(out, calls, "unflagged_line_changed")
+        self.assertEqual(self.rescans(written)[0]["outcome"], "not-eligible")
+        self.assertNotIn("/contents/", json.dumps(calls), "no rescan once the diff fails")
+
+    def test_flagged_plus_another_line_stays_human(self) -> None:
+        files = [{"filename": RE_SKILL, "status": "modified", "additions": 2, "deletions": 2,
+                  "patch": re_patch(tail="-Steps.\n+Other steps.")}]
+        out, _, calls = self.sweep(compare=re_compare(files))
+        self.assert_held(out, calls, "unflagged_line_changed")
+
+    def test_added_or_removed_line_stays_human(self) -> None:
+        added = ("@@ -5,2 +5,3 @@\n-# s1 on node-a\n+# s1\n+extra line\n Steps.")
+        removed = ("@@ -4,3 +4,2 @@\n ---\n-# s1 on node-a\n-gone\n+# s1")
+        for patch_text, adds, dels in ((added, 2, 1), (removed, 1, 2)):
+            with self.subTest(patch=patch_text):
+                files = [{"filename": RE_SKILL, "status": "modified", "additions": adds,
+                          "deletions": dels, "patch": patch_text}]
+                out, _, calls = self.sweep(compare=re_compare(files))
+                self.assert_held(out, calls, "line_count_changed")
+
+    def test_balanced_but_shifted_lines_stay_human(self) -> None:
+        # Net zero: one line dropped above the flagged line, one added below.
+        shifted = ("@@ -3,4 +3,4 @@\n-description: Use when checking things\n ---\n"
+                   "-# s1 on node-a\n+# s1\n Steps.\n+tail")
+        files = [{"filename": RE_SKILL, "status": "modified", "additions": 2,
+                  "deletions": 2, "patch": shifted}]
+        out, _, calls = self.sweep(compare=re_compare(files))
+        self.assert_held(out, calls, "line_count_changed")
+
+    def test_another_file_changed_stays_human(self) -> None:
+        for other in ({"filename": "approved/shared/s1/scripts/run.sh", "status": "modified",
+                       "additions": 1, "deletions": 1, "patch": "@@ -1 +1 @@\n-echo ok\n+echo hi"},
+                      {"filename": "approved/claude/s1/SKILL.md", "status": "renamed",
+                       "previous_filename": RE_SKILL, "additions": 0, "deletions": 0}):
+            with self.subTest(other=other["filename"]):
+                files = re_compare()["files"] + [other]
+                out, _, calls = self.sweep(compare=re_compare(files))
+                self.assert_held(out, calls, "other_file_changed")
+
+    def test_rewritten_history_stays_human(self) -> None:
+        out, _, calls = self.sweep(compare=re_compare(status="diverged", behind_by=1))
+        self.assert_held(out, calls, "history_not_linear")
+
+    def test_rescan_still_finding_a_hit_stays_human(self) -> None:
+        still = RE_HEAD_SKILL.replace("# s1", "# s1 via NODE-A")
+        files = [{"filename": RE_SKILL, "status": "modified", "additions": 1,
+                  "deletions": 1, "patch": re_patch(new5="# s1 via NODE-A")}]
+        out, written, calls = self.sweep(compare=re_compare(files), contents=still)
+        self.assert_held(out, calls, "rescan_identity_hit")
+        self.assertEqual(self.rescans(written)[0]["reasons"], ["rescan_identity_hit"])
+        self.assertNotIn("NODE-A", json.dumps(written) + json.dumps(out))
+
+    def test_ambiguous_line_breaks_stay_human(self) -> None:
+        out, _, calls = self.sweep(contents=RE_HEAD_SKILL.replace("Steps.", "Steps. More"))
+        self.assert_held(out, calls, "line_breaks_ambiguous")
+
+    def test_undeterminable_creation_head_stays_human(self) -> None:
+        for row in (self.promote_row(identity_hits=RE_HITS),
+                    self.identity_row(creation_head="not-a-sha")):
+            with self.subTest(creation=row.get("creation_head")):
+                out, written, calls = self.sweep(rows=[row])
+                self.assert_held(out, calls, "creation_head_unrecorded")
+                self.assertEqual(self.api_calls(calls), [])
+                self.assertEqual(self.rescans(written)[0]["creation_head"], "")
+
+    def test_malformed_identity_hits_stay_human(self) -> None:
+        bad = [{"name": "s1", "hits": [{"line": True}]}]
+        out, _, calls = self.sweep(rows=[self.identity_row(identity_hits=bad)])
+        self.assert_held(out, calls, "identity_hits_malformed")
+        self.assertEqual(self.api_calls(calls), [])
+
+    def test_same_head_is_not_rescanned(self) -> None:
+        for outcome, reasons in (("eligible", []), ("not-eligible", ["unflagged_line_changed"])):
+            with self.subTest(outcome=outcome):
+                cached = {"kind": "a2a-promote-rescan", "pr": "999", "creation_head": RE_CREATION,
+                          "head": AA_HEAD, "outcome": outcome, "reasons": reasons}
+                out, written, calls = self.sweep(rows=[self.identity_row(), cached])
+                self.assertEqual(self.api_calls(calls), [])
+                self.assertEqual(self.rescans(written), [])
+                if outcome == "eligible":
+                    self.assertEqual(out[0]["outcome"], "identity-rescan-eligible")
+                    self.assertFalse(out[0]["new"])
+                    self.assertEqual(out[1]["outcome"], "promote-autoapproved")
+                else:
+                    self.assert_held(out, calls, "unflagged_line_changed")
+
+    def test_a_new_head_is_rescanned(self) -> None:
+        cached = {"kind": "a2a-promote-rescan", "pr": "999", "creation_head": RE_CREATION,
+                  "head": "f" * 40, "outcome": "not-eligible", "reasons": ["unflagged_line_changed"]}
+        out, written, calls = self.sweep(rows=[self.identity_row(), cached])
+        self.assertEqual(len(self.api_calls(calls)), 2)
+        self.assertEqual(out[0]["outcome"], "identity-rescan-eligible")
+        self.assertEqual(self.rescans(written)[0]["head"], AA_HEAD)
+
+    def test_transient_compare_failure_is_retried_not_recorded(self) -> None:
+        out, written, calls = self.sweep(compare_fails=True)
+        self.assert_held(out, calls, "compare_command_failed")
+        self.assertEqual(self.rescans(written), [])
+
+    def test_l3_scan_blocking_never_falls_back_to_a_plain_merge(self) -> None:
+        out, _, calls = self.sweep(diff=aa_diff(aa_files(support="ssh node-a uptime")))
+        self.assertEqual(self.outcomes(out), [
+            "identity-rescan-eligible", "needs-human-autoapprove-blocked", "needs-human-identity"])
+        self.assertEqual(out[2]["code"], "not_autoapproved")
+        self.assertNotIn("merge", self.verbs(calls))
+        self.assertNotIn("bash", self.verbs(calls))
+
+    def test_l3_dry_run_mode_approves_and_merges_nothing(self) -> None:
+        out, written, calls = self.sweep(mode="dry-run")
+        self.assertEqual(self.outcomes(out), [
+            "identity-rescan-eligible", "would-approve-promote-pr", "needs-human-identity"])
+        self.assertNotIn("merge", self.verbs(calls))
+        self.assertNotIn("bash", self.verbs(calls))
+        self.assertEqual(self.rescans(written)[0]["outcome"], "eligible")
+
+    def test_sweep_dry_run_reports_would_outcomes_only(self) -> None:
+        for mode, expected in (("true", {"outcome": "would-hold-identity-hits", "pr": "999",
+                                         "rescan": "would-rescan-when-ready"}),
+                               ("off", {"outcome": "would-hold-identity-hits", "pr": "999"})):
+            with self.subTest(mode=mode):
+                out, written, calls = self.sweep(mode=mode, dry_run=True)
+                self.assertEqual((out, written, calls), ([expected], [], []))
+
+    def test_l3_off_keeps_the_pre_2394_hold(self) -> None:
+        out, written, calls = self.sweep(mode="off")
+        self.assertEqual((out, written, calls),
+                         ([{"outcome": "needs-human-identity", "pr": "999"}], [], []))
+
+    def test_draft_identity_batch_is_never_readied_by_the_sweep(self) -> None:
+        """#2360 unchanged: no publisher ready-mark (or ready row) for an
+        identity batch — only a human marks it ready."""
+        view = {"isDraft": True, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}],
+                "state": "OPEN", "headRefOid": AA_HEAD}
+        out, written, calls = self.sweep(view=view)
+        self.assert_held(out, calls, "still_draft")
+        self.assertEqual(self.verbs(calls), ["view"])
+        self.assertEqual(written, [])
+
+
+class FlaggedPatchLineTests(unittest.TestCase):
+    def test_several_flagged_lines_replaced_in_place(self) -> None:
+        text = "@@ -3,3 +3,3 @@\n-a\n-b\n+A\n+B\n c\n@@ -9 +9 @@\n-x\n+X"
+        removed, reasons = promotion._flagged_patch_lines(text, {3, 4, 9})
+        self.assertEqual((removed, reasons), ({3, 4, 9}, set()))
+
+    def test_header_count_mismatch_and_garbage_fail_closed(self) -> None:
+        for text in ("@@ -3,2 +3,2 @@\n-a\n+A", "-a\n+A", "@@ junk @@\n-a\n+A",
+                     "@@ -3 +3 @@\n-a\r\n+A"):
+            with self.subTest(text=text):
+                _, reasons = promotion._flagged_patch_lines(text, {3})
+                self.assertTrue(reasons)
 
 
 class ResultsOnlyTests(unittest.TestCase):

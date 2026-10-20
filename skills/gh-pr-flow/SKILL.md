@@ -584,7 +584,15 @@ fresh-approval rules above and exists only while the owner has switched it on:
   publisher (or `CCC_SKILL_PROMOTION_AUTO_APPROVE=true` in its owner-only
   config file). `dry-run` approves nothing and only records
   `would-approve-promote-pr`. Absent/`off` = no standing approval.
-- **Conditions, all on the exact head:** no creation-time identity hits; every
+- **Conditions, all on the exact head:** no creation-time identity hits —
+  or, narrow re-entry (#2394, owner decision 2026-10-20), a batch with
+  creation-time hits that a human marked ready after editing only the flagged
+  lines: the change since the recorded generator commit touches only those
+  hit lines of the flagged `SKILL.md` (same file, same line numbers, no line
+  added or removed, no other file, generator commit still an ancestor), a
+  rescan of the exact head finds no identity hit in it, and the decision is
+  recorded (`a2a-promote-rescan`); any other edit to such a batch stays human
+  review + merge. Then, unchanged for every batch: every
   path in the full PR diff under `approved/<audience>/<staged skill>/`; every
   added line rescanned clean (credentials, home paths, IPs, emails, runtime
   coupling, fleet identities) and `approval.json` in the generator's exact
