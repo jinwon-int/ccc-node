@@ -37,22 +37,35 @@
 #          `claude mcp list` is not run — same repoint-without-churn use as
 #          --browser-only (a full run would add the others, Firecrawl key
 #          included). REA ships 170 tools, so it is never registered by default.
+#        ./claude/mcp-setup.sh --web-launch-only
+#          Refresh only the launch command of web MCP servers (searxng,
+#          context7, firecrawl) that are ALREADY registered at user scope
+#          (#2315). An entry is re-registered as `node <abs cli>` only when its
+#          launch is a form this script produced (`npx -y <pkg>`, the package
+#          bin, or `node <old cli>`) and differs from the current global
+#          install; the entry's env (SearXNG URL, Firecrawl key) is kept
+#          exactly and never printed. Unregistered servers are not added,
+#          custom launches are left alone, nothing is installed (a server
+#          whose package is not installed globally is skipped) and `claude mcp
+#          list` is not run. setup.sh runs this mode from the managed checkout.
 set -uo pipefail
 
 FAMILY_ONLY=0
 BROWSER_ONLY=0
 REA_ONLY=0
+WEB_LAUNCH_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --family-only) FAMILY_ONLY=1 ;;
     --browser-only) BROWSER_ONLY=1 ;;
     --rea-only) REA_ONLY=1 ;;
+    --web-launch-only) WEB_LAUNCH_ONLY=1 ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "mcp-setup.sh: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
-if [ $((FAMILY_ONLY + BROWSER_ONLY + REA_ONLY)) -gt 1 ]; then
-  echo "mcp-setup.sh: --family-only, --browser-only and --rea-only are mutually exclusive" >&2
+if [ $((FAMILY_ONLY + BROWSER_ONLY + REA_ONLY + WEB_LAUNCH_ONLY)) -gt 1 ]; then
+  echo "mcp-setup.sh: --family-only, --browser-only, --rea-only and --web-launch-only are mutually exclusive" >&2
   exit 2
 fi
 if [ "$BROWSER_ONLY" = 1 ] && [ -z "${CCC_BROWSER_MCP_HOST:-}" ]; then
@@ -218,6 +231,114 @@ register_rea() {
     return 1
   fi
 }
+
+# web_launch_state <name> <npm-pkg> <bin-name> <cli-or-empty>
+# Read-only classification of the user-scope entry for a web MCP server,
+# written to stdout as NUL-terminated fields for the caller's array (never to
+# the terminal): the state, then for `stale` the old command, the old arg count,
+# the old args and the entry's env as KEY=VALUE pairs. States:
+#   absent     not registered (or no Claude user config)
+#   custom     a launch this script never produced, or fields `claude mcp add`
+#              cannot reproduce — left alone (operator choice)
+#   noinstall  a known launch, but no global install resolves
+#   current    already `node <cli>`
+#   stale      a known launch that differs from `node <cli>`
+#   unreadable the config cannot be parsed
+web_launch_state() {
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  [ -f "$cfg" ] || { printf 'absent\0'; return 0; }
+  python3 - "$cfg" "$@" 2>/dev/null <<'PY' || printf 'unreadable\0'
+import json, os, sys
+cfg, name, pkg, binname, cli = sys.argv[1:]
+def out(*fields):
+    sys.stdout.write("".join(f + "\0" for f in fields))
+    sys.exit(0)
+try:
+    with open(cfg, encoding="utf-8") as fh:
+        servers = json.load(fh).get("mcpServers") or {}
+    if not isinstance(servers, dict):
+        raise ValueError("mcpServers")
+except Exception:
+    out("unreadable")
+entry = servers.get(name)
+if entry is None:
+    out("absent")
+if not isinstance(entry, dict) or set(entry) - {"type", "command", "args", "env"} \
+        or entry.get("type", "stdio") != "stdio":
+    out("custom")
+command, args, env = entry.get("command"), entry.get("args", []), entry.get("env") or {}
+if not isinstance(command, str) or not isinstance(args, list) or not isinstance(env, dict) \
+        or not all(isinstance(a, str) and "\0" not in a for a in args + [command]) \
+        or not all(isinstance(k, str) and isinstance(v, str) and k and "=" not in k
+                   and "\0" not in k + v for k, v in env.items()):
+    out("custom")
+base = os.path.basename(command)
+if base == "npx":
+    rest = [a for a in args if a not in ("-y", "--yes")]
+    known = len(rest) == 1 and (rest[0] == pkg or rest[0].startswith(pkg + "@"))
+elif base == binname:
+    known = args == []
+elif base == "node":
+    known = len(args) == 1 and ("/" + pkg + "/") in args[0]
+else:
+    known = False
+if not known:
+    out("custom")
+if not cli:
+    out("noinstall")
+if command == "node" and args == [cli]:
+    out("current")
+out("stale", command, str(len(args)), *args, *(f"{k}={v}" for k, v in env.items()))
+PY
+}
+
+# web_relaunch <name> <npm-pkg> <bin-name>: --web-launch-only for one server.
+# Remove + re-add keeps the entry's env verbatim; `claude` output is discarded
+# because it would echo the arguments, the Firecrawl key included. If the
+# re-add fails, the previous launch is restored. Returns 1 only on failure.
+web_relaunch() {
+  local name="$1" pkg="$2" binname="$3" cli f state old_cmd nargs
+  local fields=() old_args=() eflags=()
+  cli="$(global_cli "$pkg")" || cli=""
+  { [ -n "$cli" ] && [ -f "$cli" ]; } || cli=""
+  while IFS= read -r -d '' f; do fields+=("$f"); done \
+    < <(web_launch_state "$name" "$pkg" "$binname" "$cli")
+  state="${fields[0]:-unreadable}"
+  case "$state" in
+    absent) echo "  - $name: not registered — left unregistered (a full run opts in)"; return 0 ;;
+    custom) echo "  - $name: custom launch — left untouched"; return 0 ;;
+    noinstall) echo "  - $name: SKIPPED — $pkg is not installed globally (npm install -g $pkg, then re-run)"; return 0 ;;
+    current) echo "  - $name: already registered (unchanged)"; return 0 ;;
+    stale) ;;
+    *) echo "  - $name: Claude user config unreadable — left untouched"; return 0 ;;
+  esac
+  old_cmd="${fields[1]}"; nargs="${fields[2]}"
+  old_args=("${fields[@]:3:$nargs}")
+  for f in "${fields[@]:$((3 + nargs))}"; do eflags+=(-e "$f"); done
+  claude mcp remove "$name" -s user >/dev/null 2>&1 || true
+  if claude mcp add "$name" -s user ${eflags[@]+"${eflags[@]}"} -- node "$cli" >/dev/null 2>&1; then
+    echo "  - $name: re-registered as node $cli (was $(basename "$old_cmd"); env kept, $(( ${#eflags[@]} / 2 )) var(s))"
+    return 0
+  fi
+  if claude mcp add "$name" -s user ${eflags[@]+"${eflags[@]}"} -- "$old_cmd" ${old_args[@]+"${old_args[@]}"} >/dev/null 2>&1; then
+    echo "  ! $name: re-registration failed — previous launch restored" >&2
+  else
+    echo "  ! $name: re-registration failed and the previous launch could not be restored — re-run ./claude/mcp-setup.sh" >&2
+  fi
+  return 1
+}
+
+if [ "$WEB_LAUNCH_ONLY" = 1 ]; then
+  # No `claude mcp list` (it health-checks networked servers), no npm install,
+  # no ~/.hermes/.env read: the existing registration's env is the source.
+  echo "==> Refreshing web MCP launch commands (user scope, registered servers only)…"
+  rc=0
+  web_relaunch searxng mcp-searxng mcp-searxng || rc=1
+  web_relaunch context7 @upstash/context7-mcp context7-mcp || rc=1
+  web_relaunch firecrawl firecrawl-mcp firecrawl-mcp || rc=1
+  echo "==> Done (web-launch-only: family-skills, family-ops, family-wiki, fleet-browser, rea untouched; unregistered servers not added)."
+  exit "$rc"
+fi
 
 if [ "$REA_ONLY" = 1 ]; then
   # No `claude mcp list`: it health-checks every server, including networked ones.

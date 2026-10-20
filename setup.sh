@@ -1599,7 +1599,8 @@ fi
 # the self-update managed checkout, never a dev worktree or secondary clone —
 # the user-scope server path must not be repointed at unreviewed code (#842).
 # Non-fatal; CCC_SETUP_FAMILY_MCP=0 opts out. The networked/keyed servers
-# (searxng, context7, firecrawl) and family-wiki stay manual.
+# (searxng, context7, firecrawl) and family-wiki stay manual to register; only
+# the launch of already-registered web servers is refreshed below (#2315).
 if [ "${CCC_SETUP_FAMILY_MCP:-1}" = "0" ]; then
   note "family MCP registration: disabled (CCC_SETUP_FAMILY_MCP=0)"
 elif [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ] \
@@ -1613,6 +1614,30 @@ elif bash "$SRC/claude/mcp-setup.sh" --family-only; then
   note "family-skills + family-ops MCP registered (user scope)"
 else
   note "WARNING: family MCP registration failed — re-run: $SRC/claude/mcp-setup.sh --family-only"
+fi
+
+# Web MCP launch refresh (#2315). The networked/keyed servers above stay
+# opt-in, but a change to how mcp-setup.sh launches them (#2300: `npx -y` ->
+# global install + `node <cli>`) never reached nodes that registered them
+# earlier, so each session kept a resident `npm exec` wrapper. --web-launch-only
+# re-registers only servers ALREADY at user scope whose launch differs from the
+# current global install, keeping their env (Firecrawl key) verbatim and never
+# printing it; it adds no server, installs nothing and runs no health check.
+# Same managed-checkout guard as the family block. Non-fatal;
+# CCC_SETUP_WEB_MCP_LAUNCH=0 opts out.
+if [ "${CCC_SETUP_WEB_MCP_LAUNCH:-1}" = "0" ]; then
+  note "web MCP launch refresh: disabled (CCC_SETUP_WEB_MCP_LAUNCH=0)"
+elif [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ] \
+  || [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
+  note "web MCP launch refresh: not the self-update managed checkout — skipped"
+elif ! command -v claude >/dev/null 2>&1; then
+  note "web MCP launch refresh: claude CLI not on PATH — skipped"
+elif [ "$DRY" = 1 ]; then
+  note "would refresh registered web MCP launch commands (claude/mcp-setup.sh --web-launch-only)"
+elif bash "$SRC/claude/mcp-setup.sh" --web-launch-only; then
+  note "web MCP launch registrations checked (user scope)"
+else
+  note "WARNING: web MCP launch refresh failed — re-run: $SRC/claude/mcp-setup.sh --web-launch-only"
 fi
 
 # #968: Termux/Android hash-locked installs may need to build packages from
