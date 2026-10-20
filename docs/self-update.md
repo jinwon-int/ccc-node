@@ -45,6 +45,30 @@ rather than composing the steps ad hoc.
    Kill-switch: operator-owned `~/.claude/self-update.no-reapply`, or
    `CCC_SELF_UPDATE_REAPPLY=0`. Re-apply runs only when HEAD changed (or
    `--force`) — an up-to-date tick cannot have installer-content drift.
+5b. refresh installed A2A handler copies (#2357).
+   `scripts/install-a2a-review-handler.sh` *copies* the skills-intake
+   dispatcher and handlers (the names come from its `--list`) to
+   `/usr/local/sbin`, or to `~/a2a-broker-worker` on Termux / non-root nodes.
+   `setup.sh` never touches those copies, so they used to drift for weeks
+   behind a current checkout. On a changed (or `--force`) tick, each of the
+   two destinations that **already holds at least one copy** is compared with
+   the checkout's `scripts/`; when a file differs or is missing the installer
+   runs with `--dest <that dir>` (old copies backed up as `*.bak-<ts>`) and
+   every file is verified afterwards. A destination with no copies is never
+   installed fresh, and a current one is not rewritten (no new backup), so
+   the step is idempotent. A destination this account cannot write (a
+   non-root tick with root-owned `/usr/local/sbin`) is skipped with a single
+   `a2a-handlers skip dest=… reason=not-writable` log line — no notification,
+   no failure; `ccc-doctor` keeps reporting that drift and names the owning
+   account. It is advisory: a failure (installer error, unverified result) is
+   logged
+   (`a2a-handlers reinstall failed dest=… rc=…`), printed as a warning and
+   notified, but rolls nothing back and does not change the exit code. It
+   restarts nothing — the worker spawns `WORKER_HANDLER_COMMAND` as a new
+   process per task, so the next task runs the new files, and `install`
+   replaces the inode so a task already running keeps its old copy. Opt out
+   with `CCC_SELF_UPDATE_A2A_HANDLERS=0`. `ccc-doctor` reports the same drift
+   as an `a2a-handlers` row (docs/doctor.md).
 6. restarts each service listed in the operator allowlist and verifies it is
    active again
 7. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
@@ -324,6 +348,8 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
+| `CCC_SELF_UPDATE_A2A_HANDLERS` | `1` | set to `0` to skip refreshing drifted installed A2A handler copies (#2357) |
+| `CCC_A2A_HANDLER_SYSTEM_DEST` | `/usr/local/sbin` | system destination of the installed A2A handlers checked by the refresh step and by `ccc-doctor` (tests point it at a temp dir); the home destination is always `$HOME/a2a-broker-worker` |
 | `CCC_SELF_UPDATE_NOTIFY` | `all` | `none` queues no owner notification (success, warning or stall); only `notify=suppressed` is logged. Equivalent operator file: `~/.claude/self-update.notify` (first non-comment line) |
 | `CCC_SELF_UPDATE_CRONTAB_CMD` | `crontab` | crontab binary (tests inject a stub) |
 | `CCC_SELF_UPDATE_FLOCK` | `flock` | flock(1) binary used to probe a foreign regular-file lock; missing → 30-minute mtime rule (#1945) |

@@ -170,6 +170,19 @@ ok "installer accepts the Termux profile flag"   '[ "$rc" = 0 ] && [ -x "$TMP/te
 bash "$INSTALLER" --termux --dest "$TMP/termux-dest" >/dev/null 2>&1; rc=$?
 ok "installer accepts the Termux profile flag"   '[ "$rc" = 0 ] && [ -x "$TMP/termux-dest/a2a-intent-dispatcher.sh" ] && [ -x "$TMP/termux-dest/skills-intake-review-handler.sh" ]'
 
+# ---- #2357: --list is the handler set; failures must exit non-zero ----
+out="$(bash "$INSTALLER" --list 2>&1)"; rc=$?
+ok "installer --list prints the four handler names and installs nothing" \
+  '[ "$rc" = 0 ] && [ "$(wc -l <<<"$out")" = 4 ] && grep -qx skills-intake-revise-handler.sh <<<"$out" && grep -qx danso-review-agent.sh <<<"$out"'
+: > "$TMP/not-a-dir"
+bash "$INSTALLER" --dest "$TMP/not-a-dir" >/dev/null 2>&1; rc=$?
+ok "installer exits non-zero when the destination cannot be created" '[ "$rc" != 0 ]'
+mkdir -p "$TMP/blocked-dest/a2a-intent-dispatcher.sh/a2a-intent-dispatcher.sh/x"
+bash "$INSTALLER" --dest "$TMP/blocked-dest" >/dev/null 2>&1; rc=$?
+ok "installer exits non-zero when a file cannot be installed" '[ "$rc" != 0 ]'
+out="$(bash "$INSTALLER" --dest "$TMP/wording-dest" 2>&1)"
+ok "installer says file replacement alone needs no worker restart" 'grep -q "no restart needed" <<<"$out"'
+
 # ---- #2027: review provenance fields (review_agent / review_model) ----
 make_task "$HEAD_OK"
 REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="-p --model xai/grok-4.6" REVIEW_TIMEOUT_SEC=30 \

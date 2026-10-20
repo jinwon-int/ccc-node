@@ -743,7 +743,9 @@ The review lane's node-side runtime is canonical in this repo:
 `scripts/skills-intake-review-handler.sh` (rubric execution + verdict result
 composition), deployed to each worker by
 `scripts/install-a2a-review-handler.sh [--dest DIR]` with an automatic backup
-of any previous copy. Historically these were hand-copied per node and forked;
+of any previous copy. Since #2357 `ccc-self-update.sh` refreshes copies that
+already exist when they drift from the checkout, and `ccc-doctor` reports the
+drift as an `a2a-handlers` row. Historically these were hand-copied per node and forked;
 two 2026-08 fleet bugs trace to that drift: a composer that omitted the
 snake_case `head_sha` binding (the publisher discarded every verdict as
 malformed) and a hardcoded `claude` invocation (review capacity died with one
