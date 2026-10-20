@@ -848,7 +848,13 @@ ssh_target_set, blocker}` — presence only, never the target or path.
   as reviewer at PR creation (the relay helper refuses non-requested
   reviewers); the sweep re-requests it if missing. Off keeps the `gh pr create`
   call unchanged.
-- **Gates, on the exact head:** no creation-time identity hits; checks green
+- **Gates, on the exact head:** no creation-time identity hits — unless
+  (#2394, owner decision 2026-10-20) the only change since the recorded
+  `creation_head` is a linear, in-place edit of exactly the flagged lines of
+  the flagged SKILL.md (same line numbers, no lines added or removed, no other
+  file) and a rescan of the exact head finds no identity hit; that re-entry is
+  recorded as an `a2a-promote-rescan` ledger row and still has to pass every
+  gate below, and it merges only after an L3 approval of that head; checks green
   and `MERGEABLE`; the full `gh pr diff` touches only
   `approved/<audience>/<staged skill>/…` (binary, symlink, submodule or
   unparseable entries block); every added line in every file passes the intake
