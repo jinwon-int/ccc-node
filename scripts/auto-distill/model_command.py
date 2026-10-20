@@ -59,6 +59,10 @@ CODEX_ARGS = (
 CODEX_WRAPPER_FLAG = "--codex-usage-wrapper"
 USAGE_LINE_PREFIX = "PIRI_USAGE="
 PR_SET_PDEATHSIG = 1
+# ccc-node#2397: claude runs behind this wrapper so a timed-out call is never
+# SIGKILLed mid OAuth refresh (see run_claude_graceful_wrapper).
+CLAUDE_GRACEFUL_FLAG = "--claude-graceful-exec"
+CLAUDE_EXECUTABLE_NAMES = frozenset({"claude", "claude.exe"})
 CLAUDE_ARGS = (
     "-p",
     "--no-session-persistence",
@@ -265,6 +269,100 @@ def parse_codex_events(stream: str) -> tuple[dict[str, object] | None, str | Non
                 errors.append(message)
     usage = normalize_codex_usage(totals) if seen_usage else None
     return usage, last_message, errors
+
+
+def claude_graceful_argv(argv: Sequence[str]) -> tuple[str, ...]:
+    """Argv that runs a claude command through the graceful-stop wrapper (#2397)."""
+
+    python = sys.executable or shutil.which("python3") or "python3"
+    return (python, str(Path(__file__).resolve()), CLAUDE_GRACEFUL_FLAG, *argv)
+
+
+def is_claude_executable(executable: str) -> bool:
+    return Path(executable).name in CLAUDE_EXECUTABLE_NAMES
+
+
+def _term_with_parent(parent_pid: int) -> Callable[[], None]:
+    """preexec hook: SIGTERM (not SIGKILL) claude when the wrapper dies (#2397).
+
+    auto-distill's per-call timeout SIGKILLs its direct child, now this
+    wrapper. A claude CLI SIGKILLed inside its ~0.5 s OAuth refresh window
+    loses the rotated refresh token and the next call wipes the host login;
+    on SIGTERM it finishes saving first (reproduced 2026-10-20).
+    """
+
+    def hook() -> None:
+        if not sys.platform.startswith(("linux", "android")):
+            return
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        except (OSError, AttributeError):
+            return
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    return hook
+
+
+def run_claude_graceful_wrapper(
+    argv: Sequence[str],
+    *,
+    stdin: IO[str] | None = None,
+    stdout: IO[str] | None = None,
+    stderr: IO[str] | None = None,
+) -> int:
+    """Run claude, relaying stdio, so a SIGKILL of this wrapper reaches claude as SIGTERM.
+
+    Output is relayed through pipes this wrapper owns: when the wrapper is
+    killed, the caller's pipes close at once (no wait on a lingering
+    grandchild) while claude gets SIGTERM via PDEATHSIG. A SIGTERM/SIGINT/
+    SIGHUP sent to the wrapper itself is forwarded and the wrapper waits.
+    The exit code is claude's (128+N when claude died from signal N).
+    """
+
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
+    if not argv or not argv[0]:
+        print(f"usage: model_command.py {CLAUDE_GRACEFUL_FLAG} CLAUDE_EXECUTABLE [ARGS...]", file=stderr)
+        return 2
+    prompt = stdin.read()
+    try:
+        child = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=_term_with_parent(os.getpid()),
+        )
+    except OSError as exc:
+        print(f"claude-graceful-wrapper: cannot spawn claude ({type(exc).__name__})", file=stderr)
+        return 127
+
+    def forward(signum: int, _frame: object) -> None:
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        out, err = child.communicate(prompt)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if err:
+        stderr.write(err)
+    if out:
+        stdout.write(out)
+    stdout.flush()
+    stderr.flush()
+    code = child.returncode
+    return code if code >= 0 else 128 - code
 
 
 def _die_with_parent(parent_pid: int) -> Callable[[], None]:
@@ -517,7 +615,7 @@ def resolve_model_command(
         if not claude_executable:
             raise ModelCommandError("provider=claude but no runnable Claude CLI was found")
         return ModelCommand(
-            (claude_executable, *CLAUDE_ARGS), "claude", str(claude_source)
+            claude_graceful_argv((claude_executable, *CLAUDE_ARGS)), "claude", str(claude_source)
         )
     if provider == "codex":
         # A node explicitly identified as codex never falls back to Piri or
@@ -538,7 +636,7 @@ def resolve_model_command(
         return ModelCommand((piri_executable, *PIRI_ARGS), "piri", str(piri_source))
     if claude_executable:
         return ModelCommand(
-            (claude_executable, *CLAUDE_ARGS),
+            claude_graceful_argv((claude_executable, *CLAUDE_ARGS)),
             "claude",
             str(claude_source),
             reason="no-runnable-piri",
@@ -562,13 +660,18 @@ def resolve_explicit_model_command(
     executable = _runnable(argv[0], which=which)
     if not executable:
         raise ModelCommandError("--model-cmd executable is not runnable")
-    return ModelCommand((executable, *argv[1:]), "custom", "--model-cmd")
+    command = (executable, *argv[1:])
+    if is_claude_executable(executable):
+        command = claude_graceful_argv(command)
+    return ModelCommand(command, "custom", "--model-cmd")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args[:1] == [CODEX_WRAPPER_FLAG]:
         return run_codex_usage_wrapper(args[1:])
+    if args[:1] == [CLAUDE_GRACEFUL_FLAG]:
+        return run_claude_graceful_wrapper(args[1:])
     print(f"usage: model_command.py {CODEX_WRAPPER_FLAG} CODEX_EXECUTABLE", file=sys.stderr)
     return 2
 
