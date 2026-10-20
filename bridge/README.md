@@ -360,7 +360,7 @@ a provider turn or reads transcript/credential files.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram Bot API token |
+| `TELEGRAM_BOT_TOKEN` | Telegram only | — | Telegram Bot API token. Required for the Telegram frontend (`CCC_CHANNEL` unset/`telegram`); optional for `matrix`/`hande` |
 | `ALLOWED_USER_IDS` | No | *(allow all)* | Comma-separated user ID whitelist; `owner-operator` requires exactly one owner |
 | `CCC_REQUIRE_ALLOWLIST` | No | `true` | Refuse startup when the allowlist is empty; must stay true for `owner-operator` |
 | `CCC_BRIDGE_RESTART_HANDOFF` | No | `off` | Set `systemd` to enable sole-owner DM `/restart` through an external transient unit |

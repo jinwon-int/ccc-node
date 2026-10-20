@@ -460,9 +460,16 @@ class BotLifecycleMixin(MemoryDistillMixin):
 
     def build(self):
         """Build the application (no post_init — lifecycle managed manually)."""
+        token = self._config.telegram_bot_token
+        if not token:
+            # Settings already refuses CCC_CHANNEL=telegram without a token
+            # (#2411); this keeps a token-less config from ever reaching PTB.
+            raise RuntimeError(
+                "TELEGRAM_BOT_TOKEN is not configured; the Telegram frontend needs it."
+            )
         self.application = (
             self._application_builder_factory()
-            .token(self._config.telegram_bot_token)
+            .token(token)
             .concurrent_updates(True)
             .get_updates_request(self._build_get_updates_request())
             .request(self._build_default_request())

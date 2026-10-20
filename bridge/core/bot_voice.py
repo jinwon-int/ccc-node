@@ -430,7 +430,12 @@ class BotVoiceMixin:
         if not normalized_path:
             raise RuntimeError("Telegram file path is unavailable.")
 
-        return f"https://api.telegram.org/file/bot{self._voice_config().telegram_bot_token}/{normalized_path}"
+        token = self._voice_config().telegram_bot_token
+        if not token:
+            raise RuntimeError(
+                "TELEGRAM_BOT_TOKEN is not configured; Telegram file downloads need it."
+            )
+        return f"https://api.telegram.org/file/bot{token}/{normalized_path}"
 
     @staticmethod
     def _resolve_image_extension(mime_type: Optional[str], file_name: Optional[str] = None) -> str:

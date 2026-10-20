@@ -116,7 +116,7 @@ utils/chat_logger.py Per-session debug chat logging
 
 | Variable | Required | Description |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Yes | Telegram Bot API token |
+| `TELEGRAM_BOT_TOKEN` | Telegram only | Telegram Bot API token. Required for `CCC_CHANNEL` unset/`telegram`; optional for `matrix`/`hande` (the Grok-on-Matrix route still needs it as its journal identity label) |
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs; `owner-operator` requires exactly one |
 | `CCC_REQUIRE_ALLOWLIST` | No | Fail-closed allowlist guard (default: true; required for `owner-operator`) |
 | `CCC_BRIDGE_RESTART_HANDOFF` | No | Set `systemd` to enable sole-owner private `/restart` (default: `off`) |
