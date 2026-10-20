@@ -423,7 +423,7 @@ a provider turn or reads transcript/credential files.
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | No | `60` | Idle resource-guard sweep interval (10–3600s) |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | No | `14400` | Close a local provider runtime after this idle period; durable session IDs remain resumable |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | No | `2` | LRU cap for cached sessions; active sessions are protected |
-| `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB` | No | `1024` | Idle bridge-tree RSS high-water mark; `0` disables |
+| `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB` | No | ¼ of RAM (1024–8192) | Idle bridge-tree RSS high-water mark; `0` disables. Necessary but not sufficient: idle sessions are evicted for RSS only while the host is also short of memory (`MemAvailable` below `max(512 MiB, 15% of MemTotal)`); if `MemAvailable` is unreadable the watermark alone decides. The eviction log line names the branch (`reason=ttl`/`lru`/`rss`) |
 | `CCC_BRIDGE_CODEX_MAX_ATTACHMENTS` | Codex only | `2` | Recycle the idle app-server before a third conversation attachment; `0` disables |
 | `DRAFT_UPDATE_MIN_CHARS` | No | `150` | Minimum characters before streaming draft update |
 | `DRAFT_UPDATE_INTERVAL` | No | `1.0` | Minimum seconds between streaming draft updates |
