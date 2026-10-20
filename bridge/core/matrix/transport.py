@@ -1058,6 +1058,18 @@ class MatrixTransport:
         land in a room other people read. The file is read, encrypted and
         uploaded only when :meth:`send` reaches the row, after the answer.
         """
+        req, payload = self._file_request(room_id, path, root=root, voice=voice)
+        if after:
+            # Held until ``after``'s answer is recorded, then queued behind it;
+            # dropped if that turn is cancelled, times out or is interrupted.
+            self.store.hold_file(after, req, key, payload)
+            return ""
+        event_id = self.store.file_job(req, key, payload)
+        self.wake()
+        return event_id
+
+    def _file_request(self, room_id: str, path: str, *, root: str | None, voice: bool) -> tuple[Request, str]:
+        """The outbound-file route and JSON payload for one direct-room file (#2001)."""
         if room_id not in self.c["rooms"]:
             raise ValueError("room-not-allowed")
         if self.room_kind(room_id) != "direct":
@@ -1078,17 +1090,16 @@ class MatrixTransport:
             "file",
             hashlib.sha256(json.dumps([self.c["account"], room_id, "outbound-file"]).encode()).hexdigest(),
         )
-        if after:
-            # Held until ``after``'s answer is recorded, then queued behind it;
-            # dropped if that turn is cancelled, times out or is interrupted.
-            self.store.hold_file(after, req, key, payload)
-            return ""
-        event_id = self.store.file_job(req, key, payload)
-        self.wake()
-        return event_id
+        return req, payload
 
-    def enqueue_voice(self, room_id: str, data: bytes, *, key: str, after: str) -> None:
-        """Persist generated speech privately until its durable outbox row is settled."""
+    def enqueue_voice(self, room_id: str, data: bytes, *, key: str, after: str) -> str:
+        """Persist generated speech privately until its durable outbox row is settled.
+
+        Speech is synthesized outside the turn (#2257), so it may arrive while
+        ``after`` still runs (held), after its answer was recorded (queued
+        behind it) or after the turn was interrupted (discarded, file
+        removed). Returns that outcome.
+        """
         from telegram_bot.core.matrix import media, voice
 
         if room_id not in self.c["rooms"] or self.room_kind(room_id) != "direct":
@@ -1098,11 +1109,17 @@ class MatrixTransport:
         directory = Path(self.c["state_directory"]) / voice.REPLY_DIRNAME
         path = media.store(directory, data, {"name": "voice.ogg", "mimetype": "audio/ogg"})
         try:
-            self.enqueue_file(room_id, str(path.resolve()), key=key, after=after, root=str(directory.resolve()), voice=True)
-            self.store._cleanup_voice_replies()  # duplicate keys must not leave a second file
+            req, payload = self._file_request(room_id, str(path.resolve()), root=str(directory.resolve()), voice=True)
+            outcome = self.store.file_for_turn(after, req, key, payload)
         except BaseException:
             media.remove(path)
             raise
+        if outcome == "discarded":
+            media.remove(path)
+        self.store._cleanup_voice_replies()  # duplicate keys must not leave a second file
+        if outcome == "queued":
+            self.wake()
+        return outcome
 
     async def _upload_cap(self) -> int:
         """Bridge cap (50 MB, as Telegram) or the homeserver's ``m.upload.size`` if lower."""

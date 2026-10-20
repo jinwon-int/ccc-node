@@ -220,6 +220,7 @@ async def test_voice_reply_uses_existing_platform_gate_and_text_survives_tts_fai
     monkeypatch.setattr(voice, "synthesize", synthesis)
     result = await bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="direct")
     assert result.text == "answer" and len(chat.calls) == 1
+    await asyncio.gather(*bot._voice_reply_tasks())  # synthesis runs outside the turn (#2257)
     assert synthesis.await_count == int(supported)
 
 
@@ -460,3 +461,197 @@ async def test_say_never_reads_a_leading_dash_as_an_option(tmp_path: Path, monke
     await synth._run_say(text="plain", voice_name="Tingting", output_path=tmp_path / "y.aiff")
     assert not seen[0][-1].startswith("-") and seen[0][-1].strip() == "-f oops"
     assert seen[1][-1] == "plain"
+
+
+# --- #2257: synthesis outside the turn, filed by the parent's state ---------
+
+class _LateVoiceTransport(_MediaTransport):
+    """Media download for the bot, speech filed into a real transport's store."""
+
+    def __init__(self, ciphertext: bytes, real: Any) -> None:
+        super().__init__(ciphertext)
+        self.real = real
+        self.outcomes: list[str] = []
+
+    def enqueue_voice(self, room_id: str, data: bytes, *, key: str, after: str) -> str:
+        outcome = self.real.enqueue_voice(self.real.c["rooms"][0], data, key=key, after=after)
+        self.outcomes.append(outcome)
+        return outcome
+
+
+def _held(transport: Any) -> list[Any]:
+    return list(transport.store.db.execute("SELECT parent FROM held_files"))
+
+
+def _file_rows(transport: Any) -> list[dict[str, Any]]:
+    return [job for job in transport.store.outbox() if job["body"] == FILE_JOB_BODY]
+
+
+def _voice_bot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real: Any) -> tuple[Any, dict[str, Any], _LateVoiceTransport]:
+    bot, _chat, manager = _bot(tmp_path, openai_api_key="test-key", matrix_voice_reply=True)
+    _resume_existing_session(bot, manager)
+    job, ciphertext = audio_job()
+    transport = _LateVoiceTransport(ciphertext, real)
+    bot._transport = transport
+    monkeypatch.setattr(core_media, "is_macos", lambda: True)
+    monkeypatch.setattr(voice, "transcribe", AsyncMock(return_value="hello"))
+    begin_turn(real, job["event_id"])
+    return bot, job, transport
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("text_delivered", [True, False])
+async def test_slow_synthesis_never_delays_text_and_late_voice_follows_answer(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch, text_delivered: bool,
+) -> None:
+    (tmp_path / "transport").mkdir()
+    async with running(tmp_path / "transport") as harness:
+        real = harness.f
+        bot, job, transport = _voice_bot(tmp_path, monkeypatch, real)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def synthesize(text: str, settings: Any, directory: Path) -> bytes:
+            started.set()
+            await release.wait()
+            return b"OggS late speech"
+
+        monkeypatch.setattr(voice, "synthesize", synthesize)
+        # The turn returns while synthesis is still blocked.
+        result = await asyncio.wait_for(bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="direct"), 2)
+        await asyncio.wait_for(started.wait(), 2)
+        assert result.text == "answer" and not release.is_set()
+        real.store.finish(job["event_id"], result.text)
+        assert [row["reply"] for row in real.store.outbox()] == ["answer"]  # text row before any speech
+        if text_delivered:
+            real.store.delivered(job["event_id"])
+        release.set()
+        await asyncio.gather(*bot._voice_reply_tasks())
+        assert transport.outcomes == ["queued"]
+        assert _held(real) == []
+        (audio,) = _file_rows(real)
+        assert Path(json.loads(audio["reply"])["path"]).read_bytes() == b"OggS late speech"
+        if not text_delivered:
+            text, voice_row = real.store.outbox()
+            assert text["event_id"] == job["event_id"] and voice_row["seq"] > text["seq"]
+        assert not list((tmp_path / "data" / "matrix-media").iterdir())
+
+
+@pytest.mark.anyio
+async def test_stop_during_synthesis_drops_speech_cleans_temp_and_needs_no_ack(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "transport").mkdir()
+    async with running(tmp_path / "transport") as harness:
+        real = harness.f
+        bot, job, transport = _voice_bot(tmp_path, monkeypatch, real)
+        started = asyncio.Event()
+
+        async def tts(self: Any, **kwargs: Any) -> Any:
+            (kwargs["output_dir"] / "partial.aiff").write_bytes(b"partial")
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(voice.MacOSTtsSynthesizer, "synthesize_to_telegram_voice", tts)
+        result = await asyncio.wait_for(bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="direct"), 2)
+        real.store.finish(job["event_id"], result.text)
+        await asyncio.wait_for(started.wait(), 2)
+        media_dir = tmp_path / "data" / "matrix-media"
+        assert list(media_dir.iterdir())  # the private synthesis directory exists meanwhile
+        # Idle /stop in the same room (the turn is over) reaches the runner seam.
+        assert await bot.stop_idle({"room_id": job["room_id"], "sender": job["sender"]}) is True
+        assert bot._voice_reply_tasks() == {}
+        assert not list(media_dir.iterdir())
+        assert transport.outcomes == [] and _held(real) == [] and _file_rows(real) == []
+        assert real.store.uncertain() == [] and real.store.block() is None
+        assert [row["reply"] for row in real.store.outbox()] == ["answer"]
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancels_synthesis_and_failures_leave_the_turn_alone(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "transport").mkdir()
+    async with running(tmp_path / "transport") as harness:
+        real = harness.f
+        bot, job, transport = _voice_bot(tmp_path, monkeypatch, real)
+        monkeypatch.setattr(voice, "synthesize", AsyncMock(side_effect=TimeoutError()))
+        result = await bot.run_turn(job, sink=FakeSink(), session_id=None, room_kind="direct")
+        real.store.finish(job["event_id"], result.text)
+        await asyncio.gather(*bot._voice_reply_tasks())
+        assert result.text == "answer" and transport.outcomes == []
+        assert [row["reply"] for row in real.store.outbox()] == ["answer"] and _held(real) == []
+        blocked = asyncio.Event()
+
+        async def hang(text: str, settings: Any, directory: Path) -> bytes:
+            blocked.set()
+            await asyncio.Event().wait()
+            return b""
+
+        monkeypatch.setattr(voice, "synthesize", hang)
+        second, ciphertext = audio_job()
+        second["event_id"] = "$m2"
+        real.store.delivered(job["event_id"])
+        begin_turn(real, "$m2")
+        transport.ciphertext = ciphertext
+        await bot.run_turn(second, sink=FakeSink(), session_id=None, room_kind="direct")
+        await asyncio.wait_for(blocked.wait(), 2)
+        assert await bot._cancel_voice_replies() == 1  # the serve() shutdown path
+        assert bot._voice_reply_tasks() == {} and transport.outcomes == []
+
+
+@pytest.mark.anyio
+async def test_late_speech_for_an_interrupted_parent_is_discarded(tmp_path: Path) -> None:
+    async with running(tmp_path) as harness:
+        transport = harness.f
+        replies = Path(transport.c["state_directory"]) / voice.REPLY_DIRNAME
+        room = transport.c["rooms"][0]
+        begin_turn(transport, "$stopped")
+        transport.store.uncertain_job("$stopped")
+        assert transport.enqueue_voice(room, b"speech", key="v", after="$stopped") == "discarded"
+        assert not list(replies.iterdir()) and _held(transport) == []
+        # Resolved by the interrupt notice (or an operator ack): 'ready', yet no answer.
+        transport.store.resolve_uncertain("$stopped", "cancelled")
+        assert transport.enqueue_voice(room, b"speech", key="v", after="$stopped") == "discarded"
+        assert transport.enqueue_voice(room, b"speech", key="v", after="$unknown") == "discarded"
+        assert not list(replies.iterdir()) and _held(transport) == [] and _file_rows(transport) == []
+        transport.store.delivered("$stopped")
+        # A repeated key for an answered parent is not queued twice and leaves one file.
+        begin_turn(transport, "$answered")
+        transport.store.finish("$answered", "answer")
+        assert transport.enqueue_voice(room, b"speech", key="v", after="$answered") == "queued"
+        assert transport.enqueue_voice(room, b"speech", key="v", after="$answered") == "queued"
+        assert len(_file_rows(transport)) == 1 and len(list(replies.iterdir())) == 1
+
+
+@pytest.mark.anyio
+async def test_restart_leaves_no_held_voice_orphan(tmp_path: Path) -> None:
+    async with running(tmp_path) as harness:
+        transport = harness.f
+        directory = Path(transport.c["state_directory"])
+        replies = directory / voice.REPLY_DIRNAME
+        room = transport.c["rooms"][0]
+        # Queued for an answered parent: survives restart as an outbox row.
+        begin_turn(transport, "$answered")
+        transport.store.finish("$answered", "answer")
+        assert transport.enqueue_voice(room, b"kept", key="v", after="$answered") == "queued"
+        transport.store.delivered("$answered")
+        # A held row stranded behind a finished parent (the pre-#2257 orphan).
+        begin_turn(transport, "$stranded")
+        transport.store.finish("$stranded", "answer")
+        transport.store.delivered("$stranded")
+        stranded = media.store(replies, b"stranded", {"name": "voice.ogg", "mimetype": "audio/ogg"})
+        req, payload = transport._file_request(room, str(stranded), root=str(replies.resolve()), voice=True)
+        transport.store.hold_file("$stranded", req, "v", payload)
+        # Held for a parent that was still running when the process died.
+        begin_turn(transport, "$crashed")
+        assert transport.enqueue_voice(room, b"lost", key="v", after="$crashed") == "held"
+        transport.store.close()
+        transport.store = MatrixStore(directory, transport.c["account"])
+        assert _held(transport) == []
+        kept = sorted(Path(json.loads(row["reply"])["path"]).read_bytes() for row in _file_rows(transport))
+        assert kept == [b"kept", b"stranded"]
+        assert sorted(path.read_bytes() for path in replies.iterdir()) == [b"kept", b"stranded"]
+        # No synthesis outlives the process, so a pre-restart parent takes no new speech.
+        assert transport.enqueue_voice(room, b"late", key="w", after="$answered") == "discarded"
+        assert len(list(replies.iterdir())) == 2

@@ -48,7 +48,7 @@ class VoiceSettingsMixin:
     matrix_voice_reply: bool = Field(
         default=False,
         description="Matrix: also send a synthesized voice reply after the text (macOS, direct rooms, voice input). "
-        "Off by default until synthesis runs outside the agent turn (#2005 follow-up).",
+        "Synthesis runs after the turn (#2257); off by default pending re-review.",
     )
     voice_reply_persona: str = Field(
         default="Tingting",

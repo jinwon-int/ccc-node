@@ -572,12 +572,19 @@ attachment in an earlier message being replied to remains file context.
   (music, podcasts, recordings sent as files) keep the ordinary file path, so
   they need no transcription key and no duration limit applies to them.
 - Voice replies are **opt-in**: `MATRIX_VOICE_REPLY=true` (default `false`).
-  Synthesis still runs inside the agent turn, so an enabled reply can hold the
-  finished text answer back for up to 120 seconds; moving it after the turn
-  needs an outbox change and is tracked as a #2005 follow-up.
+  Synthesis runs as a background task *after* the turn (#2257), so the text
+  answer is recorded and sent without waiting for it. When synthesis ends, the
+  speech is filed by the turn's state in one store transaction: queued behind
+  the answer if the turn finished (pending or delivered), held for it if it is
+  still running, discarded with its file if the turn was stopped, timed out or
+  failed. `/stop` in the room and bridge shutdown cancel synthesis and remove
+  its temporary files; a failed or timed-out synthesis only logs and never
+  affects the text answer or the turn state. The default stays `false` until
+  this out-of-turn path is re-reviewed (#2257 item 5).
 - When enabled on macOS, successful voice turns may also produce a reply with the existing
   `MacOSTtsSynthesizer` and `VOICE_REPLY_PERSONA`. The same long-reply threshold
-  applies. Other platforms and failed synthesis keep the text answer. Speech
+  applies (more than 1000 Hanzi, 1000 English words or 2000 Hangul syllables
+  stays text-only). Other platforms and failed synthesis keep the text answer. Speech
   is sent only to direct rooms, as an encrypted Ogg/Opus `m.audio` event with
   the voice marker, **after the complete text answer** through the durable
   file outbox. This retains a readable answer even if speech delivery fails.

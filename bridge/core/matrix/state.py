@@ -975,7 +975,17 @@ _MATRIX_SCHEMA = """
     CREATE TABLE IF NOT EXISTS held_files(parent TEXT NOT NULL, key TEXT NOT NULL,
         room_id TEXT NOT NULL, sender TEXT NOT NULL, scope TEXT NOT NULL, payload TEXT NOT NULL,
         seq INTEGER PRIMARY KEY AUTOINCREMENT, UNIQUE(parent, key));
+    -- #2257: turns whose answer ``finish`` recorded, so a file that arrives
+    -- after the turn (a voice reply synthesized outside it) can tell an
+    -- answered parent from one an interrupt notice resolved. Body-free,
+    -- trimmed by ``finish`` and cleared on open (no late filer outlives the
+    -- process that started it).
+    CREATE TABLE IF NOT EXISTS answered_turns(event_id TEXT PRIMARY KEY, at REAL NOT NULL);
 """
+
+# #2257: how long ``answered_turns`` remembers a finished turn — far beyond the
+# voice synthesis ceiling (VOICE_TIMEOUT_S, 120 s), the only late filer.
+ANSWERED_TURN_TTL_S = 3_600.0
 
 _STATE_FILES = ("inbox.sqlite3", "inbox.sqlite3-journal", "inbox.sqlite3-wal", "inbox.sqlite3-shm")
 
@@ -1241,6 +1251,8 @@ class MatrixStore(Store):
         super().__init__(directory, account)
         try:
             self.db.executescript(_MATRIX_SCHEMA)
+            with self.db:
+                self.db.execute("DELETE FROM answered_turns")
             self._settle_held_files()
             self._cleanup_voice_replies()
         except BaseException:
@@ -1253,10 +1265,48 @@ class MatrixStore(Store):
         """Hold one outbound file until ``parent``'s answer is recorded; idempotent per key."""
         bounded_text(payload, 4096)
         with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO held_files(parent,key,room_id,sender,scope,payload) VALUES (?,?,?,?,?,?)",
-                (parent, key, req.room_id, req.sender, req.scope, payload),
-            )
+            self._insert_held(parent, req, key, payload)
+
+    def _insert_held(self, parent: str, req: Request, key: str, payload: str) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO held_files(parent,key,room_id,sender,scope,payload) VALUES (?,?,?,?,?,?)",
+            (parent, key, req.room_id, req.sender, req.scope, payload),
+        )
+
+    def file_for_turn(self, parent: str, req: Request, key: str, payload: str) -> str:
+        """File one outbound file by ``parent``'s state now; ``held``, ``queued`` or ``discarded`` (#2257).
+
+        For a file that may arrive *after* its turn (a voice reply
+        synthesized outside it). A running parent holds it as
+        :meth:`hold_file` does, so :meth:`finish` releases it; a parent whose
+        answer :meth:`finish` recorded (pending or delivered) queues it at
+        once behind that answer; any other parent — uncertain, resolved by an
+        interrupt notice or operator ack, unknown — discards it, and the
+        caller removes the file. Deciding and writing in one transaction of
+        this single-process store (``inbox.lock``), whose methods run
+        synchronously on the event loop, means :meth:`finish` and its
+        ``_release_files`` cannot run in between, so no held row outlives an
+        already-finished parent.
+        """
+        bounded_text(payload, 4096)
+        with self.db:
+            row = self.db.execute("SELECT state FROM jobs WHERE event_id=?", (parent,)).fetchone()
+            state = row["state"] if row is not None else None
+            if state == "running":
+                self._insert_held(parent, req, key, payload)
+                return "held"
+            answered = self.db.execute("SELECT 1 FROM answered_turns WHERE event_id=?", (parent,)).fetchone()
+            if state in ("ready", "done") and answered is not None:
+                # Same identity a released held file gets, so the key stays
+                # idempotent across both paths (a repeat is not re-queued).
+                event = "$file-" + hashlib.sha256(json.dumps([parent, key]).encode()).hexdigest()
+                if self._known_digest(event) is None:
+                    self._insert_ready_row(
+                        Request(parent, req.room_id, req.sender, FILE_JOB_BODY, req.scope),
+                        key, payload, prefix="$file-", body=FILE_JOB_BODY,
+                    )
+                return "queued"
+            return "discarded"
 
     def _release_files(self, parent: str) -> int:
         rows = self.db.execute(
@@ -1305,6 +1355,11 @@ class MatrixStore(Store):
 
     def finish(self, event_id: str, reply: str, session_id: str | None = None) -> None:
         super().finish(event_id, reply, session_id)
+        now = time.time()
+        with self.db:
+            # #2257: a file filed after this turn may follow its answer.
+            self.db.execute("DELETE FROM answered_turns WHERE at<?", (now - ANSWERED_TURN_TTL_S,))
+            self.db.execute("INSERT OR REPLACE INTO answered_turns VALUES (?,?)", (event_id, now))
         # After the answer row exists, so a released file sorts behind it.
         self._release_files(event_id)
 
@@ -1506,20 +1561,24 @@ class MatrixStore(Store):
         return self._ready_row(req, key, payload, prefix="$file-", body=FILE_JOB_BODY)
 
     def _ready_row(self, req: Request, key: str, reply: str, *, prefix: str, body: str) -> str:
+        with self.db:
+            return self._insert_ready_row(req, key, reply, prefix=prefix, body=body)
+
+    def _insert_ready_row(self, req: Request, key: str, reply: str, *, prefix: str, body: str) -> str:
+        """:meth:`_ready_row` inside the caller's transaction."""
         event = prefix + hashlib.sha256(json.dumps([req.event_id, key]).encode()).hexdigest()
         txn = hashlib.sha256(json.dumps([self.account, event, "reply-v1"]).encode()).hexdigest()
         digest = hashlib.sha256(reply.encode()).hexdigest()
-        with self.db:
-            old = self._known_digest(event)
-            if old is not None:
-                if old != digest:
-                    raise SafetyStop("notice-identity-conflict")
-                return event
-            self.db.execute(
-                "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,reply,txn_id) "
-                "VALUES (?,?,?,?,?,?,'ready',?,?)",
-                (event, req.room_id, req.sender, req.scope, body, digest, reply, txn),
-            )
+        old = self._known_digest(event)
+        if old is not None:
+            if old != digest:
+                raise SafetyStop("notice-identity-conflict")
+            return event
+        self.db.execute(
+            "INSERT INTO jobs(event_id,room_id,sender,scope,body,digest,state,reply,txn_id) "
+            "VALUES (?,?,?,?,?,?,'ready',?,?)",
+            (event, req.room_id, req.sender, req.scope, body, digest, reply, txn),
+        )
         return event
 
     def delivered_parts(self, event: str) -> int:
