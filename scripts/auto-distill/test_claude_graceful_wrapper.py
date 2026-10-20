@@ -96,7 +96,9 @@ class ClaudeGracefulWrapper(unittest.TestCase):
         # Exactly what subprocess.run(timeout=) does to auto-distill's child.
         proc = subprocess.Popen(self.wrapper(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env={**self.env, "STUB_MODE": "hang"})
-        proc.stdin.write("prompt"); proc.stdin.close(); proc.stdin = None
+        proc.stdin.write("prompt")
+        proc.stdin.close()
+        proc.stdin = None
         self.assertTrue(self.wait_for(Path(str(self.marker) + ".started")), "stub never started")
         started = time.time()
         proc.kill()
@@ -108,7 +110,9 @@ class ClaudeGracefulWrapper(unittest.TestCase):
     def test_sigterm_to_wrapper_is_forwarded(self) -> None:
         proc = subprocess.Popen(self.wrapper(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env={**self.env, "STUB_MODE": "hang"})
-        proc.stdin.write("prompt"); proc.stdin.close(); proc.stdin = None
+        proc.stdin.write("prompt")
+        proc.stdin.close()
+        proc.stdin = None
         self.assertTrue(self.wait_for(Path(str(self.marker) + ".started")))
         proc.terminate()
         _out, _err = proc.communicate(timeout=10)
