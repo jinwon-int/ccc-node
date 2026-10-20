@@ -183,6 +183,7 @@ ok "older capture still merges its facts" \
 out="$(order_commit "$ord" 2026-10-15T01:00:00Z "equal capture fact" "equal capture resume")"; rc=$?
 ok "equal capture replaces the resume (later commit wins, as in the sink)" \
   '[ "$rc" = 0 ] && grep -q "equal capture resume" "$ord/resume.md" && [ "$(head -1 "$ord/resume.md")" = "<!-- ccc-node:distill captured_at=2026-10-15T01:00:00.000000Z provider=claude -->" ] && ! grep -q "resume kept" <<<"$out"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(order_commit "$ord" 2026-10-15T02:00:00Z "newer capture fact" "newer capture resume")"; rc=$?
 ok "newer capture replaces the stamped resume" \
   '[ "$rc" = 0 ] && grep -q "newer capture resume" "$ord/resume.md" && grep -q "newer capture fact" "$ord/memory-facts.jsonl"'
@@ -191,15 +192,21 @@ ok "newer capture replaces the stamped resume" \
 hl="$TMP/order-headerless"; mkdir -m 700 "$hl"
 printf '%s\n' '- 마지막 작업: today cli resume' > "$hl/resume.md"; chmod 600 "$hl/resume.md"
 touch -d "@$(( $(date +%s) - 3600 ))" "$hl/resume.md"
-out="$(order_commit "$hl" "$(iso_ago 1440)" "day-old backlog fact" "day-old backlog resume")"; rc=$?
+order_commit "$hl" "$(iso_ago 1440)" "day-old backlog fact" "day-old backlog resume" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "headerless resume newer by mtime is kept; facts merge" \
   '[ "$rc" = 0 ] && grep -q "today cli resume" "$hl/resume.md" && ! grep -q "day-old backlog resume" "$hl/resume.md" && grep -q "day-old backlog fact" "$hl/memory-facts.jsonl"'
-out="$(order_commit "$hl" "$(iso_ago 1)" "fresh capture fact" "fresh capture resume")"; rc=$?
+order_commit "$hl" "$(iso_ago 1)" "fresh capture fact" "fresh capture resume" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "headerless resume older by mtime is replaced by a newer capture" \
   '[ "$rc" = 0 ] && grep -q "fresh capture resume" "$hl/resume.md"'
 nc="$TMP/order-nocapture"; mkdir -m 700 "$nc"
 printf '%s\n' "$NEWER_RESUME" > "$nc/resume.md"; chmod 600 "$nc/resume.md"
-out="$(order_commit "$nc" "" "direct run fact" "direct run resume")"; rc=$?
+order_commit "$nc" "" "direct run fact" "direct run resume" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "a run without a capture time still writes (no ordering basis)" \
   '[ "$rc" = 0 ] && [ "$(cat "$nc/resume.md")" = "- 마지막 작업: direct run resume" ]'
 
