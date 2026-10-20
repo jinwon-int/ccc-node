@@ -36,7 +36,11 @@ is exactly the dependency this avoids).
 
 Bounded work: at most CCC_SKILL_PRESCREEN_MAX_PER_RUN drafts per run
 (default 20, `0` turns the step off), oldest first, and the run stops after
-three consecutive reviewer errors (provider down). Output: one JSON object
+three consecutive reviewer errors (provider down). A draft whose files total
+more than MAX_TOTAL_BYTES (256 KiB, the publisher's and the handler's cap,
+#1460) is skipped before the handler runs (`skipped.oversize` in the
+summary): the handler would refuse it, so it is neither a reviewer error nor
+a step toward the reviewer-down stop. Output: one JSON object
 on stdout; `prescreen-last.json` (0600) keeps the last summary for
 `status`/doctor.
 """
@@ -64,6 +68,9 @@ RESULT_FILE = "prescreen.json"
 DEFAULT_MAX_PER_RUN = 20
 MAX_FILES = 16
 MAX_FILE_BYTES = 64 * 1024
+# Total packet cap — same 16 files / 64 KiB / 256 KiB the publisher and
+# scripts/skills-intake-review-handler.sh enforce (#1460).
+MAX_TOTAL_BYTES = 256 * 1024
 MAX_INVENTORY = 64
 MAX_CONSECUTIVE_ERRORS = 3
 HANDLER_TIMEOUT_GRACE = 60
@@ -203,6 +210,11 @@ def draft_files(entry: Path) -> tuple[list[dict[str, str]], str]:
         if len(files) >= MAX_FILES:
             break
     return files, digest.hexdigest()
+
+
+def files_bytes(files: list[dict[str, str]]) -> int:
+    """UTF-8 size of the packet's file contents, as the handler measures it."""
+    return sum(len(item["content"].encode("utf-8")) for item in files)
 
 
 def draft_name(entry: Path, files: list[dict[str, str]]) -> str:
@@ -457,6 +469,13 @@ def run(state: Path, *, dry_run: bool, now: float | None = None, node: str = "")
             summary["skipped"]["no-files"] = summary["skipped"].get("no-files", 0) + 1
             continue
         name = draft_name(entry, files)
+        if files_bytes(files) > MAX_TOTAL_BYTES:
+            # #1460: the handler refuses a packet over the total cap (exit 1).
+            # Skip it here, before any handler run, so it never counts as a
+            # reviewer error. It stays undecided and keeps its name.
+            summary["skipped"]["oversize"] = summary["skipped"].get("oversize", 0) + 1
+            ctx.seen_names.add(name)
+            continue
         if _already_screened(entry, tree):
             summary["skipped"]["already-screened"] = summary["skipped"].get("already-screened", 0) + 1
             ctx.seen_names.add(name)  # an older, already-screened draft owns this name

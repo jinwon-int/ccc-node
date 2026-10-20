@@ -7,7 +7,8 @@
 # stay with prescreen.json; a failing handler never moves a draft (fail-open);
 # three consecutive failures stop the run; the per-run cap defers the rest;
 # an already-screened draft is not re-reviewed; name collision with an
-# installed skill is a deterministic blocker; max-per-run=0 is off.
+# installed skill is a deterministic blocker; max-per-run=0 is off; a draft
+# over the 256 KiB total is skipped as oversize, not counted as an error (#1460).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PS="$HERE/prescreen.py"
@@ -135,6 +136,32 @@ for i in 1 2 3 4; do d="$STATE2/pending-skills/2026090$i-000000-f$i-fail$i"; mkd
 out="$(CCC_STATE_DIR="$STATE2" run_ps run --now "$NOW")"
 ok "three consecutive errors stop the run" 'printf "%s" "$out" | jq -e ".status == \"reviewer-down\" and .errors == 3" >/dev/null && [ "$(wc -l < "$CALLS" | tr -d " ")" = 3 ]'
 ok "nothing moved while the reviewer is down" '[ "$(ls -d "$STATE2"/pending-skills/*/ | wc -l | tr -d " ")" = 4 ]'
+
+# --- 7b) #1460: a draft over the 256 KiB total is skipped before the handler -------
+# Order: fail-1, big-a, big-b (both oversize), roomy (under the cap), fail-2.
+# Counted as errors, the two oversize drafts would stop the run at big-b.
+STATE3="$TMP/s3"; P3="$STATE3/pending-skills"; mkdir -p "$P3"
+mk3() {  # <dir> <skill-name> <n support files of 60000 bytes>
+  mkdir -p "$P3/$1/references"
+  printf -- '---\nname: %s\ndescription: x.\n---\n# x\n' "$2" > "$P3/$1/SKILL.md"
+  for j in $(seq 1 "$3"); do head -c 60000 /dev/zero | tr '\0' a > "$P3/$1/references/f$j.md"; done
+}
+mk3 "20260901-000000-o1-fail1" "fail-1" 0
+mk3 "20260902-000000-o2-biga"  "big-a"  5
+mk3 "20260903-000000-o3-bigb"  "big-b"  5
+mk3 "20260904-000000-o4-roomy" "roomy"  4
+mk3 "20260905-000000-o5-fail2" "fail-2" 0
+: > "$CALLS"
+out="$(CCC_STATE_DIR="$STATE3" run_ps run --now "$NOW")"
+ok "over-total drafts are skipped as oversize, never sent to the handler (#1460)" \
+  'printf "%s" "$out" | jq -e ".skipped.oversize == 2" >/dev/null && ! grep -q "^big-" "$CALLS" && [ ! -e "$P3/20260902-000000-o2-biga/prescreen.json" ] && [ -d "$P3/20260903-000000-o3-bigb" ]'
+ok "oversize skips do not count toward the reviewer-down stop (#1460)" \
+  'printf "%s" "$out" | jq -e ".status == \"reviewed\" and .errors == 2 and .reviewed == 1" >/dev/null && [ "$(wc -l < "$CALLS" | tr -d " ")" = 3 ]'
+ok "a draft under the total cap is reviewed unchanged (#1460)" \
+  'grep -q "^roomy intent=skills-intake-review proc=[0-9]* files=5$" "$CALLS" && jq -e ".verdict == \"approve\" and .status == \"ok\"" "$P3/20260904-000000-o4-roomy/prescreen.json" >/dev/null'
+out="$(CCC_STATE_DIR="$STATE3" run_ps run --dry-run --now "$NOW")"
+ok "dry-run leaves oversize drafts out of would_review (#1460)" \
+  'printf "%s" "$out" | jq -e ".skipped.oversize == 2 and ([.would_review[].name] | index(\"big-a\") == null)" >/dev/null'
 
 # --- 8) status is read-only and summarises the queue --------------------------------------
 out="$(run_ps status)"
