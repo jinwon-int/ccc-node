@@ -182,9 +182,9 @@ that is *displayed* as "seoseo" is reachable as `@seoseo` this way).
 `wake_words` (optional, up to 8, `[0-9A-Za-z가-힣]{1,64}`) widens the same
 gate to **bare** whole-token nicknames without a leading `@` — for Korean
 display names that have no typed handle (the family calls the bot "서서" or
-"서서야"). Matching is whole-token only, so a wake word never fires inside a
-longer word ("서서" does not match "서서히"); a token glued to another word
-without a space ("서서야뭐해") does not match either. Aliases only widen the
+"서서야"). A wake word never fires inside a longer word ("서서" does not match "서서히"),
+but one glued to a Korean particle without a space still matches (#1809:
+"서서야뭐해" is the wake word + 야 + the rest). Aliases only widen the
 mention gate — sender and room admission are unchanged.
 
 **Replies carry their parent (#1943).** When someone uses the client's reply
