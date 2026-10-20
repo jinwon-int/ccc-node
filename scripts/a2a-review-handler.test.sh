@@ -184,8 +184,9 @@ out="$(bash "$INSTALLER" --dest "$TMP/wording-dest" 2>&1)"
 ok "installer says file replacement alone needs no worker restart" 'grep -q "no restart needed" <<<"$out"'
 
 # ---- #2027: review provenance fields (review_agent / review_model) ----
+# The args keep a tool lock: the handler refuses a lock-less override (#1460).
 make_task "$HEAD_OK"
-REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="-p --model xai/grok-4.6" REVIEW_TIMEOUT_SEC=30 \
+REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-4.6" REVIEW_TIMEOUT_SEC=30 \
   WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" REVIEW_STUB_OTHER_HEAD="$HEAD_OTHER" REVIEW_STUB_MODE=approve \
   bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-prov-model.json" 2>/dev/null; rc=$?
 ok "explicit --model in REVIEW_AGENT_ARGS becomes review_model, bin becomes review_agent (#2027)" \
@@ -193,7 +194,7 @@ ok "explicit --model in REVIEW_AGENT_ARGS becomes review_model, bin becomes revi
     and .output.reviewer_node == \"testnode\"" >/dev/null "$TMP/out-prov-model.json"'
 
 make_task "$HEAD_OK"
-REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="--model=openai/gpt-5.6-sol -p" REVIEW_TIMEOUT_SEC=30 \
+REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="--model=openai/gpt-5.6-sol -p --disallowed-tools *" REVIEW_TIMEOUT_SEC=30 \
   WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" REVIEW_STUB_OTHER_HEAD="$HEAD_OTHER" REVIEW_STUB_MODE=approve \
   bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-prov-eq.json" 2>/dev/null; rc=$?
 ok "--model= form parses too (#2027)" \
@@ -701,5 +702,156 @@ ok "handler composes TaskResult from danso wrapper output" \
   '[ "$rc" = 0 ] && jq -e ".output.verdict == \"approve\" and .output.reviewer_node == \"testnode\"" >/dev/null "$TMP/out-danso.json"'
 ok "handler records review_agent and review_model provenance" \
   'jq -e ".output.review_agent == \"danso-review-agent.sh\" and .output.review_model == \"glm-5.3-flash\"" >/dev/null "$TMP/out-danso.json"'
+
+# ─── #1460: review handler parity with the revise handler hardening ────────
+# timeout -k, enforced tool lock, single reviewer node id, symmetric caps and
+# TERM forwarding — the same cases the revise handler carries above.
+cat > "$BIN/review-p2-stub-agent" <<STUB
+#!/usr/bin/env bash
+cat > "\${PROMPT_CAPTURE:-/dev/null}"
+[ -n "\${AGENT_MARKER:-}" ] && touch "\$AGENT_MARKER"
+case "\${REVIEW_STUB_MODE:-approve}" in
+  approve)
+    printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-08-28.2","model":"stub-model"}' "$HEAD_OK"
+    ;;
+  hang-ignore-term) trap '' TERM; sleep 30 ;;
+  hang) echo "\$\$" > "\$AGENT_PIDFILE"; exec sleep 30 ;;
+  bigout) python3 -c 'import sys; sys.stdout.write("x" * (1024 * 1024 + 16))' ;;
+esac
+STUB
+chmod +x "$BIN/review-p2-stub-agent"
+mkdir -p "$TMP/danso-bin-review"
+cp "$BIN/review-p2-stub-agent" "$TMP/danso-bin-review/danso-review-agent.sh"
+run_review_p2() {
+  REVIEW_AGENT_BIN="${P2_BIN:-$BIN/review-p2-stub-agent}" REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-30}" \
+    WORKER_ID="${WORKER_ID-testnode}" bash "$HANDLER" < "${P2_TASK:-$TMP/task.json}"
+}
+
+# timeout -k: the fake `timeout` on PATH (above) records argv, then runs the real one.
+make_task "$HEAD_OK"
+: > "$TMP/timeout-argv-1460.txt"
+PATH="$TMP/fakebin-1460:$PATH" run_review_p2 > "$TMP/out-r2-k.json" 2>/dev/null; rc=$?
+ok "review timeout carries a 30s kill-after grace by default (#1460)" \
+  '[ "$rc" = 0 ] && grep -q "^-k 30 30 $BIN/review-p2-stub-agent -p --disallowed-tools \*$" "$TMP/timeout-argv-1460.txt"'
+: > "$TMP/timeout-argv-1460.txt"
+PATH="$TMP/fakebin-1460:$PATH" REVIEW_KILL_GRACE_SEC=7 REVIEW_TIMEOUT_SEC=11 run_review_p2 >/dev/null 2>&1; rc=$?
+ok "REVIEW_KILL_GRACE_SEC / REVIEW_TIMEOUT_SEC reach timeout -k (#1460)" \
+  '[ "$rc" = 0 ] && grep -q "^-k 7 11 " "$TMP/timeout-argv-1460.txt"'
+REVIEW_KILL_GRACE_SEC=abc run_review_p2 >/dev/null 2>&1; rc=$?
+ok "a malformed review kill grace fails as node config (exit 1, #1460)" '[ "$rc" = 1 ]'
+REVIEW_TIMEOUT_SEC=0 run_review_p2 >/dev/null 2>&1; rc=$?
+ok "a zero review timeout (unbounded) is refused (exit 1, #1460)" '[ "$rc" = 1 ]'
+# A reviewer that ignores SIGTERM is SIGKILLed after the grace, not left hanging.
+r2_started=$SECONDS
+REVIEW_STUB_MODE=hang-ignore-term REVIEW_TIMEOUT_SEC=1 REVIEW_KILL_GRACE_SEC=1 \
+  run_review_p2 >/dev/null 2>"$TMP/err-r2-hang.txt"; rc=$?
+# shellcheck disable=SC2034  # read via eval inside ok()
+r2_elapsed=$((SECONDS - r2_started))
+ok "a TERM-ignoring reviewer is killed after the grace (exit 1, #1460)" \
+  '[ "$rc" = 1 ] && [ "$r2_elapsed" -lt 15 ] && grep -q "killed after 1s + 1s grace" "$TMP/err-r2-hang.txt"'
+
+# A worker-side TERM on the handler is forwarded to the reviewer; temp dir removed.
+mkdir -p "$TMP/tmpdir-review-1460"
+rm -f "$TMP/agent-pid-review-1460"
+# Direct background command (not the helper function) so $! is the handler itself.
+TMPDIR="$TMP/tmpdir-review-1460" REVIEW_STUB_MODE=hang AGENT_PIDFILE="$TMP/agent-pid-review-1460" \
+  REVIEW_AGENT_BIN="$BIN/review-p2-stub-agent" REVIEW_TIMEOUT_SEC=30 WORKER_ID=testnode \
+  bash "$HANDLER" < "$TMP/task.json" >/dev/null 2>&1 &
+r2_hpid=$!
+for _ in $(seq 1 50); do [ -s "$TMP/agent-pid-review-1460" ] && break; sleep 0.1; done
+r2_apid="$(cat "$TMP/agent-pid-review-1460" 2>/dev/null)"
+kill -TERM "$r2_hpid" 2>/dev/null
+wait "$r2_hpid"
+# shellcheck disable=SC2034  # read via eval inside ok()
+r2_hrc=$?
+r2_agent_gone=0
+for _ in $(seq 1 50); do
+  if [ -n "$r2_apid" ] && ! kill -0 "$r2_apid" 2>/dev/null; then r2_agent_gone=1; break; fi
+  sleep 0.1
+done
+[ "$r2_agent_gone" = 1 ] || { [ -n "$r2_apid" ] && kill -KILL "$r2_apid" 2>/dev/null; }
+ok "TERM on the review handler stops the reviewer and cleans the temp dir (#1460)" \
+  '[ -n "$r2_apid" ] && [ "$r2_hrc" = 143 ] && [ "$r2_agent_gone" = 1 ] && [ -z "$(ls -A "$TMP/tmpdir-review-1460")" ]'
+
+# Tool lock: an args override must keep a total lock; otherwise fail closed
+# (exit 1) before the agent runs.
+r2_lock_case() {
+  rm -f "$TMP/agent-marker-review-1460"
+  make_task "$HEAD_OK"
+  REVIEW_AGENT_ARGS="$1" AGENT_MARKER="$TMP/agent-marker-review-1460" run_review_p2 >/dev/null 2>"$TMP/err-r2-lock.txt"
+}
+r2_lock_case "-p --model claude-test"; rc=$?
+ok "review args override without --disallowed-tools is rejected before the agent runs (#1460)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ] && grep -q "lacks a total tool lock" "$TMP/err-r2-lock.txt"'
+r2_lock_case "-p --disallowed-tools Bash"; rc=$?
+ok "review: a narrowed --disallowed-tools (not *) is rejected (#1460)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case '-p --disallowed-tools "*"'; rc=$?
+ok "review: a quoted \"*\" (literal token, not the wildcard) is rejected (#1460)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "-p --disallowed-tools * --allowedTools Bash"; rc=$?
+ok "review: an allow-list next to the lock is rejected (#1460)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "-p --no-tools --tools=Bash"; rc=$?
+ok "review: --tools next to --no-tools is rejected (#1460)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "-p --disallowed-tools * --dangerously-skip-permissions"; rc=$?
+ok "review: a permission bypass next to the lock is rejected (#1460)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "-p --model m --disallowed-tools *"; rc=$?
+ok "review: an override that keeps --disallowed-tools * runs (#1460)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "--disallowed-tools *"; rc=$?
+ok "review: a bare --disallowed-tools * line is accepted (#1460)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "-p --disallowedTools=*"; rc=$?
+ok "review: the --disallowedTools=* form is accepted (#1460)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "--no-tools"; rc=$?
+ok "review: a bare --no-tools line is accepted (#1460)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-review-1460" ]'
+r2_lock_case "-p --no-tools --model xai/grok-4.6"; rc=$?
+ok "review: the header example (-p --no-tools --model xai/grok-4.6) is accepted (#1460)" \
+  '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-review-1460" ]'
+rm -f "$TMP/agent-marker-review-1460"
+make_task "$HEAD_OK"
+P2_BIN="$TMP/danso-bin-review/danso-review-agent.sh" REVIEW_AGENT_ARGS="--model glm-test" \
+  AGENT_MARKER="$TMP/agent-marker-review-1460" run_review_p2 > "$TMP/out-r2-danso.json" 2>/dev/null; rc=$?
+ok "review: the danso wrapper (always --no-tools) is accepted with --model only (#1460)" \
+  '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-review-1460" ] && jq -e ".output.review_model == \"glm-test\"" >/dev/null "$TMP/out-r2-danso.json"'
+
+# Single reviewer node id: prompt binding, output and validation agree.
+make_task "$HEAD_OK"
+PROMPT_CAPTURE="$TMP/prompt-r2-node.txt" env -u WORKER_ID A2A_WORKER_ID=a2a-node-1460 \
+  REVIEW_AGENT_BIN="$BIN/review-p2-stub-agent" REVIEW_TIMEOUT_SEC=30 \
+  bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-r2-node.json" 2>/dev/null; rc=$?
+ok "A2A_WORKER_ID is the reviewer node in prompt, output and validation (#1460)" \
+  '[ "$rc" = 0 ] && grep -qx "reviewer_node: a2a-node-1460" "$TMP/prompt-r2-node.txt" &&
+   jq -e ".output.reviewer_node == \"a2a-node-1460\" and .validations[0].nodeId == \"a2a-node-1460\"" >/dev/null "$TMP/out-r2-node.json"'
+PROMPT_CAPTURE="$TMP/prompt-r2-host.txt" env -u WORKER_ID -u A2A_WORKER_ID \
+  REVIEW_AGENT_BIN="$BIN/review-p2-stub-agent" REVIEW_TIMEOUT_SEC=30 \
+  bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-r2-host.json" 2>/dev/null; rc=$?
+# shellcheck disable=SC2034  # read via eval inside ok()
+r2_bound_node="$(sed -n 's/^reviewer_node: //p' "$TMP/prompt-r2-host.txt")"
+ok "without WORKER_ID the review prompt and result name the same fallback node (#1460)" \
+  '[ "$rc" = 0 ] && [ -n "$r2_bound_node" ] &&
+   jq -e --arg n "$r2_bound_node" ".output.reviewer_node == \$n and .validations[0].nodeId == \$n" >/dev/null "$TMP/out-r2-host.json"'
+
+# Symmetric size caps: the packet is bounded before the agent runs, the raw
+# reviewer stdout on return.
+make_task "$HEAD_OK"
+jq '.payload.skillFiles = [range(17) | {path: ("references/f\(.).md"), content: "x"}]' \
+  "$TMP/task.json" > "$TMP/task-r2-17.json"
+rm -f "$TMP/agent-marker-review-1460"
+P2_TASK="$TMP/task-r2-17.json" AGENT_MARKER="$TMP/agent-marker-review-1460" run_review_p2 >/dev/null 2>"$TMP/err-r2-17.txt"; rc=$?
+ok "a review packet with more than 16 skillFiles fails before the agent runs (exit 1, #1460)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ] && grep -q "1..16 element array" "$TMP/err-r2-17.txt"'
+jq --arg big "$(head -c 70000 /dev/zero | tr '\0' a)" '.payload.skillFiles[0].content = $big' \
+  "$TMP/task.json" > "$TMP/task-r2-big.json"
+P2_TASK="$TMP/task-r2-big.json" AGENT_MARKER="$TMP/agent-marker-review-1460" run_review_p2 >/dev/null 2>"$TMP/err-r2-big.txt"; rc=$?
+ok "a review packet file over 64 KiB fails before the agent runs (exit 1, #1460)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ] && grep -q "exceed the size caps" "$TMP/err-r2-big.txt"'
+jq --arg big "$(head -c 60000 /dev/zero | tr '\0' a)" \
+  '.payload.skillFiles = [range(5) | {path: ("references/f\(.).md"), content: $big}]' \
+  "$TMP/task.json" > "$TMP/task-r2-total.json"
+P2_TASK="$TMP/task-r2-total.json" AGENT_MARKER="$TMP/agent-marker-review-1460" run_review_p2 >/dev/null 2>"$TMP/err-r2-total.txt"; rc=$?
+ok "a review packet over 256 KiB in total fails before the agent runs (exit 1, #1460)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-review-1460" ] && grep -q "exceed the size caps" "$TMP/err-r2-total.txt"'
+REVIEW_STUB_MODE=bigout run_review_p2 > "$TMP/out-r2-bigout.json" 2>"$TMP/err-r2-bigout.txt"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "reviewer stdout over 1 MiB is an oversized verdict (exit 1, #1460)" \
+  '[ "$rc" = 1 ] && [ ! -s "$TMP/out-r2-bigout.json" ] && grep -q "HANDLER_FAIL: reviewer output exceeds 1048576 bytes" "$TMP/err-r2-bigout.txt"'
 
 echo "PASS=$pass FAIL=$fail"

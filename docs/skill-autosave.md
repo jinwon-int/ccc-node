@@ -757,11 +757,26 @@ Node configuration lives in the worker env file the handler child inherits:
   arguments (default `claude` / `-p --disallowed-tools *`); a node whose main
   bridge runs another agent pins its own, e.g. a grok node sets
   `REVIEW_AGENT_BIN=/opt/piri/pi-test.sh` and
-  `REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-4.6"`;
+  `REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-4.6"`. The tool lock is
+  enforced, not just defaulted (#1460). An override must keep
+  `--disallowed-tools *` / `--disallowedTools *` (or `=*`) or `--no-tools`,
+  or use the `danso-review-agent.sh` wrapper. Otherwise, or with an
+  allow-list or permission bypass, the handler exits 1 before the agent runs;
 - `REVIEW_TIMEOUT_SEC` — reviewer wall clock (default 480);
+  `REVIEW_KILL_GRACE_SEC` — SIGKILL grace after it (default 30). The reviewer
+  runs as `timeout -k`, and a TERM/INT/HUP sent to the handler is forwarded
+  to it;
 - `INTAKE_REVIEW_HANDLER` / `DEFAULT_TASK_HANDLER` — dispatcher routing
   overrides (defaults resolve next to the installed dispatcher);
-- reviewer identity resolves from `WORKER_ID`, then `A2A_WORKER_ID`.
+- reviewer identity resolves once from `WORKER_ID`, then `A2A_WORKER_ID`, then
+  `hostname -s`, then `unknown`. The same value appears in the prompt
+  bindings, `output.reviewer_node` and `validations[].nodeId`.
+
+Input caps match the publisher: `skillFiles` at most 16 files, 64 KiB each,
+256 KiB total. A packet over them fails (exit 1) before any reviewer run.
+Raw reviewer output is capped at 1 MiB. The local pre-screen
+(`prescreen.py`) skips a draft over the 256 KiB total as `skipped.oversize`
+instead of sending it, so it never counts as a reviewer error.
 
 The result contract binds `head_sha` (snake_case) to the dispatched head —
 the publisher's `_verdict_from_task` discards unbound outputs as malformed by
