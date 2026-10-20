@@ -22,6 +22,8 @@
   older code — or unstamped pre-`#1081` lines — are `경고` (non-fatal); re-apply the
   named installer to re-render. See *Cron generation drift* below.
 - Selected agent provider. For `CCC_AGENT_PROVIDER=codex`, deterministic CLI, app-server surface, and login readiness without a model turn or Telegram access.
+- **Always-on budget** (`#2384`): always-on injection per source (chars/bytes, share of
+  the provider cap); over cap is `경고`, or `수동필요` under `--strict`. See *Always-on budget* below.
 
 The report is Markdown and classifies rows as:
 
@@ -37,6 +39,8 @@ The report is Markdown and classifies rows as:
 ```bash
 scripts/ccc-doctor.sh
 scripts/ccc-doctor.sh --json                 # one JSON object
+scripts/ccc-doctor.sh --strict               # over-cap always-on budget fails (exit 1)
+scripts/ccc-doctor.sh --always-on-summary    # one-line always-on budget only
 scripts/ccc-doctor.sh --fix                  # dry-run only
 scripts/ccc-doctor.sh --fix --apply          # settings-only repair after backup
 scripts/ccc-doctor.sh --fix --apply --scope=files
@@ -254,6 +258,61 @@ threshold (default 30, `0` disables the row); `CCC_DOCTOR_PUSH_STATE_ROOTS`
 The usual remedy is to point the remaining consumer at the writers' directory, or
 to symlink the orphan directory to the consumed one, and to move the stale records into `sent/`
 rather than delivering day-old notices.
+
+## Always-on budget
+
+`always-on: <source>` rows plus one `always-on budget` verdict row (#2384).
+Always-on text is what the provider loads into every session before the task
+says anything; it is sized per source, in chars and UTF-8 bytes, with each
+source's share of the provider cap.
+
+| Provider | Sources | Cap (chars) |
+|---|---|---|
+| `claude` | `~/.claude/CLAUDE.md` (global only; a project CLAUDE.md depends on cwd), the active output style (`outputStyle` → `output-styles/<name>.md`, else a frontmatter `name:` match), and every known SessionStart hook: `load-tools.sh` (`hooks/tools-cheatsheet.md`), `load-memory.sh` (memory snapshot), `nunchi/sessionstart.sh` (nunchi working memory), `report-style-canary.sh` | 24,000 |
+| `codex` | the first non-empty `$CODEX_HOME/AGENTS.override.md`, else `AGENTS.md`, with the ccc memory materializer's marked block split out as `memory snapshot (managed block)` | 8,000 |
+| other | not measured (`정상`, `not-measured`) | — |
+
+The caps are harness2's draft values; `CCC_ALWAYS_ON_MAX_CHARS` (a positive
+integer) overrides them on one node.
+
+SessionStart hooks are read from `settings.json` and `settings.local.json`
+together, the way Claude Code merges them (`scripts/install-nunchi.sh`
+registers the nunchi hook in `settings.local.json`); `outputStyle` in
+`settings.local.json` wins. Any other SessionStart hook whose stdout reaches
+the context is listed as `unmeasured hook <basename>` — visible, not counted.
+Hooks with stdout sent to `/dev/null` or backgrounded (`pending-drain.sh`)
+are skipped.
+
+The memory snapshot row is `estimated`. Doctor never runs `load-memory.sh` —
+it spawns a detached cache refresh and a query-time local search — so it
+rebuilds the deterministic parts the hook reads (MEMORY/USER with the Hermes
+fallback, PERSONA, the resume pointer, the Family Wiki cache), each under the
+hook's own byte cap (`CCC_BUILTIN_MEMORY_MAX_BYTES`, `CCC_RESUME_MAX_BYTES`,
+`CCC_WIKI_MAX_BYTES`), then the `CCC_MEMORY_MAX_BYTES` total. Query-time local
+hot memory and section headers are not counted.
+
+The nunchi row is not executed either, and nothing writes the hook's output to
+disk. It reports the byte ceiling of `nunchi.py assemble` —
+`max(CCC_NUNCHI_ASSEMBLE_BUDGET (3000), CCC_NUNCHI_CONSTRAINT_BUDGET (12000))`
+— converted to chars with `snapshot.md`'s char/byte ratio, labelled
+`estimated (budget ceiling)`. With `CCC_NUNCHI_ASSEMBLE=0`, the hook injects
+`head -c 3000 snapshot.md`, which is read as `cached`. The row is `inactive` when
+nunchi mode is off, the runtime is audience-scoped, or `snapshot.md` is missing.
+The report-style canary is `conditional`: it is counted only while
+`state/report-style-canary.flag` is armed. Its text is computed with the hook's own
+reader.
+
+| State | Class |
+|---|---|
+| total at or under the cap | `정상` |
+| total over the cap | `경고`; the action names the sources to cut, largest first, and by how many chars (`cut 1,000 chars, largest first: CLAUDE.md -1,000 (of 20,000; …)`) |
+| total over the cap under `--strict` | `수동필요` (exit 1) |
+
+A missing source is `absent`, an unwired hook `not-wired`, and a built-in or
+missing output style `no-file`; none of these is a finding.
+`--always-on-summary` prints only the one-line summary, which `/node-status`
+shows. Before adding always-on text, see the checklist in
+[`harness.md`](harness.md#always-on-text-budget).
 
 ## Fleet matrix
 
