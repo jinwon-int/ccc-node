@@ -998,6 +998,41 @@ def _safe_tool(path: Path, *, trust_root: Path | None = None) -> bool:
 _GIT_NO_BACKGROUND = ("-c", "maintenance.auto=false", "-c", "gc.auto=0")
 
 
+# ccc-node#2397: a claude CLI killed with SIGKILL inside its ~0.5 s OAuth
+# refresh window loses the rotated refresh token, and the next call wipes the
+# host login. subprocess.run(timeout=) SIGKILLs on timeout; stop the child with
+# SIGTERM first (the CLI finishes saving on TERM) and SIGKILL only after a
+# grace. Keep every copy identical (scripts/graceful_timeout_copies_test.py).
+GRACEFUL_STOP_SECONDS = 10.0
+
+
+def run_with_graceful_timeout(args, *, timeout, input=None, capture_output=False, **popen_kwargs):
+    """subprocess.run(..., timeout=) that sends SIGTERM, then SIGKILL after a grace."""
+    if capture_output:
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+    if input is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
+    with subprocess.Popen(args, **popen_kwargs) as proc:
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                out, err = proc.communicate(timeout=GRACEFUL_STOP_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err) from None
+        except BaseException:
+            proc.terminate()
+            try:
+                proc.wait(timeout=GRACEFUL_STOP_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
 def _run(
     argv: list[str],
     *,
@@ -1009,14 +1044,13 @@ def _run(
     if argv and argv[0] == "git":
         argv = ["git", *_GIT_NO_BACKGROUND, *argv[1:]]
     try:
-        completed = subprocess.run(
+        completed = run_with_graceful_timeout(
             argv,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            check=False,
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):

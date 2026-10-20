@@ -558,6 +558,12 @@ else
   err "doctor host Claude login verdict tests failed (a wiped or expiring login may go unseen until the owner's next turn)"
   tail -10 "$TMP/doctor-host-credentials-test.out" 2>/dev/null
 fi
+if python3 scripts/graceful_timeout_copies_test.py >"$TMP/graceful-timeout-test.out" 2>&1; then
+  say "  ok claude subprocess graceful-timeout copies + signal order (#2397)"
+else
+  err "graceful-timeout tests failed (a timed-out claude -p may be SIGKILLed mid OAuth refresh and wipe the host login)"
+  tail -10 "$TMP/graceful-timeout-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_promotion_backlog_test.py >"$TMP/doctor-promotion-backlog-test.out" 2>&1; then
   say "  ok doctor skill-promotion backlog verdict tests"
 else
