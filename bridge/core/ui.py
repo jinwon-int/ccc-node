@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .revert import REVERT_MODES
+
 # Matches numbered options like "1. foo", "2、bar", "3) baz" at line starts.
 OPTION_RE = re.compile(r"^\s*(\d+)[.、)）]\s*(.+)", re.MULTILINE)
 
@@ -194,37 +196,11 @@ def build_revert_mode_keyboard(msg_index: int) -> InlineKeyboardMarkup:
         msg_index: Index of the selected message in JSONL file
 
     Returns:
-        InlineKeyboardMarkup with 5 revert mode options
+        InlineKeyboardMarkup with the 5 revert mode options
+        (``revert.REVERT_MODES``, shared with the Matrix text menu, #2004)
     """
     buttons = [
-        [
-            InlineKeyboardButton(
-                "🔄 Restore code and conversation",
-                callback_data=f"revert:mode:{msg_index}:full",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💬 Restore conversation only",
-                callback_data=f"revert:mode:{msg_index}:conv",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📝 Restore code only",
-                callback_data=f"revert:mode:{msg_index}:code",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📋 Summarize from here",
-                callback_data=f"revert:mode:{msg_index}:summary",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Cancel", callback_data=f"revert:mode:{msg_index}:cancel"
-            )
-        ],
+        [InlineKeyboardButton(label, callback_data=f"revert:mode:{msg_index}:{mode}")]
+        for mode, label in REVERT_MODES
     ]
     return InlineKeyboardMarkup(buttons)

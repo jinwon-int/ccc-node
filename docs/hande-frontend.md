@@ -34,7 +34,7 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `turn.sender` `@<device>:hande` | actor = `<device>` up to the first `-` (the bot's own rule) → user `@<actor>:hande`. A person's devices share one conversation, like a Matrix user's devices |
 | `turn.room` (when the bot sends it, family-messenger#423) | room id; absent → the config's first room. Sessions are keyed `(user, room)` |
 | `turn.session_id` (always `null` today) | ignored — the session manager is the resume authority, exactly as on Matrix |
-| `turn.prompt` starting with `/` | the Matrix command set (`new model effort usage stop continue history resume waits cancelwait distill skills memory_promote restart task_*`); owner-only ones refuse non-owners |
+| `turn.prompt` starting with `/` | the Matrix command set (`new model effort usage stop continue history resume revert waits cancelwait distill skills memory_promote restart task_*`); owner-only ones refuse non-owners. Numbered menus (`/resume`, `/revert`) are plain `result` text answered by a bare-number turn |
 | `TurnSink.approval` | `approval{approval_id, action, description=<redacted snapshot>, arguments={}}` → `approve`/`deny` → `approval-resolved`; `approval_timeout_s` (default 120) → denied. Audit ledger as on Matrix |
 | `TurnSink.typing` / `status` | no-op (the port has no typing or editable bubble) |
 | `TurnSink.interim` | dropped and counted unless `interim_frames: true` (then an `interim` frame the bot must know) |

@@ -15,7 +15,7 @@ changed versus the family-messenger pilot bot ("fambot"):
 | brain | one Codex process per turn, JSON port | `ProjectChatHandler` in-process (as Telegram) |
 | session | `session_id` per room, cold start each turn | warm `AgentSession` per room |
 | progress | "작업을 시작했습니다" only | typing + interim/status notices + the Telegram session-start banner (`◐ CCC session started (<reason>)…`) whenever a turn opens a fresh provider stream |
-| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) + `/waits /cancelwait` (#2004) + `/memory_promote` (#2004, audience-scoped memory only) |
+| commands | `/cancel /ack /approve /deny` | + `/new /model /effort /usage /skills /stop` (`/ack` gate removed: interrupted turns end with a notice, like Telegram) + `/task_pause /task_resume /task_recover` (#1895, Danso long-task mode only) + `/history /resume` (#1895 PR-B) + `/continue` (#1825) + `/restart` (#2003) + `/waits /cancelwait` (#2004) + `/memory_promote` (#2004, audience-scoped memory only) + `/revert` (#2004, numbered text menu) |
 | output | plain `m.text` | plain `body` + Matrix HTML `formatted_body` |
 | E2EE / trust / room gate | fleet_matrix | same code, ported (fail-closed reasons unchanged) |
 
@@ -668,6 +668,38 @@ private Matrix memory scope to shared memory, with Telegram's semantics and
 answers: owner-only, `CCC_BRIDGE_MEMORY_MODE=audience-scoped` only (otherwise it
 answers that promotion is unavailable), accepted only in the owner's direct
 room, then the shared index is refreshed.
+
+## Conversation revert (#2004)
+
+`/revert` is Telegram's two-step revert (pick a message, then a mode) as a
+numbered text menu, since Matrix has no inline keyboard. Owner-only (#1955);
+same provider gates and answers as Telegram (unavailable on Piri/Danso,
+disabled for Claude under `audience-scoped` memory).
+
+1. `/revert` lists the conversation's last 50 user messages, newest first,
+   ten per page (`/revert page <p>`); numbers are absolute across pages.
+2. A bare number picks a message and shows the five modes (restore code and
+   conversation, conversation only, code only, summarize from here, cancel);
+   a second bare number picks the mode.
+3. One-shot forms skip a step: `/revert <n>` (mode menu for message `n`) and
+   `/revert <n> <mode>` (`full`, `conv`, `code`, `summary`, `cancel`, or
+   `1`–`5`). `/revert cancel` closes an open menu.
+
+The transcript is rewritten by the same helper Telegram uses
+(`revert.revert_conversation`: path guard, then atomic truncation to the lines
+before the chosen message); the room's provider stream is then dropped so the
+next turn resumes the shortened transcript. As on Telegram, `full` and `code`
+restore the conversation only (no file tracking yet); `summary` changes
+nothing and says so.
+
+A pending menu is in memory, per sender per room, and lasts 5 minutes (each
+answered step restarts the clock). While it is open only a bare number is
+taken as an answer: an out-of-range number keeps the menu open, a number after
+it expired gets "menu expired" (it does not reach the agent), and anything
+else — an ordinary message or another command — closes the menu and runs as
+usual. Opening `/revert` also drops a pending `/resume` list, so one numbered
+menu answers at a time. If the session changed in between, the pick is
+refused.
 
 ## Auto-continue and dead-session notices (#1825)
 

@@ -70,7 +70,6 @@ from telegram_bot.core.skill_command import (
 )
 from telegram_bot.memory.distill_types import DistillJob, DistillTrigger
 from telegram_bot.memory.promotion import MemoryPromotionResult
-from .conversation_paths import resolve_conversation_file
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils import tg_errors
 
@@ -1911,15 +1910,10 @@ class BotCommandMixin:
         Args:
             mode: "full", "conv", or "code"
         """
-        filepath = resolve_conversation_file(self._project_chat.conversations_dir, session_id)
-        if filepath is None:
-            logger.warning(
-                "Rejected conversation path outside conversations dir: session_id=%r",
-                session_id,
-            )
-            return False
-
-        if revert_ops.truncate_jsonl_to(filepath, msg_index):
+        # Shared with the Matrix /revert menu (#2004): path guard + truncation.
+        if revert_ops.revert_conversation(
+            self._project_chat.conversations_dir, session_id, msg_index
+        ):
             logger.info(
                 f"User {user_id}: conversation reverted to before message {msg_index} (mode: {mode})"
             )
