@@ -113,7 +113,7 @@ changed_ranges() {
 mode=""; findings=""; count=0; rules="-"; hidden=0
 if [ -n "$ruff" ]; then
   mode="ruff"
-  select=(--select E,F); rules="default"
+  select=(--select "E,F"); rules="default"
   if has_ruff_config "$(dirname "$fpath")" "$repo_root"; then select=(); rules="repo"; fi
   findings="$(cd "$cwd" 2>/dev/null && run_bounded "$ruff" check ${select[@]+"${select[@]}"} --no-fix --output-format concise -- "$fpath" 2>/dev/null)"
   rc=$?
