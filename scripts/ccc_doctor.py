@@ -207,6 +207,10 @@ def load_owner_only_json(path: Path, *, max_bytes: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("owner-only JSON state is not an object")
     return value
+# Host Claude login check (#2397): the credentials file is a few hundred bytes;
+# long-lived setup-token logins warn this many days before their 1-year expiry.
+CLAUDE_CREDENTIALS_MAX_BYTES = 64 * 1024
+CLAUDE_TOKEN_EXPIRY_WARN_DAYS = 30
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 # Every subprocess the doctor spawns is bounded (#1481). A wedged `git
@@ -1070,6 +1074,7 @@ class Doctor:
         self.check_nunchi_collection()
         self.check_cron_drift()
         self.check_provider_readiness()
+        self.check_claude_host_credentials()
         self.check_distill_readiness()
         self.check_claude_transcripts_privacy()
         self.check_snapshot_refusals()
@@ -1238,6 +1243,86 @@ class Doctor:
                 "live readiness not proven",
                 "inspect bridge status and Piri provider authentication",
             )
+
+    def check_claude_host_credentials(self) -> None:
+        """Flag a wiped or expiring host Claude login (ccc-node#2397).
+
+        When a ``/login`` (refresh-style) session fails to refresh, the CLI
+        rewrites ``~/.claude/.credentials.json`` with an empty ``accessToken``
+        and ``refreshToken`` and ``expiresAt=0``. From then on every bridge
+        turn, ``claude -p`` cron and distill call fails with ``OAuth session
+        expired and could not be refreshed`` while every unit stays ``active``
+        — three nodes in four days (2026-10-17..20) each sat broken until
+        the owner's next message. Long-lived ``claude setup-token``
+        tokens (no refresh token, 1-year ``expiresAt``) are the recovery, and
+        they expire silently a year later (Wiki TM-3899).
+
+        Read-only and value-free: the file is read through the owner-only 0600
+        loader and only presence, emptiness and ``expiresAt`` are inspected;
+        no token value, length or fingerprint is ever rendered. A missing file
+        is 해당 없음 because env-token / apiKeyHelper nodes legitimately have
+        none, and those auth paths are not inspected here.
+        """
+        item = "claude host credentials"
+        path = self.claude_dir / ".credentials.json"
+        reauth = (
+            "re-authenticate: `claude setup-token` on the node, replace claudeAiOauth.accessToken "
+            "(+1y expiresAt), then idle-restart the bridge (Wiki TM-3899, ccc-node#2397)"
+        )
+        try:
+            present = path.exists() or path.is_symlink()
+        except OSError:
+            self.add("경고", item, "확인 불가 (credentials path not inspectable)",
+                     "rerun ccc-doctor as the account that runs claude")
+            return
+        if not present:
+            self.add("정상", item,
+                     "해당 없음 (no .credentials.json; env-token/apiKeyHelper auth not inspected)", "none")
+            return
+        try:
+            data = load_owner_only_json(path, max_bytes=CLAUDE_CREDENTIALS_MAX_BYTES)
+        except (OSError, ValueError):
+            self.add("경고", item, "확인 불가 (not an owner-only 0600 JSON object)",
+                     "check owner, mode 0600 and JSON shape of ~/.claude/.credentials.json without printing it")
+            return
+        oauth = data.get("claudeAiOauth")
+        if not isinstance(oauth, dict):
+            self.add("정상", item, "해당 없음 (no claudeAiOauth login)", "none")
+            return
+
+        def filled(key: str) -> bool:
+            value = oauth.get(key)
+            return isinstance(value, str) and value.strip() != ""
+
+        has_access, has_refresh = filled("accessToken"), filled("refreshToken")
+        expires = oauth.get("expiresAt")
+        expires_ms = float(expires) if isinstance(expires, (int, float)) and not isinstance(expires, bool) else 0.0
+        if not math.isfinite(expires_ms):
+            expires_ms = 0.0
+        if not has_access and not has_refresh:
+            self.add("수동필요", item,
+                     "login wiped (accessToken and refreshToken empty) — every Claude call fails", reauth)
+            return
+        if not has_access:
+            self.add("경고", item, "accessToken empty with a refresh token present",
+                     "verify with `claude -p 'Reply with exactly: ok'`; re-authenticate if it fails")
+            return
+        if has_refresh:
+            self.add("정상", item, "refresh login (access token auto-refreshes)", "none")
+            return
+        if expires_ms <= 0:
+            self.add("경고", item, "long-lived token without expiresAt (CLI may treat it as expired)",
+                     "record the token's 1-year expiresAt in claudeAiOauth (Wiki TM-3899)")
+            return
+        expiry = datetime.fromtimestamp(expires_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
+        days_left = (expires_ms / 1000 - time.time()) / 86400
+        if days_left <= 0:
+            self.add("수동필요", item, f"long-lived token expired {expiry}", reauth)
+        elif days_left <= CLAUDE_TOKEN_EXPIRY_WARN_DAYS:
+            self.add("경고", item, f"long-lived token expires {expiry} ({int(days_left)}d left)",
+                     "re-issue before expiry: " + reauth)
+        else:
+            self.add("정상", item, f"long-lived token; expires {expiry}", "none")
 
     def check_provider_readiness(self) -> None:
         if self.provider == "claude":

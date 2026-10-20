@@ -552,6 +552,12 @@ else
   err "doctor worker Claude CLI floor verdict tests failed (a model pin may outrun the node's Claude Code unseen)"
   tail -10 "$TMP/doctor-cli-floor-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_host_credentials_test.py >"$TMP/doctor-host-credentials-test.out" 2>&1; then
+  say "  ok doctor host Claude login verdict tests (#2397)"
+else
+  err "doctor host Claude login verdict tests failed (a wiped or expiring login may go unseen until the owner's next turn)"
+  tail -10 "$TMP/doctor-host-credentials-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_promotion_backlog_test.py >"$TMP/doctor-promotion-backlog-test.out" 2>&1; then
   say "  ok doctor skill-promotion backlog verdict tests"
 else
