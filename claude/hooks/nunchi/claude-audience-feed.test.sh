@@ -254,7 +254,7 @@ multi_cron() {
   env -u CCC_BRIDGE_DISTILL_JOURNAL -u CCC_AGENT_PROVIDER -u CCC_FRONTENDS -u CCC_FRONTENDS_FILE \
     HOME="$mhome" CCC_STATE_DIR="$mhome/.claude/state" NUNCHI_HOME="$mhome/.nunchi" \
     CCC_BRIDGE_ENV_FILE="$TMP/no-such.env" \
-    CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$aud" "$@" \
+    CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$aud" \
     bash "$hooks/ingest-cron.sh" >"$TMP/out" 2>"$TMP/err"
 }
 multi_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]))' "$mhome/.nunchi/ingest.status.json" "$1"; }
