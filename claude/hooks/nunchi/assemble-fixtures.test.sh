@@ -274,9 +274,25 @@ ok "F-15 recency tail order holds across peers" \
 # block stayed at 3,000 B. Constraints keep priority over facts (G4) but the
 # block itself is bounded: newest first, a tail line counts the omitted rows.
 fixture_db f16
+# Twelve genuinely different rules: a shared filler sentence would now fold
+# into one line under the token-Jaccard stage (#2384), which F-20 covers.
+F16_RULES=(
+  "배포 후 웹 페이지를 2회 새로고침해서 캐시 반영을 확인"
+  "secrets 원문은 Wiki에 저장하지 않고 위치만 기록"
+  "main 브랜치에 직접 push 금지, feature branch 사용"
+  "broker 재시작 전에는 사용자에게 승인 요청"
+  "DB migration 전에 백업 파일 존재를 검사"
+  "릴리스 태그는 오너 지시가 있을 때만 생성"
+  "provider canary 발송은 사전 동의 필요"
+  "세션 덤프 원본을 이슈 본문에 붙여넣지 않기"
+  "cron 일정 변경은 dry-run 결과를 먼저 첨부"
+  "테스트 실패를 skip으로 숨기지 말 것"
+  "로그에는 토큰과 호스트 이름을 마스킹"
+  "문서 링크는 상대 경로로 작성"
+)
 for i in $(seq 1 12); do
   sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
-   ('family-assistant','node-a','constraint','CB-RULE-$i 이 규칙은 길이를 맞추기 위한 채움 문장입니다 $i','2026-08-07','cb-$i','2026-08-07T00:00:00+00:00',3,0);"
+   ('family-assistant','node-a','constraint','CB-RULE-$i ${F16_RULES[$((i-1))]}','2026-08-07','cb-$i','2026-08-07T00:00:00+00:00',3,0);"
 done
 export CCC_NUNCHI_CONSTRAINT_BUDGET=300
 run_asm 8192 ""
@@ -325,6 +341,144 @@ run_asm 8192 ""
 unset CCC_NUNCHI_CONSTRAINT_BUDGET
 ok "F-19 budget 0: every constraint present, no tail" \
   '[ "$(grep -c "^- \[제약/" <<<"$ASM")" = 6 ] && ! grep -q "건 생략" <<<"$ASM"'
+
+# ---- F-20 one snapshot line per near-duplicate cluster (#2384) --------------
+# The 40-char prefix fold (#2216) misses re-extractions that drift early in
+# the sentence (particle, quote style, an inserted adverb), so one rule was
+# still injected as several lines, each with its own `(+N 유사)` tail. The
+# second stage merges prefix groups whose texts reach token Jaccard >= the
+# threshold; N counts every folded member across both stages.
+# ids (= recency): 1 DIST-A, 2-6 dups, 7 DIST-B, 8-11 dups; id 11 is the
+# newest dup and therefore the representative; id 3 shares its 40-char prefix.
+F20_ROWS=(
+  "DIST-A 배포 후 웹 페이지를 2회 새로고침해서 캐시 반영을 확인한다"
+  "근거에 없는 내용은 지어내지 말고 \"기록 없음\"이라고 답할 것"
+  "근거에 없는 내용은 지어내지 말고 ''기록 없음''이라고 답한다 — 재추출 세션 A 기준"
+  "근거에 없는 내용을 지어내지 말고 ''기록 없음''으로 답한다"
+  "근거에 없는 내용은 절대 지어내지 말고 ''기록 없음''이라고 명시한다"
+  "근거에 없는 사실은 지어내지 말고 ''기록 없음''이라고 답한다 (evidence-only 원칙)"
+  "DIST-B secrets는 Wiki에 원문으로 저장하지 않고 위치와 취급 규칙만 기록한다"
+  "답변 시 근거에 없는 내용은 지어내지 말고 ''기록 없음''이라고 답한다"
+  "제공된 근거에 없는 내용은 지어내지 말고, 모르면 ''기록 없음''이라고 답한다"
+  "근거에 없는 내용은 지어내지 말 것 — 없으면 ''기록 없음''이라고 답한다"
+  "근거에 없는 내용은 지어내지 말고 ''기록 없음''이라고 답한다 — 재추출 세션 B 기준"
+)
+f20_seed() {
+  local i=0 row
+  for row in "${F20_ROWS[@]}"; do
+    i=$((i + 1))
+    sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+     ('family-assistant','node-a','constraint','$row','2026-08-07','nd-$i','2026-08-07T00:00:00+00:00',3,0);"
+  done
+}
+fixture_db f20
+f20_seed
+run_asm 8192 ""
+F20_LINES="$(grep -c "^- \[제약/" <<<"$ASM")"
+ok "F-20 nine variants + two distinct rules -> three constraint lines" '[ "$F20_LINES" = 3 ]'
+ok "F-20 cluster line is the newest variant with +8 (both stages counted)" \
+  'grep -qF "[제약/node-a] 근거에 없는 내용은 지어내지 말고 '"'"'기록 없음'"'"'이라고 답한다 — 재추출 세션 B 기준 (+8 유사)" <<<"$ASM"'
+ok "F-20 exactly one line mentions the rule" '[ "$(grep -c "기록 없음" <<<"$ASM")" = 1 ]'
+ok "F-20 distinct rules stay unfolded, recency order kept" \
+  '! grep "DIST-" <<<"$ASM" | grep -q "유사" && [ "$(line_of "세션 B 기준")" -lt "$(line_of "DIST-B")" ] && [ "$(line_of "DIST-B")" -lt "$(line_of "DIST-A")" ]'
+# shellcheck disable=SC2034  # F20_FIRST is read via eval inside ok()
+F20_FIRST="$ASM"
+run_asm 8192 ""
+ok "F-20 output is deterministic across runs" '[ "$ASM" = "$F20_FIRST" ]'
+export CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD=0
+run_asm 8192 ""
+unset CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD
+F20_PREFIX_ONLY="$(grep -c "^- \[제약/" <<<"$ASM")"
+ok "F-20 threshold 0 disables stage 2 (prefix-only fold: 10 lines)" '[ "$F20_PREFIX_ONLY" = 10 ]'
+echo "F-20 constraint lines: prefix-only=$F20_PREFIX_ONLY two-stage=$F20_LINES"
+
+# ---- F-21 hint-matched member becomes the representative --------------------
+# Representative rule is unchanged: first in display order = hint match, then
+# newest. A hint naming an older variant puts THAT text on the cluster line.
+run_asm 8192 "evidence-only"
+ok "F-21 hint-matched variant represents the cluster, count unchanged" \
+  'grep -qF "(evidence-only 원칙) (+8 유사)" <<<"$ASM" && [ "$(grep -c "기록 없음" <<<"$ASM")" = 1 ] && [ "$(grep -c "^- \[제약/" <<<"$ASM")" = 3 ]'
+
+# ---- F-22 budget still bounds the folded block ------------------------------
+export CCC_NUNCHI_CONSTRAINT_BUDGET=200
+run_asm 8192 ""
+unset CCC_NUNCHI_CONSTRAINT_BUDGET
+ok "F-22 cluster line survives a tight budget, tail counts omitted lines" \
+  'grep -q "세션 B 기준 (+8 유사)" <<<"$ASM" && grep -q "^- \[제약\] [12]건 생략(예산 200B, 열린 제약 11건)" <<<"$ASM"'
+ok "F-22 constraint lines stay within budget" \
+  '[ "$(grep "^- \[제약/" <<<"$ASM" | wc -c)" -le 200 ]'
+
+# ---- F-23 similar-prefix but different rules are NOT merged -----------------
+# False-positive guard: shared openings ("근거에 없는 내용은 …", "배포 후 웹
+# 페이지 …", "fresh approval 필수: …") with different actions stay separate,
+# two rules about different PRs never merge however alike they read, and two
+# near-miss pairs shaped after a real node's open constraints (a rule vs its
+# exception; a policy summary vs one of its clauses) stay apart.
+fixture_db f23
+sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+ ('family-assistant','node-a','constraint','근거에 없는 내용은 지어내지 말고 ''기록 없음''이라고 답한다','2026-08-07','fp-1','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','근거에 없는 내용은 지어내지 말고 출처 링크를 함께 남긴다','2026-08-07','fp-2','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','근거에 없는 내용은 Wiki에 쓰기 전에 live-check로 확인한다','2026-08-07','fp-3','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','배포 후 웹 페이지를 2회 새로고침해서 캐시 반영을 확인한다','2026-08-07','fp-4','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','배포 후 웹 페이지의 콘솔 에러를 확인하고 스크린샷을 남긴다','2026-08-07','fp-5','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','fresh approval 필수: broker 재시작 전에는 사용자 승인을 받는다','2026-08-07','fp-6','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','fresh approval 필수: DB migration 전에는 백업을 먼저 확인한다','2026-08-07','fp-7','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','PR #1941 머지 전에는 canary 결과를 기다린다','2026-08-07','fp-8','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','PR #1942 머지 전에는 canary 결과를 기다린다','2026-08-07','fp-9','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','미래에 종료되는 모든 테스트는 해당 이슈에 예정/실제 종료일시·판정 기준·증거·다음 확인 일시를 코멘트한다. 상대 시간만 적지 말 것','2026-08-07','fp-10','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','테스트 종료일시 이슈 코멘트 규칙에서 CI 대기는 기록 대상이 아니다. 장기·예약·관찰 테스트만 해당','2026-08-07','fp-11','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','REVIEW.md 정책: 승격 PR은 독립 리뷰 필수, 자동 머지 금지, reject close 자동화 금지. 자동 머지나 auto-close는 별도 정책 결정','2026-08-07','fp-12','2026-08-07T00:00:00+00:00',3,0),
+ ('family-assistant','node-a','constraint','\`reject\` intake는 어떤 자동화 경로에서도 닫지 않는다. supersede-autoclose는 같은 계보의 새 tree가 있을 때 옛 intake만 close','2026-08-07','fp-13','2026-08-07T00:00:00+00:00',3,0);"
+run_asm 8192 ""
+ok "F-23 thirteen distinct rules -> thirteen lines, none folded" \
+  '[ "$(grep -c "^- \[제약/" <<<"$ASM")" = 13 ] && ! grep -q "유사" <<<"$ASM"'
+
+# ---- F-24 real-shaped re-extractions: one line per rule (#2384 review) -------
+# Shaped after a real node's open constraints, where the first Jaccard stage
+# (character bigrams) still left one rule as 6 lines and another as 3: the
+# variants differ in a "Wiki" qualifier, the verb (지어내지/추측하지,
+# 표기할/명시하라) and per-extraction parenthetical notes. Rows are oldest
+# first; the newest variant of each rule is its representative. Two related
+# but distinct rules (DIST-C, DIST-D) stay separate lines.
+F24_ROWS=(
+  "Phase 2 Honcho 폐기 진입 조건 '2주간 Honcho만 답한 질의 0건'은 설계상 도달 불가능 (bench.sh가 Honcho를 호출하지 않음)"
+  "근거에 없는 내용은 지어내지 말고 '기록 없음'이라고 명시하기"
+  "향후 Fable 한도에 다시 걸리면 '한도 도달' 오류 발생 가능, 백업 복원으로 1분 안 Opus 5.5 복구 가능."
+  "Wiki 근거 없는 내용은 추측하지 말고 명시적으로 '기록 없음'이라 표기할 것 (사용자 선호)"
+  "DIST-C 미래에 종료되는 모든 테스트는 해당 이슈에 예정/실제 종료일시·판정 기준·증거·다음 확인 일시를 코멘트한다"
+  "근거에 없는 내용은 지어내지 말고 반드시 '기록 없음'으로 명시할 것 (반복 강조)"
+  "Fable 한도 재발 시 백업(20261002T142733)에서 Opus 5.5로 복구 가능, 1분 소요."
+  "Wiki 근거에 없는 내용은 추측하지 말고 반드시 '기록 없음'으로 명시하라"
+  "DIST-D 테스트 종료일시 이슈 코멘트 규칙에서 CI 대기는 기록 대상이 아니다. 장기·예약·관찰 테스트만 해당"
+  "Phase 2 폐기 진입 조건 '2주간 Honcho만 답한 질의 0건'은 설계상 도달 불가능 — bench.sh가 Honcho를 호출하지 않으므로 집계 불가능"
+  "Wiki 근거에 없는 내용은 지어내지 말고 반드시 '기록 없음'이라 표기해야 함"
+  "Fable 한도 재발 가능성 있음 — 오류 발생 시 백업 디렉터리에서 Opus 5.5로 1분 내 복구 가능"
+  "근거에 없는 내용은 지어내지 말고 명시적으로 '기록 없음'이라 표기할 것 (사용자 반복 강조, CLAUDE.md 지시)"
+)
+fixture_db f24
+i=0
+for row in "${F24_ROWS[@]}"; do
+  i=$((i + 1))
+  sql "INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review) VALUES
+   ('family-assistant','node-a','constraint','${row//\'/\'\'}','2026-08-07','rv-$i','2026-08-07T00:00:00+00:00',3,0);"
+done
+run_asm 8192 ""
+F24_LINES="$(grep -c "^- \[제약/" <<<"$ASM")"
+ok "F-24 thirteen real-shaped rows -> five lines" '[ "$F24_LINES" = 5 ]'
+ok "F-24 '기록 없음' rule is one line, newest variant, +5" \
+  '[ "$(grep -c "기록 없음" <<<"$ASM")" = 1 ] && grep -qF "CLAUDE.md 지시) (+5 유사)" <<<"$ASM"'
+ok "F-24 'Fable 한도' rule is one line, newest variant, +2" \
+  '[ "$(grep -c "Fable 한도" <<<"$ASM")" = 1 ] && grep -qF "1분 내 복구 가능 (+2 유사)" <<<"$ASM"'
+ok "F-24 'Phase 2' rule is one line, newest variant, +1" \
+  '[ "$(grep -c "Honcho만 답한" <<<"$ASM")" = 1 ] && grep -qF "집계 불가능 (+1 유사)" <<<"$ASM"'
+ok "F-24 related-but-distinct rules stay separate and unfolded" \
+  'grep -q "DIST-C" <<<"$ASM" && grep -q "DIST-D" <<<"$ASM" && ! grep "DIST-" <<<"$ASM" | grep -q "유사"'
+export CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD=0
+run_asm 8192 ""
+unset CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD
+F24_PREFIX_ONLY="$(grep -c "^- \[제약/" <<<"$ASM")"
+ok "F-24 prefix-only fold leaves every variant on its own line (13)" '[ "$F24_PREFIX_ONLY" = 13 ]'
+echo "F-24 constraint lines: prefix-only=$F24_PREFIX_ONLY two-stage=$F24_LINES"
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"

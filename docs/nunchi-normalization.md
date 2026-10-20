@@ -67,6 +67,32 @@ finite reserved allowance is rejected. Both bridge channels must use the same
 meter and policy. A crash or unknown usage stays charged; never reset historical
 counters to manufacture capacity. Each partition must fit one maximal request.
 
+## SessionStart constraint block
+
+`nunchi.py assemble` (the SessionStart path) renders open constraints ahead of
+facts under their own byte budget, `CCC_NUNCHI_CONSTRAINT_BUDGET` (default
+12000; 0 = unbounded): hint matches first, then newest, with a
+`- [제약] N건 생략 …` tail pointing at `nunchi.py constraints` (#2216).
+
+Re-extracted copies of one rule fold to **one line per cluster** in two stages:
+the case/whitespace-normalised first 40 characters (#2216), then token Jaccard
+between those groups (#2384). For similarity only, parenthetical notes such as
+`(반복 강조)` are dropped; tokens are the `constraints-triage` tokens
+(lowercase, punctuation and quotes stripped, one trailing Korean particle
+removed) with each Hangul run cut to its first two syllables, so a qualifier,
+a verb ending (`표기할`/`명시하라`) or a provenance note no longer splits a rule.
+The threshold is `CCC_NUNCHI_CONSTRAINT_FOLD_JACCARD` (default 0.46; 0 =
+prefix stage only), measured on one node's open constraints: variants of the
+same rule scored >= 0.50 against their representative, distinct rules with a
+shared opening <= 0.42. Character bigrams and IDF weighting were measured and
+did not separate the two.
+Rules naming disjoint issue/PR numbers never merge, and clustering is greedy
+rather than transitive. The kept line is the first in display order (hint
+match, else newest); `(+N 유사)` counts members folded by either stage.
+Folding changes only the injected text — `nunchi.py constraints` still lists
+every row, and `constraints-triage` is the reversible way to close duplicates
+in the DB.
+
 ## Acceptance after deployment
 
 Stage one runtime/channel, then all nodes. Capture per audience: source input

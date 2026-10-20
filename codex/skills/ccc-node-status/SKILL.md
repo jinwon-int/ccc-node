@@ -19,6 +19,7 @@ description: Inspect the current ccc-node source, serving bridge, provider readi
    git -C "$ROOT" log -1 --oneline
    bash "$ROOT/bridge/start.sh" --path "${CCC_BRIDGE_DEFAULT_PATH:-$HOME}" --status
    bash "$ROOT/scripts/agent-cron.sh" status --json
+   CCC_AGENT_PROVIDER=codex bash "$ROOT/scripts/ccc-doctor.sh" --always-on-summary
    ```
 
 3. Read the health summary, not request or message bodies. Report source

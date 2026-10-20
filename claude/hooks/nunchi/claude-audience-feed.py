@@ -7,7 +7,8 @@ global Claude lane mirrors, each routed to exactly one audience store:
 
     <audience-root>/<scope>/nunchi/{facts.db,snapshot.md}
 
-* the bridge distill journal (the bridge-managed lane), and
+* the bridge distill journal(s) (the bridge-managed lane; ``--journal`` may
+  repeat, one per frontend journal — #2350), and
 * each scope's OWN ``<root>/<scope>/state/distill-history`` — bridge sessions
   run their hooks with ``CCC_STATE_DIR`` pointed there — ingested only into
   that scope and only when the sidecar maps the session to that same scope.
@@ -408,7 +409,10 @@ class Feed:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--audience-root", required=True)
-    parser.add_argument("--journal", required=True)
+    # Repeatable (#2350): every frontend journal is read in this one run, so
+    # the scoped distill-history is walked once, rejections are counted once
+    # and pruning sees the pending sessions of every journal.
+    parser.add_argument("--journal", action="append", required=True)
     parser.add_argument("--seen", required=True)
     parser.add_argument("--nunchi-py", required=True)
     parser.add_argument("--projects-root", default=None)
@@ -416,7 +420,9 @@ def main(argv: list[str]) -> int:
 
     feed = Feed(args)
     feed.scoped_history()
-    feed.journal(Path(args.journal), _load_adapter())
+    adapter = _load_adapter()
+    for journal in dict.fromkeys(args.journal):  # order-preserving dedup
+        feed.journal(Path(journal), adapter)
     feed.snapshots()
     feed.prune(_max_age_days(), time.time())
     c = feed.counts

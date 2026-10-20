@@ -132,12 +132,14 @@ NUNCHI_AUTO_DISTILL_FEED=1 python3 "$FEED" --log /nonexistent/log.jsonl --state 
 ok "missing log while enabled is a silent no-op" '[ "$rc" = 0 ]'
 
 # ---- 9. ingest-cron wiring -------------------------------------------------
+# The journal is pinned to a missing dir: by default ingest-cron walks every
+# frontend journal under the real $HOME (#2350), which is not this fixture.
 echo on > "$CCC_STATE_DIR/nunchi.mode"
 echo on > "$CCC_STATE_DIR/nunchi.auto-distill-feed"
 rm -f "$STATE"; : > "$LOG"
-NUNCHI_AUTO_DISTILL_LOG="$LOG" bash "$ROOT/claude/hooks/nunchi/ingest-cron.sh" >/dev/null 2>&1
+NUNCHI_AUTO_DISTILL_LOG="$LOG" CCC_BRIDGE_DISTILL_JOURNAL="$TMP/no-journal" bash "$ROOT/claude/hooks/nunchi/ingest-cron.sh" >/dev/null 2>&1
 record cron1 GOLF >> "$LOG"
-NUNCHI_AUTO_DISTILL_LOG="$LOG" bash "$ROOT/claude/hooks/nunchi/ingest-cron.sh" >/dev/null 2>&1; rc=$?
+NUNCHI_AUTO_DISTILL_LOG="$LOG" CCC_BRIDGE_DISTILL_JOURNAL="$TMP/no-journal" bash "$ROOT/claude/hooks/nunchi/ingest-cron.sh" >/dev/null 2>&1; rc=$?
 ok "ingest-cron runs the feed lane" '[ "$rc" = 0 ] && [ "$(rows "select count(*) from peer_facts where fact like '"'"'%GOLF%'"'"'")" = 2 ]'
 
 # ---- 10. assemble labels and caps auto-distill rows ------------------------

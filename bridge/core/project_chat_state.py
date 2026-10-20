@@ -19,7 +19,10 @@ from telegram_bot.utils.secure_fs import (
     _secure_existing_state_file,
     ensure_private_directory,
 )
-from telegram_bot.utils.session_resource_guard import process_tree_rss_mb
+from telegram_bot.utils.session_resource_guard import (
+    host_memory_pressure,
+    process_tree_rss_mb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -684,6 +687,8 @@ class ProjectChatStateMixin:
         now: float,
         rss_mb: float,
         deferred: int = 0,
+        reasons: Optional[list[str]] = None,
+        evicted_reasons: Optional[dict[str, int]] = None,
     ) -> int:
         """Close idle candidates, sparing those whose provider still owns work.
 
@@ -691,10 +696,13 @@ class ProjectChatStateMixin:
         or a run-in-background task may be running (#2291). Peek and drop
         are synchronous with no await between them, so the busy answer holds
         for the drop it guards.
+
+        ``reasons`` runs parallel to ``candidates`` (``ttl`` / ``lru`` /
+        ``rss``); each actual eviction is tallied into ``evicted_reasons``.
         """
 
         evicted = 0
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             peeked = self._agent_session_registry.peek_idle_cached_if_same(candidate)
             if peeked is not None and self._provider_session_busy(
                 peeked.session, now
@@ -706,6 +714,13 @@ class ProjectChatStateMixin:
                 continue
             await self._close_agent_session(entry.session)
             evicted += 1
+            if evicted_reasons is not None:
+                reason = (
+                    reasons[index]
+                    if reasons is not None and index < len(reasons)
+                    else "unknown"
+                )
+                evicted_reasons[reason] = evicted_reasons.get(reason, 0) + 1
         self._session_guard_busy_deferrals += deferred
         if deferred != self._session_guard_last_busy_deferred:
             # Log on change only: a long autonomous turn would otherwise
@@ -729,6 +744,12 @@ class ProjectChatStateMixin:
         The provider's durable session id lives in ``sessions.json`` and is not
         changed here. A later message therefore resumes the same conversation.
         Active turns are never evicted or used as a runtime-recycle boundary.
+
+        Eviction branches: ``ttl`` (idle past the TTL), ``lru`` (resident cap)
+        and ``rss``. The RSS branch needs both the tree RSS watermark and real
+        host pressure (``MemAvailable`` below ``max(512 MiB, 15% MemTotal)``,
+        #2298); if ``MemAvailable`` is unreadable the watermark alone decides,
+        as before.
         """
 
         if not bool(getattr(self._config, "session_guard_enabled", False)):
@@ -746,6 +767,7 @@ class ProjectChatStateMixin:
                 for candidate in idle
                 if current - candidate.last_used_at >= ttl
             ]
+            reasons: list[str] = ["ttl"] * len(candidates)
 
             maximum = int(getattr(self._config, "max_resident_sessions", 2))
             projected = metrics.resident_sessions - len(candidates)
@@ -754,6 +776,7 @@ class ProjectChatStateMixin:
                     if candidate in candidates:
                         continue
                     candidates.append(candidate)
+                    reasons.append("lru")
                     projected -= 1
                     if projected <= maximum:
                         break
@@ -764,10 +787,20 @@ class ProjectChatStateMixin:
                 getattr(self._config, "session_tree_rss_limit_mb", 1024)
             )
             memory_high = rss_limit > 0 and rss_mb >= rss_limit
+            mem_available_mb: float | None = None
+            if memory_high:
+                # The watermark is necessary, not sufficient (#2298): an idle
+                # tree on a small host sits at the floor while the host has
+                # plenty available. Unknown MemAvailable keeps the old rule.
+                host_pressured, mem_available_mb = await asyncio.to_thread(
+                    host_memory_pressure
+                )
+                memory_high = host_pressured is not False
             if memory_high and metrics.active_sessions == 0:
                 for candidate in idle:
                     if candidate not in candidates:
                         candidates.append(candidate)
+                        reasons.append("rss")
 
             deferred = self._count_pressured_busy(
                 busy,
@@ -776,8 +809,14 @@ class ProjectChatStateMixin:
                 metrics.resident_sessions > maximum
                 or (memory_high and metrics.active_sessions == 0),
             )
+            evicted_reasons: dict[str, int] = {}
             evicted = await self._evict_guard_candidates(
-                candidates, current, rss_mb, deferred=deferred
+                candidates,
+                current,
+                rss_mb,
+                deferred=deferred,
+                reasons=reasons,
+                evicted_reasons=evicted_reasons,
             )
             if evicted:
                 self._session_guard_evictions += evicted
@@ -788,10 +827,17 @@ class ProjectChatStateMixin:
                 )
                 logger.info(
                     "Session resource guard evicted %d idle session(s); "
-                    "resident=%d rss_mb=%.1f",
+                    "reason=%s resident=%d rss_mb=%.1f mem_available_mb=%s",
                     evicted,
+                    ",".join(
+                        f"{name}:{count}"
+                        for name, count in sorted(evicted_reasons.items())
+                    ),
                     resident,
                     rss_mb,
+                    "n/a"
+                    if mem_available_mb is None
+                    else f"{mem_available_mb:.1f}",
                 )
 
             attachment_limit = int(

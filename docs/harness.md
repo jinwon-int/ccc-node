@@ -85,6 +85,23 @@ It is wired through `settings.json` `statusLine`.
 
 Switch interactively through Claude Code `/config` → Output style when needed.
 
+## Always-on text budget
+
+`CLAUDE.md`, `hooks/tools-cheatsheet.md`, the active output style, the
+SessionStart memory snapshot and the nunchi working-memory block load into every session whether the task needs
+them or not (on Codex: the global `AGENTS.md`, memory block included).
+`ccc-doctor.sh` sizes them per source against a provider cap — Claude 24,000
+chars, Codex 8,000 — and names what to cut when the total is over (see
+[`doctor.md`](doctor.md#always-on-budget)). Form priority, borrowed from
+harness2: skill > script > subagent > hook > always-on prose.
+
+Before adding always-on text:
+
+- [ ] Can it be a **skill** (loaded only when its description matches the task)?
+- [ ] Can it be a **script** the agent runs, or that a skill points to?
+- [ ] Can it be a **hook** that fires only on the event it is about (PreToolUse, PostToolUse, Stop, ...)?
+- [ ] If none fits and it must be always-on: **if you add always-on text, cut something else to pay for it.** Run `scripts/ccc-doctor.sh --always-on-summary` before and after; the total must not grow past the cap.
+
 ## Path overrides
 
 `setup.sh` defaults to root-compatible `$HOME` paths but supports explicit non-root paths:

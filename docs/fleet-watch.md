@@ -28,21 +28,35 @@ after the reviewed fix is integrated into the normal checkout.
   `UNVERIFIED`, not evidence of downtime. A successful transport exit and final
   completion marker are required before accepting a result; a truncated doctor
   response cannot become `OK`.
-- **Retired channel (#2343):** a node with no ccc bridge and no Danso service
-  that carries a retirement marker — a directory
-  `~/.claude/state/telegram-retire-<YYYYMMDD>/` in the home of the account the
-  watcher logs in as — reports `RETIRED <node> marker=<name>` instead of
-  `DOWN`. The directory is what the 2026-10-16 fleet retirement (Wiki DOC-4014:
-  Telegram bridges stopped and disabled on 11 of 12 nodes, Matrix is the main
-  channel) left behind as each node's rollback backup, so it is the node's own
-  declaration and no node list lives in the watcher. It softens absence only:
-  a bridge that is running is judged on its answer, marker or not, so a
+- **Retired channel (#2343, #2348):** a node with no ccc bridge and no Danso
+  service that declares its Telegram bridge retired reports
+  `RETIRED <node> marker=<source>` instead of `DOWN`. Both declarations are
+  read from the home of the account the watcher logs in as, so they are the
+  node's own and no node list lives in the watcher:
+  - **Canonical — the frontend list `~/.claude/frontends`** (#2342/#2346), the
+    same file `ccc-doctor`, `termux-restart-frontends.sh` and
+    `install-hande-bridge.sh` read: one name per line, `#` starts a comment,
+    names separated by space, tab or comma. When the file exists and does not
+    name `telegram`, the node reports `marker=frontends`. When it exists and
+    names `telegram`, the channel is declared live and a missing bridge is
+    `DOWN` — even if a legacy backup directory is still present.
+  - **Legacy — the backup directory
+    `~/.claude/state/telegram-retire-<YYYYMMDD>/`**, which the 2026-10-16 fleet
+    retirement (Wiki DOC-4014: Telegram bridges stopped and disabled on 11 of
+    12 nodes, Matrix is the main channel) left behind as each node's rollback
+    backup. It is consulted only when there is no frontend list, and reports
+    `marker=<directory name>` (the newest when several exist).
+
+  `CCC_FRONTENDS` / `CCC_FRONTENDS_FILE` are not honoured by the probe: it runs
+  in the watcher's or an ssh login's environment, not the bridge's, so only the
+  file is a declaration about the probed node. Either marker softens absence
+  only: a bridge that is running is judged on its answer, marker or not, so a
   rollback (TM-4018) needs no cleanup and a failing bridge on a once-retired
   node still pages. `RETIRED` is not a failure in plain mode and is folded like
-  `OK` in change mode (below). To retire a channel on another node, create the
-  directory (it is where the retirement's backups belong) after stopping and
-  disabling the bridge; to un-retire, start the bridge — the marker is inert
-  while a bridge runs.
+  `OK` in change mode (below). To retire a channel on another node, stop and
+  disable the bridge, then write a `~/.claude/frontends` that leaves out
+  `telegram` (e.g. `matrix`); to un-retire, add `telegram` back to the list and
+  start the bridge — a marker is inert while a bridge runs.
 - **Matrix availability:** identify the Matrix process by its exact
   `CCC_CHANNEL=matrix` environment or systemd cgroup. Check its private
   `BOT_DATA_DIR/health.json` only when it is fresh and names that PID. An older

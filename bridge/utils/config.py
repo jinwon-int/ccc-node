@@ -758,7 +758,10 @@ class Config(
             "8192 MiB — #1277) instead of a fixed value, since a single "
             "watermark does not fit a fleet spanning VPS and phone nodes. "
             "Zero disables the memory watermark; set explicitly to override "
-            "the automatic scaling."
+            "the automatic scaling. The watermark is necessary but not "
+            "sufficient: idle sessions are evicted for RSS only while "
+            "MemAvailable is also below max(512 MiB, 15% of MemTotal) "
+            "(#2298); an unreadable MemAvailable keeps the RSS-only rule."
         ),
     )
     codex_max_session_attachments: int = Field(

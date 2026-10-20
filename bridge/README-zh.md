@@ -254,7 +254,7 @@ Claude:  ...
 | `CCC_BRIDGE_SESSION_GUARD_INTERVAL_SECONDS` | 否 | `60` | 空闲资源守卫扫描间隔（10–3600 秒） |
 | `CCC_BRIDGE_SESSION_IDLE_TTL_SECONDS` | 否 | `14400` | 达到空闲时限后关闭本地运行时；持久会话 ID 仍可恢复 |
 | `CCC_BRIDGE_MAX_RESIDENT_SESSIONS` | 否 | `2` | 常驻会话 LRU 上限；活动会话受保护 |
-| `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB` | 否 | `1024` | 空闲桥接进程树 RSS 上限；`0` 禁用 |
+| `CCC_BRIDGE_SESSION_TREE_RSS_LIMIT_MB` | 否 | 内存的 ¼（1024–8192） | 空闲桥接进程树 RSS 上限；`0` 禁用。这是必要条件而非充分条件：仅当主机同时内存紧张（`MemAvailable` 低于 `max(512 MiB, MemTotal 的 15%)`）时才因 RSS 驱逐空闲会话；无法读取 `MemAvailable` 时仅按 RSS 上限判断。驱逐日志会注明触发分支（`reason=ttl`/`lru`/`rss`） |
 | `CCC_BRIDGE_CODEX_MAX_ATTACHMENTS` | 仅 Codex | `2` | 第三次会话附加前回收空闲 app-server；`0` 禁用 |
 | `CCC_RESUME_PERSISTED_SESSIONS` | 仅 Claude | `true` | SDK transcript 仍存在时，在重启后恢复持久化会话；dead-session wakeup 的前置条件 |
 | `CCC_DEAD_SESSION_WAKEUP` | 仅 Claude | `false` | 唤醒已退出的会话并交付待处理的后台任务通知，避免通知一直孤立在 transcript 中直到下一条手动消息。启用后会发起消耗 token 的自主轮次，在 `usage-meter.json` 中记为 `autonomous`，并受 Claude 每日自主用量额度门控；跳过计数可在 health/status 中查看；要求 `CCC_RESUME_PERSISTED_SESSIONS=true` |

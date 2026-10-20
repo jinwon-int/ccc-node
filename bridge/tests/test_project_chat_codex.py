@@ -49,6 +49,7 @@ from telegram_bot.core.project_chat_types import AgentSessionEntry
 from telegram_bot.core.task_ledger import TaskLedger
 from telegram_bot.utils.session_resource_guard import (
     default_session_tree_rss_limit_mb,
+    host_memory_pressure,
 )
 
 
@@ -829,14 +830,53 @@ async def test_session_guard_closes_expired_idle_session_but_protects_active(
     assert snapshot["evictions"] == 1
 
 
+# A 4 GiB host: MemTotal 3915 MiB, so the pressure threshold is
+# max(512, 15% * 3915 = 587.25) = 587.25 MiB of MemAvailable.
+_SMALL_HOST_TOTAL_MB = 3915.0
+_HOST_PRESSURED_AVAILABLE_MB = 256.0
+_HOST_ROOMY_AVAILABLE_MB = 2400.0
+
+
+def _stub_host_meminfo(
+    handler: ProjectChatHandler,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    mem_available_mb: float | None,
+    mem_total_mb: float = _SMALL_HOST_TOTAL_MB,
+) -> None:
+    """Point the guard's host-pressure probe at a fake ``/proc/meminfo``.
+
+    ``mem_available_mb=None`` omits the ``MemAvailable`` line (restricted or
+    old-kernel host). Uses the real probe, so thresholds are exercised too.
+    """
+
+    proc_root = tmp_path / "fake-proc"
+    proc_root.mkdir(exist_ok=True)
+    lines = [f"MemTotal:       {int(mem_total_mb * 1024)} kB"]
+    if mem_available_mb is not None:
+        lines.append(f"MemAvailable:   {int(mem_available_mb * 1024)} kB")
+    (proc_root / "meminfo").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setitem(
+        handler.enforce_session_resource_limits.__func__.__globals__,
+        "host_memory_pressure",
+        lambda: host_memory_pressure(proc_root=proc_root),
+    )
+
+
 def _rss_pressure_handler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     provider: str = "claude",
     rss_mb: float = 1057.9,
+    mem_available_mb: float | None = _HOST_PRESSURED_AVAILABLE_MB,
 ) -> tuple[ProjectChatHandler, FakeRuntime]:
-    """The 2026-10-13 incident shape: 4 GiB host, 1024 MiB floor, tree above it."""
+    """The 2026-10-13 incident shape: 4 GiB host, 1024 MiB floor, tree above it.
+
+    The host is under real memory pressure by default, so the RSS branch is
+    live (#2298); pass ``mem_available_mb`` to model a host with room.
+    """
 
     settings = _settings(tmp_path, provider=provider)
     settings.session_guard_enabled = True
@@ -850,6 +890,9 @@ def _rss_pressure_handler(
         handler.enforce_session_resource_limits.__func__.__globals__,
         "process_tree_rss_mb",
         lambda: rss_mb,
+    )
+    _stub_host_meminfo(
+        handler, monkeypatch, tmp_path, mem_available_mb=mem_available_mb
     )
     return handler, runtime
 
@@ -1077,6 +1120,158 @@ async def test_session_guard_defers_codex_runtime_recycle_while_provider_busy(
     assert handler._agent_runtime_recycle_pending is True
 
 
+@pytest.mark.anyio
+async def test_session_guard_rss_over_limit_with_host_room_does_not_evict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#2298: an idle tree at the small-host floor is not host pressure."""
+
+    handler, _runtime = _rss_pressure_handler(
+        tmp_path, monkeypatch, mem_available_mb=_HOST_ROOMY_AVAILABLE_MB
+    )
+    idle = ProviderWorkFakeSession("idle")
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=idle, last_used_at=10.0)
+    )
+
+    with caplog.at_level("INFO", logger="telegram_bot.core.project_chat_state"):
+        snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert idle.close_calls == 0
+    assert snapshot["evictions"] == 0
+    assert snapshot["tree_rss_mb"] == 1057.9
+    assert "evicted" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_session_guard_host_room_leaves_ttl_and_lru_eviction_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handler, _runtime = _rss_pressure_handler(
+        tmp_path, monkeypatch, mem_available_mb=_HOST_ROOMY_AVAILABLE_MB
+    )
+    expired = ProviderWorkFakeSession("a-expired")
+    sessions = [expired] + [
+        ProviderWorkFakeSession(f"b-idle-{index}") for index in range(3)
+    ]
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=expired, last_used_at=0.0)
+    )
+    for index, session in enumerate(sessions[1:], start=1):
+        handler._agent_session_registry.put_cached(
+            (7, 70 + index),
+            AgentSessionEntry(session=session, last_used_at=4 * 60 * 60 + index),
+        )
+
+    with caplog.at_level("INFO", logger="telegram_bot.core.project_chat_state"):
+        snapshot = await handler.enforce_session_resource_limits(
+            now=4 * 60 * 60 + 100.0
+        )
+
+    # TTL takes the expired one, the cap (2) takes the oldest remaining idle
+    # one; the newest two survive because RSS alone is not pressure.
+    assert [s.close_calls for s in sessions] == [1, 1, 0, 0]
+    assert snapshot["evictions"] == 2
+    assert snapshot["resident_sessions"] == 2
+    assert "reason=lru:1,ttl:1 " in caplog.text
+
+
+@pytest.mark.anyio
+async def test_session_guard_rss_over_limit_under_host_pressure_evicts_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handler, _runtime = _rss_pressure_handler(
+        tmp_path, monkeypatch, mem_available_mb=_HOST_PRESSURED_AVAILABLE_MB
+    )
+    idle = ProviderWorkFakeSession("idle")
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=idle, last_used_at=10.0)
+    )
+
+    with caplog.at_level("INFO", logger="telegram_bot.core.project_chat_state"):
+        snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert idle.close_calls == 1
+    assert snapshot["evictions"] == 1
+    assert "reason=rss:1 " in caplog.text
+    assert "mem_available_mb=256.0" in caplog.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("mem_available_mb", "expected_deferrals"),
+    [(_HOST_PRESSURED_AVAILABLE_MB, 1), (_HOST_ROOMY_AVAILABLE_MB, 0)],
+    ids=["host-pressured", "host-roomy"],
+)
+async def test_session_guard_spares_busy_session_with_or_without_host_pressure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mem_available_mb: float,
+    expected_deferrals: int,
+) -> None:
+    handler, _runtime = _rss_pressure_handler(
+        tmp_path, monkeypatch, mem_available_mb=mem_available_mb
+    )
+    busy = ProviderWorkFakeSession("autonomous")
+    busy.inflight = True
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=busy, last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert busy.close_calls == 0
+    assert snapshot["evictions"] == 0
+    # A deferral is counted only when the session was actually under
+    # eviction pressure, i.e. when the host is pressured.
+    assert snapshot["busy_deferrals"] == expected_deferrals
+
+
+@pytest.mark.anyio
+async def test_session_guard_unreadable_mem_available_keeps_rss_only_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No MemAvailable (restricted /proc, old kernel): fall back, never disarm."""
+
+    handler, _runtime = _rss_pressure_handler(
+        tmp_path, monkeypatch, mem_available_mb=None
+    )
+    idle = ProviderWorkFakeSession("idle")
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=idle, last_used_at=10.0)
+    )
+
+    with caplog.at_level("INFO", logger="telegram_bot.core.project_chat_state"):
+        snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert idle.close_calls == 1
+    assert snapshot["evictions"] == 1
+    assert "reason=rss:1 " in caplog.text
+    assert "mem_available_mb=n/a" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_session_guard_skips_codex_rss_recycle_when_host_has_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, runtime = _rss_pressure_handler(
+        tmp_path,
+        monkeypatch,
+        provider="codex",
+        rss_mb=2048.0,
+        mem_available_mb=_HOST_ROOMY_AVAILABLE_MB,
+    )
+    handler._agent_session_registry.put_cached(
+        (7, 70), AgentSessionEntry(session=FakeSession("thread"), last_used_at=10.0)
+    )
+
+    snapshot = await handler.enforce_session_resource_limits(now=300.0)
+
+    assert runtime.recycle_calls == 0
+    assert snapshot["evictions"] == 0
+    assert snapshot["runtime_recycles"] == 0
+
+
 def test_busy_for_seconds_is_scoped_to_active_chat(tmp_path: Path) -> None:
     handler = ProjectChatHandler(
         settings=_settings(tmp_path, provider="claude"),
@@ -1155,6 +1350,12 @@ async def test_session_guard_recycles_idle_codex_runtime_above_rss_limit(
         "process_tree_rss_mb",
         lambda: 150.0,
     )
+    _stub_host_meminfo(
+        handler,
+        monkeypatch,
+        tmp_path,
+        mem_available_mb=_HOST_PRESSURED_AVAILABLE_MB,
+    )
 
     snapshot = await handler.enforce_session_resource_limits(now=200.0)
 
@@ -1192,6 +1393,12 @@ async def test_session_guard_defers_codex_rss_recycle_until_all_turns_are_idle(
         handler.enforce_session_resource_limits.__func__.__globals__,
         "process_tree_rss_mb",
         lambda: 150.0,
+    )
+    _stub_host_meminfo(
+        handler,
+        monkeypatch,
+        tmp_path,
+        mem_available_mb=_HOST_PRESSURED_AVAILABLE_MB,
     )
 
     busy = await handler.enforce_session_resource_limits(now=200.0)

@@ -14,7 +14,7 @@ ccc_test_reset_hook_env
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 TMP="$(ccc_test_tmpdir)" || exit 1
-cleanup() { [ -n "${LIVE1:-}" ] && kill "$LIVE1" 2>/dev/null; [ -n "${LIVE2:-}" ] && kill "$LIVE2" 2>/dev/null; rm -rf "$TMP"; }
+cleanup() { for p in "${LIVE1:-}" "${LIVE2:-}" "${DYING:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; rm -rf "$TMP"; }
 trap cleanup EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME/.claude/state" "$HOME/.ccc-node/scripts" "$HOME/.ccc-node/preparations/gen-A" "$HOME/.ccc-node/preparations/gen-B" "$HOME/.ccc-matrix"
 unset CCC_BRIDGE_RESTART_DEADLINE_EPOCH SVDIR PREFIX CCC_FRONTENDS CCC_FRONTENDS_FILE
@@ -39,7 +39,11 @@ SH
 # --- fake sv in PATH: `sv restart <svc>` rewrites health.json (new process on
 # FAKE_NEW_GEN, pid FAKE_NEW_PID, state FAKE_STATE) unless FAKE_RESTART_NOOP=1;
 # `sv status <svc>` prints runit's line with pid FAKE_SV_PID (default: the
-# health pid) and uptime = now - last restart.
+# health pid) and uptime = now - last restart. FAKE_KILL_ON_STATUS=<pid>: kill
+# that pid (and wait until it is gone) before answering `sv status` — the
+# script's first `sv status` after a restart is its first phase-2 poll, i.e.
+# phase 1 has already seen the process up, so "dies inside the window" is
+# event-driven instead of a wall-clock race against phase 1 (#2295).
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/sv" <<'SH'
 #!/usr/bin/env bash
@@ -51,6 +55,10 @@ case "$1" in
     date +%s > "$FAKE_STARTED_FILE"
     write_health "$FAKE_NEW_PID" "$(date +%s)" "${FAKE_STATE:-available}" "$FAKE_NEW_GEN" 0 ;;
   status)
+    if [ -n "${FAKE_KILL_ON_STATUS:-}" ]; then
+      kill "$FAKE_KILL_ON_STATUS" 2>/dev/null
+      for _ in $(seq 300); do kill -0 "$FAKE_KILL_ON_STATUS" 2>/dev/null || break; sleep 0.1; done
+    fi
     started=$(cat "$FAKE_STARTED_FILE" 2>/dev/null || echo 0)
     pid="${FAKE_SV_PID:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["process"]["pid"])' "$HOME/.ccc-matrix/health.json" 2>/dev/null)}"
     printf 'run: %s: (pid %s) %ss; run: log: (pid 1) 999999s\n' "$2" "$pid" "$(( $(date +%s) - started ))" ;;
@@ -133,11 +141,16 @@ ok "supervised pid != health pid inside the window (crash/restart) → exit 3" '
 
 # ---------------------------------------------------------------- restart, process dies inside the window
 reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
+# The fake sv kills DYING on the first phase-2 poll (FAKE_KILL_ON_STATUS), never
+# before phase 1 saw it up. The 30 s window only bounds a regression: the next
+# poll (~1 s later) already sees the death, so a pass costs ~1 s, and a loaded
+# runner cannot run the window out before that poll (#2295).
 sleep 600 & DYING=$!
-setfake "FAKE_NEW_PID=$DYING" "FAKE_NEW_GEN=gen-B"
-( sleep 1; kill "$DYING" 2>/dev/null ) &
-out="$(run)"; rc=$?
-ok "new process dies inside the window → exit 3" '[ "$rc" = 3 ] && grep -q "matrix pid $DYING died inside" "$LOG"'
+setfake "FAKE_NEW_PID=$DYING" "FAKE_NEW_GEN=gen-B" "FAKE_KILL_ON_STATUS=$DYING"
+out="$(CCC_MATRIX_SURVIVE_SECONDS=30 run)"; rc=$?
+ok "new process dies inside the window → exit 3" '[ "$rc" = 3 ] && grep -q "matrix pid $DYING died inside the 30s window" "$LOG"'
+ok "it died only after phase 1 saw it up (no 'NOT up' timeout)" '! grep -q "matrix NOT up" "$LOG"'
+kill "$DYING" 2>/dev/null; DYING=""
 
 # ---------------------------------------------------------------- restart, up but not available
 reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
@@ -150,7 +163,12 @@ reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available g
 setfake "FAKE_NEW_PID=$LIVE2" "FAKE_NEW_GEN=gen-B"
 out="$(CCC_BRIDGE_RESTART_DEADLINE_EPOCH=$(( $(date +%s) + 31 )) run)"; rc=$?
 ok "busy Matrix until the deadline: no restart, follower detached, exit 0" '[ "$rc" = 0 ] && ! grep -q "sv restart" "$CALLS" && grep -q "matrix busy until deadline (running=gen-A want=gen-B)" "$LOG" && grep -q "follower detached (waits up to 1s" "$LOG"'
-sleep 3  # let the 1 s follower give up (still busy) so it does not outlive the test
+# Wait for the detached 1 s follower to give up (still busy): its own
+# "busy until deadline" line is the second one. Event-driven instead of a
+# fixed sleep, so a slow runner cannot leave it alive into the next case,
+# where Matrix is idle and it would issue its own `sv restart` (#2295).
+for _ in $(seq 600); do [ "$(grep -c "matrix busy until deadline" "$LOG")" -ge 2 ] && break; sleep 0.1; done
+ok "the detached follower gave up on its own (still busy)" '[ "$(grep -c "matrix busy until deadline" "$LOG")" -ge 2 ]'
 
 # ---------------------------------------------------------------- window truncated by the deadline
 reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
