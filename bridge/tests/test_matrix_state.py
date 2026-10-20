@@ -912,6 +912,81 @@ def test_aliases_and_wake_words_stack() -> None:
         assert p.admit(GROUP, e, decrypted=True, now_ms=NOW) is not None, body
 
 
+def _reply(parent: str, body: str = "what about tomorrow", **relation: Any) -> dict[str, Any]:
+    e = event("$reply")
+    e["content"]["body"] = body
+    e["content"]["m.relates_to"] = {"m.in_reply_to": {"event_id": parent}, **relation}
+    return e
+
+
+def test_reply_to_the_bots_own_event_addresses_a_family_room() -> None:
+    # #1808 A: replying to a message the bot sent needs no handle.
+    sent = m.SentEvents()
+    sent.add(GROUP, "$bot-answer")
+    sent.add(ROOM, "$bot-dm")
+    p = policy(own_events=sent)
+    req = p.admit(GROUP, _reply("$bot-answer"), decrypted=True, now_ms=NOW)
+    assert req is not None and req.reply_to == "$bot-answer" and req.body == "what about tomorrow"
+    # A reply to someone else's message, or to a bot event of another room, is not addressed.
+    assert p.admit(GROUP, _reply("$family-chatter"), decrypted=True, now_ms=NOW) is None
+    assert p.admit(GROUP, _reply("$bot-dm"), decrypted=True, now_ms=NOW) is None
+    # Without the ring (a policy built without one) the rule never fires.
+    assert policy().admit(GROUP, _reply("$bot-answer"), decrypted=True, now_ms=NOW) is None
+    # Restart: a fresh, empty ring fails closed for pre-restart bot messages.
+    restarted = policy(own_events=m.SentEvents())
+    assert restarted.admit(GROUP, _reply("$bot-answer"), decrypted=True, now_ms=NOW) is None
+    assert restarted.rejection(GROUP, _reply("$bot-answer"), decrypted=True, now_ms=NOW) is None
+
+
+def test_reply_to_bot_never_admits_edits_and_only_explains_threads() -> None:
+    sent = m.SentEvents()
+    sent.add(GROUP, "$bot-answer")
+    p = policy(own_events=sent)
+    # An edit is rejected whatever it relates to, and its reply target never addresses the bot.
+    edit = _reply("$bot-answer", rel_type="m.replace", event_id="$bot-answer")
+    assert p.admit(GROUP, edit, decrypted=True, now_ms=NOW) is None
+    assert p.addressed(edit["content"], "what about tomorrow", GROUP) is False
+    assert p.rejection(GROUP, edit, decrypted=True, now_ms=NOW) is None
+    edit["content"]["m.new_content"] = {"msgtype": "m.text", "body": "fixed typo"}
+    assert p.rejection(GROUP, edit, decrypted=True, now_ms=NOW) is None
+    # A thread started on the bot's message is still never run, but its sender is told why.
+    thread = _reply("$bot-answer", rel_type="m.thread", event_id="$bot-answer", is_falling_back=True)
+    assert p.admit(GROUP, thread, decrypted=True, now_ms=NOW) is None
+    assert p.rejection(GROUP, thread, decrypted=True, now_ms=NOW) == m.REJECT_THREAD
+    other = _reply("$family-chatter", rel_type="m.thread", event_id="$family-chatter", is_falling_back=True)
+    assert p.rejection(GROUP, other, decrypted=True, now_ms=NOW) is None
+
+
+def test_direct_rooms_ignore_the_reply_to_bot_rule() -> None:
+    # Direct rooms are always addressed: any reply (or none) is admitted, ring or not.
+    p = policy(own_events=m.SentEvents())
+    for e in (_reply("$anything"), event()):
+        e["content"]["body"] = "no handle here"
+        assert p.admit(ROOM, e, decrypted=True, now_ms=NOW) is not None
+
+
+def test_sent_events_ring_is_bounded_and_evicts_the_oldest() -> None:
+    assert m.SENT_EVENTS_CAP == 512
+    ring = m.SentEvents(3)
+    for i in range(4):
+        ring.add(GROUP, f"$e{i}")
+    assert len(ring) == 3
+    assert not ring.sent_in(GROUP, "$e0") and ring.sent_in(GROUP, "$e3")
+    ring.add(GROUP, "$e1")  # re-adding refreshes recency
+    ring.add(GROUP, "$e4")
+    assert ring.sent_in(GROUP, "$e1") and not ring.sent_in(GROUP, "$e2")
+    for room, event_id in ((GROUP, "not-an-id"), (GROUP, None), ("not-a-room", "$e5")):
+        ring.add(room, event_id)  # type: ignore[arg-type]
+    assert len(ring) == 3 and not ring.sent_in("not-a-room", "$e5")
+    full = m.SentEvents()
+    for i in range(m.SENT_EVENTS_CAP + 10):
+        full.add(GROUP, f"$f{i}")
+    assert len(full) == m.SENT_EVENTS_CAP and not full.sent_in(GROUP, "$f9") and full.sent_in(GROUP, "$f10")
+    for bad in (0, -1, True, "3"):
+        with pytest.raises(ValueError):
+            m.SentEvents(bad)  # type: ignore[arg-type]
+
+
 def test_identities_replace_owner_pins_and_join_the_saved_policy(tmp_path: Path) -> None:
     c = config(tmp_path)
     master = "M" * 43

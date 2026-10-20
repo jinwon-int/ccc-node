@@ -34,7 +34,7 @@ Differences from the pilot (#1780 PR-2a):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fcntl
 import getpass
 import hashlib
@@ -340,6 +340,57 @@ def reply_target(content: Mapping[str, Any]) -> str | None:
     return event_id if identifier(event_id, "$") else None
 
 
+SENT_EVENTS_CAP = 512  # bot-sent event ids remembered for the reply-to-bot gate (#1808)
+
+
+def addressing_reply_target(content: Mapping[str, Any]) -> str | None:
+    """The ``m.in_reply_to`` event id that may address the bot (#1808); ``None`` for edits.
+
+    A plain reply qualifies, and so does a thread event's ``m.in_reply_to``
+    (``rel_type: m.thread``, fallback or not): threads are still never
+    admitted (#2002), but one started on the bot's message is then answered
+    with the thread notice instead of silence. An edit (``m.replace``) or any
+    other relation never addresses the bot through its reply target.
+    """
+    relation = content.get("m.relates_to")
+    if not isinstance(relation, dict) or relation.get("rel_type") not in (None, "m.thread"):
+        return None
+    parent = relation.get("m.in_reply_to")
+    event_id = parent.get("event_id") if isinstance(parent, dict) else None
+    return event_id if identifier(event_id, "$") else None
+
+
+class SentEvents:
+    """Bounded in-memory ring of ``event id -> room`` for events the bot sent (#1808).
+
+    Never persisted: a restart starts empty, so a reply to a message sent
+    before the restart is not addressed by this rule (fail closed). The
+    oldest id is evicted once ``cap`` is exceeded. The room is kept so a
+    reply only counts in the room the bot's message was sent to — a crafted
+    ``m.in_reply_to`` naming a direct-room event cannot address a family room.
+    """
+
+    def __init__(self, cap: int = SENT_EVENTS_CAP) -> None:
+        if type(cap) is not int or cap < 1:
+            raise ValueError("invalid sent-events cap")
+        self.cap = cap
+        self._rooms: dict[str, str] = {}
+
+    def add(self, room_id: str, event_id: Any) -> None:
+        if not identifier(event_id, "$") or not identifier(room_id, "!"):
+            return
+        self._rooms.pop(event_id, None)
+        self._rooms[event_id] = room_id
+        while len(self._rooms) > self.cap:
+            del self._rooms[next(iter(self._rooms))]
+
+    def sent_in(self, room_id: str, event_id: str) -> bool:
+        return self._rooms.get(event_id) == room_id
+
+    def __len__(self) -> int:
+        return len(self._rooms)
+
+
 def strip_reply_fallback(body: str) -> str:
     """Drop a legacy ``> <@user> quoted`` reply fallback prefix (Matrix spec §rich replies).
 
@@ -400,6 +451,8 @@ class Policy:
     not_before_ms: int
     aliases: frozenset[str] = frozenset()  # extra typed @handles that address the bot
     wake_words: frozenset[str] = frozenset()  # extra bare nickname tokens that address the bot
+    # Events the bot sent (the transport's live ring); a reply to one addresses the bot (#1808).
+    own_events: SentEvents | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         users = frozenset(self.users)
@@ -492,7 +545,7 @@ class Policy:
             return None
         if self.rooms[room_id] == "mention":
             gate_body = gate.get("body") if isinstance(gate.get("body"), str) else ""
-            if not self.addressed(gate, gate_body):
+            if not self.addressed(gate, gate_body, room_id):
                 return None
         return reason
 
@@ -515,7 +568,7 @@ class Policy:
             return None
         # The mention gate still sees the original body (fallback included),
         # so replies are admitted exactly as before (#1943).
-        if self.rooms[room_id] == "mention" and not self.addressed(content, body):
+        if self.rooms[room_id] == "mention" and not self.addressed(content, body, room_id):
             return None
         parent = reply_target(content)
         if parent is not None:
@@ -541,25 +594,33 @@ class Policy:
             encoded = encode_attachment(attachment)
         except ValueError:
             return None
-        if self.rooms[room_id] == "mention" and not self.addressed(content, caption):
+        if self.rooms[room_id] == "mention" and not self.addressed(content, caption, room_id):
             return None
         body = (strip_reply_fallback(caption) if parent is not None else caption) or ATTACHMENT_PLACEHOLDER
         return Request(
             event["event_id"], room_id, sender, body, scope_of(self.account, room_id, sender), parent, encoded
         )
 
-    def addressed(self, content: Mapping[str, Any], body: str) -> bool:
-        """Family-room gate: spec'd m.mentions, or a typed @localpart handle in the body.
+    def addressed(self, content: Mapping[str, Any], body: str, room_id: str | None = None) -> bool:
+        """Family-room gate: spec'd m.mentions, a reply to the bot, or a typed handle in the body.
 
         Element X only emits m.mentions for pill mentions; family members on
         the phone type "@fambot" as plain text (owner request 2026-09-17).
         The handle must match the bot's own localpart as a whole token —
-        display names and partial matches still do not count.
+        display names and partial matches still do not count. A reply in
+        ``room_id`` whose ``m.in_reply_to`` names an event the bot sent to
+        that room since it started (``own_events``, #1808) is addressed too;
+        clients that already put the replied-to sender in ``m.mentions``
+        pass the first check anyway.
         """
         mentions = content.get("m.mentions", {})
         if isinstance(mentions, dict):
             ids = mentions.get("user_ids", [])
             if isinstance(ids, list) and self.account in ids:
+                return True
+        target = addressing_reply_target(content)
+        if target is not None and room_id is not None and self.own_events is not None:
+            if self.own_events.sent_in(room_id, target):
                 return True
         if HANDLE_RE(self.account).search(body):
             return True

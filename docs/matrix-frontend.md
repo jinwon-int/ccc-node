@@ -174,7 +174,8 @@ work (owner request 2026-09-18).
 
 Room policy is unchanged from the pilot: a direct room is exactly
 `{owner, bot}`; a family room admits only the allowlisted family users and
-answers only when addressed (`m.mentions`, a typed `@localpart`, or a typed
+answers only when addressed (`m.mentions`, a reply to a recent bot message
+(#1808, below), a typed `@localpart`, or a typed
 `@<alias>` from `mention_aliases` — Matrix ids cannot be renamed, so a bot
 that is *displayed* as "seoseo" is reachable as `@seoseo` this way).
 
@@ -201,8 +202,26 @@ present). If staging the original fails, the question still runs with an
 explicit "reply attachment unavailable" context rather than inferred contents.
 Parent decryption keys are dropped when a turn completes or becomes uncertain.
 A missing, plaintext, untrusted or undecryptable parent simply leaves the
-reply as-is. `/command` and bare-number replies are never rewritten. A reply
-in a family room still needs a mention, exactly like any other message.
+reply as-is. `/command` and bare-number replies are never rewritten.
+
+**A reply to the bot addresses it (#1808).** In a family room, a message
+whose `m.relates_to` carries an `m.in_reply_to` naming an event the bot sent
+*to that room* is addressed without a handle, alias or wake word. The
+transport records the event id of every message it sends (replies, notices,
+files, the progress bubble — not its `m.replace` edits, which reuse the
+original's id) in a bounded in-memory ring (`SENT_EVENTS_CAP = 512`, oldest
+evicted). The ring is never persisted: after a restart it is empty, so a
+reply to a message sent before the restart is not addressed by this rule
+(fail closed — use a handle). A reply to anyone else's message still needs a
+mention, as does a reply naming a bot event of another room. Edits
+(`rel_type: m.replace`) stay refused whatever they point at. A thread event
+(`rel_type: m.thread`) is still never run; when its `m.in_reply_to` (fallback
+or not) names a recent bot event — a thread started on the bot's message —
+its sender gets the thread notice below instead of silence. A client that
+puts the replied-to sender in `m.mentions` (Matrix v1.7 intentional mentions
+recommends it) was already addressed through `m.mentions`, restart or not;
+this rule covers clients that do not, and replies whose mention the user
+removed. Direct rooms are unchanged (always addressed).
 
 ### Device trust: cross-signing identity (preferred) or pinned devices
 
@@ -435,8 +454,8 @@ same prompt contract as Telegram (a local path in the prompt):
 
 - **Admission** — direct rooms accept a photo with or without a caption; a
   family room needs an explicit address in the caption (`@handle`, alias,
-  wake word) or an `m.mentions` pill, so a caption-less photo there is
-  ignored. Per Matrix v1.10 the `body` is a caption only when `filename` is
+  wake word), an `m.mentions` pill or a reply to a recent bot message
+  (#1808), so a caption-less photo there is otherwise ignored. Per Matrix v1.10 the `body` is a caption only when `filename` is
   present and differs from it. Plaintext media (a bare `url`, no
   `EncryptedFile`) is refused. An unverified device is ignored (with the
   existing cross-signing notice, or the pin-mode "unregistered device"

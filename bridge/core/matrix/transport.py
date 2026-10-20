@@ -58,6 +58,7 @@ from telegram_bot.core.matrix.state import (
     REJECT_TEXT_TOO_LARGE,
     Request,
     SafetyStop,
+    SentEvents,
     bounded_text,
     family_config,
     identities,
@@ -320,6 +321,12 @@ def message_content(text: str, *, msgtype: str = "m.text") -> dict[str, Any]:
     return event_content(text, msgtype=msgtype)
 
 
+def _is_edit(content: Mapping[str, Any]) -> bool:
+    """An ``m.replace`` edit (its event id is not a message of its own)."""
+    relation = content.get("m.relates_to")
+    return isinstance(relation, dict) and relation.get("rel_type") == "m.replace"
+
+
 # --------------------------------------------------------------------------- #
 # Runner contract — channel-neutral since #2380 PR-1; re-exported here so
 # ``telegram_bot.core.matrix.transport.TurnRunner`` keeps working. In Matrix
@@ -510,6 +517,9 @@ class MatrixTransport:
             self.store.close()
             raise SafetyStop("saved-policy-changed")
         self.store.set_meta("policy", policy)
+        # Event ids this process sent (in memory only, #1808): a family-room
+        # reply to one is addressed; a restart starts empty (fail closed).
+        self.sent_events = SentEvents()
         # Family rooms reuse mention admission; direct rooms are unchanged.
         self.policy = Policy(
             config["account"],
@@ -519,6 +529,7 @@ class MatrixTransport:
             config["not_before_ms"],
             aliases=mention_aliases(config),
             wake_words=wake_words(config),
+            own_events=self.sent_events,
         )
         self.blocked: set[str] = set(self.store.get_meta("room_gate_blocked") or ())
         self.room_members: dict[str, set[str]] = {}
@@ -1708,7 +1719,7 @@ class MatrixTransport:
         content = source.get("content") if isinstance(source, dict) else None
         if not isinstance(content, dict):
             return
-        if self.policy.rooms.get(room) != "direct" and not self.policy.addressed(content, media_caption(content)):
+        if self.policy.rooms.get(room) != "direct" and not self.policy.addressed(content, media_caption(content), room):
             return
         raw_id = source.get("event_id") if isinstance(source, dict) else None
         event_id = str(getattr(event, "event_id", "") or raw_id or "")
@@ -1989,6 +2000,11 @@ class MatrixTransport:
         )
         event_id = result.get("event_id")
         bounded_text(event_id, 255)
+        if kind == "m.room.message" and not _is_edit(content):
+            # Every user-visible bot message (replies, notices, files, the
+            # progress bubble) passes here; edits keep their original's id,
+            # so they are not recorded and never evict a real message (#1808).
+            self.sent_events.add(room, event_id)
         active = self.active
         if active is not None and active.get("room_id") == room:
             self.mark(active["event_id"], "first_sent")
