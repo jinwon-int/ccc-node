@@ -196,7 +196,9 @@ class ModelCommandTest(unittest.TestCase):
             piri_default_paths=(),
         )
         self.assertEqual(selected.engine, "claude")
-        self.assertEqual(selected.argv, (str(claude), *CLAUDE_ARGS))
+        # #2397: claude always runs behind the graceful-stop wrapper.
+        self.assertEqual(selected.argv[2], "--claude-graceful-exec")
+        self.assertEqual(selected.argv[3:], (str(claude), *CLAUDE_ARGS))
 
     def test_codex_runtime_hint_keeps_auto_piri_lane(self) -> None:
         piri = self.executable("piri")
