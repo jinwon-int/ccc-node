@@ -42,11 +42,9 @@ class RepoFixture(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name) / "repo"
-        for rel in ("skills", "codex/skills", "piri/skills", "claude/hooks", "claude/output-styles"):
+        for rel in ("skills", "codex/skills", "piri/skills", "claude/hooks"):
             (self.repo / rel).mkdir(parents=True)
         self.write("claude/skill-listing-core.txt", "# core\nalpha\nabsent-core\n")
-        self.write("claude/CLAUDE.md.template", "Use the alpha skill for fixtures.\n")
-        self.write("claude/hooks/tools-cheatsheet.md", "nothing here\n")
         self.write("claude/settings.base.json", json.dumps({"hooks": {}}))
         self.add_skill("skills", "alpha")
         self._cwd = os.getcwd()
@@ -157,55 +155,80 @@ class FrontmatterTests(RepoFixture):
         self.assertEqual(self.run_cli()[0], 0)
 
 
-class TriggerTests(RepoFixture):
-    def test_core_skill_without_trigger_fails(self) -> None:
-        self.write("claude/CLAUDE.md.template", "the alphabet is not a trigger\n")
-        rc, found = self.findings()
+class CoreDescriptionTests(RepoFixture):
+    """Core skills are described every turn: "Use when ..." first, <=300 chars."""
+
+    def core_findings(self, *args: str) -> tuple[int, list[dict]]:
+        rc, found = self.findings(*args)
+        return rc, [f for f in found if f["rule"] == "core-description"]
+
+    def test_compliant_core_description_passes(self) -> None:
+        self.add_skill("skills", "alpha", skill_md("alpha", desc="Use whenever " + "x" * 287))
+        rc, hits = self.core_findings("--strict")
+        self.assertEqual((rc, hits), (0, []))
+
+    def test_core_description_must_start_with_use_when(self) -> None:
+        self.add_skill("skills", "alpha", skill_md("alpha", desc="Checks the fixture tree. Use when needed."))
+        rc, hits = self.core_findings()
         self.assertEqual(rc, 1)
-        self.assertEqual([f["skill"] for f in found if f["rule"] == "trigger-core-missing"], ["alpha"])
+        self.assertEqual([(h["skill"], h["severity"], h["line"]) for h in hits], [("alpha", "error", 3)])
+        self.assertIn("must start with 'Use when'", hits[0]["message"])
 
-    def test_trigger_in_output_style_or_cheatsheet_counts(self) -> None:
-        self.write("claude/CLAUDE.md.template", "nothing\n")
-        self.write("claude/output-styles/report.md", "load `/alpha` when needed\n")
-        self.assertEqual(self.run_cli()[0], 0)
-        (self.repo / "claude/output-styles/report.md").unlink()
-        self.write("claude/hooks/tools-cheatsheet.md", "- alpha: fixture skill\n")
-        self.assertEqual(self.run_cli()[0], 0)
+    def test_use_when_is_case_insensitive_and_whole_word(self) -> None:
+        self.add_skill("skills", "alpha", skill_md("alpha", desc="  use WHEN the fixture is read."))
+        self.assertEqual(self.core_findings()[1], [])
+        self.add_skill("skills", "alpha", skill_md("alpha", desc="Use whence the fixture is read."))
+        self.assertEqual(len(self.core_findings()[1]), 1)
 
-    def test_name_must_match_whole_token(self) -> None:
-        self.write("claude/CLAUDE.md.template", "alpha-beta and alphas\n")
-        self.assertIn("trigger-core-missing:alpha", self.rules())
+    def test_core_description_over_300_chars_fails(self) -> None:
+        self.add_skill("skills", "alpha", skill_md("alpha", desc="Use when " + "x" * 292))
+        rc, hits = self.core_findings()
+        self.assertEqual(rc, 1)
+        self.assertEqual([h["message"] for h in hits], ["core skill description is 301 chars (max 300)"])
 
-    def test_non_core_untriggered_is_a_note_even_strict(self) -> None:
-        self.add_skill("skills", "loner")
-        rc, found = self.findings("--strict")
-        self.assertEqual(rc, 0)
-        self.assertEqual([f["severity"] for f in found if f["skill"] == "loner"], ["note"])
+    def test_block_scalar_core_description_is_folded_before_checking(self) -> None:
+        text = "---\nname: alpha\ndescription: >\n  Use when folding\n  the fixture.\n---\nbody\n"
+        self.add_skill("skills", "alpha", text)
+        self.assertEqual(self.core_findings()[1], [])
+
+    def test_non_core_skill_is_not_subject(self) -> None:
+        self.add_skill("skills", "loner", skill_md("loner", desc="Does things. " + "x" * 400))
+        self.assertEqual(self.run_cli("--strict")[0], 0)
+
+    def test_core_rule_applies_in_every_scanned_root(self) -> None:
+        self.add_skill("codex/skills", "alpha", skill_md("alpha", desc="Validates fixtures."))
+        self.assertEqual([h["path"] for h in self.core_findings()[1]], ["codex/skills/alpha/SKILL.md"])
+
+    def test_missing_description_is_reported_once(self) -> None:
+        self.add_skill("skills", "alpha", skill_md("alpha", desc=None))
+        rules = self.rules()
+        self.assertEqual(rules["description-missing:alpha"], "error")
+        self.assertNotIn("core-description:alpha", rules)
 
     def test_absent_core_names_are_ignored(self) -> None:
         self.assertNotIn("absent-core", json.dumps(self.findings()[1]))
 
-    def test_warn_rule_demotes_core_trigger(self) -> None:
-        self.write("claude/CLAUDE.md.template", "nothing\n")
-        rc, found = self.findings("--warn-rule", "trigger-core-missing")
-        self.assertEqual(rc, 0)
-        self.assertEqual([f["severity"] for f in found if f["rule"] == "trigger-core-missing"], ["warn"])
+    def test_always_on_text_is_not_consulted(self) -> None:
+        self.write("claude/CLAUDE.md.template", "nothing names the core skill here\n")
+        self.assertEqual(self.run_cli("--strict")[0], 0)
 
-    def test_autotrigger_dry_run_suggests_line(self) -> None:
-        self.write("claude/CLAUDE.md.template", "nothing\n")
-        rc, out = self.run_cli("--json", "--autotrigger", "--dry-run")
-        self.assertEqual(rc, 1)
-        line = json.loads(out)["autotrigger"][0]["line"]
-        self.assertEqual(
-            line,
-            "- When checking the fixture tree, so the validator has something to read, "
-            "load the alpha skill.",
-        )
+    def test_warn_rule_demotes_core_description(self) -> None:
+        self.add_skill("skills", "alpha", skill_md("alpha", desc="Validates fixtures."))
+        rc, hits = self.core_findings("--warn-rule", "core-description")
+        self.assertEqual((rc, [h["severity"] for h in hits]), (0, ["warn"]))
+        self.assertEqual(self.core_findings("--warn-rule", "core-description", "--strict")[0], 1)
 
-    def test_autotrigger_without_dry_run_is_usage_error(self) -> None:
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
-            sv.main(["--repo-root", str(self.repo), "--autotrigger"])
-        self.assertEqual(cm.exception.code, 2)
+    def test_removed_trigger_options_are_usage_errors(self) -> None:
+        for argv in (["--warn-rule", "trigger-core-missing"], ["--autotrigger", "--dry-run"],
+                     ["--trigger-file", "x.md"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as cm:
+                sv.main(["--repo-root", str(self.repo), *argv])
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_json_has_no_autotrigger_key(self) -> None:
+        data = json.loads(self.run_cli("--json")[1])
+        self.assertEqual(sorted(data), ["findings", "roots", "skills_checked", "strict", "summary", "version"])
 
 
 class ScriptRefTests(RepoFixture):
@@ -315,11 +338,11 @@ class NodeModeTests(unittest.TestCase):
         self.claude = Path(self._tmp.name) / "claude-home"
         (self.claude / "skills").mkdir(parents=True)
         (self.claude / "hooks").mkdir()
-        (self.claude / "CLAUDE.md").write_text("load the core-one skill\n", encoding="utf-8")
         (self.claude / "core.txt").write_text("core-one\ncore-two\n", encoding="utf-8")
-        for name in ("core-one", "core-two"):
+        descs = {"core-one": GOOD_DESC, "core-two": "Checks the node fixture."}
+        for name, desc in descs.items():
             (self.claude / "skills" / name).mkdir()
-            (self.claude / "skills" / name / "SKILL.md").write_text(skill_md(name), encoding="utf-8")
+            (self.claude / "skills" / name / "SKILL.md").write_text(skill_md(name, desc), encoding="utf-8")
         (self.claude / "settings.json").write_text(
             json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": ""}]}]}}),
             encoding="utf-8",
@@ -341,12 +364,13 @@ class NodeModeTests(unittest.TestCase):
         data = json.loads(proc.stdout)
         self.assertEqual(data["skills_checked"], 2)
         got = sorted((f["rule"], f["skill"]) for f in data["findings"])
-        self.assertEqual(got, [("hooks-schema", ""), ("trigger-core-missing", "core-two")])
+        self.assertEqual(got, [("core-description", "core-two"), ("hooks-schema", "")])
 
     def test_settings_override_and_text_output(self) -> None:
         good = self.claude / "ok.json"
         good.write_text("{}", encoding="utf-8")
-        (self.claude / "CLAUDE.md").write_text("core-one core-two\n", encoding="utf-8")
+        (self.claude / "skills" / "core-two" / "SKILL.md").write_text(
+            skill_md("core-two"), encoding="utf-8")
         proc = self.run_node("--settings", str(good))
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("2 skill(s) in 1 root(s) — 0 error(s), 0 warning(s), 0 note(s)", proc.stdout)
@@ -361,11 +385,11 @@ class NodeModeTests(unittest.TestCase):
 
 
 class ShippedTreeTests(unittest.TestCase):
-    """The repo's own skills pass in the CI mode validate-harness.sh uses."""
+    """The repo's own skills pass every rule at its default severity (CI mode)."""
 
     def test_repo_tree_passes_ci_mode(self) -> None:
         proc = subprocess.run(
-            [sys.executable, str(SCRIPT), "--warn-rule", "trigger-core-missing"],
+            [sys.executable, str(SCRIPT)],
             capture_output=True, text=True, check=False, cwd=HERE.parent,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
