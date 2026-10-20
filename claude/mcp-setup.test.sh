@@ -312,5 +312,123 @@ borun "CCC_BROWSER_MCP_HOST=-oProxyCommand=sh" --
 ok "full run: a rejected browser host still does not fail the run" \
   '[ "$bo_rc" = 0 ] && ! grep -q "fleet-browser" "$TMP/claude.log" && grep -q "^mcp list" "$TMP/claude.log"'
 
+# --web-launch-only (#2315): setup.sh refreshes the launch of web MCP servers
+# that are already registered at user scope (#2300 npx -> node <cli> never
+# reached such nodes). Only stale known launches are rewritten, env (the
+# Firecrawl key) is kept verbatim and never printed, nothing is newly
+# registered or installed. This fake `claude` echoes its arguments to stdout
+# and stderr, as a CLI might, to prove the script discards that output.
+WBIN="$TMP/wbin"; mkdir -p "$WBIN"
+cat > "$WBIN/claude" <<EOF
+#!$BASH_BIN
+echo "\$*" >> "$TMP/claude.log"
+echo "claude says: \$*"; echo "claude err: \$*" >&2
+if [ "\${FAKE_CLAUDE_FAIL_NODE:-0}" = 1 ] && [ "\$1 \$2" = "mcp add" ]; then
+  case " \$* " in *" -- node "*) exit 1 ;; esac
+fi
+exit 0
+EOF
+chmod +x "$WBIN/claude"
+WHOME="$TMP/whome"; mkdir -p "$WHOME/.hermes"
+# A different key in the env file proves the registration's own key is kept.
+echo 'FIRECRAWL_API_KEY=fc-envfile-key-should-not-be-used' > "$WHOME/.hermes/.env"
+FAKE_KEY="fc-FAKE2315-0123456789abcdef"
+C7_CLI="$GROOT/@upstash/context7-mcp/dist/cli.js"
+FC_CLI="$GROOT/firecrawl-mcp/dist/cli.js"
+SX_CLI="$GROOT/mcp-searxng/dist/cli.js"
+write_wcfg() { # write_wcfg '<mcpServers JSON>'
+  python3 - "$WHOME/.claude.json" "$1" <<'PY'
+import json, sys
+json.dump({"numStartups": 7, "mcpServers": json.loads(sys.argv[2])}, open(sys.argv[1], "w"))
+PY
+}
+wrun() { # wrun [env assignments...]; sets w_rc, w_out
+  : > "$TMP/claude.log"; : > "$TMP/npm.log"
+  # shellcheck disable=SC2034  # w_out/w_rc are read via eval inside ok()
+  w_out="$(env -i PATH="$WBIN:$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$WHOME" "$@" bash "$SUT" --web-launch-only 2>&1)"
+  # shellcheck disable=SC2034
+  w_rc=$?
+}
+no_key_printed() { ! grep -qF -- "$FAKE_KEY" <<<"$w_out"; }
+
+# Registered with the old npx launch -> re-registered with node <cli>.
+write_wcfg '{"context7":{"type":"stdio","command":"npx","args":["-y","@upstash/context7-mcp"],"env":{}},
+  "firecrawl":{"type":"stdio","command":"npx","args":["-y","firecrawl-mcp"],"env":{"FIRECRAWL_API_KEY":"'"$FAKE_KEY"'"}}}'
+wrun
+ok "web-launch: exit 0" '[ "$w_rc" = 0 ]'
+ok "web-launch: npx context7 re-registered as node cli" \
+  'grep -qx "mcp remove context7 -s user" "$TMP/claude.log" && grep -qx "mcp add context7 -s user -- node $C7_CLI" "$TMP/claude.log"'
+ok "web-launch: firecrawl re-registered with its registered key kept exactly" \
+  'grep -qxF -- "mcp add firecrawl -s user -e FIRECRAWL_API_KEY=$FAKE_KEY -- node $FC_CLI" "$TMP/claude.log"'
+ok "web-launch: env-file key is not substituted" '! grep -q "fc-envfile-key" "$TMP/claude.log"'
+ok "web-launch: firecrawl key never printed (stdout/stderr, claude output discarded)" 'no_key_printed'
+ok "web-launch: unregistered searxng untouched (not added)" '! grep -q "searxng" "$TMP/claude.log"'
+ok "web-launch: unregistered searxng reported" 'grep -q "searxng: not registered" <<<"$w_out"'
+ok "web-launch: no install, no health-checking mcp list" \
+  '! grep -q "^install" "$TMP/npm.log" && ! grep -q "^mcp list" "$TMP/claude.log"'
+ok "web-launch: family/browser/rea servers untouched" \
+  '! grep -Eq "family-|fleet-browser|rea" "$TMP/claude.log"'
+
+# Already current -> no claude call at all, config bytes unchanged.
+write_wcfg '{"searxng":{"type":"stdio","command":"node","args":["'"$SX_CLI"'"],"env":{"SEARXNG_URL":"https://search.example.test"}},
+  "context7":{"type":"stdio","command":"node","args":["'"$C7_CLI"'"],"env":{}},
+  "firecrawl":{"type":"stdio","command":"node","args":["'"$FC_CLI"'"],"env":{"FIRECRAWL_API_KEY":"'"$FAKE_KEY"'"}}}'
+# shellcheck disable=SC2034  # read via eval inside ok()
+wcfg_before="$(cat "$WHOME/.claude.json")"
+wrun
+ok "web-launch: already-current registrations -> no claude calls" \
+  '[ "$w_rc" = 0 ] && [ ! -s "$TMP/claude.log" ] && [ "$(grep -c "already registered (unchanged)" <<<"$w_out")" = 3 ]'
+ok "web-launch: already-current config not rewritten" '[ "$(cat "$WHOME/.claude.json")" = "$wcfg_before" ]'
+ok "web-launch: already-current run prints no key" 'no_key_printed'
+
+# Package bin launch and a node path from an old prefix are known forms too.
+write_wcfg '{"searxng":{"type":"stdio","command":"mcp-searxng","args":[],"env":{"SEARXNG_URL":"https://search.example.test"}},
+  "context7":{"type":"stdio","command":"/usr/bin/node","args":["/old/prefix/lib/node_modules/@upstash/context7-mcp/dist/index.js"],"env":{}}}'
+wrun
+ok "web-launch: searxng bin launch re-registered with its URL kept" \
+  'grep -qx "mcp add searxng -s user -e SEARXNG_URL=https://search.example.test -- node $SX_CLI" "$TMP/claude.log"'
+ok "web-launch: stale node path re-registered" 'grep -qx "mcp add context7 -s user -- node $C7_CLI" "$TMP/claude.log"'
+ok "web-launch: firecrawl absent -> untouched" '! grep -q "firecrawl" "$TMP/claude.log"'
+
+# Global install missing -> skipped with a log line, nothing installed.
+write_wcfg '{"context7":{"type":"stdio","command":"npx","args":["-y","@upstash/context7-mcp"],"env":{}},
+  "firecrawl":{"type":"stdio","command":"npx","args":["-y","firecrawl-mcp"],"env":{"FIRECRAWL_API_KEY":"'"$FAKE_KEY"'"}}}'
+wrun FAKE_NPM_ROOT="$EMPTY_GROOT"
+ok "web-launch: missing global install -> skipped, no claude call, exit 0" \
+  '[ "$w_rc" = 0 ] && [ ! -s "$TMP/claude.log" ] && grep -q "firecrawl: SKIPPED — firecrawl-mcp is not installed globally" <<<"$w_out"'
+ok "web-launch: missing global install -> no npm install attempted" '! grep -q "^install" "$TMP/npm.log" && ! grep -q "^ls" "$TMP/npm.log"'
+ok "web-launch: skipped run prints no key" 'no_key_printed'
+
+# Custom launches (other command, extra args, non-stdio, extra fields) are left alone.
+write_wcfg '{"searxng":{"type":"http","url":"https://search.example.test/mcp"},
+  "context7":{"type":"stdio","command":"npx","args":["-y","@upstash/context7-mcp","--api-key","x"],"env":{}},
+  "firecrawl":{"type":"stdio","command":"docker","args":["run","-i","firecrawl"],"env":{"FIRECRAWL_API_KEY":"'"$FAKE_KEY"'"}}}'
+wrun
+ok "web-launch: custom launches left untouched" \
+  '[ "$w_rc" = 0 ] && [ ! -s "$TMP/claude.log" ] && [ "$(grep -c "custom launch — left untouched" <<<"$w_out")" = 3 ]'
+
+# No Claude user config / unparsable config -> nothing changed.
+rm -f "$WHOME/.claude.json"
+wrun
+ok "web-launch: no user config -> no claude calls" '[ "$w_rc" = 0 ] && [ ! -s "$TMP/claude.log" ]'
+printf 'not json' > "$WHOME/.claude.json"
+wrun
+ok "web-launch: unreadable config -> untouched (no remove+add fallback)" '[ "$w_rc" = 0 ] && [ ! -s "$TMP/claude.log" ]'
+
+# Re-add failure -> previous launch (and key) restored, exit 1, key not printed.
+write_wcfg '{"firecrawl":{"type":"stdio","command":"npx","args":["-y","firecrawl-mcp"],"env":{"FIRECRAWL_API_KEY":"'"$FAKE_KEY"'"}}}'
+wrun FAKE_CLAUDE_FAIL_NODE=1
+ok "web-launch: failed re-add exits 1 and restores the previous launch" \
+  '[ "$w_rc" = 1 ] && grep -qxF -- "mcp add firecrawl -s user -e FIRECRAWL_API_KEY=$FAKE_KEY -- npx -y firecrawl-mcp" "$TMP/claude.log" && grep -q "previous launch restored" <<<"$w_out"'
+ok "web-launch: failure path prints no key" 'no_key_printed'
+rm -f "$WHOME/.claude.json"
+
+# shellcheck disable=SC2034  # read via eval inside ok()
+wrun_excl_out="$(env -i PATH="$WBIN:$BIN:$NODE_DIR:/usr/bin:/bin" HOME="$WHOME" bash "$SUT" --web-launch-only --family-only 2>&1)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+wrun_excl_rc=$?
+ok "web-launch + family-only: mutually exclusive, exit 2" \
+  '[ "$wrun_excl_rc" = 2 ] && grep -q "mutually exclusive" <<<"$wrun_excl_out"'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

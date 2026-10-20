@@ -1273,6 +1273,56 @@ out="$(run_setup_in "$guard_repo" "$fam_home")"
 ok "family MCP: CCC_SETUP_FAMILY_MCP=0 opts out" \
   'grep -q "family MCP registration: disabled" <<<"$out" && [ ! -s "$fam_log" ]'
 
+# --- web MCP launch refresh (#2315) -------------------------------------------
+# setup.sh runs mcp-setup.sh --web-launch-only from the managed checkout, so a
+# web MCP server already registered with the old `npx -y` launch is moved to
+# the global install's `node <cli>` with its key kept. Stub `claude` (shared
+# log) and a stub `npm` whose global root holds the package; the suite-wide
+# default (test-stub reset) is off, so each case passes the value explicitly.
+web_bin="$TMP/web-cli"; mkdir -p "$web_bin"
+web_groot="$TMP/web-gmodules"; mkdir -p "$web_groot/firecrawl-mcp/dist"
+printf '#!/usr/bin/env node\n' > "$web_groot/firecrawl-mcp/dist/cli.js"
+printf '{"name":"firecrawl-mcp","bin":{"firecrawl-mcp":"dist/cli.js"}}\n' > "$web_groot/firecrawl-mcp/package.json"
+printf '#!%s\n[ "$1 $2" = "root -g" ] && { echo %q; exit 0; }\nexit 1\n' \
+  "$(PATH="$REAL_PATH" command -v bash)" "$web_groot" > "$web_bin/npm"
+chmod +x "$web_bin/npm"
+web_key="fc-FAKE2315-setup-test-key"
+web_home="$TMP/web-home"; mkdir -p "$web_home"
+write_web_cfg() {
+  printf '{"mcpServers":{"firecrawl":{"type":"stdio","command":"npx","args":["-y","firecrawl-mcp"],"env":{"FIRECRAWL_API_KEY":"%s"}}}}\n' \
+    "$web_key" > "$web_home/.claude.json"
+}
+run_setup_web() { # <CCC_SETUP_WEB_MCP_LAUNCH> <home> [extra setup args...]
+  local v="$1" home="$2"; shift 2
+  : > "$fam_log"
+  (cd "$guard_repo" && env -u CLAUDE_CONFIG_DIR HOME="$home" CCC_CLAUDE_DIR="$home/.claude" \
+    CCC_HERMES_DIR="$home/.hermes" CCC_SETUP_WEB_MCP_LAUNCH="$v" PATH="$fam_bin:$web_bin:$REAL_PATH" \
+    bash "$guard_repo/setup.sh" --no-backup "$@" 2>&1)
+}
+write_web_cfg
+out="$(run_setup_web 1 "$web_home")"; rc=$?
+ok "web MCP: managed checkout re-registers a stale npx launch as node <cli>, key kept" \
+  '[ "$rc" = 0 ] && grep -qxF -- "mcp add firecrawl -s user -e FIRECRAWL_API_KEY=$web_key -- node $web_groot/firecrawl-mcp/dist/cli.js" "$fam_log" && grep -q "web MCP launch registrations checked" <<<"$out"'
+ok "web MCP: unregistered servers not added, key never printed" \
+  '! grep -Eq "add (searxng|context7)" "$fam_log" && ! grep -qF -- "$web_key" <<<"$out"'
+
+out="$(run_setup_web 0 "$web_home")"
+ok "web MCP: CCC_SETUP_WEB_MCP_LAUNCH=0 opts out (mcp-setup not invoked)" \
+  'grep -q "web MCP launch refresh: disabled" <<<"$out" && [ ! -s "$fam_log" ] && ! grep -q "Refreshing web MCP" <<<"$out"'
+
+out="$(run_setup_web 1 "$other_home")"
+ok "web MCP: skipped when another checkout is the managed repo" \
+  'grep -q "web MCP launch refresh: not the self-update managed checkout" <<<"$out" && [ ! -s "$fam_log" ]'
+
+out="$(run_setup_web 1 "$TMP/web-dry-home" --dry-run)"
+ok "web MCP: dry-run announces without calling claude" \
+  'grep -q "would refresh registered web MCP launch commands" <<<"$out" && [ ! -s "$fam_log" ]'
+
+write_web_cfg
+out="$(FAM_CLAUDE_RC=1 run_setup_web 1 "$web_home")"; rc=$?
+ok "web MCP: refresh failure is a warning, not a failed install" \
+  '[ "$rc" = 0 ] && grep -q "WARNING: web MCP launch refresh failed" <<<"$out" && ! grep -qF -- "$web_key" <<<"$out"'
+
 # #1950: Termux has no /usr/bin/env and git exec()s hooks directly, so a
 # verbatim `#!/usr/bin/env bash` hook fails ("cannot exec") and git switch
 # exits 1. On Termux the installed copy must carry `#!$PREFIX/bin/bash`, with

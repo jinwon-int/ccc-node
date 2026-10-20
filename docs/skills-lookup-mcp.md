@@ -14,7 +14,7 @@ server (`wiki-agent mcp-serve`) and is never reimplemented here.
 | `bridge/core/family_mcp.py` | Bridge-side explicit injection for owner profiles; merges with the curated web MCP without overwriting it. |
 | `scripts/ccc-skill-lookup.py` | JSON CLI. `stdout` carries results only; diagnostics go to `stderr`. |
 | `claude/mcp-setup.sh` | Idempotent user-scope registration of `family-skills` and `family-wiki` for Claude CLI; `--family-only` registers just the in-repo `family-skills`/`family-ops` servers. |
-| `setup.sh` | Runs `claude/mcp-setup.sh --family-only` from the self-update managed checkout, so installs and self-updates register `family-skills` automatically (#2011 D). |
+| `setup.sh` | Runs `claude/mcp-setup.sh --family-only` from the self-update managed checkout, so installs and self-updates register `family-skills` automatically (#2011 D), then `--web-launch-only` to refresh the launch of already-registered web MCP servers (#2315). |
 
 ## Sources, ids, and revisions
 
@@ -85,6 +85,32 @@ the local, stdlib-only, secret-free `family-skills` and `family-ops` servers
 
 `family-wiki` (external `wiki-agent`) and the networked/keyed `searxng`,
 `context7` and `firecrawl` servers stay manual via `./claude/mcp-setup.sh`.
+
+Web MCP launch refresh (#2315). Registering the web servers stays an operator
+choice, but once registered their launch must follow `mcp-setup.sh`: #2300
+moved them from `npx -y <pkg>` to the global install's `node <cli>`, and a
+node that registered them earlier kept a resident `npm exec` wrapper per
+server per session until someone re-ran the script. After the family step,
+`setup.sh` therefore runs `claude/mcp-setup.sh --web-launch-only`:
+
+- it only looks at `searxng`, `context7` and `firecrawl` entries **already**
+  in the user-scope config; an unregistered server is never added;
+- an entry is re-registered as `node <cli>` only when its launch is a form the
+  script produced (`npx -y <pkg>`, the package bin, or `node` with an older
+  cli path) and differs from the current global install; an identical entry is
+  left untouched (no `~/.claude.json` rewrite) and any other launch (other
+  command, extra args, non-stdio, extra fields) is treated as custom and kept;
+- the entry's `env` (SearXNG URL, Firecrawl key) is passed back unchanged, and
+  the key is never printed: `~/.hermes/.env` is not read and the `claude`
+  CLI's own output is discarded. If the re-add fails, the previous launch is
+  restored;
+- nothing is installed: a server whose package has no global install
+  (`npm root -g`) is skipped with a log line, so such a node stays on `npx -y`
+  until `npm install -g <pkg>` is run there;
+- no `claude mcp list` health check; same managed-checkout and `claude` CLI
+  guards as the family step; `--dry-run` only announces it; failure is a
+  warning, never a failed install; `CCC_SETUP_WEB_MCP_LAUNCH=0` opts a node
+  out.
 Codex, Piri and Danso registration remains out of scope (see below). A running
 Claude session sees a new user-scope server only after it restarts; the
 bridge's owner-profile injection is unchanged.
