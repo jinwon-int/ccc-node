@@ -181,6 +181,47 @@ ok "new */15 task is due once at its latest window (#2119)" '[ "$rc" = 0 ] && jq
 ok "stale lastRunAt converges to the latest window instead of replaying the past (#2119)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"poisoned\" and .scheduledAt == \"2026-10-02T11:00:00Z\")" <<<"$out" >/dev/null'
 ok "interval schedule with stale lastRunAt converges too (#2119)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"interval-poisoned\" and .scheduledAt == \"2026-10-02T11:00:00Z\")" <<<"$out" >/dev/null'
 
+# #2314: add defaults a cron task's notBefore to its creation time, so adding
+# "0 9 15 10 *" the day before must not fire last year's occurrence.
+ADD_NB="$TMP/add-not-before/tasks.json"
+mkdir -p "$(dirname "$ADD_NB")"
+echo '{"version":1,"tasks":[]}' > "$ADD_NB"
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" add --at 2026-10-14T19:30:00Z probe --schedule "0 9 15 10 *" --timezone Asia/Seoul --prompt probe --argv /bin/true --max-runs 1 --json)"; rc=$?
+ok "add defaults a cron task's notBefore to the --at clock (#2314)" '[ "$rc" = 0 ] && jq -e ".task.notBefore == \"2026-10-14T19:30:00Z\"" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"probe\" and .notBefore == \"2026-10-14T19:30:00Z\")" "$ADD_NB" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" add --at 2026-10-14T19:30:00Z explicit --schedule "0 9 15 10 *" --timezone Asia/Seoul --prompt x --not-before 2026-10-01T00:00:00Z --json)"; rc=$?
+ok "add keeps an explicit --not-before instead of overwriting it (#2314)" '[ "$rc" = 0 ] && jq -e ".task.notBefore == \"2026-10-01T00:00:00Z\"" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" add --at 2026-10-14T19:30:00Z every-hour --schedule "every 1h" --prompt x --json)"; rc=$?
+ok "add does not stamp notBefore on an interval task (#2314)" '[ "$rc" = 0 ] && jq -e ".task | has(\"notBefore\") | not" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" add --at 2026-10-14T19:30:00Z at-once --schedule "at 2026-10-14T19:00:00Z" --prompt x --json)"; rc=$?
+ok "add does not stamp notBefore on an at one-shot task (#2314)" '[ "$rc" = 0 ] && jq -e ".task | has(\"notBefore\") | not" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" add clock --schedule "@daily" --prompt x --json)"; rc=$?
+ok "add defaults notBefore from the real clock with seconds precision (#2314)" '[ "$rc" = 0 ] && jq -e ".task.notBefore | test(\"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$\")" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" add --at not-a-date bad-clock --schedule "@daily" --prompt x --json 2>&1)"; rc=$?
+ok "add rejects an invalid --at clock without writing (#2314)" '[ "$rc" = 2 ] && ! jq -e ".tasks[] | select(.id == \"bad-clock\")" "$ADD_NB" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" validate --json)"; rc=$?
+ok "store with defaulted notBefore validates (#2314)" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" due --json --at 2026-10-14T19:30:00Z)"; rc=$?
+ok "issue repro: freshly added date-pinned one-shot is not due (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"probe\" and .due == false and .dueCount == 0 and .missedRuns == 0 and .scheduledAt == null and .nextDueAt == \"2026-10-15T00:00:00Z\")" <<<"$out" >/dev/null'
+ok "never-run interval task added without notBefore is still due once (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"every-hour\" and .due == true and .scheduledAt == \"2026-10-14T19:30:00Z\")" <<<"$out" >/dev/null'
+ok "past at one-shot added without notBefore is still due (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"at-once\" and .due == true and .scheduledAt == \"2026-10-14T19:00:00Z\")" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ADD_NB" bash "$CMD" due --json --at 2026-10-15T00:00:00Z)"; rc=$?
+ok "freshly added date-pinned one-shot fires on its real date (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"probe\" and .due == true and .scheduledAt == \"2026-10-15T00:00:00Z\")" <<<"$out" >/dev/null'
+
+# lastRunAt still floors the scan once a task has run; legacy tasks (no
+# notBefore, no lastRunAt) keep the 366-day floor.
+LEGACY_NB="$TMP/legacy-not-before.json"
+cat > "$LEGACY_NB" <<'JSON'
+{"version":1,"tasks":[
+{"id":"pinned-ran","schedule":"0 9 15 10 *","timezone":"Asia/Seoul","prompt":"a","enabled":true,"notify":"none","lastRunAt":"2025-10-14T00:00:00Z"},
+{"id":"pinned-ran-nb","schedule":"0 9 15 10 *","timezone":"Asia/Seoul","prompt":"a","enabled":true,"notify":"none","notBefore":"2025-01-01T00:00:00Z","lastRunAt":"2025-10-15T00:00:00Z"},
+{"id":"pinned-legacy","schedule":"0 9 15 10 *","timezone":"Asia/Seoul","prompt":"a","enabled":true,"notify":"none"}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$LEGACY_NB" bash "$CMD" due --json --at 2026-10-14T19:30:00Z)"; rc=$?
+ok "lastRunAt floor is unchanged for a task that already ran (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"pinned-ran\" and .due == true and .scheduledAt == \"2025-10-15T00:00:00Z\")" <<<"$out" >/dev/null'
+ok "a run past notBefore waits for the next occurrence (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"pinned-ran-nb\" and .due == false and .nextDueAt == \"2026-10-15T00:00:00Z\")" <<<"$out" >/dev/null'
+ok "legacy task without notBefore keeps the 366-day scan floor (#2314)" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"pinned-legacy\" and .due == true and .scheduledAt == \"2025-10-15T00:00:00Z\")" <<<"$out" >/dev/null'
+
 out="$(CCC_AGENT_CRON_STORE="$DUE" bash "$CMD" due --json --at not-a-date 2>&1)"; rc=$?
 ok "invalid --at fails closed without traceback" '[ "$rc" = 1 ] && grep -q -- "--at" <<<"$out" && ! grep -q "Traceback" <<<"$out"'
 
