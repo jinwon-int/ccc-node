@@ -85,6 +85,13 @@ run "alpha beta"
 okc "$RC" 0 "a retired bridge does not fail the run"
 ok "retired node reported under its own name, with its marker" \
   'grep -q "^RETIRED beta marker=telegram-retire-20261016$" "$OUT" && ! grep -qE "^(OK|DOWN|UNVERIFIED) beta" "$OUT"'
+# The canonical frontend list (#2348) is named as the marker source.
+reply beta - retired -
+echo "RETIRED=frontends" >> "$TMP/reply/beta"
+run "alpha beta"
+okc "$RC" 0 "a node retired by its frontend list does not fail the run"
+ok "frontend-list retirement is reported as marker=frontends" \
+  'grep -q "^RETIRED beta marker=frontends$" "$OUT" && ! grep -qE "^(OK|DOWN|UNVERIFIED) beta" "$OUT"'
 ok "healthy node beside it still OK" 'grep -q "^OK alpha" "$OUT"'
 
 # ---- degraded: alive and serving, but not restartable ----------------------
@@ -929,6 +936,70 @@ ok "a running bridge is judged on its answer despite the marker" \
   'grep -q "^AVAIL=no$" "$TMP/retired-running-out" && ! grep -q "^AVAIL=retired$" "$TMP/retired-running-out"'
 PATH="$TMP/probe-bin:$PATH" HOME="$TMP/retired-home" sh "$TMP/owner-probe.sh" > "$TMP/retired-running-out"
 ok "a healthy bridge is available despite the marker" 'grep -q "^AVAIL=yes$" "$TMP/retired-running-out"'
+
+# ---- retired on purpose: the canonical frontend list (#2348) ----------------
+# `~/.claude/frontends` is the declaration ccc-doctor and
+# termux-restart-frontends.sh read (#2342/#2346). A node that wrote only that
+# list (no backup directory) and leaves out `telegram` is RETIRED, not DOWN.
+# fe_home <name> <printf-format>: a HOME holding only that frontend list.
+fe_home() { mkdir -p "$TMP/$1/.claude"; printf "$2" > "$TMP/$1/.claude/frontends"; }
+probe_empty() { PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" HOME="$TMP/$1" sh "$TMP/owner-probe.sh" > "$TMP/$1.out"; }
+fe_home fe-matrix 'matrix\n'
+probe_empty fe-matrix
+ok "a frontend list without telegram is RETIRED marker=frontends" \
+  'grep -q "^AVAIL=retired$" "$TMP/fe-matrix.out" && grep -q "^RETIRED=frontends$" "$TMP/fe-matrix.out" && grep -q "^RUNTIME=-$" "$TMP/fe-matrix.out" && [ "$(tail -1 "$TMP/fe-matrix.out")" = PROBE_COMPLETE=1 ]'
+fe_home fe-telegram 'matrix\ntelegram\n'
+probe_empty fe-telegram
+ok "a frontend list naming telegram, with no bridge running, is still DOWN" \
+  'grep -q "^AVAIL=no$" "$TMP/fe-telegram.out" && ! grep -q "^AVAIL=retired$" "$TMP/fe-telegram.out"'
+# Separators are space, tab and comma, as in the other readers; a CRLF list is
+# read like ccc-doctor reads it (telegram still named).
+fe_home fe-comma 'matrix,telegram\n'
+probe_empty fe-comma
+ok "comma-separated telegram is a declared frontend" 'grep -q "^AVAIL=no$" "$TMP/fe-comma.out"'
+fe_home fe-tab 'hande\tmatrix telegram\n'
+probe_empty fe-tab
+ok "tab/space-separated telegram is a declared frontend" 'grep -q "^AVAIL=no$" "$TMP/fe-tab.out"'
+fe_home fe-crlf 'matrix\r\ntelegram\r\n'
+probe_empty fe-crlf
+ok "a CRLF list naming telegram is not misread as retired" 'grep -q "^AVAIL=no$" "$TMP/fe-crlf.out"'
+# `telegram` only inside a comment is not a declaration of it.
+fe_home fe-comment '# telegram retired 2026-10-16\nmatrix # was: telegram\n'
+probe_empty fe-comment
+ok "telegram named only in a comment is RETIRED marker=frontends" \
+  'grep -q "^AVAIL=retired$" "$TMP/fe-comment.out" && grep -q "^RETIRED=frontends$" "$TMP/fe-comment.out"'
+# A near-miss name is not telegram (whole-word match).
+fe_home fe-near 'matrix telegram-old\n'
+probe_empty fe-near
+ok "a name that merely contains telegram does not declare it" 'grep -q "^RETIRED=frontends$" "$TMP/fe-near.out"'
+# The list is canonical: when it exists it decides over the legacy directory.
+# A rolled-back node keeps its backup directory, so a list naming telegram must
+# still page a missing bridge; a list without it names itself as the source.
+fe_home fe-dir-telegram 'matrix telegram\n'
+mkdir -p "$TMP/fe-dir-telegram/.claude/state/telegram-retire-20261016"
+probe_empty fe-dir-telegram
+ok "a list naming telegram overrides a leftover backup directory (DOWN)" \
+  'grep -q "^AVAIL=no$" "$TMP/fe-dir-telegram.out" && ! grep -q "^RETIRED=" "$TMP/fe-dir-telegram.out"'
+fe_home fe-dir-matrix 'matrix\n'
+mkdir -p "$TMP/fe-dir-matrix/.claude/state/telegram-retire-20261016"
+probe_empty fe-dir-matrix
+ok "with both markers the canonical list is reported as the source" \
+  'grep -q "^RETIRED=frontends$" "$TMP/fe-dir-matrix.out"'
+# A directory where the list should be is not a list: the legacy directory
+# marker (here: none) decides, so the node stays DOWN.
+mkdir -p "$TMP/fe-isdir/.claude/frontends"
+probe_empty fe-isdir
+ok "a directory named frontends is not a declaration" 'grep -q "^AVAIL=no$" "$TMP/fe-isdir.out"'
+# Overrides in the watcher's own environment do not describe the probed node.
+PATH="$TMP/empty-bin:$TMP/probe-bin:$PATH" HOME="$TMP/empty-home" CCC_FRONTENDS=matrix \
+  CCC_FRONTENDS_FILE="$TMP/fe-matrix/.claude/frontends" sh "$TMP/owner-probe.sh" > "$TMP/fe-env.out"
+ok "CCC_FRONTENDS/CCC_FRONTENDS_FILE in the probe environment are ignored" 'grep -q "^AVAIL=no$" "$TMP/fe-env.out"'
+# A running bridge still wins over the list, as over the directory marker.
+PATH="$TMP/probe-bin:$PATH" HOME="$TMP/fe-matrix" PROBE_STATUS=unavailable sh "$TMP/owner-probe.sh" > "$TMP/fe-running.out"
+ok "a running bridge is judged on its answer despite a list without telegram" \
+  'grep -q "^AVAIL=no$" "$TMP/fe-running.out" && ! grep -q "^AVAIL=retired$" "$TMP/fe-running.out"'
+PATH="$TMP/probe-bin:$PATH" HOME="$TMP/fe-matrix" sh "$TMP/owner-probe.sh" > "$TMP/fe-running.out"
+ok "a healthy bridge is available despite a list without telegram" 'grep -q "^AVAIL=yes$" "$TMP/fe-running.out"'
 
 # ---- runtime owner is not the service manager ------------------------------
 # Execute the POSIX probe: a system service may use User=gongmyoung without
