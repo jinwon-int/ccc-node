@@ -92,6 +92,31 @@ MAX_SESSION_TREE_RSS_LIMIT_MB = 8192
 SESSION_TREE_RSS_LIMIT_FRACTION = 0.25
 
 
+def _meminfo_mb(field: str, *, proc_root: Path) -> float | None:
+    """Return one ``<proc_root>/meminfo`` field in MiB, or None if unavailable.
+
+    Missing, unreadable, or malformed input returns None rather than raising
+    (non-Linux hosts have no ``/proc``; hardened or Android hosts may hide it).
+    """
+    try:
+        text = (proc_root / "meminfo").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    prefix = f"{field}:"
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            kib = int(parts[1])
+        except ValueError:
+            return None
+        return round(kib / 1024.0, 1) if kib >= 0 else None
+    return None
+
+
 def system_total_memory_mb(*, proc_root: Path = Path("/proc")) -> float:
     """Return total system memory in MiB, or 0.0 if it cannot be determined.
 
@@ -99,21 +124,19 @@ def system_total_memory_mb(*, proc_root: Path = Path("/proc")) -> float:
     or malformed input fails open (returns 0.0) rather than raising, so
     callers can fall back to a fixed default on hardened or non-Linux hosts.
     """
-    try:
-        text = (proc_root / "meminfo").read_text(encoding="utf-8")
-    except OSError:
-        return 0.0
-    for line in text.splitlines():
-        if not line.startswith("MemTotal:"):
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            return 0.0
-        try:
-            return round(int(parts[1]) / 1024.0, 1)
-        except ValueError:
-            return 0.0
-    return 0.0
+    return _meminfo_mb("MemTotal", proc_root=proc_root) or 0.0
+
+
+def system_available_memory_mb(*, proc_root: Path = Path("/proc")) -> float | None:
+    """Return the kernel's ``MemAvailable`` estimate in MiB, or None.
+
+    ``MemAvailable`` (Linux 3.14+) counts reclaimable page cache, so it is the
+    number that says whether the host is actually short of memory. None means
+    "unknown" (no ``/proc`` on macOS, restricted ``/proc`` on Termux or a
+    hardened host, an older kernel without the field, malformed input); it is
+    never reported as zero, which would read as maximal pressure.
+    """
+    return _meminfo_mb("MemAvailable", proc_root=proc_root)
 
 
 def default_session_tree_rss_limit_mb(*, proc_root: Path = Path("/proc")) -> int:
@@ -134,3 +157,46 @@ def default_session_tree_rss_limit_mb(*, proc_root: Path = Path("/proc")) -> int
     return max(
         MIN_SESSION_TREE_RSS_LIMIT_MB, min(MAX_SESSION_TREE_RSS_LIMIT_MB, scaled)
     )
+
+
+# -- host memory pressure gate for the RSS watermark (#2298) ------------------
+#
+# On a 4 GiB host the watermark sits at the 1024 MiB floor, and an idle bridge
+# tree (bridge + claude + a few stdio MCP servers) is already at that floor.
+# The RSS watermark alone then reads "pressure" on almost every tick while the
+# host still has more than half of its memory available, and each eviction
+# only buys a cold start of the CLI and its MCP servers. So the RSS watermark
+# is a necessary condition, and the host must also be genuinely short of
+# memory: ``MemAvailable`` below ``max(512 MiB, 15% of MemTotal)``.
+
+HOST_PRESSURE_MIN_AVAILABLE_MB = 512
+HOST_PRESSURE_AVAILABLE_FRACTION = 0.15
+
+
+def host_pressure_available_threshold_mb(total_mb: float) -> float:
+    """Return the ``MemAvailable`` level below which the host is pressured."""
+
+    return max(
+        float(HOST_PRESSURE_MIN_AVAILABLE_MB),
+        max(0.0, float(total_mb)) * HOST_PRESSURE_AVAILABLE_FRACTION,
+    )
+
+
+def host_memory_pressure(
+    *, proc_root: Path = Path("/proc")
+) -> tuple[bool | None, float | None]:
+    """Return ``(pressured, mem_available_mb)`` for the RSS-watermark gate.
+
+    ``pressured`` is None when ``MemAvailable`` cannot be read; the caller
+    then keeps the RSS-only rule so pressure protection never silently
+    disappears on a host whose ``/proc/meminfo`` is restricted. An unreadable
+    ``MemTotal`` alone only drops the 15 % term (the 512 MiB floor stays).
+    """
+
+    available = system_available_memory_mb(proc_root=proc_root)
+    if available is None:
+        return None, None
+    threshold = host_pressure_available_threshold_mb(
+        system_total_memory_mb(proc_root=proc_root)
+    )
+    return available < threshold, available

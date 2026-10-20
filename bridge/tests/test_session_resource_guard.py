@@ -2,10 +2,14 @@ from pathlib import Path
 
 from telegram_bot.utils.session_resource_guard import (
     DEFAULT_SESSION_TREE_RSS_LIMIT_MB,
+    HOST_PRESSURE_MIN_AVAILABLE_MB,
     MAX_SESSION_TREE_RSS_LIMIT_MB,
     MIN_SESSION_TREE_RSS_LIMIT_MB,
     default_session_tree_rss_limit_mb,
+    host_memory_pressure,
+    host_pressure_available_threshold_mb,
     process_tree_rss_mb,
+    system_available_memory_mb,
     system_total_memory_mb,
 )
 
@@ -134,3 +138,85 @@ def test_process_tree_rss_skips_a_descendant_whose_status_vanished(
     tmp_path.joinpath("11", "status").unlink()
 
     assert process_tree_rss_mb(10, proc_root=tmp_path) == 2.0
+
+
+# -- MemAvailable / host pressure gate (#2298) ---------------------------------
+
+
+def _write_full_meminfo(
+    root: Path, *, total_kib: int | None, available_kib: int | None
+) -> None:
+    lines = []
+    if total_kib is not None:
+        lines.append(f"MemTotal:       {total_kib} kB")
+    lines.append("MemFree:          123456 kB")
+    if available_kib is not None:
+        lines.append(f"MemAvailable:   {available_kib} kB")
+    root.joinpath("meminfo").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_system_available_memory_reads_meminfo(tmp_path: Path) -> None:
+    _write_full_meminfo(tmp_path, total_kib=4009 * 1024, available_kib=2400 * 1024)
+
+    assert system_available_memory_mb(proc_root=tmp_path) == 2400.0
+
+
+def test_system_available_memory_is_none_when_unavailable(tmp_path: Path) -> None:
+    # No /proc/meminfo at all (macOS, restricted Termux).
+    assert system_available_memory_mb(proc_root=tmp_path) is None
+    # meminfo without the field (pre-3.14 kernel, filtered /proc).
+    _write_full_meminfo(tmp_path, total_kib=4009 * 1024, available_kib=None)
+    assert system_available_memory_mb(proc_root=tmp_path) is None
+    # Malformed value.
+    tmp_path.joinpath("meminfo").write_text(
+        "MemAvailable: lots kB\n", encoding="utf-8"
+    )
+    assert system_available_memory_mb(proc_root=tmp_path) is None
+
+
+def test_host_pressure_threshold_is_max_of_floor_and_fifteen_percent() -> None:
+    # 4 GiB host: 15% of 3915 MiB = 587.25 MiB, above the 512 MiB floor.
+    assert host_pressure_available_threshold_mb(3915.0) == 3915.0 * 0.15
+    # 2 GiB host: 15% = 307 MiB, so the 512 MiB floor wins.
+    assert host_pressure_available_threshold_mb(2048.0) == 512.0
+    # Unknown total keeps the floor.
+    assert host_pressure_available_threshold_mb(0.0) == HOST_PRESSURE_MIN_AVAILABLE_MB
+
+
+def test_host_memory_pressure_small_host_idle_baseline_is_not_pressure(
+    tmp_path: Path,
+) -> None:
+    # The #2298 field shape: 3.9 GiB total, ~2.4 GiB available.
+    _write_full_meminfo(tmp_path, total_kib=3915 * 1024, available_kib=2400 * 1024)
+
+    assert host_memory_pressure(proc_root=tmp_path) == (False, 2400.0)
+
+
+def test_host_memory_pressure_low_available_is_pressure(tmp_path: Path) -> None:
+    _write_full_meminfo(tmp_path, total_kib=3915 * 1024, available_kib=500 * 1024)
+
+    assert host_memory_pressure(proc_root=tmp_path) == (True, 500.0)
+
+
+def test_host_memory_pressure_uses_fraction_on_large_hosts(tmp_path: Path) -> None:
+    # 22 GiB host: threshold is 15% = 3379 MiB, so 3000 MiB available is low.
+    _write_full_meminfo(
+        tmp_path, total_kib=22 * 1024 * 1024, available_kib=3000 * 1024
+    )
+
+    assert host_memory_pressure(proc_root=tmp_path) == (True, 3000.0)
+
+
+def test_host_memory_pressure_unknown_without_mem_available(tmp_path: Path) -> None:
+    assert host_memory_pressure(proc_root=tmp_path) == (None, None)
+    _write_full_meminfo(tmp_path, total_kib=3915 * 1024, available_kib=None)
+    assert host_memory_pressure(proc_root=tmp_path) == (None, None)
+
+
+def test_host_memory_pressure_without_mem_total_keeps_the_floor(
+    tmp_path: Path,
+) -> None:
+    _write_full_meminfo(tmp_path, total_kib=None, available_kib=600 * 1024)
+    assert host_memory_pressure(proc_root=tmp_path) == (False, 600.0)
+    _write_full_meminfo(tmp_path, total_kib=None, available_kib=400 * 1024)
+    assert host_memory_pressure(proc_root=tmp_path) == (True, 400.0)
