@@ -116,7 +116,10 @@ class CodexDistillLocalSinkWorker:
     Audience-routed jobs land in their opaque audience scope. When a
     ``global_route`` is configured (off/curated modes, #2296), route-free jobs —
     including ones extraction already marked UNROUTABLE — land in the
-    node-global state instead.
+    node-global state instead. Audience-routed jobs are never written there:
+    a global-only worker closes them as superseded (#2333: TERMINAL_FAILED
+    with error_code ``local_sink_superseded_route``), and an audience worker
+    picks those back up.
     """
 
     def __init__(
@@ -188,6 +191,12 @@ class CodexDistillLocalSinkWorker:
         """True when route-free (incl. UNROUTABLE) jobs are this worker's work."""
 
         return self._global_route is not None
+
+    @property
+    def audience_routes_enabled(self) -> bool:
+        """True when audience-routed (incl. superseded, #2333) jobs are its work."""
+
+        return self._audience_root is not None
 
     async def _fail(
         self,

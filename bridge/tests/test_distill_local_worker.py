@@ -20,7 +20,10 @@ from test_distill_local_journal import extracted_job
 import test_distill_worker as fixtures
 
 from telegram_bot.core.bot import TelegramBot
-from telegram_bot.memory.distill_journal import DistillJournal
+from telegram_bot.memory.distill_journal import (
+    DistillJournal,
+    is_local_sink_superseded_route,
+)
 from telegram_bot.memory.distill_local_worker import (
     CodexDistillLocalSinkWorker,
     GlobalLocalMemoryRoute,
@@ -906,7 +909,7 @@ async def test_audience_worker_never_writes_route_free_job_globally(
 
 
 @pytest.mark.anyio
-async def test_global_only_worker_leaves_audience_routed_job_pending(
+async def test_global_only_worker_supersedes_audience_routed_job(
     tmp_path: Path,
 ) -> None:
     journal = DistillJournal(tmp_path / "journal")
@@ -925,7 +928,8 @@ async def test_global_only_worker_leaves_audience_routed_job_pending(
 
     result = await worker.write_once(job_id=job.job_id)
 
-    assert result.local_sink_status is DistillLocalSinkStatus.PENDING
+    # #2333: closed as superseded (never adopted), nothing written.
+    assert is_local_sink_superseded_route(result)
     assert not (route.state_dir / "memory-facts.jsonl").exists()
     # No audience root: an audience refresh fails closed instead of guessing.
     with pytest.raises(RuntimeError, match="local_sink_index_unsafe"):
@@ -1079,3 +1083,82 @@ async def test_lifecycle_loop_adopts_unroutable_jobs_only_with_global_route(
         audience_journal.get(orphan.job_id).local_sink_status
         is DistillLocalSinkStatus.UNROUTABLE
     )
+
+
+@pytest.mark.anyio
+async def test_global_worker_closes_routed_pending_without_writing_any_sink(
+    tmp_path: Path,
+) -> None:
+    """#2333: audience content never reaches the owner's node-global memory."""
+
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    assert job.local_sink_status is DistillLocalSinkStatus.PENDING
+    route = _global_route(tmp_path)
+    audience_root = tmp_path / "audiences"
+
+    result = await CodexDistillLocalSinkWorker(
+        journal, global_route=route, owner_token="global-worker"
+    ).write_once(job_id=job.job_id)
+
+    assert is_local_sink_superseded_route(result)
+    assert result.local_sink_attempts == 0
+    assert result.extraction_output == job.extraction_output
+    assert not (route.state_dir / "memory-facts.jsonl").exists()
+    assert not (route.state_dir / "resume.md").exists()
+    assert not audience_root.exists()
+
+    # Audience mode re-enabled: the job lands in its original audience only.
+    worker = CodexDistillLocalSinkWorker(
+        journal, audience_root=audience_root, owner_token="audience-worker"
+    )
+    assert worker.audience_routes_enabled is True
+    resumed = await worker.write_once(job_id=job.job_id)
+    assert resumed.local_sink_status is DistillLocalSinkStatus.DONE
+    assert resumed.local_sink_attempts == 1
+    facts_path = audience_root / str(job.memory_scope) / "state" / "memory-facts.jsonl"
+    assert len(facts_path.read_text().splitlines()) == 1
+    assert not (route.state_dir / "memory-facts.jsonl").exists()
+
+
+@pytest.mark.anyio
+async def test_lifecycle_loop_supersedes_then_resumes_routed_work_by_mode(
+    tmp_path: Path,
+) -> None:
+    journal = DistillJournal(tmp_path / "journal")
+    journal.initialize()
+    job = await extracted_job(journal)
+    route = _global_route(tmp_path)
+    global_worker = CodexDistillLocalSinkWorker(
+        journal, global_route=route, owner_token="g"
+    )
+    assert global_worker.audience_routes_enabled is False
+    calls: list[str] = []
+    original = global_worker.write_once
+
+    async def counting_write_once(*, job_id: str):
+        calls.append(job_id)
+        return await original(job_id=job_id)
+
+    global_worker.write_once = counting_write_once  # type: ignore[method-assign]
+    await _drive_local_sink_loop(
+        global_worker,
+        journal,
+        until=lambda: is_local_sink_superseded_route(journal.get(job.job_id))
+        and len(calls) >= 3,
+    )
+    assert is_local_sink_superseded_route(journal.get(job.job_id))
+    # Offered once while PENDING, never again once superseded.
+    assert calls == [job.job_id]
+    assert not (route.state_dir / "memory-facts.jsonl").exists()
+
+    await _drive_local_sink_loop(
+        CodexDistillLocalSinkWorker(
+            journal, audience_root=tmp_path / "audiences", owner_token="a"
+        ),
+        journal,
+        until=lambda: journal.get(job.job_id).local_sink_status
+        is DistillLocalSinkStatus.DONE,
+    )
+    assert journal.get(job.job_id).local_sink_status is DistillLocalSinkStatus.DONE

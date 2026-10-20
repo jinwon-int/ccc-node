@@ -682,6 +682,32 @@ cp "$journal/$done_id.json" "$settled_journal/$done_id.json"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$settled_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports a completed write-back queue as settled" '[ "$rc" = 0 ] && jq -e '\''.writeback_queue.status == "settled" and .writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 0'\'' >/dev/null <<<"$out"'
 
+# #2333: audience work closed as superseded after a switch to off/curated
+# (terminal_failed + error_code=local_sink_superseded_route) is counted on its
+# own, and neither pending backlog nor degraded; a genuine terminal failure
+# still degrades.
+superseded_journal="$TMP/superseded-distill-journal"
+mkdir -m 700 "$superseded_journal"
+superseded_id="$(printf '9%.0s' {1..64})"
+sed -e "s/$done_id/$superseded_id/" -e 's/"local_sink_status":"done","local_sink_attempts":1/"local_sink_status":"terminal_failed","error_code":"local_sink_superseded_route","local_sink_attempts":0/' \
+  "$journal/$done_id.json" > "$superseded_journal/$superseded_id.json"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$superseded_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check classifies superseded-route jobs apart from pending backlog" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_queue.status == "settled"
+  and .writeback_queue.jobs == 1
+  and .writeback_queue.pending_jobs == 0
+  and .writeback_queue.invalid_records == 0
+  and .writeback_queue.local_status_counts == {superseded_route:1}
+'\'' >/dev/null <<<"$out"'
+sed -e 's/"error_code":"local_sink_superseded_route"/"error_code":"local_sink_io_failed"/' \
+  "$superseded_journal/$superseded_id.json" > "$superseded_journal/$superseded_id.json.tmp"
+mv "$superseded_journal/$superseded_id.json.tmp" "$superseded_journal/$superseded_id.json"
+out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$superseded_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
+ok "memory check still degrades a genuine local-sink terminal failure" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_queue.status == "degraded"
+  and .writeback_queue.local_status_counts == {terminal_failed:1}
+'\'' >/dev/null <<<"$out"'
+
 # All-valid multi-file journal: the single batched jq pass (no malformed file
 # forcing the per-file fallback) must aggregate the same per-file projections.
 valid_journal="$TMP/valid-batch-distill-journal"

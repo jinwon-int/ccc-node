@@ -404,6 +404,17 @@ class MemoryDistillMixin:
                     # #2296: orphans awaiting node-global adoption survive
                     # retention until the local-sink sweep adopts them.
                     prune_kwargs["keep_unroutable"] = True
+                if (
+                    getattr(
+                        getattr(self, "_distill_local_sink_worker", None),
+                        "audience_routes_enabled",
+                        False,
+                    )
+                    is True
+                ):
+                    # #2333: superseded audience work is claimable again
+                    # while audience routes exist; keep it until written.
+                    prune_kwargs["keep_superseded_route"] = True
                 try:
                     pruned = await asyncio.to_thread(prune, **prune_kwargs)
                 except Exception:
@@ -520,6 +531,9 @@ class MemoryDistillMixin:
     async def _distill_local_sink_loop(self, stop_event: asyncio.Event) -> None:
         """Drive independently leased local write-back without re-extraction."""
 
+        from telegram_bot.memory.distill_journal import (
+            is_local_sink_superseded_route,
+        )
         from telegram_bot.memory.distill_types import DistillLocalSinkStatus
 
         worker = self._distill_local_sink_worker
@@ -534,13 +548,21 @@ class MemoryDistillMixin:
             # off/curated (#2296): route-free work goes to the node-global
             # sink, and previously orphaned UNROUTABLE jobs are adopted once.
             eligible.add(DistillLocalSinkStatus.UNROUTABLE)
+        # #2333: audience work closed as superseded (TERMINAL_FAILED plus the
+        # local_sink_superseded_route marker) while the node had no audience
+        # routes resumes once audience mode is back. A global-only worker
+        # still sees routed PENDING work (it closes it) but never re-offers
+        # superseded jobs; genuine terminal failures are never re-offered.
+        resume_superseded = getattr(worker, "audience_routes_enabled", False) is True
         while not stop_event.is_set():
             try:
                 jobs = await self._distill_sweep_jobs(interval)
                 for job in jobs:
                     if stop_event.is_set():
                         break
-                    if job.local_sink_status not in eligible:
+                    if job.local_sink_status not in eligible and not (
+                        resume_superseded and is_local_sink_superseded_route(job)
+                    ):
                         continue
                     await worker.write_once(job_id=job.job_id)
             except asyncio.CancelledError:
