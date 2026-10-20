@@ -71,7 +71,7 @@
       "reconcile": "receipt",
       "compensation": "delete",
       "audit_surface": "body-free spool path and redacted owner text envelope",
-      "approval_boundary": "notify=telegram-owner or allowlisted telegram-chat",
+      "approval_boundary": "notify=owner (alias telegram-owner) or allowlisted telegram-chat",
       "recovery": {
         "before_intent": "safe-replay",
         "after_intent_before_call": "safe-replay",
