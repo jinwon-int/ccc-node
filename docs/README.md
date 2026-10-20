@@ -16,6 +16,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`trajectory-render.md`](trajectory-render.md) | Shared session rendering grammar (`[USER]`/`[ACTION]`/`[OBSERVATION]`…), the `…(+N chars — render truncation)` marker contract, and the `obs_trunc >= 10,000` guard for distill, skill-review and nunchi (#2388). |
 | [`skill-registry.md`](skill-registry.md) | Generated single registry over all repo skill sources; CI-enforced freshness; lifecycle `status` field (#1338). |
 | [`skill-listing-budget.md`](skill-listing-budget.md) | Deterministic skill-listing budget: core + recently used skills keep descriptions, the rest `name-only` via owned `skillOverrides` (#2011). |
+| [`skill-validate.md`](skill-validate.md) | Read-only skill pre-validation: name == directory, description + banned measurement words, core-skill trigger lines, SKILL.md `scripts/` refs + py_compile, hooks schema; repo and node (`--root`) modes (#2386). |
 | [`skill-graduation.md`](skill-graduation.md) | fleet-skills → ccc-node graduation: criteria, procedure, precedence contract across the skill tools (#1344). |
 | [`skill-usage-report.md`](skill-usage-report.md) | Read-only per-node skill usage report + fleet aggregation (archive/graduation/unused candidates); two-stage curator archive opt-in; `fleet-managed` ownership class (#2239). |
 | [`codex-managed-skills.md`](codex-managed-skills.md) | Static Codex operating-skill catalog, safe provisioning, collision policy, and rollback. |
