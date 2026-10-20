@@ -17,13 +17,17 @@
 #                     "could not determine". Such a node reports KIND=danso,
 #                     a RUNTIME that is a binary path rather than a checkout
 #                     root, and the GENERATION (sha256) of that binary.
-#                     A node with no bridge at all that carries a retirement
-#                     marker (`~/.claude/state/telegram-retire-<YYYYMMDD>/` in
-#                     the probing account's home — the rollback backup the
-#                     2026-10-16 fleet retirement left behind, Wiki DOC-4014,
-#                     #2343) reports RETIRED <node> marker=<name>: absent on
-#                     purpose, not a failure. A running bridge is judged on
-#                     its answer regardless of the marker.
+#                     A node with no bridge at all that declares Telegram
+#                     retired reports RETIRED <node> marker=<source>: absent on
+#                     purpose, not a failure. The canonical declaration is the
+#                     frontend list `~/.claude/frontends` in the probing
+#                     account's home without `telegram` (marker=frontends,
+#                     #2348); when no list exists, the legacy rollback-backup
+#                     directory `~/.claude/state/telegram-retire-<YYYYMMDD>/`
+#                     the 2026-10-16 fleet retirement left behind (Wiki
+#                     DOC-4014, #2343) still counts (marker=<dir name>). A
+#                     running bridge is judged on its answer regardless of
+#                     either marker.
 #   2. canonical    — the checkout it serves from is one the fleet installs at,
 #                     not a PR/issue work tree
 #   3. boot path    — the systemd unit that would restart the bridge points at
@@ -348,10 +352,32 @@ if [ -z "$line" ]; then
   # the header). Only ABSENCE is softened by it: a bridge that is running is
   # judged on its answer, so a rollback (TM-4018) needs no marker cleanup. The
   # newest marker is reported when several exist.
+  #
+  # The canonical declaration is the operator-owned frontend list
+  # `~/.claude/frontends` (#2342/#2346, #2348) that ccc-doctor,
+  # termux-restart-frontends.sh and install-hande-bridge.sh already read: one
+  # name per line, `#` comments, names separated by space/tab/comma. When it
+  # exists it decides — without `telegram` the channel is retired
+  # (RETIRED=frontends); with `telegram` it is not, even if an old backup
+  # directory is still around (a rolled-back node keeps it), so a bridge that
+  # is declared and absent still pages DOWN. Only a node with no list falls
+  # back to the legacy backup directory. CCC_FRONTENDS / CCC_FRONTENDS_FILE are
+  # deliberately not read: this probe runs in the watcher's environment
+  # (local) or a fresh ssh login (remote), never the bridge's, so an override
+  # here would describe the wrong process and make the self node disagree with
+  # every other. `\r` is a separator too, as in ccc-doctor's parse, so a CRLF
+  # list that names telegram is not misread as a retirement.
   retired=""
-  for _m in "$HOME"/.claude/state/telegram-retire-*; do
-    [ -d "$_m" ] && retired=${_m##*/}
-  done
+  _fe="$HOME/.claude/frontends"
+  if [ -f "$_fe" ] && [ -r "$_fe" ]; then
+    if ! sed 's/#.*//' "$_fe" 2>/dev/null | tr -s ' \t\r,' '\n' | grep -qx telegram; then
+      retired=frontends
+    fi
+  else
+    for _m in "$HOME"/.claude/state/telegram-retire-*; do
+      [ -d "$_m" ] && retired=${_m##*/}
+    done
+  fi
   if [ -n "$retired" ]; then
     echo "RUNTIME=-"; echo "AVAIL=retired"; echo "RETIRED=$retired"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
   fi
