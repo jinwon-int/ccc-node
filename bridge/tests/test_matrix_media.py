@@ -29,7 +29,7 @@ from telegram_bot.core.matrix.attachments import (
     media_caption,
     parse_mxc,
 )
-from telegram_bot.core.matrix.state import MatrixStore, Policy, Request, job_digest, scope_of
+from telegram_bot.core.matrix.state import ConversationHold, MatrixStore, Policy, Request, job_digest, scope_of
 
 BOT = "@bot:example.org"
 OWNER = "@owner:example.org"
@@ -126,6 +126,23 @@ def test_family_room_needs_an_explicit_address_even_for_media() -> None:
     assert captioned is not None and captioned.body == "@bot 이게 뭐야"
     pill = admit(image_content(**{"m.mentions": {"user_ids": [BOT]}}), room=FAMILY, sender=KID)
     assert pill is not None and pill.body == ATTACHMENT_PLACEHOLDER
+
+
+def test_family_hold_admits_the_same_senders_caption_less_photo() -> None:
+    # #1808 B: right after a turn, the sender's follow-up photo needs no caption address.
+    hold = ConversationHold(600)
+    p = Policy(BOT, frozenset({OWNER, KID}), frozenset({BOT}), {DM: "direct", FAMILY: "mention"}, 0, hold=hold)
+    now = int(time.time() * 1000)
+
+    def photo(sender: str) -> dict[str, Any]:
+        return {"type": "m.room.message", "event_id": "$photo", "sender": sender, "origin_server_ts": now,
+                "content": image_content()}
+
+    assert p.admit(FAMILY, photo(KID), decrypted=True, now_ms=now) is None
+    hold.open(scope_of(BOT, FAMILY, KID), started=hold.now())
+    req = p.admit(FAMILY, photo(KID), decrypted=True, now_ms=now)
+    assert req is not None and req.body == ATTACHMENT_PLACEHOLDER and req.attachment is not None
+    assert p.admit(FAMILY, photo(OWNER), decrypted=True, now_ms=now) is None  # someone else's hold
 
 
 @pytest.mark.parametrize(

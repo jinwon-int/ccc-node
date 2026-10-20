@@ -57,9 +57,11 @@ from telegram_bot.core.matrix.state import (
     REJECT_EDIT,
     REJECT_TEXT_TOO_LARGE,
     Request,
+    ConversationHold,
     SafetyStop,
     SentEvents,
     bounded_text,
+    conversation_hold_minutes,
     family_config,
     identities,
     mention_aliases,
@@ -321,6 +323,39 @@ def message_content(text: str, *, msgtype: str = "m.text") -> dict[str, Any]:
     return event_content(text, msgtype=msgtype)
 
 
+def _conversation_hold(minutes: float, runner: Any) -> ConversationHold:
+    """The #1808 B hold table, kept within the runner's idle-session reset.
+
+    A runner exposing ``session_reset_seconds()`` (MatrixBot: the
+    ``AUTO_NEW_SESSION_AFTER_HOURS`` reset) bounds the hold: a configured
+    window longer than the reset is clamped to it and logged, and each hold
+    also ends at turn start + reset (see :class:`ConversationHold`). A runner
+    without the seam (or one reporting no reset) leaves the window as set.
+    """
+    seconds = minutes * 60.0
+    reset: float | None = None
+    probe = getattr(runner, "session_reset_seconds", None)
+    if callable(probe):
+        try:
+            value = probe()
+        except Exception as exc:  # fail-safe: an unknown reset turns the hold off
+            logger.warning("matrix conversation hold off: session reset unavailable (%s)", type(exc).__name__)
+            return ConversationHold(0)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+                logger.warning("matrix conversation hold off: invalid session reset")
+                return ConversationHold(0)
+            reset = float(value)
+    if reset is not None and seconds > reset:
+        logger.warning(
+            "matrix conversation hold %.0f min exceeds the %.0f-min session reset; clamped",
+            minutes,
+            reset / 60.0,
+        )
+        seconds = reset
+    return ConversationHold(seconds, reset_seconds=reset)
+
+
 def _is_edit(content: Mapping[str, Any]) -> bool:
     """An ``m.replace`` edit (its event id is not a message of its own)."""
     relation = content.get("m.relates_to")
@@ -489,6 +524,7 @@ class MatrixTransport:
         self.turn_timeout = (
             turn_timeout if turn_timeout is not None else turn_timeout_minutes(config) * 60.0
         )
+        hold_minutes = conversation_hold_minutes(config)
         # Family settings are a trust boundary; reject them before opening state.
         self.family_rooms, self.family_users, self.family_devices = family_config(config)
         # Trust model per user (#149): a user with a pinned cross-signing
@@ -520,6 +556,9 @@ class MatrixTransport:
         # Event ids this process sent (in memory only, #1808): a family-room
         # reply to one is addressed; a restart starts empty (fail closed).
         self.sent_events = SentEvents()
+        # Same-sender follow-up windows (in memory only, #1808 B): a restart
+        # starts empty (fail closed), like the sent-events ring.
+        self.conversation_hold = _conversation_hold(hold_minutes, runner)
         # Family rooms reuse mention admission; direct rooms are unchanged.
         self.policy = Policy(
             config["account"],
@@ -530,6 +569,7 @@ class MatrixTransport:
             aliases=mention_aliases(config),
             wake_words=wake_words(config),
             own_events=self.sent_events,
+            hold=self.conversation_hold,
         )
         self.blocked: set[str] = set(self.store.get_meta("room_gate_blocked") or ())
         self.room_members: dict[str, set[str]] = {}
@@ -2176,6 +2216,7 @@ class MatrixTransport:
         self.cancel_requested = False
         self.turn_timed_out = False
         outcome = "uncertain"
+        started = self.conversation_hold.now()
         # Routing context is admitted data (sender/room passed the gate), not user text.
         turn = asyncio.create_task(
             self.runner.run(
@@ -2199,6 +2240,7 @@ class MatrixTransport:
                 # session id without echoing the answer a second time.
                 self.store.finish(job["event_id"], "" if result.streamed else result.text, result.session_id)
                 outcome = result.status
+                self._hold_conversation(job, started)
         except asyncio.CancelledError:
             outcome = "cancelled"
             current = asyncio.current_task()
@@ -2248,6 +2290,27 @@ class MatrixTransport:
                     # After the reply row is ready: anything the runner queues
                     # from here sorts behind it in the outbox (#2088).
                     self._runner_hook("turn_closed", job)
+
+    def _hold_conversation(self, job: Mapping[str, Any], started: float) -> None:
+        """Open (or extend) the sender's family-room hold after a completed turn (#1808 B).
+
+        Called only for a final result (``complete``, or ``error`` with its
+        user-facing notice). A turn admitted from the sender's own message
+        opens that sender's hold — a held follow-up's completion extends it —
+        while self-jobs (``$self-``), direct rooms and cancelled, timed-out or
+        uncertain turns open nothing; another member's turn only ever touches
+        that member's own scope.
+        """
+        room, sender = job.get("room_id"), job.get("sender")
+        if (
+            not isinstance(room, str)
+            or not isinstance(sender, str)
+            or self.policy.rooms.get(room) != "mention"
+            or sender not in self.senders
+            or str(job.get("event_id") or "").startswith("$self-")
+        ):
+            return
+        self.conversation_hold.open(scope_of(self.c["account"], room, sender), started=started)
 
     def _runner_hook(self, name: str, job: Mapping[str, Any]) -> None:
         """Run the runner's optional ``name(job)`` hook in the background, fail-open.
