@@ -45,6 +45,21 @@ annual cron expression cannot catch up an occurrence from the previous year.
 For example, a July 22 one-time job uses its normal five-field schedule,
 `notBefore: 2026-07-22T02:27:00Z`, and `maxRuns: 1`.
 
+`add` now does this by default for cron-kind schedules (#2314): when
+`--not-before` is not given, it stores `notBefore` = the creation time (UTC
+ISO8601, seconds precision; a global `--at ISO8601` before the task id,
+`add --at ISO8601 <task-id> …`, overrides the clock like `due`/`run`). The
+creation minute itself still counts. So `0 9 15 10 *` added on October 14
+waits for this year's October 15 instead of firing last year's occurrence at
+once and burning `maxRuns: 1`. An explicit `--not-before` is kept as given.
+Interval and `at` one-shot schedules are not stamped and keep their own
+never-run rules. Tasks already in the store are unchanged: a legacy cron task
+with neither `lastRunAt` nor `notBefore` keeps the 366-day scan floor. To let a
+new cron task catch up a past occurrence on purpose, pass an earlier
+`--not-before` to `add`, or `edit <task-id> --not-before <earlier ISO8601>`
+later; `edit --not-before ''` cannot clear the field (the schema requires a
+non-empty string), and remove + add stamps it again.
+
 ## Schedule forms
 
 `schedule` accepts four kinds (epic #584-adjacent cron upgrade, referencing the
