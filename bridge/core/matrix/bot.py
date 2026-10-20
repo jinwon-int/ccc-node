@@ -2515,6 +2515,20 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         user_id, chat_id, _ = self._job_identity(job, kind)
         return user_id, chat_id
 
+    def session_reset_seconds(self) -> float | None:
+        """Idle gap after which a turn starts a fresh session, or ``None`` (#1808 B).
+
+        ``AUTO_NEW_SESSION_AFTER_HOURS`` (``0``/``off`` → no reset). The
+        transport keeps its family-room conversation hold within it so a
+        held follow-up never lands in a session that is about to be reset.
+        Reported even for Danso (which never resets on time) so a runtime
+        provider switch cannot outgrow the clamp.
+        """
+        hours = getattr(self._settings, "auto_new_session_after_hours", None)
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < float("inf"):
+            return None
+        return float(hours) * 3600.0
+
     async def stop_idle(self, job: Mapping[str, Any]) -> bool:
         """``/stop`` with no turn running in the sender's scope (#1825).
 
@@ -4058,6 +4072,10 @@ class MatrixTurnRunner:
 
     async def cancel(self, job: Mapping[str, Any]) -> bool:
         return await self._bot.cancel(job)
+
+    def session_reset_seconds(self) -> float | None:
+        """Transport seam: the idle-session reset bounding the conversation hold (#1808 B)."""
+        return self._bot.session_reset_seconds()
 
     async def stop_idle(self, job: Mapping[str, Any]) -> bool:
         return await self._bot.stop_idle(job)

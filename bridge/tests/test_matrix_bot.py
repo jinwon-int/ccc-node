@@ -432,6 +432,18 @@ async def test_auto_new_session_resets_the_row(tmp_path: Path, matrix_config: di
     assert chat.calls[0]["session_id"] is None
 
 
+@pytest.mark.parametrize(
+    ("hours", "seconds"),
+    [(24.0, 86_400.0), (0.5, 1800.0), (2, 7200.0), (None, None), (0, None), (True, None), ("24", None),
+     (float("inf"), None), (float("nan"), None)],
+)
+def test_session_reset_seconds_follows_auto_new_session(tmp_path: Path, hours: Any, seconds: Any) -> None:
+    # #1808 B: the transport keeps the family conversation hold within this reset.
+    bot, _chat, _manager = _bot(tmp_path, auto_new_session_after_hours=hours)
+    assert bot.session_reset_seconds() == seconds
+    assert MatrixTurnRunner(bot).session_reset_seconds() == seconds
+
+
 # --- session-start banner (parity with the Telegram bridge) ------------------
 
 

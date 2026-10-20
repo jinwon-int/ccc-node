@@ -987,6 +987,166 @@ def test_sent_events_ring_is_bounded_and_evicts_the_oldest() -> None:
             m.SentEvents(bad)  # type: ignore[arg-type]
 
 
+# --------------------------------------------------------------------------- #
+# Conversation hold (#1808 B)
+# --------------------------------------------------------------------------- #
+
+GROUP2 = "!group2:example.test"
+
+
+class FakeClock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _held_policy(minutes: float = 10, *, reset: float | None = None, sent: Any = None) -> tuple[Policy, Any, FakeClock]:
+    clock = FakeClock()
+    hold = m.ConversationHold(minutes * 60, reset_seconds=reset, clock=clock)
+    p = policy(rooms={ROOM: "direct", GROUP: "mention", GROUP2: "mention"}, hold=hold, own_events=sent)
+    return p, hold, clock
+
+
+def _chat(body: str = "and what about tomorrow", sender: str = OWNER, event_id: str = "$follow", **content: Any) -> dict[str, Any]:
+    e = event(event_id, sender)
+    e["content"]["body"] = body
+    e["content"].update(content)
+    return e
+
+
+def _open(hold: Any, room: str = GROUP, sender: str = OWNER, *, started: float | None = None) -> None:
+    hold.open(m.scope_of(BOT, room, sender), started=hold.now() if started is None else started)
+
+
+def test_conversation_hold_minutes_config_validation(caplog: pytest.LogCaptureFixture) -> None:
+    assert m.CONVERSATION_HOLD_DEFAULT_MINUTES == 10 and m.CONVERSATION_HOLD_MAX_MINUTES == 120
+    assert m.conversation_hold_minutes({}) == 10.0
+    assert m.conversation_hold_minutes({"conversation_hold_minutes": 0}) == 0.0
+    assert m.conversation_hold_minutes({"conversation_hold_minutes": 2.5}) == 2.5
+    assert m.conversation_hold_minutes({"conversation_hold_minutes": 120}) == 120.0
+    assert not caplog.records
+    caplog.set_level("WARNING")
+    assert m.conversation_hold_minutes({"conversation_hold_minutes": 500}) == 120.0  # hard cap: clamped
+    assert any("clamped" in r.getMessage() for r in caplog.records)
+    assert "invalid-conversation-hold" in SAFETY_STOP_REASONS
+    for bad in (True, False, -1, "10", None, [10], float("nan"), float("inf")):
+        with pytest.raises(SafetyStop, match="invalid-conversation-hold"):
+            m.conversation_hold_minutes({"conversation_hold_minutes": bad})
+
+
+def test_hold_admits_the_same_senders_follow_up_until_the_window_ends() -> None:
+    p, hold, clock = _held_policy(10)
+    assert p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is None  # no turn completed yet
+    _open(hold)
+    clock.now += 9 * 60
+    req = p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW)
+    assert req is not None and req.body == "and what about tomorrow" and req.scope == m.scope_of(BOT, GROUP, OWNER)
+    clock.now += 60  # the window ends exactly at turn end + 10 min
+    assert p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is None
+    assert len(hold) == 0  # pruned lazily on access
+
+
+def test_hold_is_per_sender_and_per_room() -> None:
+    p, hold, _clock = _held_policy(10)
+    _open(hold)
+    # Another member's chatter is not admitted and does not touch the hold.
+    assert p.admit(GROUP, _chat(sender=OTHER), decrypted=True, now_ms=NOW) is None
+    # The same sender in another family room is not held either.
+    assert p.admit(GROUP2, _chat(), decrypted=True, now_ms=NOW) is None
+    assert p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is not None
+    assert not hold.holds(m.scope_of(BOT, GROUP, OTHER)) and not hold.holds(m.scope_of(BOT, GROUP2, OWNER))
+    # Direct rooms are always addressed; the hold neither applies nor matters there.
+    assert p.held(ROOM, OWNER, {}) is False
+
+
+def test_hold_never_admits_a_message_aimed_at_someone_else() -> None:
+    sent = m.SentEvents()
+    sent.add(GROUP, "$bot-answer")
+    p, hold, _clock = _held_policy(10, sent=sent)
+    _open(hold)
+    to_other = _chat("can you pick me up?", **{"m.mentions": {"user_ids": [OTHER]}})
+    assert p.admit(GROUP, to_other, decrypted=True, now_ms=NOW) is None
+    # Naming the bot as well is an explicit address, hold or not.
+    both = _chat("you two", **{"m.mentions": {"user_ids": [OTHER, BOT]}})
+    assert p.admit(GROUP, both, decrypted=True, now_ms=NOW) is not None
+    # An empty or malformed m.mentions names nobody else: still held.
+    for mentions in ({}, {"user_ids": []}, {"user_ids": "x"}, {"room": True}):
+        assert p.admit(GROUP, _chat(**{"m.mentions": mentions}), decrypted=True, now_ms=NOW) is not None, mentions
+    # A reply to someone else's message is aimed at them; a reply to the bot is addressed on its own.
+    reply_other = _chat(**{"m.relates_to": {"m.in_reply_to": {"event_id": "$family-chatter"}}})
+    assert p.admit(GROUP, reply_other, decrypted=True, now_ms=NOW) is None
+    reply_bot = _chat(**{"m.relates_to": {"m.in_reply_to": {"event_id": "$bot-answer"}}})
+    assert p.admit(GROUP, reply_bot, decrypted=True, now_ms=NOW) is not None
+
+
+def test_hold_leaves_edits_threads_and_rejections_unchanged() -> None:
+    p, hold, _clock = _held_policy(10)
+    _open(hold)
+    edit = _chat(**{"m.relates_to": {"rel_type": "m.replace", "event_id": "$one"}})
+    thread = _chat(**{"m.relates_to": {"rel_type": "m.thread", "event_id": "$root", "is_falling_back": True,
+                                       "m.in_reply_to": {"event_id": "$root"}}})
+    for e in (edit, thread):
+        assert p.admit(GROUP, e, decrypted=True, now_ms=NOW) is None
+        # Unaddressed edits/threads stay silent exactly as without a hold.
+        assert p.rejection(GROUP, e, decrypted=True, now_ms=NOW) is None
+        assert policy().rejection(GROUP, e, decrypted=True, now_ms=NOW) is None
+
+
+def test_hold_zero_is_off_and_a_policy_without_one_never_holds() -> None:
+    p, hold, _clock = _held_policy(0)
+    _open(hold)
+    assert len(hold) == 0 and p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is None
+    assert policy().held(GROUP, OWNER, {}) is False
+
+
+def test_hold_extends_on_each_completed_turn_and_restart_starts_empty() -> None:
+    p, hold, clock = _held_policy(10)
+    _open(hold)
+    clock.now += 8 * 60
+    _open(hold)  # the held follow-up's turn completed: the window restarts from its end
+    clock.now += 8 * 60
+    assert p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is not None
+    # A restart builds a fresh table: fail closed.
+    restarted = policy(rooms={ROOM: "direct", GROUP: "mention"}, hold=m.ConversationHold(600, clock=clock))
+    assert restarted.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is None
+
+
+def test_hold_ends_at_the_session_reset_measured_from_turn_start() -> None:
+    # Reset 30 min after the user message that started a 25-minute turn:
+    # the 10-minute hold would outlive it, so it ends 5 minutes after the turn.
+    p, hold, clock = _held_policy(10, reset=30 * 60)
+    started = clock.now
+    clock.now += 25 * 60
+    _open(hold, started=started)
+    clock.now += 4 * 60
+    assert p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is not None
+    clock.now += 60
+    assert p.admit(GROUP, _chat(), decrypted=True, now_ms=NOW) is None
+    # A turn that ran past the reset opens no hold at all.
+    started = clock.now
+    clock.now += 31 * 60
+    _open(hold, started=started)
+    assert len(hold) == 0
+
+
+def test_conversation_hold_validates_and_bounds_its_table() -> None:
+    for args, kwargs in (((-1,), {}), ((True,), {}), (("10",), {}), ((float("inf"),), {}),
+                         ((60,), {"reset_seconds": 0}), ((60,), {"reset_seconds": float("nan")}),
+                         ((60,), {"cap": 0})):
+        with pytest.raises(ValueError):
+            m.ConversationHold(*args, **kwargs)
+    clock = FakeClock()
+    hold = m.ConversationHold(60, clock=clock, cap=2)
+    for name in ("a", "b", "c"):
+        hold.open(name, started=clock.now)
+    assert len(hold) == 2 and not hold.holds("a") and hold.holds("c")
+    clock.now += 61
+    hold.open("d", started=clock.now)  # opening prunes every expired scope
+    assert len(hold) == 1 and hold.holds("d")
+
+
 def test_identities_replace_owner_pins_and_join_the_saved_policy(tmp_path: Path) -> None:
     c = config(tmp_path)
     master = "M" * 43

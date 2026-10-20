@@ -22,7 +22,7 @@ from urllib.parse import quote
 import pytest
 
 from telegram_bot.core.matrix import transport as t
-from telegram_bot.core.matrix.state import MatrixStore, SafetyStop, turn_id
+from telegram_bot.core.matrix.state import MatrixStore, SafetyStop, scope_of, turn_id
 from telegram_bot.core.matrix.transport import (
     NOTICE_CANCELLED,
     NOTICE_RESTARTED,
@@ -2578,6 +2578,110 @@ async def test_reply_to_a_sent_bot_event_addresses_the_family_room_until_restart
         h.f = f = MatrixTransport(family_config(tmp_path), h.runner)
         assert len(f.sent_events) == 0
         assert f.admit_event(FAMILY, reply(answer)) is None
+
+
+@pytest.mark.anyio
+async def test_conversation_hold_follows_completed_family_turns_until_restart(tmp_path: Path) -> None:
+    # #1808 B: after the bot completes the sender's turn, their follow-ups need no handle for 10 min.
+    async with family(tmp_path) as h:
+        f = h.f
+        clock = [1000.0]
+        f.conversation_hold.clock = lambda: clock[0]
+        assert f.conversation_hold.seconds == 600.0 and f.conversation_hold.reset_seconds is None
+        now = int(time.time() * 1000)
+
+        def message(body: str, event_id: str = "$follow", sender: str = DAD, key: str = "c" * 43) -> Any:
+            content = {"msgtype": "m.text", "body": body}
+            source = {"type": "m.room.message", "event_id": event_id, "sender": sender, "origin_server_ts": now, "content": content}
+            return h.nio.RoomMessageText(sender=sender, source=source, verified=True, sender_key=key, ts=now)
+
+        async def turn(req: Any) -> None:
+            h.drain()  # a scope claims nothing until its replies are out
+            f.store.accept_batch([req], None)
+            job = f.store.claim()
+            assert job is not None and job["event_id"] == req.event_id
+            await f.run_turn(job)
+
+        assert f.admit_event(FAMILY, message("and tomorrow?")) is None  # no completed turn yet
+        await turn(f.admit_event(FAMILY, message("@bot how is the weather", "$ask")))
+        follow = f.admit_event(FAMILY, message("and tomorrow?", "$follow1"))
+        assert follow is not None and follow.sender == DAD and follow.body == "and tomorrow?"
+        # Another member's chatter is neither admitted nor does it touch DAD's hold.
+        assert f.admit_event(FAMILY, message("dinner at 7", "$chatter", h.owner, "b" * 43)) is None
+        # The held follow-up's own completed turn extends the hold from its end.
+        clock[0] += 8 * 60
+        await turn(follow)
+        clock[0] += 8 * 60
+        assert f.admit_event(FAMILY, message("one more", "$follow2")) is not None
+        clock[0] += 2 * 60
+        assert f.admit_event(FAMILY, message("one more", "$follow2")) is None  # window over
+        # Neither a self-job turn nor an interrupted turn opens a hold.
+        f.enqueue_self_job(FAMILY, "continue", key="hold-test", sender=DAD)
+        h.drain()
+        job = f.store.claim()
+        assert job is not None and job["event_id"].startswith("$self-")
+        await f.run_turn(job)
+        assert f.admit_event(FAMILY, message("still there?", "$follow3")) is None
+        h.runner.mode = "uncertain"
+        await turn(f.admit_event(FAMILY, message("@bot try this", "$ask2")))
+        assert f.admit_event(FAMILY, message("still there?", "$follow3")) is None
+        h.runner.mode = "complete"
+        await turn(f.admit_event(FAMILY, message("@bot again", "$ask3")))
+        assert f.admit_event(FAMILY, message("still there?", "$follow3")) is not None
+        # A direct-room turn never opens a hold (direct rooms are always addressed).
+        direct = f.c["rooms"][0]
+        await turn(f.admit_event(direct, message("hello", "$direct", h.owner, "b" * 43)))
+        assert len(f.conversation_hold) == 1
+        assert not f.conversation_hold.holds(scope_of(h.account, direct, h.owner))
+        await f.close()
+        h.f = f = MatrixTransport(family_config(tmp_path), h.runner)
+        assert len(f.conversation_hold) == 0  # in memory only: a restart fails closed
+        assert f.admit_event(FAMILY, message("still there?", "$follow3")) is None
+
+
+@pytest.mark.parametrize(
+    ("extra", "reset", "seconds", "log"),
+    [
+        ({}, "absent", 600.0, None),
+        ({"conversation_hold_minutes": 0}, "absent", 0.0, None),
+        ({"conversation_hold_minutes": 500}, "absent", 7200.0, "clamped"),  # hard cap
+        ({}, 86_400.0, 600.0, None),
+        ({}, None, 600.0, None),  # the runner reports no reset
+        ({"conversation_hold_minutes": 60}, 1800.0, 1800.0, "exceeds the 30-min session reset"),
+        ({"conversation_hold_minutes": 500}, 3600.0, 3600.0, "exceeds the 60-min session reset"),
+        ({}, RuntimeError("boom"), 0.0, "session reset unavailable"),
+        ({}, "1800", 0.0, "invalid session reset"),
+        ({}, 0, 0.0, "invalid session reset"),
+    ],
+)
+def test_conversation_hold_config_is_capped_and_kept_within_the_session_reset(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, extra: dict[str, Any], reset: Any, seconds: float, log: str | None
+) -> None:
+    class ResetRunner(FakeRunner):
+        def session_reset_seconds(self) -> Any:
+            if isinstance(reset, Exception):
+                raise reset
+            return reset
+
+    caplog.set_level("WARNING")
+    runner = FakeRunner() if reset == "absent" else ResetRunner()
+    f = MatrixTransport({**family_config(tmp_path), **extra}, runner)
+    try:
+        assert f.conversation_hold.seconds == seconds
+        assert f.policy.hold is f.conversation_hold
+        if isinstance(reset, float) and seconds:
+            assert f.conversation_hold.reset_seconds == reset
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(log in msg for msg in messages) if log else not messages
+    finally:
+        f.store.close()
+
+
+def test_invalid_conversation_hold_stops_before_opening_state(tmp_path: Path) -> None:
+    for bad in ("10", -5, True, None):
+        with pytest.raises(SafetyStop, match="invalid-conversation-hold"):
+            MatrixTransport({**family_config(tmp_path), "conversation_hold_minutes": bad}, FakeRunner())
+    assert not (tmp_path / "state").exists()
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,8 @@ import fcntl
 import getpass
 import hashlib
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -46,7 +48,7 @@ import sqlite3
 import stat
 import time
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
@@ -59,6 +61,8 @@ from telegram_bot.core.matrix.attachments import (  # noqa: F401 - re-exported
     media_caption,
     parse_mxc,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_TEXT_BYTES = 16_384
 # Outbox rows whose ``reply`` is an outbound-file payload, not text (#2001).
@@ -115,6 +119,7 @@ SAFETY_STOP_REASONS: frozenset[str] = frozenset(
         "invalid-mention-aliases",
         "invalid-wake-words",
         "invalid-turn-timeout",
+        "invalid-conversation-hold",
         "invalid-identities",
         "owner-identity-changed",
         "family-identity-changed",
@@ -268,6 +273,31 @@ def turn_timeout_minutes(config: Mapping[str, Any]) -> float:
     return float(raw)
 
 
+CONVERSATION_HOLD_DEFAULT_MINUTES = 10
+CONVERSATION_HOLD_MAX_MINUTES = 120
+
+
+def conversation_hold_minutes(config: Mapping[str, Any]) -> float:
+    """Optional ``conversation_hold_minutes`` (#1808 B): same-sender follow-up window.
+
+    Default 10; ``0`` turns the hold off. A value above the hard cap (120) is
+    clamped to it and logged instead of refused: the knob only sizes a
+    convenience window and is not a trust boundary. A bool, a non-number, a
+    non-finite or a negative value is a config error like the other knobs.
+    """
+    raw = config.get("conversation_hold_minutes", CONVERSATION_HOLD_DEFAULT_MINUTES)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0:
+        raise SafetyStop("invalid-conversation-hold")
+    if raw > CONVERSATION_HOLD_MAX_MINUTES:
+        logger.warning(
+            "matrix conversation_hold_minutes=%s above the %d-minute cap; clamped",
+            raw,
+            CONVERSATION_HOLD_MAX_MINUTES,
+        )
+        return float(CONVERSATION_HOLD_MAX_MINUTES)
+    return float(raw)
+
+
 def identifier(value: Any, prefix: str) -> bool:
     return (
         isinstance(value, str)
@@ -391,6 +421,87 @@ class SentEvents:
         return len(self._rooms)
 
 
+class ConversationHold:
+    """In-memory ``scope -> hold deadline`` for same-sender follow-ups (#1808 B).
+
+    :meth:`open` runs when the bot completes a turn for a family-room scope
+    ``sha(account, room, sender)``; until the deadline that sender's next
+    messages in that room count as addressed. The deadline is
+    ``min(turn end + seconds, turn start + reset_seconds)``: ``reset_seconds``
+    is the agent's idle-session reset, measured by the runner from the user
+    message that started the turn, so a held follow-up never lands in a
+    session that is about to be reset. Never persisted — a restart starts
+    empty (fail closed). Expired scopes are pruned lazily on access; ``cap``
+    bounds the table (least recently opened scope evicted) even though family scopes are
+    few. ``clock`` is monotonic seconds (tests inject a fake one).
+    """
+
+    def __init__(
+        self,
+        seconds: float,
+        *,
+        reset_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        cap: int = 256,
+    ) -> None:
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 <= seconds < math.inf:
+            raise ValueError("invalid conversation hold")
+        if reset_seconds is not None and (
+            isinstance(reset_seconds, bool)
+            or not isinstance(reset_seconds, (int, float))
+            or not 0 < reset_seconds < math.inf
+        ):
+            raise ValueError("invalid session reset")
+        if type(cap) is not int or cap < 1:
+            raise ValueError("invalid conversation hold cap")
+        self.seconds = float(seconds)
+        self.reset_seconds = None if reset_seconds is None else float(reset_seconds)
+        self.clock = clock
+        self.cap = cap
+        self._until: dict[str, float] = {}
+
+    def now(self) -> float:
+        return self.clock()
+
+    def open(self, scope: str, *, started: float) -> None:
+        """Hold ``scope`` from now: called once its turn completed (``started`` = turn start)."""
+        if self.seconds <= 0:
+            return
+        now = self.clock()
+        until = now + self.seconds
+        if self.reset_seconds is not None:
+            until = min(until, started + self.reset_seconds)
+        self._prune(now)
+        self._until.pop(scope, None)
+        if until > now:
+            self._until[scope] = until
+        while len(self._until) > self.cap:
+            del self._until[next(iter(self._until))]
+
+    def holds(self, scope: str) -> bool:
+        until = self._until.get(scope)
+        if until is None:
+            return False
+        if self.clock() < until:
+            return True
+        del self._until[scope]
+        return False
+
+    def _prune(self, now: float) -> None:
+        for scope in [s for s, until in self._until.items() if until <= now]:
+            del self._until[scope]
+
+    def __len__(self) -> int:
+        return len(self._until)
+
+
+def addresses_someone_else(content: Mapping[str, Any], account: str) -> bool:
+    """``m.mentions.user_ids`` names someone, but not the bot (#1808 B: no hold hijack)."""
+    mentions = content.get("m.mentions")
+    ids = mentions.get("user_ids") if isinstance(mentions, dict) else None
+    return isinstance(ids, list) and any(isinstance(u, str) and u != account for u in ids) and account not in ids
+
+
 def strip_reply_fallback(body: str) -> str:
     """Drop a legacy ``> <@user> quoted`` reply fallback prefix (Matrix spec §rich replies).
 
@@ -453,6 +564,8 @@ class Policy:
     wake_words: frozenset[str] = frozenset()  # extra bare nickname tokens that address the bot
     # Events the bot sent (the transport's live ring); a reply to one addresses the bot (#1808).
     own_events: SentEvents | None = field(default=None, compare=False)
+    # Same-sender follow-up windows (the transport's live table, #1808 B).
+    hold: ConversationHold | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         users = frozenset(self.users)
@@ -568,7 +681,9 @@ class Policy:
             return None
         # The mention gate still sees the original body (fallback included),
         # so replies are admitted exactly as before (#1943).
-        if self.rooms[room_id] == "mention" and not self.addressed(content, body, room_id):
+        if self.rooms[room_id] == "mention" and not (
+            self.addressed(content, body, room_id) or self.held(room_id, sender, content)
+        ):
             return None
         parent = reply_target(content)
         if parent is not None:
@@ -594,7 +709,9 @@ class Policy:
             encoded = encode_attachment(attachment)
         except ValueError:
             return None
-        if self.rooms[room_id] == "mention" and not self.addressed(content, caption, room_id):
+        if self.rooms[room_id] == "mention" and not (
+            self.addressed(content, caption, room_id) or self.held(room_id, sender, content)
+        ):
             return None
         body = (strip_reply_fallback(caption) if parent is not None else caption) or ATTACHMENT_PLACEHOLDER
         return Request(
@@ -627,6 +744,22 @@ class Policy:
         if any(handle_pattern(alias).search(body) for alias in self.aliases):
             return True
         return any(wake_word_pattern(word).search(body) for word in self.wake_words)
+
+    def held(self, room_id: str, sender: str, content: Mapping[str, Any]) -> bool:
+        """Family-room conversation hold (#1808 B): a same-sender follow-up counts as addressed.
+
+        Only :meth:`admit` consults it — edits and threads never reach this
+        point, and :meth:`rejection` stays exactly as before. The hold never
+        admits a message aimed at someone else: one whose ``m.mentions``
+        names other users but not the bot, or a reply to an event the bot did
+        not send (a reply to the bot is addressed on its own, see
+        :meth:`addressed`).
+        """
+        if self.hold is None or self.rooms.get(room_id) != "mention":
+            return False
+        if addresses_someone_else(content, self.account) or addressing_reply_target(content) is not None:
+            return False
+        return self.hold.holds(scope_of(self.account, room_id, sender))
 
 
 # --------------------------------------------------------------------------- #

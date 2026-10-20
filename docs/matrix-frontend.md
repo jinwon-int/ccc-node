@@ -60,6 +60,7 @@ service overrides two keys in its unit):
   "mention_aliases": ["seoseo"],
   "wake_words": ["서서", "서서야"],
   "turn_timeout_minutes": 360,
+  "conversation_hold_minutes": 10,
   "identities": {"@owner:matrix.example.invalid": {"master": "43_BASE64_CHARACTERS"}}
 }
 ```
@@ -175,7 +176,8 @@ work (owner request 2026-09-18).
 Room policy is unchanged from the pilot: a direct room is exactly
 `{owner, bot}`; a family room admits only the allowlisted family users and
 answers only when addressed (`m.mentions`, a reply to a recent bot message
-(#1808, below), a typed `@localpart`, or a typed
+(#1808, below), a follow-up inside the sender's conversation hold (#1808,
+below), a typed `@localpart`, or a typed
 `@<alias>` from `mention_aliases` — Matrix ids cannot be renamed, so a bot
 that is *displayed* as "seoseo" is reachable as `@seoseo` this way).
 
@@ -222,6 +224,42 @@ puts the replied-to sender in `m.mentions` (Matrix v1.7 intentional mentions
 recommends it) was already addressed through `m.mentions`, restart or not;
 this rule covers clients that do not, and replies whose mention the user
 removed. Direct rooms are unchanged (always addressed).
+
+**Conversation hold: follow-ups need no handle for a while (#1808).** After
+the bot completes a turn for a family member's message in a family room,
+that member's next messages *in that room* are addressed without a handle
+for `conversation_hold_minutes` (optional, default 10; `0` turns it off; a
+number above the hard cap of 120 is clamped to 120 and logged; a bool,
+string, negative or non-finite value stops the service like any other
+invalid knob). The hold is per scope `sha(account, room, sender)`:
+
+- Only that sender's own completed turns open or extend it — a held
+  follow-up's completed turn restarts the window from its end, so a
+  back-and-forth keeps going. Other members' messages are never admitted
+  by it and never extend it; the same sender in another family room is not
+  held. A completed turn counts whether it answered or reported an error;
+  a turn that ended cancelled, timed out or uncertain opens nothing (an
+  existing hold just runs out), and neither do agent-queued self-jobs
+  (`$self-…` continuations).
+- A message aimed at someone else is not admitted by the hold: one whose
+  `m.mentions.user_ids` names other users but not the bot, or a reply to an
+  event the bot did not send (a reply to the bot is addressed by the rule
+  above anyway). Mentioning the bot, a handle, alias or wake word always
+  addresses it, hold or not.
+- Edits (`m.replace`) and threads stay refused exactly as before, and the
+  "not read" notices below are unchanged — the hold only widens admission
+  of plain text and media.
+- The hold stays within the agent's idle-session reset
+  (`AUTO_NEW_SESSION_AFTER_HOURS`, default 24 h), so an answer never lands
+  in a session that is about to be reset: a window longer than the reset
+  is clamped to it and logged at startup, and each hold also ends at the
+  start of the turn that opened it + the reset (the runner measures the
+  reset from that user message). A runner without a time-based reset
+  (Grok-on-Matrix) keeps the configured window.
+- The table lives in memory only (pruned lazily as holds expire): after a
+  restart nobody is held (fail closed — use a handle once). Direct rooms
+  are unaffected (always addressed). HandeBot does not use this gate: its
+  native bot addresses room messages before a turn reaches the bridge.
 
 ### Device trust: cross-signing identity (preferred) or pinned devices
 
@@ -454,8 +492,9 @@ same prompt contract as Telegram (a local path in the prompt):
 
 - **Admission** — direct rooms accept a photo with or without a caption; a
   family room needs an explicit address in the caption (`@handle`, alias,
-  wake word), an `m.mentions` pill or a reply to a recent bot message
-  (#1808), so a caption-less photo there is otherwise ignored. Per Matrix v1.10 the `body` is a caption only when `filename` is
+  wake word), an `m.mentions` pill, a reply to a recent bot message or the
+  sender's conversation hold (#1808), so a caption-less photo there is
+  otherwise ignored. Per Matrix v1.10 the `body` is a caption only when `filename` is
   present and differs from it. Plaintext media (a bare `url`, no
   `EncryptedFile`) is refused. An unverified device is ignored (with the
   existing cross-signing notice, or the pin-mode "unregistered device"
