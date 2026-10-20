@@ -1879,6 +1879,122 @@ run2357 >/dev/null 2>&1; rc=$?
 ok "Termux-style ~/a2a-broker-worker copies are refreshed via HOME" \
   '[ "$rc" = 0 ] && same_as_checkout "$H2357/a2a-broker-worker" && grep -q "a2a-handlers reinstall ok dest=$H2357/a2a-broker-worker" "$STATE/self-update.log"'
 ok "refreshing the home dest does not install into the empty system dest" '[ -z "$(ls -A "$SBIN")" ]'
+
+# --- #1460: the same refresh runs on settled up-to-date ticks ------------------
+# The tick that first pulls a commit runs the PREVIOUSLY installed script, so
+# the first tick that pulled #2357 had no refresh step and every later tick was
+# up-to-date: drifted copies stayed until main changed again. Simulate that
+# bootstrap: a changed tick without the step (opt-out), then up-to-date ticks.
+a2a_fail_notices() { # <sha>: queued handler-failure notices for that SHA
+  jq -r .dedup "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -c "^SelfUpdate:a2a-handlers-fail-$1$"
+}
+seed_old_copies "$SBIN"
+bump2357 bootstrap-gap
+out="$(CCC_SELF_UPDATE_A2A_HANDLERS=0 run2357 2>&1)"; rc=$?
+ok "bootstrap fixture: changed tick without the step leaves the drift" '[ "$rc" = 0 ] && grep -q "# 09-10" "$SBIN/skills-intake-revise-handler.sh"'
+# shellcheck disable=SC2034  # setup_runs_before is read via eval inside ok()
+setup_runs_before="$(wc -l < "$SETUP_MARKER")"
+: > "$STATE/self-update.log"; : > "$TMP/systemctl.calls"; rm -f "$TMP/spool"/*.json
+out="$(run2357 2>&1)"; rc=$?
+ok "up-to-date tick reinstalls drifted copies (#1460)" \
+  '[ "$rc" = 0 ] && grep -q "already up to date" <<<"$out" && same_as_checkout "$SBIN" && grep -q "a2a-handlers reinstall begin dest=$SBIN drift=skills-intake-revise-handler.sh tick=up-to-date" "$STATE/self-update.log" && grep -q "a2a-handlers reinstall ok dest=$SBIN tick=up-to-date" "$STATE/self-update.log"'
+ok "up-to-date refresh runs no setup, restarts nothing, notifies nothing" \
+  '[ "$(wc -l < "$SETUP_MARKER")" = "$setup_runs_before" ] && [ ! -s "$TMP/systemctl.calls" ] && ! compgen -G "$TMP/spool/*SelfUpdate*.json" >/dev/null'
+ok "up-to-date refresh is reported on stdout and the tick still logs done" \
+  'grep -q "A2A 핸들러 갱신 1곳" <<<"$out" && grep -q "done result=up-to-date sha=$(git -C "$REPO" rev-parse HEAD)" "$STATE/self-update.log"'
+
+# shellcheck disable=SC2034  # baks_before is read via eval inside ok()
+baks_before="$(compgen -G "$SBIN/*.bak-*" | wc -l)"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "up-to-date tick leaves current copies alone: no reinstall, no new backup" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers current dest=$SBIN files=4 tick=up-to-date" "$STATE/self-update.log" && ! grep -q "reinstall" "$STATE/self-update.log" && [ "$(compgen -G "$SBIN/*.bak-*" | wc -l)" = "$baks_before" ]'
+
+rm -rf "${SBIN:?}"/* "$H2357/a2a-broker-worker"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "up-to-date tick never installs fresh" \
+  '[ "$rc" = 0 ] && [ -z "$(ls -A "$SBIN")" ] && [ ! -e "$H2357/a2a-broker-worker" ] && grep -q "a2a-handlers skip reason=not-installed dest=$SBIN tick=up-to-date" "$STATE/self-update.log"'
+
+seed_old_copies "$SBIN"
+: > "$STATE/self-update.log"
+out="$(CCC_SELF_UPDATE_A2A_HANDLERS=0 run2357 2>&1)"; rc=$?
+ok "up-to-date tick honors CCC_SELF_UPDATE_A2A_HANDLERS=0" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers skip reason=env-disabled tick=up-to-date" "$STATE/self-update.log" && ! grep -q "a2a-handlers reinstall" "$STATE/self-update.log" && grep -q "# 09-10" "$SBIN/skills-intake-revise-handler.sh"'
+
+# Healthy-runtime branch (health + restart command configured): same step.
+printf 'exit 0\n' > "$CLAUDE/self-update.health-cmd"
+printf 'touch %s\n' "$TMP/a2a-restart-should-not-run" > "$CLAUDE/self-update.restart-cmd"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "healthy-runtime up-to-date tick refreshes without restarting" \
+  '[ "$rc" = 0 ] && [ ! -e "$TMP/a2a-restart-should-not-run" ] && same_as_checkout "$SBIN" && grep -q "a2a-handlers reinstall ok dest=$SBIN tick=up-to-date" "$STATE/self-update.log" && grep -q "done result=up-to-date sha=.* runtime=healthy" "$STATE/self-update.log"'
+
+# Recovery branch: runtime down, the one recovery restart succeeds -> settled.
+seed_old_copies "$SBIN"
+rm -f "$TMP/a2a-runtime-up"
+printf '[ -f %s ]\n' "$TMP/a2a-runtime-up" > "$CLAUDE/self-update.health-cmd"
+printf 'touch %s\n' "$TMP/a2a-runtime-up" > "$CLAUDE/self-update.restart-cmd"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "up-to-date tick refreshes after a successful recovery restart" \
+  '[ "$rc" = 0 ] && grep -q "\"result\":\"runtime-recovered\"" "$STATE/self-update.log" && same_as_checkout "$SBIN" && grep -q "a2a-handlers reinstall ok dest=$SBIN tick=up-to-date" "$STATE/self-update.log"'
+
+# Recovery restart FAILS (exit 7): not a settled tick — no refresh.
+seed_old_copies "$SBIN"
+rm -f "$TMP/a2a-runtime-up"
+printf 'exit 1\n' > "$CLAUDE/self-update.restart-cmd"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "failed recovery restart (exit 7) does not run the refresh" \
+  '[ "$rc" = 7 ] && ! grep -q "a2a-handlers" "$STATE/self-update.log" && grep -q "# 09-10" "$SBIN/skills-intake-revise-handler.sh"'
+rm -f "$CLAUDE/self-update.health-cmd" "$CLAUDE/self-update.restart-cmd" "$TMP/a2a-runtime-up"
+rm -rf "$STATE"/self-update-install-rollback.*
+
+# A refusing tick (unsafe pending-activation record, exit 14) never refreshes.
+A2A_PENDING="$STATE/self-update.pending-activation.json"
+[ -e "$A2A_PENDING" ] && mv "$A2A_PENDING" "$TMP/a2a-pending.bak"
+printf '{"schema":"ccc.self-update.activation.v1","target_sha":"trunc' > "$A2A_PENDING"; chmod 600 "$A2A_PENDING"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "pending-unsafe up-to-date tick (exit 14) does not run the refresh" \
+  '[ "$rc" = 14 ] && ! grep -q "a2a-handlers" "$STATE/self-update.log" && grep -q "# 09-10" "$SBIN/skills-intake-revise-handler.sh"'
+rm -f "$A2A_PENDING"; [ -e "$TMP/a2a-pending.bak" ] && mv "$TMP/a2a-pending.bak" "$A2A_PENDING"
+
+# A deferred tick (in-checkout worktree gate, exit 8) never refreshes.
+mkdir -p "$REPO/.claude/worktrees/a2a-wip"
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "deferred up-to-date tick (exit 8) does not run the refresh" \
+  '[ "$rc" = 8 ] && ! grep -q "a2a-handlers" "$STATE/self-update.log" && grep -q "# 09-10" "$SBIN/skills-intake-revise-handler.sh"'
+rm -rf "$REPO/.claude"
+
+# Installer failure on up-to-date ticks: one notice per SHA, not per tick.
+cat > "$TMP/seed/scripts/install-a2a-review-handler.sh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "--list" ] && { printf '%s\n' a2a-intent-dispatcher.sh danso-review-agent.sh skills-intake-review-handler.sh skills-intake-revise-handler.sh; exit 0; }
+echo "simulated install failure" >&2; exit 1
+SH
+bump2357 uptodate-installer-fails
+CCC_SELF_UPDATE_A2A_HANDLERS=0 run2357 >/dev/null 2>&1
+# shellcheck disable=SC2034  # a2a_sha is read via eval inside ok()
+a2a_sha="$(git -C "$REPO" rev-parse HEAD)"
+: > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+out="$(run2357 2>&1)"; rc=$?
+ok "up-to-date installer failure: exit 0, logged, warned, notified once" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers reinstall failed dest=$SBIN rc=1 tick=up-to-date" "$STATE/self-update.log" && grep -q "installed A2A handler refresh failed" <<<"$out" && [ "$(a2a_fail_notices "$a2a_sha")" = 1 ] && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "A2A 핸들러 갱신 실패"'
+: > "$STATE/self-update.log"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(run2357 2>&1)"; rc=$?
+ok "second up-to-date tick at the same SHA does not notify again" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers reinstall failed dest=$SBIN rc=1 tick=up-to-date" "$STATE/self-update.log" && grep -q "a2a-handlers notify=suppressed reason=already-notified sha=$a2a_sha tick=up-to-date" "$STATE/self-update.log" && [ "$(a2a_fail_notices "$a2a_sha")" = 1 ]'
+ok "once-per-SHA marker names the notified SHA" '[ "$(head -n1 "$STATE/self-update.a2a-handlers-notified")" = "$a2a_sha" ]'
+cp "$TMP/real-installer-2357.sh" "$TMP/seed/scripts/install-a2a-review-handler.sh"
+bump2357 uptodate-installer-fixed
+: > "$STATE/self-update.log"
+run2357 >/dev/null 2>&1; rc=$?
+ok "a clean refresh clears the once-per-SHA marker" \
+  '[ "$rc" = 0 ] && same_as_checkout "$SBIN" && [ ! -e "$STATE/self-update.a2a-handlers-notified" ]'
 rm -f "$CLAUDE/self-update.services"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

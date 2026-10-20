@@ -57,7 +57,9 @@
 #   5b. refresh installed A2A handler copies (/usr/local/sbin,
 #      ~/a2a-broker-worker) that already exist and drifted from the checkout
 #      (#2357; advisory — a failure warns but never aborts; no worker restart).
-#      Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
+#      Also runs on every settled up-to-date tick (#1460: the first tick that
+#      pulls a commit runs the previously installed script, so a node could
+#      stay drifted until main changed again). Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
 #   6. restart each allowlisted service and verify it is active again
 #   7. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
@@ -1360,6 +1362,117 @@ elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ];
   printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 fi
 
+# --- installed A2A handler refresh (#2357, #1460) -----------------------------
+# scripts/install-a2a-review-handler.sh COPIES the skills-intake dispatcher and
+# handlers to /usr/local/sbin (Termux / non-root: ~/a2a-broker-worker). setup.sh
+# never touches those copies, so a node kept running weeks-old handlers while
+# its checkout was current. Refresh them, but only where copies already
+# exist (never a fresh install) and only when one is missing or differs from
+# the checkout (idempotent: a current dest is not rewritten, so no new .bak).
+# Runs on a changed (or --force) tick AND on every settled up-to-date tick
+# (#1460): the tick that first pulls a commit runs the PREVIOUSLY installed
+# copy of this script, so the first tick that pulled #2357 had no refresh step
+# and every later tick was up-to-date — two fleet nodes kept drifted handler
+# copies with a current checkout until main changed again. On an up-to-date
+# tick the step only `cmp`s existing copies; it reinstalls on drift alone.
+# Advisory: a failure is logged and notified but neither rolls anything back
+# nor changes the exit code. No restart: the worker spawns the handler per
+# task, so the next task runs the new files; `install` replaces the inode, so
+# a task already running keeps the old one. Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
+# CCC_A2A_HANDLER_SYSTEM_DEST overrides the system destination (tests).
+# A destination this account cannot write (non-root tick, root-owned
+# /usr/local/sbin) is skipped with one log line and no notification: it is not
+# this tick's to fix, and ccc-doctor keeps reporting the drift with the
+# owning-account hint. CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE is a test
+# seam only (colon-separated dirs treated as unwritable — root ignores 0555).
+# A failure notice is sent once per checkout SHA (dedup key
+# a2a-handlers-fail-<sha>; the marker below outlives the notifier's short
+# dedup window, so twice-daily up-to-date ticks do not re-page the owner).
+A2A_HANDLER_NOTE=""
+A2A_HANDLER_FAILED_DESTS=""
+A2A_HANDLER_NOTIFIED_FILE="$STATE_DIR/self-update.a2a-handlers-notified"
+a2a_dest_writable() { # <dir>
+  case ":${CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE:-}:" in *":$1:"*) return 1 ;; esac
+  [ -d "$1" ] && [ -w "$1" ]
+}
+a2a_handlers_refresh() { # <tick: changed|up-to-date>
+  local installer="$REPO/scripts/install-a2a-review-handler.sh" t=" tick=$1"
+  local names dest name present drift rc refreshed=0 failed="" seen=" "
+  if [ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ]; then
+    log "a2a-handlers skip reason=env-disabled$t"; return 0
+  fi
+  [ -f "$installer" ] || { log "a2a-handlers skip reason=no-installer$t"; return 0; }
+  if ! names="$(bash "$installer" --list 2>>"$LOG" </dev/null)" || [ -z "$names" ] \
+     || grep -qvE '^[A-Za-z0-9][A-Za-z0-9._-]*$' <<<"$names"; then
+    log "a2a-handlers failed reason=list-failed$t"
+    A2A_HANDLER_FAILED_DESTS="(installer --list)"; return 0
+  fi
+  for dest in "${CCC_A2A_HANDLER_SYSTEM_DEST:-/usr/local/sbin}" "$HOME/a2a-broker-worker"; do
+    case "$seen" in *" $dest "*) continue ;; esac
+    seen="$seen$dest "
+    present=0; drift=""
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if [ -f "$dest/$name" ]; then
+        present=$((present + 1))
+        cmp -s "$REPO/scripts/$name" "$dest/$name" || drift="$drift${drift:+,}$name"
+      else
+        drift="$drift${drift:+,}$name(missing)"
+      fi
+    done <<<"$names"
+    if [ "$present" -eq 0 ]; then
+      log "a2a-handlers skip reason=not-installed dest=$dest$t"; continue
+    fi
+    if [ -z "$drift" ]; then
+      log "a2a-handlers current dest=$dest files=$present$t"; continue
+    fi
+    if ! a2a_dest_writable "$dest"; then
+      log "a2a-handlers skip dest=$dest reason=not-writable drift=$drift$t"; continue
+    fi
+    log "a2a-handlers reinstall begin dest=$dest drift=$drift$t"
+    rc=0
+    bash "$installer" --dest "$dest" >>"$LOG" 2>&1 </dev/null || rc=$?
+    # Verify rather than trust the exit code: every file must now match.
+    if [ "$rc" -eq 0 ]; then
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        cmp -s "$REPO/scripts/$name" "$dest/$name" || { rc=99; break; }
+      done <<<"$names"
+    fi
+    if [ "$rc" -ne 0 ]; then
+      log "a2a-handlers reinstall failed dest=$dest rc=$rc$t"
+      failed="$failed${failed:+ }$dest"
+      continue
+    fi
+    log "a2a-handlers reinstall ok dest=$dest$t"
+    refreshed=$((refreshed + 1))
+  done
+  A2A_HANDLER_FAILED_DESTS="$failed"
+  [ "$refreshed" -gt 0 ] && A2A_HANDLER_NOTE=", A2A 핸들러 갱신 ${refreshed}곳"
+  return 0
+}
+a2a_handlers_tick() { # <tick: changed|up-to-date> — refresh + once-per-SHA failure notice
+  local tick="$1" short context
+  A2A_HANDLER_FAILED_DESTS=""; A2A_HANDLER_NOTE=""
+  a2a_handlers_refresh "$tick"
+  if [ -z "$A2A_HANDLER_FAILED_DESTS" ]; then
+    # A clean pass ends the episode: a later failure is news again.
+    rm -f "$A2A_HANDLER_NOTIFIED_FILE" 2>/dev/null || :
+    return 0
+  fi
+  short="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+  if [ "$tick" = "up-to-date" ] \
+     && [ "$(head -n1 "$A2A_HANDLER_NOTIFIED_FILE" 2>/dev/null)" = "$NEW_SHA" ]; then
+    log "a2a-handlers notify=suppressed reason=already-notified sha=$NEW_SHA tick=$tick"
+  else
+    context="업데이트는 계속 진행되며"
+    [ "$tick" = "up-to-date" ] && context="코드는 최신 상태이나"
+    notify "self-update ${short} 경고: 설치된 A2A 핸들러 갱신 실패 (${A2A_HANDLER_FAILED_DESTS}) — ${context} 구버전 핸들러가 남아 있을 수 있습니다. 수동: bash scripts/install-a2a-review-handler.sh --dest <dir>. 로그: ~/.claude/state/self-update.log" "a2a-handlers-fail-$NEW_SHA"
+    printf '%s\n' "$NEW_SHA" > "$A2A_HANDLER_NOTIFIED_FILE" 2>/dev/null || :
+  fi
+  say "self-update: warning — installed A2A handler refresh failed (${A2A_HANDLER_FAILED_DESTS}); continuing" >&2
+}
+
 if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
   # Pending-activation evidence (#1527) outranks every up-to-date shortcut: an
   # installed-but-unverified generation must be reported, never papered over by
@@ -1378,7 +1491,9 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
   if [ "$PENDING_STATE" = "0" ]; then
     report_pending_activation
     pending_report_rc=$?
-    if [ "$pending_report_rc" = "0" ]; then exit 0; fi
+    # Reconciled: the installed generation is verified serving and the record
+    # is cleared — a settled tick, so the handler refresh runs (#1460).
+    if [ "$pending_report_rc" = "0" ]; then a2a_handlers_tick up-to-date; exit 0; fi
     if [ "$pending_report_rc" = "2" ]; then exit 14; fi
     # rc 3: the runtime is DOWN. That is the pre-existing #971 recovery shape
     # (an updated-but-down node), not a healthy-old-runtime masquerade, so the
@@ -1399,8 +1514,9 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
   # audited and notified, never discarded.
   if hcmd="$(resolve_health_cmd)" && resolve_restart_cmd >/dev/null 2>&1; then
     if run_bounded_operator_cmd "$RESTART_WAIT_SECONDS" "$hcmd"; then
+      a2a_handlers_tick up-to-date
       log "done result=up-to-date sha=$NEW_SHA runtime=healthy"
-      say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))"
+      say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))${A2A_HANDLER_NOTE}"
       exit 0
     fi
     SHORT_CUR="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
@@ -1418,6 +1534,8 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
       audit "runtime-recovered" "$OLD_SHA" "$NEW_SHA" "$CHANGED" true '[{"name":"external-restart","ok":true,"scope":"external"}]'
       notify "self-update ${SHORT_CUR}: 코드는 최신이나 런타임 다운 감지 — 외부 재시작으로 복구 완료. ~/.claude/state/self-update.log" "recovered-$NEW_SHA"
       say "self-update: code up to date but runtime was down; recovered via external restart"
+      # Recovered and verified healthy: settled up-to-date tick (#1460).
+      a2a_handlers_tick up-to-date
       exit 0
     fi
     if [ "$PENDING_STATE" = "0" ]; then
@@ -1436,8 +1554,9 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
     say "self-update: activation incomplete and runtime unhealthy with no recovery restart configured; not reporting up-to-date" >&2
     exit 14
   fi
+  a2a_handlers_tick up-to-date
   log "done result=up-to-date sha=$NEW_SHA"
-  say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))"
+  say "self-update: already up to date ($(git -C "$REPO" rev-parse --short HEAD))${A2A_HANDLER_NOTE}"
   exit 0
 fi
 
@@ -1587,89 +1706,8 @@ else
 fi
 
 # --- installed A2A handler refresh (#2357) ------------------------------------
-# scripts/install-a2a-review-handler.sh COPIES the skills-intake dispatcher and
-# handlers to /usr/local/sbin (Termux / non-root: ~/a2a-broker-worker). setup.sh
-# never touches those copies, so a node kept running weeks-old handlers while
-# its checkout was current. Refresh them here, but only where copies already
-# exist (never a fresh install) and only when one is missing or differs from
-# the checkout (idempotent: a current dest is not rewritten, so no new .bak).
-# Advisory: a failure is logged and notified but neither rolls anything back
-# nor changes the exit code. No restart: the worker spawns the handler per
-# task, so the next task runs the new files; `install` replaces the inode, so
-# a task already running keeps the old one. Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
-# CCC_A2A_HANDLER_SYSTEM_DEST overrides the system destination (tests).
-# A destination this account cannot write (non-root tick, root-owned
-# /usr/local/sbin) is skipped with one log line and no notification: it is not
-# this tick's to fix, and ccc-doctor keeps reporting the drift with the
-# owning-account hint. CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE is a test
-# seam only (colon-separated dirs treated as unwritable — root ignores 0555).
-A2A_HANDLER_NOTE=""
-a2a_dest_writable() { # <dir>
-  case ":${CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE:-}:" in *":$1:"*) return 1 ;; esac
-  [ -d "$1" ] && [ -w "$1" ]
-}
-a2a_handlers_refresh() {
-  local installer="$REPO/scripts/install-a2a-review-handler.sh"
-  local names dest name present drift rc refreshed=0 failed="" seen=" "
-  if [ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ]; then
-    log "a2a-handlers skip reason=env-disabled"; return 0
-  fi
-  [ -f "$installer" ] || { log "a2a-handlers skip reason=no-installer"; return 0; }
-  if ! names="$(bash "$installer" --list 2>>"$LOG" </dev/null)" || [ -z "$names" ] \
-     || grep -qvE '^[A-Za-z0-9][A-Za-z0-9._-]*$' <<<"$names"; then
-    log "a2a-handlers failed reason=list-failed"
-    A2A_HANDLER_FAILED_DESTS="(installer --list)"; return 0
-  fi
-  for dest in "${CCC_A2A_HANDLER_SYSTEM_DEST:-/usr/local/sbin}" "$HOME/a2a-broker-worker"; do
-    case "$seen" in *" $dest "*) continue ;; esac
-    seen="$seen$dest "
-    present=0; drift=""
-    while IFS= read -r name; do
-      [ -n "$name" ] || continue
-      if [ -f "$dest/$name" ]; then
-        present=$((present + 1))
-        cmp -s "$REPO/scripts/$name" "$dest/$name" || drift="$drift${drift:+,}$name"
-      else
-        drift="$drift${drift:+,}$name(missing)"
-      fi
-    done <<<"$names"
-    if [ "$present" -eq 0 ]; then
-      log "a2a-handlers skip reason=not-installed dest=$dest"; continue
-    fi
-    if [ -z "$drift" ]; then
-      log "a2a-handlers current dest=$dest files=$present"; continue
-    fi
-    if ! a2a_dest_writable "$dest"; then
-      log "a2a-handlers skip dest=$dest reason=not-writable drift=$drift"; continue
-    fi
-    log "a2a-handlers reinstall begin dest=$dest drift=$drift"
-    rc=0
-    bash "$installer" --dest "$dest" >>"$LOG" 2>&1 </dev/null || rc=$?
-    # Verify rather than trust the exit code: every file must now match.
-    if [ "$rc" -eq 0 ]; then
-      while IFS= read -r name; do
-        [ -n "$name" ] || continue
-        cmp -s "$REPO/scripts/$name" "$dest/$name" || { rc=99; break; }
-      done <<<"$names"
-    fi
-    if [ "$rc" -ne 0 ]; then
-      log "a2a-handlers reinstall failed dest=$dest rc=$rc"
-      failed="$failed${failed:+ }$dest"
-      continue
-    fi
-    log "a2a-handlers reinstall ok dest=$dest"
-    refreshed=$((refreshed + 1))
-  done
-  A2A_HANDLER_FAILED_DESTS="$failed"
-  [ "$refreshed" -gt 0 ] && A2A_HANDLER_NOTE=", A2A 핸들러 갱신 ${refreshed}곳"
-  return 0
-}
-A2A_HANDLER_FAILED_DESTS=""
-a2a_handlers_refresh
-if [ -n "$A2A_HANDLER_FAILED_DESTS" ]; then
-  notify "self-update $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null) 경고: 설치된 A2A 핸들러 갱신 실패 (${A2A_HANDLER_FAILED_DESTS}) — 업데이트는 계속 진행되며 구버전 핸들러가 남아 있을 수 있습니다. 수동: bash scripts/install-a2a-review-handler.sh --dest <dir>. 로그: ~/.claude/state/self-update.log" "a2a-handlers-fail-$NEW_SHA"
-  say "self-update: warning — installed A2A handler refresh failed (${A2A_HANDLER_FAILED_DESTS}); continuing" >&2
-fi
+# Defined above the up-to-date block (#1460), which runs the same step.
+a2a_handlers_tick changed
 
 # --- runtime preparation (#2207 ③) --------------------------------------------
 # Termux serves a prepared generation (~/.ccc-node/preparations/<gen>), so a
