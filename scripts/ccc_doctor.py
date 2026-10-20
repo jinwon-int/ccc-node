@@ -585,6 +585,88 @@ def _read_regular_text(path: Path) -> str | None:
             os.close(fd)
 
 
+# Always-on injection budget (#2384). Text a provider loads into EVERY session
+# whether or not the task needs it, capped per provider — values borrowed from
+# google-research/harness2 (OpenCode surface 24,000 chars; Codex surface 8,000
+# chars, since AGENTS.md is injected whole every turn). Draft caps: tune after
+# fleet measurement, or override per node with CCC_ALWAYS_ON_MAX_CHARS.
+ALWAYS_ON_MAX_CHARS = {"claude": 24_000, "codex": 8_000}
+# A source past this is reported by size alone, never slurped into memory.
+ALWAYS_ON_READ_MAX_BYTES = 1 << 20
+# Mirrors scripts/ccc_codex_memory.py BEGIN_MARKER/END_MARKER (pinned equal by
+# ccc_doctor_always_on_test.py) so doctor need not import the materializer.
+CODEX_MEMORY_BEGIN_MARKER = "<!-- ccc-node:codex-memory:begin -->"
+CODEX_MEMORY_END_MARKER = "<!-- ccc-node:codex-memory:end -->"
+
+
+@dataclass
+class AlwaysOnSource:
+    """One always-on source: what it costs and where to cut it."""
+
+    name: str
+    chars: int
+    nbytes: int
+    # measured | estimated | absent | not-wired | no-file | oversized
+    state: str
+    hint: str = ""
+
+
+def _always_on_bytes(path: Path) -> bytes | None:
+    """Bytes of a regular file (symlinks followed, as the harness does), or None.
+
+    Bounded: a file past ALWAYS_ON_READ_MAX_BYTES returns only its first
+    ALWAYS_ON_READ_MAX_BYTES + 1 bytes, which the caller reports as oversized.
+    """
+    try:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            return None
+        with open(resolved, "rb") as handle:
+            return handle.read(ALWAYS_ON_READ_MAX_BYTES + 1)
+    except OSError:
+        return None
+
+
+def _always_on_source(name: str, data: bytes | None, hint: str, state: str = "measured") -> AlwaysOnSource:
+    if data is None:
+        return AlwaysOnSource(name, 0, 0, "absent", hint)
+    if len(data) > ALWAYS_ON_READ_MAX_BYTES:
+        return AlwaysOnSource(name, len(data), len(data), "oversized", hint)
+    return AlwaysOnSource(name, len(data.decode("utf-8", "replace")), len(data), state, hint)
+
+
+def _env_byte_cap(name: str, default: int) -> int:
+    """load-memory.sh byte cap from the environment; 0 means uncapped there."""
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() else default
+
+
+def _env_disabled(name: str, default: str) -> bool:
+    """Same falsy set as hook-common.sh is_disabled."""
+    return os.environ.get(name, default) in {"0", "false", "FALSE", "off", "OFF", "no", "NO"}
+
+
+def always_on_cut_plan(sources: list[AlwaysOnSource], over: int) -> str:
+    """Reason sentence for an over-cap budget: which sources to cut, by how much.
+
+    Largest first, so the sentence names the biggest lever before the small
+    ones — the shape a rewrite loop can retry against.
+    """
+    remaining = over
+    cuts: list[str] = []
+    for source in sorted(sources, key=lambda s: s.chars, reverse=True):
+        if remaining <= 0 or source.chars <= 0:
+            continue
+        take = min(remaining, source.chars)
+        remaining -= take
+        where = f"; {source.hint}" if source.hint else ""
+        cuts.append(f"{source.name} -{take:,} (of {source.chars:,}{where})")
+    return (
+        f"cut {over:,} chars, largest first: " + ", ".join(cuts)
+        + " — before adding always-on text, move it to a skill/script/hook (docs/harness.md)"
+    )
+
+
 _EMPTY_SNAPSHOT_SUCCESS_STATUSES = frozenset({"snapshot_done", "extraction_done"})
 
 
@@ -633,6 +715,10 @@ class Doctor:
         self.current_settings: dict[str, Any] | None = None
         self._rewrite_pairs: dict[str, str] | None = None
         self._bridge_provider_state: tuple[str, str] | None = None
+        # --strict: an over-cap always-on budget is 수동필요 (exit 1) instead
+        # of 경고 (#2384). No other check reads it.
+        self.strict = False
+        self.always_on_line = ""
 
     def add(self, klass: str, item: str, status: str, action: str) -> None:
         self.rows.append(Row(klass, item, status, action))
@@ -994,6 +1080,7 @@ class Doctor:
         self.check_continuation_state()
         self.check_session_scope_rows()
         self.check_memory_cache()
+        self.check_always_on_budget()
         self.check_stale_memory_guidance()
         self.check_nunchi_collection()
         self.check_cron_drift()
@@ -3950,6 +4037,319 @@ class Doctor:
                 "if this node should self-start",
             )
 
+    def _always_on_settings(self) -> dict[str, Any] | None:
+        if self.current_settings is not None:
+            return self.current_settings
+        try:
+            data = json.loads(self.settings.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _always_on_local_settings(self) -> dict[str, Any] | None:
+        """settings.local.json — install-nunchi.sh registers its SessionStart hook there."""
+        try:
+            data = json.loads((self.claude_dir / "settings.local.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _session_start_commands(settings: dict[str, Any] | None) -> list[str]:
+        """Every SessionStart command-hook string in one settings document."""
+        hooks = settings.get("hooks") if isinstance(settings, dict) else None
+        groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+        commands: list[str] = []
+        for group in groups if isinstance(groups, list) else []:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            for entry in entries if isinstance(entries, list) else []:
+                if isinstance(entry, dict) and entry.get("command"):
+                    commands.append(str(entry["command"]))
+        return commands
+
+    def _merged_session_start_commands(self) -> list[str] | None:
+        """SessionStart hooks from settings.json + settings.local.json, as Claude Code merges them.
+
+        Hook arrays from both files all run (identical commands once); None
+        when neither file is readable, so the caller assumes the default wiring.
+        """
+        documents = [self._always_on_settings(), self._always_on_local_settings()]
+        if all(document is None for document in documents):
+            return None
+        merged: list[str] = []
+        for document in documents:
+            for command in self._session_start_commands(document):
+                if command not in merged:
+                    merged.append(command)
+        return merged
+
+    @staticmethod
+    def _hook_stdout_discarded(command: str) -> bool:
+        """True when a hook's stdout cannot reach the context: redirected to /dev/null or backgrounded."""
+        stripped = command.rstrip()
+        backgrounded = stripped.endswith("&") and not stripped.endswith("&&")
+        return backgrounded or re.search(r"(?<![0-9])(?:1|&)?>\s*/dev/null", stripped) is not None
+
+    @staticmethod
+    def _hook_basename(command: str) -> str:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        scripts = [t for t in tokens if t.endswith((".sh", ".py", ".mjs", ".js"))]
+        token = (scripts or tokens or ["?"])[0]
+        return _printable(Path(token).name or token, 60)
+
+    def _output_style_file(self, name: str) -> Path | None:
+        """Installed file for an outputStyle name: `<name>.md`, else a frontmatter `name:` match."""
+        root = self.claude_dir / "output-styles"
+        direct = root / f"{name}.md"
+        if direct.is_file():
+            return direct
+        try:
+            candidates = sorted(root.glob("*.md"))
+        except OSError:
+            return None
+        for candidate in candidates:
+            head = (_always_on_bytes(candidate) or b"")[:4096].decode("utf-8", "replace")
+            match = re.match(r"---\n(.*?)\n---", head, re.S)
+            if match and re.search(rf"^name:\s*['\"]?{re.escape(name)}['\"]?\s*$", match.group(1), re.M):
+                return candidate
+        return None
+
+    def _memory_snapshot_estimate(self) -> AlwaysOnSource:
+        """SessionStart memory snapshot, estimated from the parts load-memory.sh reads.
+
+        Doctor never runs load-memory.sh: it fires a detached cache refresh and
+        a query-time local search, so measuring by execution would mutate the
+        caches it reports on. Instead this rebuilds the deterministic parts —
+        MEMORY/USER (Hermes fallback), PERSONA, resume pointer, Family Wiki
+        cache — each under its own byte cap, then the CCC_MEMORY_MAX_BYTES
+        total cap. Query-time local hot memory and section headers are not
+        counted, so the row is labelled ``estimated``.
+        """
+        hint = "lower CCC_MEMORY_MAX_BYTES or trim MEMORY/USER and the wiki prefetch"
+        memdir = Path(os.environ.get("CCC_MEMORY_DIR") or (self.claude_dir / "memories"))
+        state_dir = Path(os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state"))
+        cache = Path(os.environ.get("CCC_MEMORY_CACHE_DIR") or (self.claude_dir / "hooks/cache"))
+
+        def cat(*paths: Path) -> bytes:
+            return b"".join(_always_on_bytes(path) or b"" for path in paths)
+
+        def capped(data: bytes, cap: int) -> bytes:
+            return data[:cap] if cap > 0 else data
+
+        mem = cat(memdir / "MEMORY.md", memdir / "USER.md")
+        if not mem.strip():
+            hermes = self.claude_dir.parent / ".hermes" / "memories"
+            mem = cat(hermes / "MEMORY.md", hermes / "USER.md")
+        parts = [
+            capped(mem, _env_byte_cap("CCC_BUILTIN_MEMORY_MAX_BYTES", 4000)),
+            cat(memdir / "PERSONA.md"),
+            capped(cat(Path(os.environ.get("CCC_RESUME_FILE") or (state_dir / "resume.md"))),
+                   _env_byte_cap("CCC_RESUME_MAX_BYTES", 2000)),
+        ]
+        if not _env_disabled("CCC_WIKI_MEMORY_ENABLED", "1") and os.environ.get("CCC_NODE_ISOLATION_PROFILE") != "external":
+            parts.append(capped(cat(cache / "wiki.txt"), _env_byte_cap("CCC_WIKI_MAX_BYTES", 5000)))
+        blob = capped(b"\n".join(part for part in parts if part.strip()),
+                      _env_byte_cap("CCC_MEMORY_MAX_BYTES", 12000))
+        text = blob.decode("utf-8", "ignore")
+        return AlwaysOnSource(
+            "memory snapshot", len(text), len(text.encode("utf-8")),
+            "estimated (cached parts; local hot memory not counted)", hint,
+        )
+
+    def _nunchi_block_estimate(self) -> AlwaysOnSource:
+        """nunchi SessionStart block (claude/hooks/nunchi/sessionstart.sh), never executed.
+
+        The hook prints ``nunchi.py assemble`` output: header + open constraints
+        bounded by CCC_NUNCHI_CONSTRAINT_BUDGET (default 12000 B, 0 = unbounded)
+        + facts filling what is left of CCC_NUNCHI_ASSEMBLE_BUDGET (default
+        3000 B). Nothing writes that output to disk, so the row reports the
+        byte ceiling ``max(assemble, constraint)``, converted to chars with
+        snapshot.md's char/byte ratio. With CCC_NUNCHI_ASSEMBLE=0 the hook
+        injects ``head -c 3000 snapshot.md``, which is read directly.
+        """
+        name = "nunchi working memory"
+        hint = "lower CCC_NUNCHI_CONSTRAINT_BUDGET or close stale nunchi constraints"
+        state_dir = Path(os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state"))
+        mode = os.environ.get("CCC_NUNCHI_MODE", "").strip()
+        if not mode:
+            mode = (_always_on_bytes(state_dir / "nunchi.mode") or b"off").decode("utf-8", "replace").strip()
+        if mode != "on":
+            return AlwaysOnSource(name, 0, 0, "inactive (nunchi mode off)")
+        if os.environ.get("CCC_MEMORY_AUDIENCE_SCOPED", "0") in {"1", "true", "TRUE", "on", "ON", "yes", "YES"}:
+            return AlwaysOnSource(name, 0, 0, "inactive (audience-scoped)")
+        nunchi_home = Path(os.environ.get("NUNCHI_HOME") or (Path.home() / ".nunchi"))
+        snapshot = _always_on_bytes(Path(os.environ.get("NUNCHI_SNAPSHOT") or (nunchi_home / "snapshot.md")))
+        if snapshot is None:
+            return AlwaysOnSource(name, 0, 0, "inactive (no snapshot.md)")
+        raw_budget = os.environ.get("CCC_NUNCHI_ASSEMBLE_BUDGET", "3000").strip()
+        if os.environ.get("CCC_NUNCHI_ASSEMBLE", "1") in {"0", "false"} or not raw_budget.isdigit():
+            # Legacy path, and the hook's own fallback when assemble fails.
+            head = snapshot[:3000].decode("utf-8", "ignore")
+            return AlwaysOnSource(name, len(head), len(head.encode("utf-8")), "cached (snapshot.md head -c 3000)", hint)
+        raw_constraint = os.environ.get("CCC_NUNCHI_CONSTRAINT_BUDGET", "").strip()
+        try:
+            constraint = int(raw_constraint) if raw_constraint else 12000
+        except ValueError:
+            constraint = 12000
+        constraint = constraint if constraint >= 0 else 12000
+        ceiling = max(int(raw_budget), constraint)
+        state = "estimated (budget ceiling)"
+        if constraint == 0:
+            state = "estimated (fact budget only; CCC_NUNCHI_CONSTRAINT_BUDGET=0 leaves constraints unbounded)"
+        text = snapshot.decode("utf-8", "replace")
+        ratio = len(text) / len(snapshot) if snapshot else 1.0
+        return AlwaysOnSource(name, round(ceiling * ratio), ceiling, state, hint)
+
+    def _report_style_canary(self) -> AlwaysOnSource:
+        """report-style-canary.sh: injects the STE rule only while the canary flag is armed."""
+        name = "report-style canary"
+        try:
+            from ccc_report_style import read_report_style
+        except Exception:
+            return AlwaysOnSource(name, 0, 0, "unmeasured (report-style reader unavailable)")
+        try:
+            text = read_report_style(self.claude_dir, environ=os.environ)
+        except Exception:
+            text = ""
+        if not text:
+            return AlwaysOnSource(name, 0, 0, "conditional (canary flag not armed)")
+        return AlwaysOnSource(name, len(text), len(text.encode("utf-8")), "conditional (canary flag armed)",
+                              "disarm state/report-style-canary.flag when the canary window ends")
+
+    def _claude_always_on_sources(self) -> list[AlwaysOnSource]:
+        settings = self._always_on_settings()
+        local = self._always_on_local_settings()
+        commands = self._merged_session_start_commands()
+        joined = "\n".join(commands or [])
+        hooks_dir = Path(os.environ.get("CCC_HOOK_DIR") or (self.claude_dir / "hooks"))
+        sources = [
+            # Global only: a project CLAUDE.md depends on the session cwd.
+            _always_on_source("CLAUDE.md", _always_on_bytes(self.claude_dir / "CLAUDE.md"),
+                              "trim ~/.claude/CLAUDE.md"),
+        ]
+        if commands is None or "load-tools.sh" in joined:
+            sources.append(_always_on_source(
+                "tools-cheatsheet.md", _always_on_bytes(hooks_dir / "tools-cheatsheet.md"),
+                "trim hooks/tools-cheatsheet.md (load-tools.sh)",
+            ))
+        else:
+            sources.append(AlwaysOnSource("tools-cheatsheet.md", 0, 0, "not-wired"))
+        style = None
+        for document in (local, settings):  # settings.local.json wins
+            if isinstance(document, dict) and document.get("outputStyle") is not None:
+                style = document.get("outputStyle")
+                break
+        if isinstance(style, str) and style.strip() and style.strip().lower() != "default":
+            style_file = self._output_style_file(style.strip())
+            label = f"output-style {_printable(style.strip(), 40)}"
+            if style_file is None:
+                sources.append(AlwaysOnSource(label, 0, 0, "no-file (built-in or missing)"))
+            else:
+                sources.append(_always_on_source(label, _always_on_bytes(style_file),
+                                                 f"trim output-styles/{style_file.name}"))
+        else:
+            sources.append(AlwaysOnSource("output-style", 0, 0, "no-file (default style)"))
+        if commands is None or "load-memory.sh" in joined:
+            sources.append(self._memory_snapshot_estimate())
+        else:
+            sources.append(AlwaysOnSource("memory snapshot", 0, 0, "not-wired"))
+        if "nunchi/sessionstart.sh" in joined:
+            sources.append(self._nunchi_block_estimate())
+        if "report-style-canary.sh" in joined:
+            sources.append(self._report_style_canary())
+        known = ("load-memory.sh", "load-tools.sh", "nunchi/sessionstart.sh", "report-style-canary.sh")
+        for command in commands or []:
+            if any(marker in command for marker in known) or self._hook_stdout_discarded(command):
+                continue
+            # Visible but not counted: doctor cannot size an arbitrary hook's stdout without running it.
+            sources.append(AlwaysOnSource(f"unmeasured hook {self._hook_basename(command)}", 0, 0,
+                                          "unmeasured (not counted)"))
+        return sources
+
+    def _codex_always_on_sources(self) -> list[AlwaysOnSource]:
+        """Codex global instructions: first non-empty AGENTS.override.md, else AGENTS.md.
+
+        The ccc memory materializer writes its snapshot as a marked block inside
+        that file, so the block is split out as its own (measured) source.
+        """
+        home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        for name in ("AGENTS.override.md", "AGENTS.md"):
+            data = _always_on_bytes(home / name)
+            if data is not None and data.strip():
+                break
+        else:
+            return [AlwaysOnSource("AGENTS.md", 0, 0, "absent")]
+        hint = f"trim $CODEX_HOME/{name} outside the managed block"
+        if len(data) > ALWAYS_ON_READ_MAX_BYTES:
+            return [_always_on_source(name, data, hint)]
+        text = data.decode("utf-8", "replace")
+        begin = text.find(CODEX_MEMORY_BEGIN_MARKER)
+        end = text.find(CODEX_MEMORY_END_MARKER)
+        if (
+            text.count(CODEX_MEMORY_BEGIN_MARKER) != 1
+            or text.count(CODEX_MEMORY_END_MARKER) != 1
+            or end < begin
+        ):
+            return [_always_on_source(name, data, hint)]
+        end += len(CODEX_MEMORY_END_MARKER)
+        block, rest = text[begin:end], text[:begin] + text[end:]
+        return [
+            _always_on_source(name, rest.encode("utf-8"), hint),
+            _always_on_source("memory snapshot (managed block)", block.encode("utf-8"),
+                              "lower CCC_CODEX_MEMORY_MAX_BYTES"),
+        ]
+
+    def check_always_on_budget(self) -> None:
+        """Always-on injection total per source against the provider cap (#2384).
+
+        Read-only: sizes installed files and cached snapshot parts; never runs a
+        SessionStart hook. Over cap is 경고 (수동필요 under --strict) and the
+        action names which sources to cut, largest first, and by how much.
+        """
+        item = "always-on budget"
+        provider = self.provider
+        if provider == "claude":
+            sources = self._claude_always_on_sources()
+        elif provider == "codex":
+            sources = self._codex_always_on_sources()
+        else:
+            status = f"provider={_printable(provider, 40)}: not-measured (no always-on cap defined)"
+            self.add("정상", item, status, "none")
+            self.always_on_line = f"always-on: {status}"
+            return
+        raw_cap = os.environ.get("CCC_ALWAYS_ON_MAX_CHARS", "").strip()
+        cap = int(raw_cap) if raw_cap.isdigit() and int(raw_cap) > 0 else ALWAYS_ON_MAX_CHARS[provider]
+        for source in sources:
+            self.add(
+                "정상", f"always-on: {source.name}",
+                f"{source.chars:,} chars / {source.nbytes:,} B; {source.chars * 100 / cap:.0f}% of cap; {source.state}",
+                "none",
+            )
+        total_chars = sum(source.chars for source in sources)
+        total_bytes = sum(source.nbytes for source in sources)
+        summary = (
+            f"provider={provider}; total {total_chars:,} chars / {total_bytes:,} B = "
+            f"{total_chars * 100 / cap:.0f}% of cap {cap:,} chars"
+        )
+        if any(source.state.startswith("estimated") for source in sources):
+            summary += " (includes estimates)"
+        parts = ", ".join(
+            f"{source.name} {source.chars:,}"
+            for source in sorted(sources, key=lambda s: s.chars, reverse=True)
+            if source.chars > 0
+        )
+        if total_chars <= cap:
+            self.add("정상", item, summary, "none")
+            self.always_on_line = f"always-on: ok — {summary}" + (f" [{parts}]" if parts else "")
+            return
+        over = total_chars - cap
+        reason = always_on_cut_plan(sources, over)
+        self.add("수동필요" if self.strict else "경고", item, f"{summary}; over by {over:,} chars", reason)
+        self.always_on_line = f"always-on: OVER — {summary}; {reason}"
+
     def check_memory_cache(self) -> None:
         script = self.repo / "scripts/ccc-memory-check.sh"
         if os.access(script, os.X_OK):
@@ -4875,8 +5275,8 @@ class Doctor:
         return True
 
 
-def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
-    fix = rollback = apply = json_output = False
+def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str, bool, bool]:
+    fix = rollback = apply = json_output = strict = always_on = False
     scope = "settings"
     i = 0
     while i < len(argv):
@@ -4889,16 +5289,21 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
             apply = True
         elif arg == "--json":
             json_output = True
+        elif arg == "--strict":
+            strict = True
+        elif arg == "--always-on-summary":
+            always_on = True
         elif arg == "--scope":
             if i + 1 >= len(argv):
                 print("--scope requires a value", file=sys.stderr)
-                return 2, fix, rollback, apply, json_output, scope
+                return 2, fix, rollback, apply, json_output, scope, strict, always_on
             i += 1
             scope = argv[i]
         elif arg.startswith("--scope="):
             scope = arg.split("=", 1)[1]
         elif arg in {"-h", "--help"}:
             print("Usage: ccc-doctor.sh [--fix [--apply] [--scope=settings|files|hooks,output-styles]] [--rollback [--apply]]")
+            print("       ccc-doctor.sh [--json] [--strict] | --always-on-summary")
             print()
             print("Diagnostics classify checks as: 정상 / 경고 / 교정가능 / 수동필요.")
             print()
@@ -4920,20 +5325,22 @@ def parse_args(argv: list[str]) -> tuple[int, bool, bool, bool, bool, str]:
             print("- `--json` writes exactly one JSON object to stdout (surrounding whitespace")
             print("  only); probe/subprocess diagnostics go to stderr so stdout stays strictly")
             print("  machine-parseable. `--fix`/`--rollback` take precedence and emit human text.")
+            print("- `--strict` turns an over-cap always-on budget (#2384) from 경고 into 수동필요.")
+            print("- `--always-on-summary` prints only the one-line always-on budget summary.")
             print()
             print("Exit codes (human and --json alike): 0 when only 정상/경고 findings exist; 1")
             print("when any 교정가능 (correctable) or 수동필요 (manual) finding is present. 경고")
             print("(warning) findings do not change the exit code.")
-            return 0, fix, rollback, apply, json_output, scope
+            return 0, fix, rollback, apply, json_output, scope, strict, always_on
         else:
             print(f"Unknown flag: {arg}", file=sys.stderr)
-            return 2, fix, rollback, apply, json_output, scope
+            return 2, fix, rollback, apply, json_output, scope, strict, always_on
         i += 1
     parts = scope.split(",") if scope else [""]
     if any(part not in VALID_SCOPES for part in parts):
         print(f"unsupported --scope: {scope}", file=sys.stderr)
-        return 2, fix, rollback, apply, json_output, scope
-    return -1, fix, rollback, apply, json_output, scope
+        return 2, fix, rollback, apply, json_output, scope, strict, always_on
+    return -1, fix, rollback, apply, json_output, scope, strict, always_on
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -4987,12 +5394,19 @@ def emit_json_report(doctor: Doctor) -> int:
 
 
 def main(argv: list[str]) -> int:  # noqa: C901 -- #348 baseline hotspot
-    parsed_rc, fix, rollback, apply, json_output, scope = parse_args(argv)
+    parsed_rc, fix, rollback, apply, json_output, scope, strict, always_on = parse_args(argv)
     if parsed_rc >= 0:
         return parsed_rc
     repo = Path(os.environ.get("CCC_DOCTOR_REPO_DIR", Path(__file__).resolve().parents[1])).resolve()
     claude_dir = Path(os.environ.get("CCC_DOCTOR_CLAUDE_DIR", str(Path.home() / ".claude"))).resolve()
     doctor = Doctor(repo, claude_dir, scope)
+    doctor.strict = strict
+
+    # One-line always-on budget for node-status (#2384): only that check runs.
+    if always_on and not fix and not rollback:
+        doctor.check_always_on_budget()
+        print(doctor.always_on_line)
+        return doctor.report_exit_code()
 
     # Pure --json report: diagnose under a stdout guard so stdout stays a single
     # JSON document. --fix/--rollback intentionally emit human-readable stdout and

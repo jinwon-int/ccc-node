@@ -534,6 +534,12 @@ else
   err "doctor transcripts privacy tests failed (an 0755 transcripts dir may silently refuse every distill snapshot again)"
   tail -10 "$TMP/doctor-transcripts-privacy-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_always_on_test.py >"$TMP/doctor-always-on-test.out" 2>&1; then
+  say "  ok doctor always-on injection budget tests (#2384)"
+else
+  err "doctor always-on budget tests failed (always-on text may grow past the provider cap unseen)"
+  tail -10 "$TMP/doctor-always-on-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_memory_guidance_refresh_test.py >"$TMP/refresh-guidance-test.out" 2>&1; then
   say "  ok setup --refresh-guidance tests (#2238)"
 else
