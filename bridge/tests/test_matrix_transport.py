@@ -2540,9 +2540,44 @@ async def test_sent_chunks_and_trusted_sync_texts_are_remembered(tmp_path: Path)
             h.start(f.retry(f.send))
             await h.until(lambda: not f.store.outbox())
         assert [v for v in f.recent_text.values()] == [(room, h.account, "보낸 답변")]
+        assert f.sent_events.sent_in(room, next(iter(f.recent_text)))  # outbox sends feed the #1808 ring
         for i in range(t.RECENT_TEXT_CAP + 5):
             f._remember_text(f"$e{i}", room, DAD, "x")
         assert len(f.recent_text) == t.RECENT_TEXT_CAP
+
+
+@pytest.mark.anyio
+async def test_reply_to_a_sent_bot_event_addresses_the_family_room_until_restart(tmp_path: Path) -> None:
+    # #1808 A: the send path records bot event ids; a family reply to one needs no handle.
+    async with family(tmp_path) as h:
+        f = h.f
+        client_mock(f)
+        f.client.olm.outbound_group_sessions = {FAMILY: types.SimpleNamespace(users_shared_with={(h.owner, "OWNER")})}
+        f.expected_recipients = lambda room: {(h.owner, "OWNER")}  # type: ignore[method-assign]
+
+        async def raw(method: str, path: str, data: Any = None, params: Any = None) -> Any:
+            return {"event_id": "$sent-" + path.rsplit("/", 1)[1]}
+
+        f.raw = raw  # type: ignore[method-assign]
+        answer = await f.encrypted_send(FAMILY, "answer", "txn-answer")
+        edit = await f.encrypted_edit(FAMILY, "edited answer", answer, "txn-edit")
+        assert f.sent_events.sent_in(FAMILY, answer)
+        assert not f.sent_events.sent_in(FAMILY, edit)  # an edit is not a message of its own
+        now = int(time.time() * 1000)
+
+        def reply(parent: str) -> Any:
+            source = reply_event(parent=parent, sender=DAD, now=now, body="and tomorrow?")
+            return h.nio.RoomMessageText(sender=DAD, source=source, verified=True, sender_key="c" * 43, ts=now)
+
+        req = f.admit_event(FAMILY, reply(answer))
+        assert req is not None and req.reply_to == answer and req.body == "and tomorrow?"
+        assert f.admit_event(FAMILY, reply(edit)) is None
+        assert f.admit_event(FAMILY, reply("$someone-else")) is None
+        # Restart: the ring is in memory only, so the same reply now fails closed.
+        await f.close()
+        h.f = f = MatrixTransport(family_config(tmp_path), h.runner)
+        assert len(f.sent_events) == 0
+        assert f.admit_event(FAMILY, reply(answer)) is None
 
 
 # --------------------------------------------------------------------------- #
