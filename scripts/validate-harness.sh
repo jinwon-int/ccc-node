@@ -450,6 +450,25 @@ else
     printf '       (the artifact is derived, never hand-edited — docs/skill-registry.md)\n'
   fi
 fi
+# #2386: skill pre-validation over skills/, codex/skills/, piri/skills/ plus the
+# settings/hooks templates — name == directory, description present and free of
+# measurement words, SKILL.md scripts/ refs resolve, bundled *.py compile, hooks
+# blocks well-formed. The core-skill trigger-line rule is demoted to a warning:
+# most core skills have no literal trigger in the always-on text yet (report-only
+# until a PR adds them; see docs/skill-validate.md).
+if python3 scripts/ccc-skill-validate.py --warn-rule trigger-core-missing >"$TMP/skill-validate.out" 2>&1; then
+  say "  ok Skill pre-validation (#2386) — $(tail -1 "$TMP/skill-validate.out")"
+else
+  err "skill pre-validation failed (#2386)"
+  grep '^ERROR' "$TMP/skill-validate.out" | head -20
+  tail -1 "$TMP/skill-validate.out"
+fi
+if python3 scripts/ccc_skill_validate_test.py >"$TMP/skill-validate-test.out" 2>&1; then
+  say "  ok Skill pre-validator tests (#2386)"
+else
+  err "skill pre-validator tests failed"
+  tail -15 "$TMP/skill-validate-test.out" 2>/dev/null
+fi
 if bash scripts/canon-node-name-scan.sh >"$TMP/canon-scan.out" 2>&1; then
   say "  ok Canon node-name scan — public-safe skill jurisdiction (#1446)"
 else
