@@ -5147,7 +5147,11 @@ def _sweep_promote_merge(
 ) -> list[dict[str, object]]:
     """Mark-ready and squash-merge mechanical promote PRs this publisher opened.
 
-    Skips any batch that recorded identity hits — those stay draft for a human.
+    A batch that recorded identity hits is never readied or merged on the
+    pre-L3 path — it stays for a human. With L3 on (#2394) it may re-enter
+    the L3 path once a human marked it ready, if `_identity_reentry` finds
+    only the flagged lines replaced and the rescan clean; it is then merged
+    only on an L3 approval of that exact head, never on today's plain merge.
     Does not wait for CI: pending checks return `waiting-checks` and retry next
     collect. Never uses `--admin`.
 
@@ -5165,22 +5169,18 @@ def _sweep_promote_merge(
     ][: config.collect_window]
     if not pending:
         return []
-    if dry_run:
-        return [
-            {"outcome": "would-merge-promote-pr", "pr": row.get("pr")}
-            for row in pending if not row.get("identity_hits")
-        ] + [
-            {"outcome": "would-hold-identity-hits", "pr": row.get("pr")}
-            for row in pending if row.get("identity_hits")
-        ]
     mode = str(getattr(config, "auto_approve_mode", "off"))
+    if dry_run:
+        return _promote_sweep_preview(pending, mode)
     processed: list[dict[str, object]] = []
     notify: dict[str, list[str]] = {"approved": [], "dry-run": []}
     for row in pending:
         pr = str(row.get("pr") or "")
         if not pr:
             continue
-        if row.get("identity_hits"):
+        identity = bool(row.get("identity_hits"))
+        if identity and mode == "off":
+            # No L3, no re-entry: exactly the pre-#2394 hold, no API call.
             processed.append({"outcome": "needs-human-identity", "pr": pr})
             continue
         try:
@@ -5201,7 +5201,12 @@ def _sweep_promote_merge(
             )
             processed.append({"outcome": "promote-pr-already-terminal", "pr": pr})
             continue
-        if payload.get("isDraft") is True:
+        if identity:
+            eligible, decision = _identity_reentry(config, rows, row, payload)
+            processed.append(decision)
+            if not eligible:
+                continue
+        elif payload.get("isDraft") is True:
             try:
                 _run(["gh", "pr", "ready", pr, "--repo", config.repo])
             except PromotionError as error:
@@ -5220,9 +5225,30 @@ def _sweep_promote_merge(
         if green is None or str(payload.get("mergeable")) not in {"MERGEABLE"}:
             processed.append({"outcome": "waiting-checks", "pr": pr})
             continue
-        processed += _approve_and_merge_promote_pr(config, row, payload, mode=mode, notify=notify)
+        processed += _approve_and_merge_promote_pr(
+            config, row, payload, mode=mode, notify=notify, require_approval=identity
+        )
     _notify_promote_autoapprove(config, notify)
     return processed
+
+
+def _promote_sweep_preview(
+    pending: list[dict[str, object]], mode: str
+) -> list[dict[str, object]]:
+    """Dry-run sweep: `would-...` outcomes only — no API call, no ledger row.
+    With L3 on, an identity batch notes it would be rescanned (#2394) once a
+    human marks it ready."""
+    held: list[dict[str, object]] = []
+    for row in pending:
+        if row.get("identity_hits"):
+            item: dict[str, object] = {"outcome": "would-hold-identity-hits", "pr": row.get("pr")}
+            if mode != "off":
+                item["rescan"] = "would-rescan-when-ready"
+            held.append(item)
+    return [
+        {"outcome": "would-merge-promote-pr", "pr": row.get("pr")}
+        for row in pending if not row.get("identity_hits")
+    ] + held
 
 
 def _approve_and_merge_promote_pr(
@@ -5232,9 +5258,14 @@ def _approve_and_merge_promote_pr(
     *,
     mode: str,
     notify: dict[str, list[str]],
+    require_approval: bool = False,
 ) -> list[dict[str, object]]:
     """The green + MERGEABLE tail of the sweep: optional #2239 L3 approval,
-    then the merge attempt. Off = exactly the pre-L3 merge call."""
+    then the merge attempt. Off = exactly the pre-L3 merge call.
+
+    `require_approval` (an identity batch that re-entered, #2394): without an
+    L3 approval of this exact head there is no merge attempt at all — the
+    human-edited batch goes back to human review instead of today's merge."""
     pr = str(row.get("pr") or "")
     out: list[dict[str, object]] = []
     merge_argv = [
@@ -5260,6 +5291,8 @@ def _approve_and_merge_promote_pr(
                 "gh", "pr", "merge", pr, "--repo", config.repo,
                 "--squash", "--match-head-commit", approved_head,
             ]
+    if require_approval and not approved_head:
+        return [*out, {"outcome": "needs-human-identity", "pr": pr, "code": "not_autoapproved"}]
     if not approved_head and str(payload.get("mergeStateStatus") or "") == "BLOCKED":
         # Branch protection still wants something this sweep did not provide
         # (a review, typically). On a repo with auto-merge allowed, `gh pr
@@ -5478,6 +5511,291 @@ def _approval_json_ok(content: str, name: str, trees: set[str]) -> bool:
         and _APPROVED_AT_RE.fullmatch(str(value["approved_at"])) is not None
         and (not trees or tree in trees)
     )
+
+
+# #2394 (owner decision 2026-10-20, "narrow re-entry"): a promote batch whose
+# creation-time scan found identity hits may re-enter the L3 path only when
+# the edits since the generator commit touch exactly the flagged lines of the
+# flagged SKILL.md files — same file, same line numbers, no line added or
+# removed, no other file — and a rescan of the exact head finds no hit there.
+# Anything else stays human review + merge, so a human edit is never approved
+# unreviewed beyond the lines the generator itself pointed at. The decision
+# is recorded per (creation head, head) as `a2a-promote-rescan` (codes only).
+_PROMOTE_RESCAN_KIND = "a2a-promote-rescan"
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# `str.splitlines()` (how creation hit lines were numbered) breaks on more
+# than `\n`; git numbers by `\n` alone. Any of these makes the two line
+# numberings disagree, so the flagged-line check cannot be trusted.
+_AMBIGUOUS_LINE_BREAK_RE = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85  ]")
+# GitHub's compare API lists at most 300 files.
+_COMPARE_MAX_FILES = 300
+
+
+def _local_head(work: Path) -> str:
+    """The commit `work` has checked out, or "" when it cannot be read."""
+    try:
+        head = _run(["git", "rev-parse", "HEAD"], cwd=work).stdout.decode("utf-8").strip().lower()
+    except (PromotionError, UnicodeDecodeError):
+        return ""
+    return head if _HEAD_SHA_RE.fullmatch(head) else ""
+
+
+def _identity_hit_lines(row: dict[str, object]) -> dict[str, set[int]] | None:
+    """Staged SKILL.md path -> creation-time hit line numbers (None = malformed).
+
+    `_promote` scans each staged SKILL.md and stages every skill under the
+    default audience, so the path follows from the recorded name. A moved
+    directory therefore shows up as another file changing — human review.
+    """
+    hits, names = row.get("identity_hits"), row.get("staged_names")
+    if not isinstance(hits, list) or not hits or not isinstance(names, list):
+        return None
+    lines_by_path: dict[str, set[int]] = {}
+    for entry in hits:
+        if not isinstance(entry, dict):
+            return None
+        name, found = entry.get("name"), entry.get("hits")
+        if (
+            not isinstance(name, str) or not _NAME_RE.fullmatch(name) or name not in names
+            or not isinstance(found, list) or not found
+        ):
+            return None
+        path = f"approved/{_PROMOTE_DEFAULT_AUDIENCE}/{name}/SKILL.md"
+        bucket = lines_by_path.setdefault(path, set())
+        for hit in found:
+            line = hit.get("line") if isinstance(hit, dict) else None
+            if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+                return None
+            bucket.add(line)
+    return lines_by_path
+
+
+def _patch_hunks(
+    patch: str,
+) -> tuple[list[tuple[tuple[int, int, int, int], list[str]]], set[str]]:
+    """((old start, old len, new start, new len), body) per hunk; any line
+    this cannot place in a hunk fails the whole patch closed."""
+    hunks: list[tuple[tuple[int, int, int, int], list[str]]] = []
+    lines = patch.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for line in lines:
+        if line.startswith("@@"):
+            match = _HUNK_HEADER_RE.match(line)
+            if match is None:
+                return [], {"patch_unparsed"}
+            old_len, new_len = (int(g) if g is not None else 1 for g in match.group(2, 4))
+            hunks.append(((int(match.group(1)), old_len, int(match.group(3)), new_len), []))
+        elif not hunks:
+            return [], {"patch_unparsed"}
+        else:
+            hunks[-1][1].append(line)
+    return hunks, set()
+
+
+def _hunk_reasons(
+    header: tuple[int, int, int, int], body: list[str], removed: set[int], added: set[int]
+) -> set[str]:
+    """Walk one hunk, collecting replaced line numbers into removed/added."""
+    old, old_len, new, new_len = header
+    reasons: set[str] = set()
+    if old != new or old_len != new_len:
+        reasons.add("line_count_changed")
+    ends = (old + old_len, new + new_len)
+    for line in body:
+        if line.startswith("\\"):
+            continue  # "\ No newline at end of file" — the -/+ pair carries it
+        if _AMBIGUOUS_LINE_BREAK_RE.search(line[1:]):
+            reasons.add("line_breaks_ambiguous")
+        if line.startswith("-"):
+            removed.add(old)
+            old += 1
+        elif line.startswith("+"):
+            added.add(new)
+            new += 1
+        elif line.startswith(" "):
+            if old != new:
+                reasons.add("line_count_changed")
+            old, new = old + 1, new + 1
+        else:
+            reasons.add("patch_unparsed")
+    if (old, new) != ends:
+        reasons.add("patch_count_mismatch")
+    return reasons
+
+
+def _flagged_patch_lines(patch: str, allowed: set[int]) -> tuple[set[int], set[str]]:
+    """(replaced line numbers, reason codes) for one file's unified patch.
+
+    Clear only when every hunk replaces lines in place: each removed line is
+    re-added at the same number, the old and new numbering never drift
+    apart, and every replaced number is a creation-time hit line.
+    """
+    hunks, reasons = _patch_hunks(patch)
+    removed: set[int] = set()
+    added: set[int] = set()
+    for header, body in hunks:
+        reasons |= _hunk_reasons(header, body, removed, added)
+    if removed != added:
+        reasons.add("line_count_changed")
+    if not removed and not added:
+        reasons.add("patch_empty")
+    if (removed | added) - allowed:
+        reasons.add("unflagged_line_changed")
+    return removed, reasons
+
+
+def _compare_reasons(payload: object, allowed: dict[str, set[int]]) -> set[str]:
+    """Reason codes for a `compare/<creation>...<head>` payload ([] = only
+    flagged lines replaced in place, in flagged files, on linear history)."""
+    if not isinstance(payload, dict):
+        return {"compare_unreadable"}
+    reasons: set[str] = set()
+    # "ahead" + behind_by 0 = the creation commit is an ancestor of the head:
+    # a force-push that rewrote the generator commit is not an edit on it.
+    if (
+        payload.get("status") != "ahead" or payload.get("behind_by") != 0
+        or not isinstance(payload.get("ahead_by"), int) or int(payload["ahead_by"]) < 1
+    ):
+        reasons.add("history_not_linear")
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        return reasons | {"compare_files_missing"}
+    if len(files) >= _COMPARE_MAX_FILES:
+        reasons.add("compare_files_truncated")
+    seen: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            reasons.add("compare_unreadable")
+            continue
+        path = item.get("filename")
+        if not isinstance(path, str) or path not in allowed or item.get("previous_filename"):
+            reasons.add("other_file_changed")
+            continue
+        if path in seen:
+            reasons.add("compare_unreadable")
+            continue
+        seen.add(path)
+        if item.get("status") != "modified":
+            reasons.add("file_not_modified_in_place")
+        additions, deletions = item.get("additions"), item.get("deletions")
+        if (
+            not isinstance(additions, int) or not isinstance(deletions, int)
+            or additions != deletions
+        ):
+            reasons.add("line_count_changed")
+        patch = item.get("patch")
+        if not isinstance(patch, str) or not patch:
+            reasons.add("patch_missing")
+            continue
+        removed, patch_reasons = _flagged_patch_lines(patch, allowed[path])
+        reasons |= patch_reasons
+        if not isinstance(deletions, int) or len(removed) != deletions:
+            reasons.add("patch_count_mismatch")
+    return reasons
+
+
+def _identity_rescan(
+    config: Config, row: dict[str, object], creation: str, head: str
+) -> tuple[list[str], bool]:
+    """(reason codes, transient) for re-entering L3 at `head` ([] = eligible).
+
+    Both reads are pinned to commit SHAs, so the answer belongs to exactly
+    this (creation, head) pair. `transient` marks a read failure — not a
+    decision, so it is not recorded and the next sweep retries.
+    """
+    allowed = _identity_hit_lines(row)
+    if allowed is None:
+        return ["identity_hits_malformed"], False
+    if creation == head:
+        return ["no_edit_since_creation"], False
+    try:
+        compared = _run(["gh", "api", f"repos/{config.repo}/compare/{creation}...{head}"])
+        payload = json.loads(compared.stdout.decode("utf-8"))
+    except PromotionError as error:
+        return [f"compare_{error.code}"], True
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ["compare_unreadable"], True
+    reasons = _compare_reasons(payload, allowed)
+    if reasons:
+        return sorted(reasons), False
+    nodes = _promote_worker_nodes(config)
+    for path in sorted(allowed):
+        try:
+            item = _run(["gh", "api", f"repos/{config.repo}/contents/{path}?ref={head}"])
+            entry = json.loads(item.stdout.decode("utf-8"))
+        except PromotionError as error:
+            return [f"contents_{error.code}"], True
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ["contents_unreadable"], True
+        try:
+            if (
+                not isinstance(entry, dict) or entry.get("type") != "file"
+                or entry.get("encoding") != "base64"
+            ):
+                raise ValueError("not a base64 file entry")
+            text = base64.b64decode(str(entry["content"])).decode("utf-8")
+        except (KeyError, ValueError):  # binascii.Error / UnicodeDecodeError too
+            reasons.add("contents_unreadable")
+            continue
+        if _AMBIGUOUS_LINE_BREAK_RE.search(text):
+            reasons.add("line_breaks_ambiguous")
+        if _promote_identity_hits(text, nodes):
+            reasons.add("rescan_identity_hit")
+    return sorted(reasons), False
+
+
+def _latest_rescan(rows: list[dict[str, object]], pr: str) -> dict[str, object] | None:
+    latest: dict[str, object] | None = None
+    for row in rows:
+        if row.get("kind") == _PROMOTE_RESCAN_KIND and str(row.get("pr") or "") == pr:
+            latest = row
+    return latest
+
+
+def _identity_reentry(
+    config: Config, rows: list[dict[str, object]], row: dict[str, object],
+    payload: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    """Whether an identity-hit promote batch may re-enter L3 at the live head.
+
+    Only a PR a human marked ready is considered (the sweep never readies an
+    identity batch itself, so #2360's publisher-ready rows are untouched).
+    One rescan per (creation head, head): an unchanged head reuses the last
+    recorded decision without any API call.
+    """
+    pr = str(row.get("pr") or "")
+    held: dict[str, object] = {"outcome": "needs-human-identity", "pr": pr, "rescan": "not-eligible"}
+    if payload.get("isDraft") is not False:
+        return False, {**held, "reasons": ["still_draft"]}
+    head = str(payload.get("headRefOid") or "").lower()
+    if not _HEAD_SHA_RE.fullmatch(head):
+        return False, {**held, "reasons": ["head_unreadable"]}
+    recorded = row.get("creation_head")
+    creation = recorded.lower() if isinstance(recorded, str) else ""
+    if not _HEAD_SHA_RE.fullmatch(creation):
+        creation = ""
+    last = _latest_rescan(rows, pr)
+    if last is not None and last.get("head") == head and last.get("creation_head") == creation:
+        cached = last.get("reasons")
+        reasons = [str(code) for code in cached] if isinstance(cached, list) else ["rescan_row_invalid"]
+        eligible = last.get("outcome") == "eligible" and not reasons
+        new = False
+    else:
+        if creation:
+            reasons, transient = _identity_rescan(config, row, creation, head)
+        else:
+            reasons, transient = ["creation_head_unrecorded"], False
+        eligible, new = not reasons, True
+        if not transient:
+            _append_ledger(config, {
+                "ts": _utc_now(), "kind": _PROMOTE_RESCAN_KIND, "pr": pr,
+                "creation_head": creation, "head": head,
+                "outcome": "eligible" if eligible else "not-eligible", "reasons": reasons,
+            })
+    if eligible:
+        return True, {"outcome": "identity-rescan-eligible", "pr": pr, "head_sha": head, "new": new}
+    return False, {**held, "reasons": reasons or ["rescan_row_invalid"]}
 
 
 def _promote_autoapprove(
@@ -6059,6 +6377,7 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
              f"promote: {len(staged)} approved intake candidates"],
             cwd=work,
         )
+        creation_head = _local_head(work)
         _run(["git", "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"], cwd=work)
     flagged = [row for row in staged if row["identity_hits"]]
     lines = [
@@ -6085,7 +6404,11 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     if flagged:
         lines.append(
             "`policies/REVIEW.md` requires node/provider facts to be removed before "
-            "promotion. These lines still name the fleet — edit them, then mark ready:"
+            "promotion. These lines still name the fleet. Edit ONLY these lines (same "
+            "line numbers, no lines added or removed, no other file) and mark ready: "
+            "the publisher's sweep may then auto-approve and merge it under the "
+            "standing L3 approval. Any other edit (including an audience move) needs "
+            "a human review and merge:"
         )
         lines.append("")
         for row in flagged:
@@ -6130,6 +6453,10 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
             "url": url,
             "branch": branch,
             "state": "OPEN",
+            # #2394: the generator commit this PR was opened at. The identity
+            # re-entry check diffs it against the live head; a row without one
+            # (or with a malformed one) keeps any identity batch human-only.
+            **({"creation_head": creation_head} if creation_head else {}),
             "identity_hits": [
                 {"name": row["name"], "hits": row["identity_hits"]}
                 for row in flagged

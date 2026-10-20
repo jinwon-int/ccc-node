@@ -274,6 +274,35 @@ class PromoteFlowTests(unittest.TestCase):
         self.assertIn("node-name", body)
         self.assertIn("shared", body)
 
+    def test_ledger_row_records_the_generator_commit(self) -> None:
+        """#2394: the identity re-entry check diffs this commit against the
+        live head; an unreadable one is omitted, never guessed."""
+        ledger: list[dict] = []
+        with patch.object(promotion, "_local_head", return_value="1" * 40):
+            self.run_promote(lineage("140", TREE_A), ledger=ledger)
+        opened = [r for r in ledger if r.get("kind") == "a2a-promote-pr"]
+        self.assertEqual(opened[0]["creation_head"], "1" * 40)
+        ledger = []
+        self.run_promote(lineage("140", TREE_A), ledger=ledger)  # rev-parse prints nothing
+        opened = [r for r in ledger if r.get("kind") == "a2a-promote-pr"]
+        self.assertNotIn("creation_head", opened[0])
+
+    def test_creation_head_is_read_before_the_push(self) -> None:
+        _, calls = self.run_promote(lineage("140", TREE_A))
+        git = [c[1] for c in calls if c[:1] == ["git"]]
+        self.assertLess(git.index("rev-parse"), git.index("push"))
+
+    def test_identity_body_says_which_edits_keep_the_l3_path(self) -> None:
+        """#2394: only a flagged-line-only fix may be auto-approved."""
+        _, calls = self.run_promote(lineage("140", TREE_A))
+        body = self.create_call(calls)[-1]
+        self.assertIn("Edit ONLY these lines", body)
+        self.assertIn("no lines added or removed", body)
+        self.assertIn("Any other edit", body)
+        self.assertIn("human review and merge", body)
+        self.assertNotIn("edit them, then mark ready", body)
+        self.assertNotIn("#2239", body, "a bare #ref would link a fleet-skills PR")
+
     def test_limit_bounds_the_batch(self) -> None:
         rows: list[dict] = []
         for n in range(6):
