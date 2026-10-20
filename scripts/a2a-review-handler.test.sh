@@ -374,6 +374,174 @@ REVIEW_STUB_MODE=noop run_revise_p1 > "$TMP/out-noop.json" 2>"$TMP/err-noop.txt"
 ok "revised result byte-identical to the packet is a no-op failure, never a pass (#1460 P1)" \
   '[ "$rc" = 3 ] && [ ! -s "$TMP/out-noop.json" ] && grep -q "no-op revision" "$TMP/err-noop.txt"'
 
+# ─── #1460 P2: timeout -k, tool lock, single node id, symmetric caps ───────
+cat > "$BIN/revise-p2-stub-agent" <<STUB
+#!/usr/bin/env bash
+cat > "\${PROMPT_CAPTURE:-/dev/null}"
+[ -n "\${AGENT_MARKER:-}" ] && touch "\$AGENT_MARKER"
+T="${TREE_OK}"
+case "\${REVIEW_STUB_MODE:-revised}" in
+  revised)
+    printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"rewrote the procedure","skillFiles":[{"path":"SKILL.md","content":"# revised p2 stub"}]}' "\$T"
+    ;;
+  hang-ignore-term) trap '' TERM; sleep 30 ;;
+  hang) echo "\$\$" > "\$AGENT_PIDFILE"; exec sleep 30 ;;
+  bigout) python3 -c 'import sys; sys.stdout.write("x" * (1024 * 1024 + 16))' ;;
+  bigfile)
+    big="\$(python3 -c 'print("a" * 70000)')"
+    printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"x","skillFiles":[{"path":"SKILL.md","content":"%s"}]}' "\$T" "\$big"
+    ;;
+esac
+STUB
+chmod +x "$BIN/revise-p2-stub-agent"
+mkdir -p "$TMP/danso-bin"
+cp "$BIN/revise-p2-stub-agent" "$TMP/danso-bin/danso-review-agent.sh"
+run_revise_p2() {
+  REVIEW_AGENT_BIN="${P2_BIN:-$BIN/revise-p2-stub-agent}" REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-30}" \
+    WORKER_ID="${WORKER_ID-testnode}" bash "$REVISE_HANDLER" < "${P2_TASK:-$TMP/revise-task.json}"
+}
+
+# timeout -k: a fake `timeout` first on PATH records its argv, then runs the real one.
+REAL_TIMEOUT_1460="$(command -v timeout)"
+mkdir -p "$TMP/fakebin-1460"
+cat > "$TMP/fakebin-1460/timeout" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/timeout-argv-1460.txt"
+exec "$REAL_TIMEOUT_1460" "\$@"
+STUB
+chmod +x "$TMP/fakebin-1460/timeout"
+make_revise_task
+: > "$TMP/timeout-argv-1460.txt"
+PATH="$TMP/fakebin-1460:$PATH" run_revise_p2 > "$TMP/out-p2-k.json" 2>/dev/null; rc=$?
+ok "reviser timeout carries a 30s kill-after grace by default (#1460 P2)" \
+  '[ "$rc" = 0 ] && grep -q "^-k 30 30 $BIN/revise-p2-stub-agent -p --disallowed-tools \*$" "$TMP/timeout-argv-1460.txt"'
+make_revise_task
+: > "$TMP/timeout-argv-1460.txt"
+PATH="$TMP/fakebin-1460:$PATH" REVISE_KILL_GRACE_SEC=7 REVISE_TIMEOUT_SEC=11 run_revise_p2 >/dev/null 2>&1; rc=$?
+ok "REVISE_KILL_GRACE_SEC / REVISE_TIMEOUT_SEC reach timeout -k (#1460 P2)" \
+  '[ "$rc" = 0 ] && grep -q "^-k 7 11 " "$TMP/timeout-argv-1460.txt"'
+make_revise_task
+REVISE_KILL_GRACE_SEC=abc run_revise_p2 >/dev/null 2>&1; rc=$?
+ok "a malformed kill grace fails as node config (exit 1, #1460 P2)" '[ "$rc" = 1 ]'
+make_revise_task
+REVISE_TIMEOUT_SEC=0 run_revise_p2 >/dev/null 2>&1; rc=$?
+ok "a zero revise timeout (unbounded) is refused (exit 1, #1460 P2)" '[ "$rc" = 1 ]'
+# A reviser that ignores SIGTERM is SIGKILLed after the grace, not left hanging.
+make_revise_task
+p2_started=$SECONDS
+REVIEW_STUB_MODE=hang-ignore-term REVISE_TIMEOUT_SEC=1 REVISE_KILL_GRACE_SEC=1 \
+  run_revise_p2 >/dev/null 2>"$TMP/err-p2-hang.txt"; rc=$?
+# shellcheck disable=SC2034  # read via eval inside ok()
+p2_elapsed=$((SECONDS - p2_started))
+ok "a TERM-ignoring reviser is killed after the grace (exit 1, #1460 P2)" \
+  '[ "$rc" = 1 ] && [ "$p2_elapsed" -lt 15 ] && grep -q "killed after 1s + 1s grace" "$TMP/err-p2-hang.txt"'
+
+# A worker-side TERM on the handler is forwarded to the reviser; temp dir removed.
+make_revise_task
+mkdir -p "$TMP/tmpdir-1460"
+rm -f "$TMP/agent-pid-1460"
+# Direct background command (not the helper function) so $! is the handler itself.
+TMPDIR="$TMP/tmpdir-1460" REVIEW_STUB_MODE=hang AGENT_PIDFILE="$TMP/agent-pid-1460" \
+  REVIEW_AGENT_BIN="$BIN/revise-p2-stub-agent" REVIEW_TIMEOUT_SEC=30 WORKER_ID=testnode \
+  bash "$REVISE_HANDLER" < "$TMP/revise-task.json" >/dev/null 2>&1 &
+p2_hpid=$!
+for _ in $(seq 1 50); do [ -s "$TMP/agent-pid-1460" ] && break; sleep 0.1; done
+p2_apid="$(cat "$TMP/agent-pid-1460" 2>/dev/null)"
+kill -TERM "$p2_hpid" 2>/dev/null
+wait "$p2_hpid"
+# shellcheck disable=SC2034  # read via eval inside ok()
+p2_hrc=$?
+p2_agent_gone=0
+for _ in $(seq 1 50); do
+  if [ -n "$p2_apid" ] && ! kill -0 "$p2_apid" 2>/dev/null; then p2_agent_gone=1; break; fi
+  sleep 0.1
+done
+[ "$p2_agent_gone" = 1 ] || { [ -n "$p2_apid" ] && kill -KILL "$p2_apid" 2>/dev/null; }
+ok "TERM on the handler stops the reviser and cleans the temp dir (#1460 P3)" \
+  '[ -n "$p2_apid" ] && [ "$p2_hrc" = 143 ] && [ "$p2_agent_gone" = 1 ] && [ -z "$(ls -A "$TMP/tmpdir-1460")" ]'
+
+# Tool lock: an args override must keep a total lock; otherwise fail closed
+# (exit 1) before the agent runs.
+p2_lock_case() {
+  rm -f "$TMP/agent-marker-1460"
+  make_revise_task
+  REVIEW_AGENT_ARGS="$1" AGENT_MARKER="$TMP/agent-marker-1460" run_revise_p2 >/dev/null 2>"$TMP/err-p2-lock.txt"
+}
+p2_lock_case "-p --model claude-test"; rc=$?
+ok "args override without --disallowed-tools is rejected before the agent runs (#1460 P2)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ] && grep -q "lacks a total tool lock" "$TMP/err-p2-lock.txt"'
+p2_lock_case "-p --disallowed-tools Bash"; rc=$?
+ok "a narrowed --disallowed-tools (not *) is rejected (#1460 P2)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ]'
+p2_lock_case '-p --disallowed-tools "*"'; rc=$?
+ok "a quoted \"*\" (literal token, not the wildcard) is rejected (#1460 P2)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ]'
+p2_lock_case "-p --disallowed-tools * --allowedTools Bash"; rc=$?
+ok "an allow-list next to the lock is rejected (#1460 P2)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ]'
+p2_lock_case "-p --disallowed-tools * --dangerously-skip-permissions"; rc=$?
+ok "a permission bypass next to the lock is rejected (#1460 P2)" '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ]'
+p2_lock_case "-p --model m --disallowed-tools *"; rc=$?
+ok "an override that keeps --disallowed-tools * runs (#1460 P2)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-1460" ]'
+p2_lock_case "-p --disallowedTools=*"; rc=$?
+ok "the --disallowedTools=* form is accepted (#1460 P2)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-1460" ]'
+p2_lock_case "-p --no-tools --model xai/grok-test"; rc=$?
+ok "a --no-tools agent line is accepted (#1460 P2)" '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-1460" ]'
+rm -f "$TMP/agent-marker-1460"
+make_revise_task
+P2_BIN="$TMP/danso-bin/danso-review-agent.sh" REVIEW_AGENT_ARGS="--model glm-test" \
+  AGENT_MARKER="$TMP/agent-marker-1460" run_revise_p2 > "$TMP/out-p2-danso.json" 2>/dev/null; rc=$?
+ok "the danso wrapper (always --no-tools) is accepted with --model only (#1460 P2)" \
+  '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-1460" ] && jq -e ".output.reviser_model == \"glm-test\"" >/dev/null "$TMP/out-p2-danso.json"'
+
+# Single reviser node id: prompt binding, output and validation agree.
+make_revise_task
+PROMPT_CAPTURE="$TMP/prompt-p2-node.txt" env -u WORKER_ID A2A_WORKER_ID=a2a-node-1460 \
+  REVIEW_AGENT_BIN="$BIN/revise-p2-stub-agent" REVIEW_TIMEOUT_SEC=30 \
+  bash "$REVISE_HANDLER" < "$TMP/revise-task.json" > "$TMP/out-p2-node.json" 2>/dev/null; rc=$?
+ok "A2A_WORKER_ID is the reviser node in prompt, output and validation (#1460 P2)" \
+  '[ "$rc" = 0 ] && grep -qx "reviser_node: a2a-node-1460" "$TMP/prompt-p2-node.txt" &&
+   jq -e ".output.reviser_node == \"a2a-node-1460\" and .validations[0].nodeId == \"a2a-node-1460\"" >/dev/null "$TMP/out-p2-node.json"'
+make_revise_task
+PROMPT_CAPTURE="$TMP/prompt-p2-host.txt" env -u WORKER_ID -u A2A_WORKER_ID \
+  REVIEW_AGENT_BIN="$BIN/revise-p2-stub-agent" REVIEW_TIMEOUT_SEC=30 \
+  bash "$REVISE_HANDLER" < "$TMP/revise-task.json" > "$TMP/out-p2-host.json" 2>/dev/null; rc=$?
+# shellcheck disable=SC2034  # read via eval inside ok()
+p2_bound_node="$(sed -n 's/^reviser_node: //p' "$TMP/prompt-p2-host.txt")"
+ok "without WORKER_ID the prompt and result name the same fallback node (#1460 P2)" \
+  '[ "$rc" = 0 ] && [ -n "$p2_bound_node" ] &&
+   jq -e --arg n "$p2_bound_node" ".output.reviser_node == \$n and .validations[0].nodeId == \$n" >/dev/null "$TMP/out-p2-host.json"'
+jq 'del(.payload.provenance.revise_round)' "$TMP/revise-task.json" > "$TMP/revise-task-noround.json"
+PROMPT_CAPTURE="$TMP/prompt-p2-round.txt" P2_TASK="$TMP/revise-task-noround.json" \
+  run_revise_p2 > "$TMP/out-p2-round.json" 2>/dev/null; rc=$?
+ok "a packet without revise_round binds round 1 in both prompt and result (#1460 P2)" \
+  '[ "$rc" = 0 ] && grep -qx "revision round: 1" "$TMP/prompt-p2-round.txt" && jq -e ".output.revise_round == 1" >/dev/null "$TMP/out-p2-round.json"'
+
+# Symmetric size caps: the packet is bounded like the result, before the agent runs.
+make_revise_task
+jq '.payload.skillFiles = [range(17) | {path: ("references/f\(.).md"), content: "x"}]' \
+  "$TMP/revise-task.json" > "$TMP/revise-task-17.json"
+rm -f "$TMP/agent-marker-1460"
+P2_TASK="$TMP/revise-task-17.json" AGENT_MARKER="$TMP/agent-marker-1460" run_revise_p2 >/dev/null 2>"$TMP/err-p2-17.txt"; rc=$?
+ok "a packet with more than 16 skillFiles fails before the agent runs (exit 1, #1460 P2)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ] && grep -q "1..16 element array" "$TMP/err-p2-17.txt"'
+jq --arg big "$(head -c 70000 /dev/zero | tr '\0' a)" '.payload.skillFiles[0].content = $big' \
+  "$TMP/revise-task.json" > "$TMP/revise-task-big.json"
+P2_TASK="$TMP/revise-task-big.json" AGENT_MARKER="$TMP/agent-marker-1460" run_revise_p2 >/dev/null 2>"$TMP/err-p2-big.txt"; rc=$?
+ok "a packet file over 64 KiB fails before the agent runs (exit 1, #1460 P2)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ] && grep -q "exceed the size caps" "$TMP/err-p2-big.txt"'
+jq --arg big "$(head -c 60000 /dev/zero | tr '\0' a)" \
+  '.payload.skillFiles = [range(5) | {path: ("references/f\(.).md"), content: $big}]' \
+  "$TMP/revise-task.json" > "$TMP/revise-task-total.json"
+P2_TASK="$TMP/revise-task-total.json" AGENT_MARKER="$TMP/agent-marker-1460" run_revise_p2 >/dev/null 2>"$TMP/err-p2-total.txt"; rc=$?
+ok "a packet over 256 KiB in total fails before the agent runs (exit 1, #1460 P2)" \
+  '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ] && grep -q "exceed the size caps" "$TMP/err-p2-total.txt"'
+make_revise_task
+REVIEW_STUB_MODE=bigfile run_revise_p2 > "$TMP/out-p2-bigfile.json" 2>"$TMP/err-p2-bigfile.txt"; rc=$?
+ok "a returned file over 64 KiB is a deterministic result failure (exit 3, #1460 P2)" \
+  '[ "$rc" = 3 ] && [ ! -s "$TMP/out-p2-bigfile.json" ] && grep -q "exceeds the packet size caps" "$TMP/err-p2-bigfile.txt"'
+make_revise_task
+REVIEW_STUB_MODE=bigout run_revise_p2 > "$TMP/out-p2-bigout.json" 2>"$TMP/err-p2-bigout.txt"; rc=$?
+ok "reviser stdout over 1 MiB is a deterministic oversized result (exit 3, #1460 P2)" \
+  '[ "$rc" = 3 ] && [ ! -s "$TMP/out-p2-bigout.json" ] && grep -q "HANDLER_FAIL: reviser output exceeds 1048576 bytes" "$TMP/err-p2-bigout.txt"'
+
 # ─── dispatcher revise routing (#1460) ──────────────────────────────────
 printf '#!/usr/bin/env bash\necho REVISE-HANDLER-CALLED\n' > "$BIN/revise-route-stub"
 chmod +x "$BIN/revise-route-stub"
