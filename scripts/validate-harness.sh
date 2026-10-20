@@ -453,10 +453,9 @@ fi
 # #2386: skill pre-validation over skills/, codex/skills/, piri/skills/ plus the
 # settings/hooks templates — name == directory, description present and free of
 # measurement words, SKILL.md scripts/ refs resolve, bundled *.py compile, hooks
-# blocks well-formed. The core-skill trigger-line rule is demoted to a warning:
-# most core skills have no literal trigger in the always-on text yet (report-only
-# until a PR adds them; see docs/skill-validate.md).
-if python3 scripts/ccc-skill-validate.py --warn-rule trigger-core-missing >"$TMP/skill-validate.out" 2>&1; then
+# blocks well-formed, and core-list skills (claude/skill-listing-core.txt) keep a
+# "Use when ..." description of <=300 chars. Every rule at default severity.
+if python3 scripts/ccc-skill-validate.py >"$TMP/skill-validate.out" 2>&1; then
   say "  ok Skill pre-validation (#2386) — $(tail -1 "$TMP/skill-validate.out")"
 else
   err "skill pre-validation failed (#2386)"

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Pre-validate skill trees before they ship (ccc-node#2386).
 
-A skill whose frontmatter is malformed is dropped silently at load, a skill
-nobody's always-on text names is rarely triggered, a SKILL.md that tells the
-agent to run a script that is not there fails only at use time, and a
-malformed hook never fires instead of erroring. This read-only validator
+A skill whose frontmatter is malformed is dropped silently at load, a core
+skill whose description does not say when to use it (or is too long) wastes
+the per-turn listing budget, a SKILL.md that tells the agent to run a script
+that is not there fails only at use time, and a malformed hook never fires
+instead of erroring. This read-only validator
 catches those shapes up front. Rules (rule id -> default severity):
 
 * ``frontmatter-missing`` (error): SKILL.md does not open with a ``---``
@@ -16,10 +17,12 @@ catches those shapes up front. Rules (rule id -> default severity):
 * ``description-banned-word`` (warn): the description uses measurement
   vocabulary (benchmark / evaluation / grader / rubric / score) that invites
   grader-gaming wording.
-* ``trigger-core-missing`` (error): a skill in the core listing set
-  (``claude/skill-listing-core.txt``) whose directory name never appears
-  literally in the always-on text (CLAUDE.md, tools-cheatsheet.md, the output
-  styles). ``trigger-missing`` (note): the same for a non-core skill.
+* ``core-description`` (error): a skill named in the core listing set
+  (``claude/skill-listing-core.txt``) whose ``description`` does not start
+  with "Use when" / "Use whenever" (any case) or is longer than 300
+  characters. Core descriptions are kept in Claude Code's per-turn skill
+  listing (``ccc-skill-listing-policy.py``), so the description itself is the
+  trigger; a separate always-on trigger line would only duplicate it.
 * ``script-ref-missing`` (error): SKILL.md runs a ``scripts/<x>.py|.sh``
   anchored to its own skill directory (``$SKILL_DIR/``, ``<skill-root>/``,
   ``.../skills/<name>/``) and the file is not there.
@@ -38,15 +41,14 @@ catches those shapes up front. Rules (rule id -> default severity):
 ``--warn-rule RULE`` demotes an error rule to a warning (CI uses it for rules
 the shipped tree does not satisfy yet). Exit status: 0 clean, 1 failing
 findings, 2 usage error. Output is sorted and stable; ``--json`` emits one
-object. ``--autotrigger --dry-run`` prints a suggested trigger line for every
-core skill without one; applying it is a PR, never this tool.
+object.
 
 Modes: with no ``--root`` the repo layout is checked (``skills/``,
-``codex/skills/``, ``piri/skills/`` plus the repo's settings/hook templates and
-always-on text). With ``--root PATH`` (repeatable; e.g. ``~/.claude/skills``)
-the node layout under ``--claude-dir`` (default ``$CCC_CLAUDE_DIR`` or
-``~/.claude``) supplies the always-on text and ``settings.json``; the script
-bases are that dir plus the checkout this file runs from. Dot-directories
+``codex/skills/``, ``piri/skills/`` plus the repo's settings/hook templates).
+With ``--root PATH`` (repeatable; e.g. ``~/.claude/skills``) the node layout
+under ``--claude-dir`` (default ``$CCC_CLAUDE_DIR`` or ``~/.claude``) supplies
+``settings.json``; the script bases are that dir plus the checkout this file
+runs from. Dot-directories
 (install staging) are skipped. Stdlib only; never writes.
 """
 
@@ -69,8 +71,7 @@ DEFAULT_SEVERITY = {
     "name-missing": "warn",
     "name-mismatch": "error",
     "description-banned-word": "warn",
-    "trigger-core-missing": "error",
-    "trigger-missing": "note",
+    "core-description": "error",
     "script-ref-missing": "error",
     "script-ref-unresolved": "warn",
     "py-compile": "error",
@@ -85,9 +86,10 @@ REPO_HOOK_FILES = (
     "claude/hooks/hooks.json",
     "claude/hooks/enforcement-overlay.json",
 )
-REPO_TRIGGER_FILES = ("claude/CLAUDE.md.template", "claude/hooks/tools-cheatsheet.md")
-REPO_OUTPUT_STYLES = "claude/output-styles"
 CORE_LIST = "claude/skill-listing-core.txt"
+# docs/skill-listing-budget.md "Core list": "Use when ..." first, <=300 chars.
+CORE_DESC_MAX = 300
+CORE_DESC_START = re.compile(r"use when(?:ever)?\b", re.IGNORECASE)
 
 BANNED_WORDS = re.compile(r"\b(benchmark|evaluation|grader|rubric|score)s?\b", re.IGNORECASE)
 
@@ -149,7 +151,6 @@ class Skill:
 class Config:
     roots: list
     hook_files: list
-    trigger_files: list
     core_list: Path | None
     script_bases: list
     strict: bool = False
@@ -276,7 +277,7 @@ def check_frontmatter(skill: Skill, report: Report) -> None:
         )
 
 
-# ---------------------------------------------------------------- triggers
+# ---------------------------------------------------------------- core
 
 
 def read_core_list(path: Path | None) -> list[str]:
@@ -290,50 +291,24 @@ def read_core_list(path: Path | None) -> list[str]:
     return names
 
 
-def always_on_text(paths: list[Path]) -> str:
-    chunks = []
-    for path in paths:
-        if path.is_file():
-            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
-    return "\n".join(chunks)
-
-
-def has_trigger(name: str, text: str) -> bool:
-    return re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text) is not None
-
-
-def check_triggers(skills: list[Skill], config: Config, report: Report) -> list[dict]:
-    """Core skills need a literal trigger; returns autotrigger suggestions."""
-    core = set(read_core_list(config.core_list))
-    text = always_on_text(config.trigger_files)
-    first: dict[str, Skill] = {}
-    for skill in skills:
-        first.setdefault(skill.name, skill)
-    suggestions = []
-    for name in sorted(first):
-        skill = first[name]
-        if has_trigger(name, text):
-            continue
-        if name in core:
-            report.add(
-                "trigger-core-missing", skill.skill_md, 1,
-                f"core skill {name!r} is not named in CLAUDE.md/tools-cheatsheet/output-style", name,
-            )
-            suggestions.append({"skill": name, "line": suggest_trigger(name, skill)})
-        else:
-            report.add("trigger-missing", skill.skill_md, 1, f"skill {name!r} has no trigger line", name)
-    return suggestions
-
-
-def suggest_trigger(name: str, skill: Skill) -> str:
-    desc = " ".join(skill.fields.get("description", ("", 0))[0].split())
-    stripped = re.sub(r"(?i)^use (?:this skill )?when(?:ever)?\s+", "", desc)
-    sentence = re.split(r"(?<!e\.g\.)(?<!i\.e\.)(?<=[.;])\s|\s[—–]\s", stripped, maxsplit=1)[0].rstrip(".;")
-    if len(sentence) > 160:
-        sentence = sentence[:157].rstrip() + "..."
-    if stripped == desc:
-        return f'- When the task matches "{sentence}", load the {name} skill.'
-    return f"- When {sentence}, load the {name} skill."
+def check_core_description(skill: Skill, core: frozenset, report: Report) -> None:
+    """Core descriptions are listed every turn: "Use when ..." first, <=300 chars."""
+    if skill.name not in core or "__invalid__" in skill.fields:
+        return
+    desc, line = skill.fields.get("description", ("", 1))
+    desc = desc.strip()
+    if not desc:
+        return  # description-missing already reports it
+    if not CORE_DESC_START.match(desc):
+        report.add(
+            "core-description", skill.skill_md, line,
+            f"core skill description must start with 'Use when' (starts {desc[:30]!r})", skill.name,
+        )
+    if len(desc) > CORE_DESC_MAX:
+        report.add(
+            "core-description", skill.skill_md, line,
+            f"core skill description is {len(desc)} chars (max {CORE_DESC_MAX})", skill.name,
+        )
 
 
 # ---------------------------------------------------------------- scripts
@@ -500,19 +475,20 @@ def discover_skills(roots: list[Path]) -> list[Skill]:
     return skills
 
 
-def run(config: Config) -> tuple[Report, list[dict], int]:
+def run(config: Config) -> tuple[Report, int]:
     report = Report(config)
     skills = discover_skills(config.roots)
+    core = frozenset(read_core_list(config.core_list))
     compiled: dict = {}
     for skill in skills:
         check_frontmatter(skill, report)
+        check_core_description(skill, core, report)
         check_script_refs(skill, config, report, compiled)
         check_skill_python(skill, report, compiled)
-    suggestions = check_triggers(skills, config, report)
     for hook_file in config.hook_files:
         if hook_file.is_file():
             check_hook_file(hook_file, report)
-    return report, suggestions, len(skills)
+    return report, len(skills)
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -523,8 +499,6 @@ def build_config(args: argparse.Namespace) -> Config:
         )
         roots = [Path(os.path.expanduser(r)) for r in args.root]
         hook_files = [claude_dir / "settings.json"]
-        trigger_files = [claude_dir / "CLAUDE.md", claude_dir / "hooks" / "tools-cheatsheet.md"]
-        styles = claude_dir / "output-styles"
         bases = [claude_dir]
         if (SCRIPT_REPO / "setup.sh").is_file() and (SCRIPT_REPO / "scripts").is_dir():
             bases.append(SCRIPT_REPO)  # run from a checkout: repo scripts/ resolve too
@@ -535,32 +509,21 @@ def build_config(args: argparse.Namespace) -> Config:
         repo = Path(os.path.expanduser(args.repo_root)) if args.repo_root else SCRIPT_REPO
         roots = [repo / r for r in REPO_SKILL_ROOTS]
         hook_files = [repo / f for f in REPO_HOOK_FILES]
-        trigger_files = [repo / f for f in REPO_TRIGGER_FILES]
-        styles = repo / REPO_OUTPUT_STYLES
         bases = [repo]
         core = repo / CORE_LIST
-    if styles.is_dir():
-        trigger_files += sorted(styles.glob("*.md"))
     if args.settings:
         hook_files = [Path(os.path.expanduser(p)) for p in args.settings]
-    if args.trigger_file:
-        trigger_files = [Path(os.path.expanduser(p)) for p in args.trigger_file]
     if args.script_base:
         bases = [Path(os.path.expanduser(p)) for p in args.script_base]
     if args.core_list:
         core = Path(os.path.expanduser(args.core_list))
-    return Config(roots, hook_files, trigger_files, core, bases, args.strict, warn_rules)
+    return Config(roots, hook_files, core, bases, args.strict, warn_rules)
 
 
-def render_text(report: Report, suggestions: list[dict], n_skills: int, autotrigger: bool) -> str:
+def render_text(report: Report, n_skills: int) -> str:
     out = []
     for f in report.sorted():
         out.append(f"{f.severity.upper():5} {f.rule} {f.path}:{f.line}: {f.message}")
-    if autotrigger:
-        out.append("autotrigger suggestions (dry-run; apply through a PR):")
-        out.extend(f"  {s['skill']}: {s['line']}" for s in suggestions)
-        if not suggestions:
-            out.append("  (none — every core skill has a trigger line)")
     roots = len(report.config.roots)
     out.append(
         f"skill-validate: {n_skills} skill(s) in {roots} root(s) — "
@@ -570,7 +533,7 @@ def render_text(report: Report, suggestions: list[dict], n_skills: int, autotrig
     return "\n".join(out)
 
 
-def render_json(report: Report, suggestions: list[dict], n_skills: int, autotrigger: bool) -> str:
+def render_json(report: Report, n_skills: int) -> str:
     payload = {
         "version": 1,
         "strict": report.config.strict,
@@ -579,8 +542,6 @@ def render_json(report: Report, suggestions: list[dict], n_skills: int, autotrig
         "summary": {s: report.count(s) for s in SEVERITIES},
         "findings": [f.as_dict() for f in report.sorted()],
     }
-    if autotrigger:
-        payload["autotrigger"] = suggestions
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
 
 
@@ -590,19 +551,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--repo-root", help="repo checkout for the default repo mode")
     p.add_argument("--claude-dir", help="node mode: Claude dir (default $CCC_CLAUDE_DIR or ~/.claude)")
     p.add_argument("--settings", action="append", help="settings/hooks JSON to check (repeatable)")
-    p.add_argument("--trigger-file", action="append", help="always-on text file (repeatable)")
     p.add_argument("--script-base", action="append", help="base dir for scripts/ refs (repeatable)")
     p.add_argument("--core-list", help="core skill list (default claude/skill-listing-core.txt)")
     p.add_argument("--strict", action="store_true", help="warnings fail too")
     p.add_argument("--warn-rule", action="append", choices=sorted(DEFAULT_SEVERITY),
                    help="demote an error rule to a warning (repeatable)")
     p.add_argument("--json", action="store_true", help="emit one JSON object")
-    p.add_argument("--autotrigger", action="store_true", help="suggest trigger lines (needs --dry-run)")
-    p.add_argument("--dry-run", action="store_true", help="print only; this tool never writes")
-    args = p.parse_args(argv)
-    if args.autotrigger and not args.dry_run:
-        p.error("--autotrigger only supports --dry-run (apply the suggestion through a PR)")
-    return args
+    return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -612,9 +567,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.root and missing:
         print(f"skill-validate: root not found: {display(missing[0])}", file=sys.stderr)
         return 2
-    report, suggestions, n_skills = run(config)
+    report, n_skills = run(config)
     render = render_json if args.json else render_text
-    print(render(report, suggestions, n_skills, args.autotrigger))
+    print(render(report, n_skills))
     return 1 if report.count("error") else 0
 
 

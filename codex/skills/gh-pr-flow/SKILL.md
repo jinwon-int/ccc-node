@@ -1,6 +1,6 @@
 ---
 name: gh-pr-flow
-description: Validate, independently review, and normally squash-merge protected GitHub pull requests. Use when a PR must pass exact-head, green-check, author/reviewer separation, or required-review gates; when a jinon86- or seoseo-ai-authored PR needs approval from the other relay-held account; or when landing changes without weakening branch protection.
+description: Use when a protected GitHub PR must pass exact-head, green-check, author/reviewer separation, or required-review gates before a normal squash merge; when a jinon86- or seoseo-ai-authored PR needs the other relay-held account's approval; or when landing changes without weakening branch protection.
 ---
 
 # GitHub PR Flow
