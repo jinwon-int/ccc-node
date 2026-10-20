@@ -32,7 +32,7 @@
       "name": "ccc-node-status",
       "source": "codex/skills/ccc-node-status",
       "status": "active",
-      "tree_sha256": "76ad90ff09d4c1b92f9be06609fda17bc273edec7f6a0d8c1f699320b60ae48d"
+      "tree_sha256": "022fe8ee6d5e11f503fe3476ae9cd511e53081cc4942b060a91d5939bd205478"
     },
     {
       "audience": "codex",
