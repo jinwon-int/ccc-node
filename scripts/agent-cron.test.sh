@@ -418,6 +418,40 @@ ok "on-failure notify skips successful runs" '[ "$rc" = 0 ] && jq -e ".notificat
 out="$(CCC_AGENT_CRON_STORE="$NOTIFY_FAIL_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$NF_SPOOL" bash "$CMD" run nf-bad --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
 ok "on-failure notify spools failed runs" '[ "$rc" = 1 ] && jq -e ".notification.delivery == \"spooled\"" <<<"$out" >/dev/null && [ -n "$(ls -A "$NF_SPOOL" 2>/dev/null)" ]'
 
+# --- #2426: channel-neutral owner notify names; legacy telegram-owner* stay as aliases ---
+ALIAS_STORE="$TMP/alias-store/tasks.json"
+mkdir -p "$(dirname "$ALIAS_STORE")"
+cat > "$ALIAS_STORE" <<'JSON'
+{"version":1,"tasks":[
+  {"id":"al-owner","schedule":"* * * * *","prompt":"Owner every run","enabled":true,"notify":"owner","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"al-ok","schedule":"* * * * *","prompt":"Quiet when fine","enabled":true,"notify":"owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"al-bad","schedule":"* * * * *","prompt":"Loud when Fail","enabled":true,"notify":"owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"al-legacy","schedule":"* * * * *","prompt":"Legacy spelling","enabled":true,"notify":"telegram-owner","lastRunAt":"2026-01-01T00:00:00Z"},
+  {"id":"al-legacy-fail","schedule":"* * * * *","prompt":"Legacy Fail spelling","enabled":true,"notify":"telegram-owner-on-failure","lastRunAt":"2026-01-01T00:00:00Z"}
+]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" bash "$CMD" validate 2>&1)"; rc=$?
+ok "#2426 validate accepts owner/owner-on-failure next to legacy telegram-owner*" '[ "$rc" = 0 ]'
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run al-owner --dry-run --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "#2426 dry-run previews notify=owner (canonical) as preview-only" '[ "$rc" = 0 ] && jq -e ".notification.policy == \"owner\" and .notification.canonicalPolicy == \"owner\" and .notification.delivery == \"preview-only\"" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run al-legacy --dry-run --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "#2426 dry-run keeps the stored legacy policy and reports canonicalPolicy=owner" '[ "$rc" = 0 ] && jq -e ".notification.policy == \"telegram-owner\" and .notification.canonicalPolicy == \"owner\" and .notification.delivery == \"preview-only\"" <<<"$out" >/dev/null'
+AL_SPOOL="$TMP/alias-spool"
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$AL_SPOOL" bash "$CMD" run al-owner --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "#2426 notify=owner spools successful runs with recipient=owner" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"spooled\" and .notification.canonicalPolicy == \"owner\"" <<<"$out" >/dev/null && [ "$(find "$AL_SPOOL" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ] && jq -e ".recipient == \"owner\" and .event == \"AgentCronRun\"" "$(find "$AL_SPOOL" -maxdepth 1 -type f -name "*.json" | head -1)" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$AL_SPOOL" bash "$CMD" run al-ok --json --at 2026-01-01T00:01:00Z)"; rc=$?
+ok "#2426 owner-on-failure skips successful runs" '[ "$rc" = 0 ] && jq -e ".notification.delivery == \"skipped-success\" and .notification.canonicalPolicy == \"owner-on-failure\"" <<<"$out" >/dev/null && [ "$(find "$AL_SPOOL" -maxdepth 1 -type f -name "*.json" | wc -l)" = 1 ]'
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$AL_SPOOL" bash "$CMD" run al-bad --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2426 owner-on-failure spools failed runs" '[ "$rc" = 1 ] && jq -e ".notification.delivery == \"spooled\"" <<<"$out" >/dev/null && [ "$(find "$AL_SPOOL" -maxdepth 1 -type f -name "*.json" | wc -l)" = 2 ]'
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$AL_SPOOL" bash "$CMD" run al-legacy-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2426 legacy telegram-owner-on-failure still spools failed runs unchanged" '[ "$rc" = 1 ] && jq -e ".notification.policy == \"telegram-owner-on-failure\" and .notification.canonicalPolicy == \"owner-on-failure\" and .notification.delivery == \"spooled\"" <<<"$out" >/dev/null && [ "$(find "$AL_SPOOL" -maxdepth 1 -type f -name "*.json" | wc -l)" = 3 ]'
+ok "#2426 stored legacy values are not rewritten by run" 'jq -e "[.tasks[] | select(.id | startswith(\"al-legacy\")) | .notify] == [\"telegram-owner\", \"telegram-owner-on-failure\"]" "$ALIAS_STORE" >/dev/null'
+ALIAS_CRUD="$TMP/alias-crud/tasks.json"
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_CRUD" bash "$CMD" add alias-add --schedule "0 9 * * *" --prompt "Daily" --notify owner-on-failure --json)"; rc=$?
+ok "#2426 add accepts --notify owner-on-failure and stores the canonical spelling" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"alias-add\" and .notify == \"owner-on-failure\")" "$ALIAS_CRUD" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$ALIAS_CRUD" bash "$CMD" add alias-bad --schedule "0 9 * * *" --prompt "Daily" --notify matrix-owner --json 2>&1)"; rc=$?
+ok "#2426 unknown channel-prefixed notify name still fails closed" '[ "$rc" = 1 ] && ! jq -e ".tasks[] | select(.id == \"alias-bad\")" "$ALIAS_CRUD" >/dev/null 2>&1'
+
 PAYLOAD_STORE="$TMP/payload-store/tasks.json"
 mkdir -p "$(dirname "$PAYLOAD_STORE")"
 cat > "$PAYLOAD_STORE" <<'JSON'

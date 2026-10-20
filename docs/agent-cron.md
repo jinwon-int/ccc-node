@@ -114,9 +114,9 @@ never labelled `retry-exhausted` — its failures stay plain `failed`.
 > silences every finding.** Exit 1 is then a success, and `*-on-failure` never
 > spools a successful run. The watch can find a node DOWN on every run and
 > nobody is told. Use `--success-exit-codes 0,1` only when findings reach a
-> person some other way, for example `--notify telegram-owner`, which reports
+> person some other way, for example `--notify owner`, which reports
 > every run. For a watch whose findings should page, keep the default success
-> set and `telegram-owner-on-failure`. If a chronic finding would then page on
+> set and `owner-on-failure`. If a chronic finding would then page on
 > every run, make the watch report changes rather than states:
 > `fleet-bridge-watch.sh --state-file PATH` exits 1 only for NEW, STILL
 > (re-alert due) and RECOVERED events (docs/fleet-watch.md, #2086). Add
@@ -126,9 +126,17 @@ never labelled `retry-exhausted` — its failures stay plain `failed`.
 ## Notify modes
 
 - `none` (default) — no spool writes.
-- `telegram-owner` — every run writes a short redacted owner-only spool entry.
-- `telegram-owner-on-failure` — spool only non-success runs (failed/timeout);
+- `owner` — every run writes a short redacted owner-only spool entry.
+- `owner-on-failure` — spool only non-success runs (failed/timeout);
   successful runs report `delivery: skipped-success`.
+- `telegram-owner` / `telegram-owner-on-failure` — **deprecated aliases** of
+  `owner` / `owner-on-failure` (#2426). Still accepted everywhere; stored tasks
+  keep their value and are normalized on read (`notification.canonicalPolicy`
+  in `run` / `run --dry-run` output shows the canonical name next to the stored
+  `policy`). The name was misleading: agent-cron never sends to Telegram, it
+  writes a channel-neutral spool record that whichever bridge is active on the
+  node delivers — on a node whose Telegram bridge is retired that is the Matrix
+  bridge via the fleet relay.
 - `telegram-chat` / `telegram-chat-on-failure` (#665) — deliver to a specific
   group/channel chat instead of the owner DM. Requires `--notify-chat-id <id>`
   (numeric group id like `-1001234567890`, or `@channelusername`); the schema
@@ -217,7 +225,7 @@ Two counters, each bounded so no pattern of outcomes alerts on every run:
   alerted yet is never pruned (finished one-shots are the incident evidence).
 
 A run where both counters fire produces one message. Alarms go to the owner
-through the same push spool as `notify=telegram-owner`, carry only task ids,
+through the same push spool as `notify=owner`, carry only task ids,
 classes, counts and timestamps, and never run output. The state is persisted
 with the alert marked sent **before** the spool write: if the state cannot be
 written the alert is suppressed with a stderr warning (failing quiet, not once
