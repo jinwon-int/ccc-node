@@ -49,6 +49,7 @@ from telegram_bot.contracts.transport import (  # noqa: F401 (TransportPort re-e
     TurnSink,
 )
 from telegram_bot.core import restart_handoff, session_resume, tool_policy
+from telegram_bot.core import revert as revert_ops
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
@@ -126,7 +127,7 @@ SUPPORTED_COMMANDS = frozenset(
     {
         "new", "distill", "model", "effort", "usage", "skills", "stop", "continue",
         "task_pause", "task_resume", "task_recover", "history", "resume", "restart",
-        "waits", "cancelwait", "memory_promote",
+        "waits", "cancelwait", "memory_promote", "revert",
     }
 )
 _STATUS_HANDLE = 1
@@ -163,9 +164,14 @@ _OWNER_ONLY_COMMANDS = frozenset(
     {
         "resume", "history", "model", "effort", "distill", "usage", "continue",
         "task_pause", "task_resume", "task_recover", "restart", "waits", "cancelwait",
-        "memory_promote",
+        "memory_promote", "revert",
     }
 )
+# #2004: a /revert numbered menu (message pick, then mode pick) stays answerable
+# this long per (room, sender); a digit after that gets a "menu expired" answer.
+_REVERT_CHOICE_TTL_S = 300.0
+_REVERT_PAGE_SIZE = 10
+REVERT_MENU_EXPIRED = "⌛ That /revert menu expired. Send /revert again."
 # #2001: files an answer names are sent after it, at most this many per turn.
 MAX_FILES_PER_TURN = 10
 FILES_DIRECT_ONLY = "📎 답변에 파일 {count}개가 있지만, 파일은 개인 대화방에서만 보냅니다."
@@ -690,6 +696,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         # bot.py) and the sink of the turn currently being served, so a typed
         # recovery choice can dispatch with the same room callbacks.
         self._task_resume_generations: dict[Any, int] = {}
+        # #2004: pending /revert text menus keyed by (user_id, chat_id), i.e.
+        # per sender per room; in memory only (a restart drops them).
+        self._revert_choices: dict[tuple[int, int], dict[str, Any]] = {}
         self._active_sink: Any = None
         # #2001: event id of the turn being served, keying its outbound files.
         self._active_turn_id = ""
@@ -2295,6 +2304,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             command, args = self._parse_command(body)
             if command in _OWNER_ONLY_COMMANDS and not self._check_user_access(user_id):
                 return _turn_result(OWNER_ONLY_COMMAND, None)
+            if command is not None and command != "revert":
+                # #2004: any other command abandons a pending /revert menu.
+                self._revert_choices.pop((user_id, chat_id), None)
             if command == "skills":
                 return await self._cmd_skills(user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink, turn_marker=str(job.get("event_id") or ""))
             if command == "task_resume":
@@ -2309,6 +2321,9 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 return _turn_result(text, None)
             if await self._answer_danso_recovery_choice(body, user_id=user_id, chat_id=chat_id):
                 return _turn_result("", None, streamed=True)
+            reverted = await self._select_revert_choice(body, user_id=user_id, chat_id=chat_id)
+            if reverted is not None:
+                return _turn_result(reverted, None)
             chosen = await self._select_resume_choice(body, user_id=user_id, chat_id=chat_id)
             if chosen is not None:
                 return _turn_result(chosen, None)
@@ -2478,14 +2493,21 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         return name, parts[1:]
 
     async def _run_command(self, command: str, args: list[str], *, user_id: int, chat_id: int) -> str:
+        # Handlers taking ``(args, *, user_id, chat_id)``.
+        with_args: dict[str, Callable[..., Awaitable[str]]] = {
+            "model": self._cmd_model,
+            "effort": self._cmd_effort,
+            "memory_promote": self._cmd_memory_promote,
+            "task_pause": self._cmd_task_pause,
+            "resume": self._cmd_resume,
+            "revert": self._cmd_revert,
+        }
+        if command in with_args:
+            return await with_args[command](args, user_id=user_id, chat_id=chat_id)
         if command == "new":
             return await self._cmd_new(user_id=user_id, chat_id=chat_id)
         if command == "distill":
             return await self._cmd_distill(user_id=user_id, chat_id=chat_id)
-        if command == "model":
-            return await self._cmd_model(args, user_id=user_id, chat_id=chat_id)
-        if command == "effort":
-            return await self._cmd_effort(args, user_id=user_id, chat_id=chat_id)
         if command == "usage":
             return await self._cmd_usage(user_id=user_id, chat_id=chat_id)
         if command == "stop":
@@ -2496,16 +2518,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             return await self._cmd_waits(user_id=user_id)
         if command == "cancelwait":
             return await self._cmd_cancelwait(args, user_id=user_id)
-        if command == "memory_promote":
-            return await self._cmd_memory_promote(args, user_id=user_id, chat_id=chat_id)
-        if command == "task_pause":
-            return await self._cmd_task_pause(args, user_id=user_id, chat_id=chat_id)
         if command == "task_recover":
             return await self._cmd_task_recover(user_id=user_id, chat_id=chat_id)
         if command == "history":
             return await self._cmd_history(user_id=user_id, chat_id=chat_id)
-        if command == "resume":
-            return await self._cmd_resume(args, user_id=user_id, chat_id=chat_id)
         raise ValueError(f"unsupported command: {command}")
 
     # -- conversation/session plumbing (mirrors bot.py) ----------------------
@@ -3287,6 +3303,260 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             if last:
                 reply += f"\n\n📋 {last}"
         return reply
+
+    # -- /revert (#2004) --------------------------------------------------------
+    #
+    # Telegram's inline-keyboard flow (bot_commands._cmd_revert ->
+    # _handle_revert_callback) as a numbered text menu, since Matrix has no
+    # inline keyboard: step 1 numbers the recent user messages (same source and
+    # limit as Telegram), step 2 numbers the same modes (revert.REVERT_MODES).
+    # A bare number answers the pending step; ``/revert <n> [<mode>]`` skips a
+    # step. The transcript rewrite is the shared revert.revert_conversation.
+
+    _REVERT_USAGE = (
+        "Usage: /revert, /revert page <p>, /revert <n>, /revert <n> <mode>, /revert cancel\n"
+        "Modes: " + ", ".join(f"{i}={mode}" for i, (mode, _label) in enumerate(revert_ops.REVERT_MODES, 1))
+    )
+
+    def _revert_unavailable(self) -> str | None:
+        """Telegram's provider gates, same answers."""
+
+        provider = self._active_provider()
+        if provider in {"piri", "danso"}:
+            return f"ℹ️ /revert is unavailable for {provider.title()} sessions."
+        if self._claude_scoped_transcript_controls_disabled():
+            return (
+                "🔒 Claude transcript revert is disabled while private memory "
+                "is audience-scoped. Use /new to start a fresh session."
+            )
+        return None
+
+    def _live_revert_choice(self, user_id: int, chat_id: int) -> tuple[dict[str, Any] | None, bool]:
+        """``(pending menu, expired)``; an expired menu is dropped here."""
+
+        pending = self._revert_choices.get((user_id, chat_id))
+        if pending is None:
+            return None, False
+        if float(self._clock.time()) >= float(pending["expires"]):
+            self._revert_choices.pop((user_id, chat_id), None)
+            return None, True
+        return pending, False
+
+    async def _remember_revert_choice(
+        self,
+        key: Any,
+        session: Mapping[str, Any],
+        *,
+        user_id: int,
+        chat_id: int,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        selected: int | None = None,
+    ) -> None:
+        self._revert_choices[(user_id, chat_id)] = {
+            "session_id": session_id,
+            "messages": messages,
+            "selected": selected,
+            "expires": float(self._clock.time()) + _REVERT_CHOICE_TTL_S,
+        }
+        if session.get("resume_list"):
+            # One numbered menu at a time: a later digit answers /revert, not /resume.
+            await self._session_manager.patch_session(key, remove_fields={"resume_list"})
+
+    @staticmethod
+    def _revert_mode(token: str) -> str | None:
+        modes = [mode for mode, _label in revert_ops.REVERT_MODES]
+        text = token.strip().lower()
+        if re.fullmatch(r"[0-9]+", text):
+            number = int(text)
+            return modes[number - 1] if 1 <= number <= len(modes) else None
+        return text if text in modes else None
+
+    def _revert_time(self, timestamp: str) -> str:
+        try:
+            moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except (AttributeError, ValueError):
+            return timestamp[:16]
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return self._relative_time(moment.timestamp())
+
+    def _render_revert_messages(self, messages: Sequence[Mapping[str, Any]], page: int) -> str:
+        pages = max(1, (len(messages) + _REVERT_PAGE_SIZE - 1) // _REVERT_PAGE_SIZE)
+        page = min(max(1, page), pages)
+        start = (page - 1) * _REVERT_PAGE_SIZE
+        lines = ["🔄 Select a message to revert to:", ""]
+        for number, message in enumerate(messages[start:start + _REVERT_PAGE_SIZE], start + 1):
+            content = str(message.get("content") or "")
+            preview = (content[:40] + "...") if len(content) > 40 else content
+            preview = " ".join(preview.split())
+            when = self._revert_time(str(message.get("timestamp") or ""))
+            lines.append(" ".join(part for part in (f"{number}. 💬", when, preview) if part))
+        lines.append("")
+        if pages > 1:
+            lines.append(f"Page {page}/{pages}. Older messages: /revert page <p>.")
+        lines.append("Reply with a number to choose, or /revert cancel.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_revert_modes(message: Mapping[str, Any]) -> str:
+        preview = str(message.get("content") or "")[:200]
+        lines = [f"🔄 Selected message:\n\n{preview}...\n", "Choose revert mode:"]
+        lines.extend(f"{number}. {label}" for number, (_mode, label) in enumerate(revert_ops.REVERT_MODES, 1))
+        lines.append("")
+        lines.append("Reply with a number.")
+        return "\n".join(lines)
+
+    async def _cmd_revert(self, args: list[str], *, user_id: int, chat_id: int) -> str:
+        """``/revert``: list, pick a message (``<n>``), pick a mode (``<n> <mode>``)."""
+
+        unavailable = self._revert_unavailable()
+        if unavailable is not None:
+            self._revert_choices.pop((user_id, chat_id), None)
+            return unavailable
+        if len(args) == 1 and args[0].lower() == "cancel":
+            had = self._revert_choices.pop((user_id, chat_id), None)
+            return "❌ Revert cancelled" if had is not None else "ℹ️ No /revert menu is open."
+        page, number, mode = 1, None, None
+        if args and args[0].lower() == "page":
+            if len(args) != 2 or re.fullmatch(r"[0-9]+", args[1]) is None or int(args[1]) < 1:
+                return self._REVERT_USAGE
+            page = int(args[1])
+        elif args:
+            if len(args) > 2 or re.fullmatch(r"[0-9]+", args[0]) is None:
+                return self._REVERT_USAGE
+            number = int(args[0])
+            if len(args) == 2:
+                mode = self._revert_mode(args[1])
+                if mode is None:
+                    return self._REVERT_USAGE
+
+        key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        session_id = self._effective_session_id(key, session)
+        if not session_id:
+            self._revert_choices.pop((user_id, chat_id), None)
+            return "📭 No active session. Start a conversation first."
+        pending, _expired = self._live_revert_choice(user_id, chat_id)
+        if args and pending is not None and pending["session_id"] == session_id:
+            # Keep the numbering the owner was shown.
+            messages = pending["messages"]
+        else:
+            # Offloaded: reading a large transcript never stalls the loop (#456).
+            messages = await asyncio.to_thread(
+                self._project_chat.get_conversation_history, session_id, limit=revert_ops.HISTORY_LIMIT
+            )
+        if not messages:
+            self._revert_choices.pop((user_id, chat_id), None)
+            return "📭 No conversation history available to revert."
+        remember = functools.partial(
+            self._remember_revert_choice, key, session,
+            user_id=user_id, chat_id=chat_id, session_id=session_id, messages=messages,
+        )
+        if number is None:
+            await remember()
+            return self._render_revert_messages(messages, page)
+        if not 1 <= number <= len(messages):
+            return "❌ Invalid number, please try again."
+        if mode is None:
+            await remember(selected=number)
+            return self._render_revert_modes(messages[number - 1])
+        return await self._finish_revert(
+            user_id=user_id, chat_id=chat_id, session_id=session_id,
+            selected=messages[number - 1], mode=mode,
+        )
+
+    async def _select_revert_choice(self, body: str, *, user_id: int, chat_id: int) -> str | None:
+        """A bare number answers a pending /revert menu; anything else is a normal turn.
+
+        A non-number drops the menu and returns ``None`` (the message runs as a
+        normal turn, like the /resume digit reply). An out-of-range number
+        keeps the menu open; a number after the menu expired gets
+        :data:`REVERT_MENU_EXPIRED` instead of reaching the agent.
+        """
+
+        if (user_id, chat_id) not in self._revert_choices:
+            return None
+        text = body.strip()
+        if not self._check_user_access(user_id) or re.fullmatch(r"[0-9]+", text) is None:
+            self._revert_choices.pop((user_id, chat_id), None)  # #1955 owner-only
+            return None
+        pending, expired = self._live_revert_choice(user_id, chat_id)
+        if pending is None:
+            return REVERT_MENU_EXPIRED if expired else None
+        unavailable = self._revert_unavailable()
+        if unavailable is not None:
+            self._revert_choices.pop((user_id, chat_id), None)
+            return unavailable
+        number = int(text)
+        messages = pending["messages"]
+        key = self._conversation_key(user_id, chat_id)
+        session = await self._session_manager.get_session(key)
+        session_id = self._effective_session_id(key, session)
+        if session_id is None or session_id != pending["session_id"]:
+            self._revert_choices.pop((user_id, chat_id), None)
+            return "❌ The session changed since /revert. Send /revert again."
+        if pending["selected"] is None:
+            if not 1 <= number <= len(messages):
+                return "❌ Invalid number, please try again."
+            await self._remember_revert_choice(
+                key, session, user_id=user_id, chat_id=chat_id,
+                session_id=session_id, messages=messages, selected=number,
+            )
+            return self._render_revert_modes(messages[number - 1])
+        mode = self._revert_mode(text)
+        if mode is None:
+            return "❌ Invalid number, please try again."
+        return await self._finish_revert(
+            user_id=user_id, chat_id=chat_id, session_id=session_id,
+            selected=messages[int(pending["selected"]) - 1], mode=mode,
+        )
+
+    async def _finish_revert(
+        self, *, user_id: int, chat_id: int, session_id: str, selected: Mapping[str, Any], mode: str
+    ) -> str:
+        """Run one chosen mode; the menu is closed whatever the outcome."""
+
+        self._revert_choices.pop((user_id, chat_id), None)
+        if mode == "cancel":
+            return "❌ Revert cancelled"
+        if mode == "summary":
+            # Telegram's summarize mode is a logged no-op too (_execute_summarize_mode);
+            # say so instead of claiming a restore.
+            logger.info("Matrix /revert summarize mode requested; transcript unchanged")
+            return "📋 Summarize-from-here does not rewrite the transcript yet; nothing was reverted."
+        msg_index = int(selected.get("index", -1))
+        conversations_dir = getattr(self._project_chat, "conversations_dir", None)
+        if msg_index < 0 or conversations_dir is None:
+            return "❌ Revert operation failed"
+        # Same order as Telegram's _execute_revert: cancel, truncate, then drop
+        # the provider stream so the next turn resumes the shortened transcript.
+        await self._cancel_turn(user_id, chat_id)
+        try:
+            reverted = await asyncio.to_thread(
+                revert_ops.revert_conversation, Path(conversations_dir), session_id, msg_index
+            )
+            if reverted:
+                await self._project_chat.clear_user_stream(user_id, chat_id)
+        except Exception as exc:
+            logger.error("Matrix /revert failed: %s", type(exc).__name__)
+            return "❌ Revert failed."
+        if not reverted:
+            return "❌ Revert operation failed"
+        logger.info("Matrix conversation reverted to before message %s (mode: %s)", msg_index, mode)
+        timestamp = str(selected.get("timestamp") or "")
+        try:
+            when = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            when = timestamp[:19]
+        content = str(selected.get("content") or "")
+        preview = (content[:80] + "...") if len(content) > 80 else content
+        preview = preview.replace("\n", " ")
+        if when and preview:
+            return f"✅ Reverted to before:\n\n[{when}]\n{preview}\n\nConversation state restored."
+        if when:
+            return f"✅ Reverted to before [{when}]. Conversation state restored."
+        return "✅ Revert completed successfully."
 
     async def _cmd_task_pause(self, args: list[str], *, user_id: int, chat_id: int) -> str:
         if args:
