@@ -74,6 +74,24 @@ class DeliveryStrategyTest(unittest.TestCase):
         long_english = " ".join(["word"] * 1001)
         self.assertEqual(media.voice_delivery_strategy(long_english), "text_only")
 
+    # #2257: Hangul syllables, matched to the English rule by spoken length.
+    def test_short_korean_is_voice_only(self):
+        self.assertEqual(media.voice_delivery_strategy("안녕하세요, 확인했습니다."), "voice_only")
+
+    def test_korean_at_threshold_still_speaks(self):
+        # Spaces between words are not syllables: 2000 blocks + 399 spaces.
+        text = " ".join(["가나다라마"] * 400)
+        self.assertEqual(media.count_hangul_syllables(text), media.VOICE_LONG_HANGUL_THRESHOLD)
+        self.assertEqual(media.voice_delivery_strategy(text), "voice_and_text")
+
+    def test_long_korean_is_text_only(self):
+        text = " ".join(["가나다라마"] * 400) + " 끝"
+        self.assertEqual(media.voice_delivery_strategy(text), "text_only")
+
+    def test_bare_jamo_are_not_syllables(self):
+        self.assertEqual(media.count_hangul_syllables("ㅋ" * 3000), 0)
+        self.assertEqual(media.voice_delivery_strategy("ㅋ" * 3000), "voice_and_text")
+
 
 class UrlTest(unittest.TestCase):
     def test_redacts_bot_token(self):

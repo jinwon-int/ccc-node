@@ -879,6 +879,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                     await early_task
             if not initialize:
                 await self._enqueue_shutdown_distills()
+            # #2257: no voice synthesis outlives the transport (temp files go with it).
+            await self._cancel_voice_replies()
             self._transport = None
             self._stop_health_reporting()
             await transport.close()
@@ -2395,7 +2397,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 responses=responses,
             )
             if voice_input and responses:
-                await self._queue_voice_reply(responses[0], room_id, directory)
+                self._queue_voice_reply(responses[0], room_id, directory)
             return result
         finally:
             for path in paths:
@@ -2415,29 +2417,80 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             logger.warning("Matrix voice transcription failed error=%s", type(exc).__name__)
             return "", voice.VOICE_FAILED
 
-    async def _queue_voice_reply(self, response: Any, room_id: str, directory: Path) -> None:
+    def _queue_voice_reply(self, response: Any, room_id: str, directory: Path) -> None:
+        """Start synthesizing the voice reply *outside* the turn (#2257).
+
+        The turn returns its finished text at once; the speech follows as a
+        file filed by the parent turn's state when synthesis ends (see
+        ``MatrixStore.file_for_turn``). The parent id is captured here, while
+        the turn still owns ``_active_turn_id``.
+        """
         from telegram_bot.core import media
-        from telegram_bot.core.matrix import voice
 
         transport = self._transport
-        enqueue = getattr(transport, "enqueue_voice", None)
         content = str(getattr(response, "content", "") or "")
-        # Opt-in (MATRIX_VOICE_REPLY, default off): synthesis currently runs inside the turn and
-        # holds back the finished text reply for up to VOICE_TIMEOUT_S (#2253 review, follow-up).
+        # Opt-in (MATRIX_VOICE_REPLY, default off) until the out-of-turn path
+        # has been re-reviewed (#2257 item 5).
         if not getattr(self._settings, "matrix_voice_reply", False):
             return
         if not (getattr(response, "success", True) and content.strip() and media.is_macos()):
             return
-        if not callable(enqueue) or transport.room_kind(room_id) != "direct":
+        if not callable(getattr(transport, "enqueue_voice", None)) or transport.room_kind(room_id) != "direct":
             return
         if media.voice_delivery_strategy(content) == "text_only":
             return
+        parent = self._active_turn_id
+        if not parent:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._synthesize_voice_reply(content, room_id, directory, parent), name="matrix-voice-reply"
+        )
+        tasks = self._voice_reply_tasks()
+        tasks[task] = room_id
+        task.add_done_callback(lambda done: tasks.pop(done, None))
+
+    def _voice_reply_tasks(self) -> dict[asyncio.Task[None], str]:
+        """In-flight voice syntheses by room (lazy: keeps the voice path self-contained)."""
+        tasks: dict[asyncio.Task[None], str] | None = getattr(self, "_voice_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._voice_tasks = tasks
+        return tasks
+
+    async def _synthesize_voice_reply(self, content: str, room_id: str, directory: Path, parent: str) -> None:
+        """Synthesize and file one voice reply; never touches the text answer or the turn state."""
+        from telegram_bot.core.matrix import voice
+
+        started = time.monotonic()
+        outcome = "unavailable"
         try:
+            # ``synthesize`` removes its private temporary directory on every
+            # exit, cancellation included, and reaps the audio subprocesses.
             data = await voice.synthesize(content, self._settings, directory)
-            enqueue(room_id, data, key=f"voice-{self._active_turn_id}", after=self._active_turn_id)
+            transport = self._transport
+            enqueue = getattr(transport, "enqueue_voice", None)
+            if not callable(enqueue):
+                outcome = "no-transport"
+                return
+            outcome = str(enqueue(room_id, data, key=f"voice-{parent}", after=parent) or "queued")
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except Exception as exc:
             # The complete text reply is still the parent outbox row.
-            logger.warning("Matrix voice reply unavailable error=%s", type(exc).__name__)
+            outcome = "failed:" + type(exc).__name__
+        finally:
+            log = logger.warning if outcome.startswith("failed") else logger.info
+            log("Matrix voice reply outcome=%s elapsed=%.1fs", outcome, time.monotonic() - started)
+
+    async def _cancel_voice_replies(self, room_id: str | None = None) -> int:
+        """Cancel in-flight voice syntheses (one room, or all on shutdown) and wait for their cleanup."""
+        tasks = [task for task, room in self._voice_reply_tasks().items() if room_id is None or room == room_id]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)
 
     @staticmethod
     def _attachment_prompt(path: Path, attachment: Mapping[str, Any], caption: str) -> str:
@@ -2465,12 +2518,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
     async def stop_idle(self, job: Mapping[str, Any]) -> bool:
         """``/stop`` with no turn running in the sender's scope (#1825).
 
-        Cancels that conversation's queued continuations; ``False`` (nothing
-        queued) leaves the transport's ordinary invalid-control answer.
+        Cancels that conversation's queued continuations and in-flight voice
+        reply synthesis (#2257); ``False`` (nothing to stop) leaves the
+        transport's ordinary invalid-control answer.
         """
 
         user_id, chat_id = self._control_identity(job)
-        return bool(self._cancel_continuations(user_id, chat_id))
+        voice = await self._cancel_voice_replies(str(job["room_id"]))
+        return bool(self._cancel_continuations(user_id, chat_id)) or bool(voice)
 
     async def cancel(self, job: Mapping[str, Any]) -> bool:
         """``TurnRunner.cancel``: same handler path as ``/stop``."""
@@ -2479,6 +2534,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         # Only a user control (/stop, /cancel <turn>) reaches this runner seam;
         # the turn timeout cancels the task directly.
         self._cancel_continuations(user_id, chat_id)
+        await self._cancel_voice_replies(str(job["room_id"]))  # #2257: an earlier turn's speech too
         return await self._cancel_turn(user_id, chat_id)
 
     @staticmethod

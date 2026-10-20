@@ -24,6 +24,12 @@ from typing import Any, BinaryIO, Optional, Tuple
 VOICE_TEXT_CHAR_THRESHOLD = 300
 VOICE_LONG_HANZI_THRESHOLD = 1000
 VOICE_LONG_ENGLISH_WORD_THRESHOLD = 1000
+# #2257: Hangul syllable blocks, matched to the English threshold by spoken
+# length rather than by count. 1000 English words at ~150 words/min is about
+# 400 s of speech; read Korean runs at ~5 syllables/s, and one Hangul block is
+# one syllable, so ~400 s is ~2000 blocks. Spaces and punctuation are not
+# counted (as the English rule counts words, not characters).
+VOICE_LONG_HANGUL_THRESHOLD = 2000
 
 
 def resolve_voice_extension(mime_type: Optional[str]) -> str:
@@ -52,6 +58,11 @@ def is_macos() -> bool:
 
 def count_hanzi(text: str) -> int:
     return len(re.findall(r"[一-鿿]", text))
+
+
+def count_hangul_syllables(text: str) -> int:
+    """Precomposed Hangul syllable blocks (U+AC00..U+D7A3); bare jamo are not syllables."""
+    return len(re.findall(r"[\uac00-\ud7a3]", text))
 
 
 def count_english_words(text: str) -> int:
@@ -86,6 +97,7 @@ def voice_delivery_strategy(content: str) -> str:
     if (
         hanzi_count > VOICE_LONG_HANZI_THRESHOLD
         or english_word_count > VOICE_LONG_ENGLISH_WORD_THRESHOLD
+        or count_hangul_syllables(content) > VOICE_LONG_HANGUL_THRESHOLD
     ):
         return "text_only"
     if len(content) > VOICE_TEXT_CHAR_THRESHOLD:
