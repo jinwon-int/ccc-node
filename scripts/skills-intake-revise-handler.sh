@@ -7,12 +7,14 @@
 # stdin; this script prints the TaskResult JSON on stdout. Exit 0 = terminal
 # result. Any nonzero exit fails the task as `handler_exit_nonzero`; the exit
 # code is kept in the task error's details.code. Exit codes (#1460):
-#   1 = environment / agent-run failure (missing tool, empty packet, the
-#       reviser agent crashed or timed out, ...)
-#   3 = deterministic result failure the composer detected (HANDLER_FAIL on
-#       stderr: unparseable, ambiguous, unbound, unsafe or no-op revise
-#       result) — rerunning the same packet cannot help. An uncaught composer
-#       error still exits 1.
+#   1 = environment / agent-run failure (missing tool, invalid node config
+#       such as a reviser command line without a tool lock or a malformed
+#       timeout, an empty / incomplete / oversized packet, the reviser agent
+#       crashed or timed out, ...)
+#   3 = deterministic result failure (HANDLER_FAIL on stderr: unparseable,
+#       ambiguous, unbound, unsafe, oversized or no-op revise result) —
+#       rerunning the same packet cannot help. An uncaught composer error
+#       still exits 1.
 # The broker retries a failed task only when its payload carries a retryPolicy
 # (planClassAwareTaskRetry → no_retry_policy). The skills_intake_revise
 # dispatch in ccc-skill-promotion.py sets none, so either code fails the task
@@ -31,13 +33,49 @@
 #   REVIEW_AGENT_BIN / REVIEW_AGENT_ARGS   tool-blocked reviser command line
 #                                          (default: claude / "-p --disallowed-tools *")
 #   REVISE_TIMEOUT_SEC (fallback REVIEW_TIMEOUT_SEC, default 480)
+#   REVISE_KILL_GRACE_SEC  SIGKILL grace after the timeout's SIGTERM
+#                          (default 30, the `timeout -k 30` the headless
+#                          runners use) so a hung reviser cannot outlive the
+#                          budget by ignoring SIGTERM (#1460 P2)
+#
+# Tool lock (#1460 P2): an override of REVIEW_AGENT_ARGS is checked, not
+# trusted. The reviser runs only when the command line keeps a total tool
+# lock — `--disallowed-tools *` / `--disallowedTools *` (or `=*`), `--no-tools`
+# (pi-style agents), or the danso-review-agent.sh wrapper, which always runs
+# danso with --no-tools. A command line that drops the lock, narrows it to
+# something other than `*`, or adds an allow-list / permission bypass
+# (--allowed-tools, --allowedTools, --tools, --dangerously-skip-permissions)
+# fails closed with exit 1 before the agent starts: it is node configuration,
+# not a property of the packet.
+#
+# Reviser node id (#1460 P2): one value, resolved once, used in the prompt
+# bindings, output.reviser_node and validations[].nodeId. Precedence:
+# WORKER_ID, then A2A_WORKER_ID, then `hostname -s`, then "unknown".
+#
+# Size caps (#1460 P2) — symmetric on both sides of the reviser, matching the
+# publisher (ccc-skill-promotion.py _MAX_FILES / _MAX_FILE_BYTES /
+# _MAX_TOTAL_BYTES):
+#   packet skillFiles (input)    1..16 files, <= 64 KiB each, <= 256 KiB total;
+#                                a packet over the caps fails (exit 1) before
+#                                the agent runs, so it never spends a reviser
+#                                run on a result the caps would reject.
+#   revised skillFiles (return)  the same 16 / 64 KiB / 256 KiB (exit 3).
+#   raw reviser stdout (return)  <= 1 MiB (MAX_REVISER_OUTPUT_BYTES, the
+#                                publisher's command-output cap); more is an
+#                                oversized result (exit 3).
 set -uo pipefail
 
 REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-480}"
 REVISION_TIMEOUT_SEC="${REVISE_TIMEOUT_SEC:-$REVIEW_TIMEOUT_SEC}"
+REVISE_KILL_GRACE_SEC="${REVISE_KILL_GRACE_SEC:-30}"
 REVIEW_AGENT_BIN="${REVIEW_AGENT_BIN:-claude}"
 REVIEW_AGENT_ARGS="${REVIEW_AGENT_ARGS:--p --disallowed-tools *}"
-REVISER_NODE="${WORKER_ID:-$(hostname -s 2>/dev/null || echo unknown)}"
+REVISER_NODE="${WORKER_ID:-${A2A_WORKER_ID:-$(hostname -s 2>/dev/null || true)}}"
+[ -n "$REVISER_NODE" ] || REVISER_NODE="unknown"
+MAX_FILES=16
+MAX_FILE_BYTES=$((64 * 1024))
+MAX_TOTAL_BYTES=$((256 * 1024))
+MAX_REVISER_OUTPUT_BYTES=$((1024 * 1024))
 
 log() { echo "skills-intake-revise-handler: $*" >&2; }
 fail() { echo "skills-intake-revise-handler: $*" >&2; exit 1; }
@@ -45,11 +83,54 @@ command -v jq >/dev/null 2>&1 || fail "jq required"
 command -v python3 >/dev/null 2>&1 || fail "python3 required"
 command -v timeout >/dev/null 2>&1 || fail "timeout required"
 
+case "$REVISION_TIMEOUT_SEC" in
+  ''|*[!0-9]*|0) fail "invalid revise timeout: ${REVISION_TIMEOUT_SEC:0:16} (need a positive integer)" ;;
+esac
+case "$REVISE_KILL_GRACE_SEC" in
+  ''|*[!0-9]*|0) fail "invalid REVISE_KILL_GRACE_SEC: ${REVISE_KILL_GRACE_SEC:0:16} (need a positive integer)" ;;
+esac
+
+# Returns 0 when the reviser command line keeps a total tool lock (see the
+# header). $1 = agent basename, rest = REVIEW_AGENT_ARGS tokens.
+reviser_tool_locked() {
+  local agent="$1" locked=0 prev="" tok
+  shift
+  [ "$agent" = "danso-review-agent.sh" ] && locked=1
+  for tok in "$@"; do
+    case "$tok" in
+      --allowed-tools|--allowed-tools=*|--allowedTools|--allowedTools=*|--tools|--tools=*|--dangerously-skip-permissions)
+        return 1 ;;
+      '--disallowed-tools=*'|'--disallowedTools=*'|--no-tools) locked=1 ;;
+    esac
+    if [ "$prev" = "--disallowed-tools" ] || [ "$prev" = "--disallowedTools" ]; then
+      [ "$tok" = "*" ] && locked=1
+    fi
+    prev="$tok"
+  done
+  [ "$locked" = 1 ]
+}
+read -ra reviser_args_tokens <<<"${REVIEW_AGENT_ARGS:-}"
+reviser_agent="$(basename "${REVIEW_AGENT_BIN:-unknown}")"
+reviser_tool_locked "$reviser_agent" "${reviser_args_tokens[@]}" \
+  || fail "reviser command line lacks a total tool lock (REVIEW_AGENT_ARGS must keep --disallowed-tools * or --no-tools; allow-lists are refused)"
+
 task_json="$(cat 2>/dev/null)" || fail "stdin read failed"
 [ -n "$task_json" ] || fail "empty task"
 
 tmp="$(mktemp -d)" || fail "mktemp failed"
+agent_pid=""
 trap 'rm -rf "$tmp"' EXIT
+# bash already runs the EXIT trap on a fatal TERM/INT/HUP; these traps add
+# forwarding so a worker-side kill stops the reviser too instead of leaving
+# it running past the handler. TERM, not the received signal: a background
+# job inherits SIGINT ignored.
+on_signal() {
+  [ -n "$agent_pid" ] && kill -TERM "$agent_pid" 2>/dev/null
+  exit "$1"
+}
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 printf '%s' "$task_json" > "$tmp/task.json"
 
 task_id="$(jq -r '.id // empty' "$tmp/task.json")"
@@ -63,6 +144,9 @@ esac
 skill_name="$(jq -r '.payload.skillName // empty' "$tmp/task.json")"
 tree_sha="$(jq -r '.payload.provenance.source_tree_sha256 // empty' "$tmp/task.json")"
 round_no="$(jq -r '.payload.provenance.revise_round // empty' "$tmp/task.json")"
+# One round value for the prompt bindings and the result (#1460 P2: the
+# prompt used to say "?" while the result said 1).
+round_no="${round_no:-1}"
 [ -n "$skill_name" ] && [ -n "$tree_sha" ] \
   || fail "packet bindings incomplete (need skillName, provenance.source_tree_sha256)"
 
@@ -77,8 +161,37 @@ jq -r '.payload.findings // [] | if length == 0 then empty else
   "$tmp/task.json" > "$tmp/findings.txt"
 [ -s "$tmp/findings.txt" ] || fail "packet lacks findings"
 
-# Candidate copy to revise (untrusted). Bounds are enforced upstream
-# (16 files / 64KiB each); re-checked below on the returned set.
+# Candidate copy to revise (untrusted). The publisher bounds it upstream;
+# the same caps are re-checked here on the packet (before any agent run) and
+# below on the returned set, so the two sides cannot drift apart (#1460 P2).
+cap_err="$(python3 - "$tmp/task.json" "$MAX_FILES" "$MAX_FILE_BYTES" "$MAX_TOTAL_BYTES" <<'PYEOF'
+import json, sys
+max_files, max_file, max_total = (int(v) for v in sys.argv[2:5])
+try:
+    with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+        files = json.load(handle).get("payload", {}).get("skillFiles")
+except Exception:
+    print("packet unreadable")
+    sys.exit(0)
+if files is None or files == []:
+    sys.exit(0)  # reported as "packet lacks skillFiles" below
+if not isinstance(files, list) or len(files) > max_files:
+    print(f"packet skillFiles must be a 1..{max_files} element array")
+    sys.exit(0)
+total = 0
+for item in files:
+    if not isinstance(item, dict) or not isinstance(item.get("path"), str) \
+            or not isinstance(item.get("content"), str):
+        print("packet skillFiles entries need string path and content")
+        sys.exit(0)
+    size = len(item["content"].encode("utf-8", errors="surrogatepass"))
+    total += size
+    if size > max_file or total > max_total:
+        print(f"packet skillFiles exceed the size caps ({max_file} bytes/file, {max_total} bytes total)")
+        sys.exit(0)
+PYEOF
+)" || fail "packet size check failed"
+[ -z "$cap_err" ] || fail "$cap_err"
 jq -r '.payload.skillFiles // [] | if length == 0 then empty else
   map("### FILE: " + .path + "\n" + .content) | join("\n\n") end' \
   "$tmp/task.json" > "$tmp/skillfiles.txt"
@@ -108,7 +221,7 @@ HDR
   cat "$tmp/schema.json"
   echo "## Bindings (must appear in the result JSON)"
   printf 'skillName: %s\nsourceTreeSha256: %s\nrevision round: %s\nreviser_node: %s\n' \
-    "$skill_name" "$tree_sha" "${round_no:-?}" "$REVISER_NODE"
+    "$skill_name" "$tree_sha" "$round_no" "$REVISER_NODE"
 } > "$tmp/prompt.txt"
 
 log "prompt built: $(wc -c < "$tmp/prompt.txt") bytes"
@@ -116,9 +229,8 @@ log "prompt built: $(wc -c < "$tmp/prompt.txt") bytes"
 # executed — agent family from the binary basename, model from an explicit
 # --model argument when the fleet config carries one, else the agent's
 # self-report.
-reviser_agent="$(basename "${REVIEW_AGENT_BIN:-unknown}")"
+# (reviser_agent and reviser_args_tokens were resolved with the tool lock.)
 reviser_model_arg=""
-read -ra reviser_args_tokens <<<"${REVIEW_AGENT_ARGS:-}"
 _prev_arg=""
 for _tok in "${reviser_args_tokens[@]}"; do
   if [ -z "$reviser_model_arg" ]; then
@@ -131,31 +243,51 @@ for _tok in "${reviser_args_tokens[@]}"; do
   _prev_arg="$_tok"
 done
 read -ra reviser_argv <<<"$REVIEW_AGENT_BIN $REVIEW_AGENT_ARGS"
-if ! model_out="$(timeout "$REVISION_TIMEOUT_SEC" "${reviser_argv[@]}" < "$tmp/prompt.txt" 2>"$tmp/agent.err")"; then
+# `-k`: SIGKILL after the grace when the reviser ignores the SIGTERM at the
+# budget (#1460 P2). The run is a background job + `wait` so the signal traps
+# above fire at once and can forward the kill; stdout goes to a file so its
+# size can be capped without holding it in a shell variable.
+timeout -k "$REVISE_KILL_GRACE_SEC" "$REVISION_TIMEOUT_SEC" "${reviser_argv[@]}" \
+  < "$tmp/prompt.txt" > "$tmp/model-out.txt" 2> "$tmp/agent.err" &
+agent_pid=$!
+agent_rc=0
+wait "$agent_pid" || agent_rc=$?
+agent_pid=""
+if [ "$agent_rc" -ne 0 ]; then
   # Surface BOTH streams: `claude -p` reports quota exhaustion on stdout with
   # empty stderr (nosuk pr75/76 lesson, 2026-08-30).
-  agent_out="$(printf '%s' "$model_out" | tail -c 300 | tr "\n" " ")"
+  agent_out="$(tail -c 300 "$tmp/model-out.txt" 2>/dev/null | tr "\n" " ")"
   agent_err="$(tail -c 300 "$tmp/agent.err" 2>/dev/null | tr "\n" " ")"
-  log "reviser agent run failed: out[${agent_out}] err[${agent_err}]"
+  case "$agent_rc" in
+    124) log "reviser agent timed out after ${REVISION_TIMEOUT_SEC}s" ;;
+    137) log "reviser agent killed after ${REVISION_TIMEOUT_SEC}s + ${REVISE_KILL_GRACE_SEC}s grace" ;;
+  esac
+  log "reviser agent run failed (rc=${agent_rc}): out[${agent_out}] err[${agent_err}]"
   fail "reviser agent run failed"
 fi
-[ -n "$model_out" ] || fail "empty reviser output"
-printf '%s' "$model_out" > "$tmp/model-out.txt"
+out_bytes="$(wc -c < "$tmp/model-out.txt" | tr -d '[:space:]')"
+if [ "${out_bytes:-0}" -gt "$MAX_REVISER_OUTPUT_BYTES" ]; then
+  # Return-side cap (#1460 P2): deterministic oversized result, exit 3.
+  echo "HANDLER_FAIL: reviser output exceeds ${MAX_REVISER_OUTPUT_BYTES} bytes (bytes=${out_bytes})" >&2
+  exit 3
+fi
+[ -n "$(tr -d '[:space:]' < "$tmp/model-out.txt" | head -c 1)" ] || fail "empty reviser output"
 
 compose_rc=0
-task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "${round_no:-1}" "$reviser_agent" "$reviser_model_arg" "$tmp/task.json" <<'PYEOF'
-import json, os, sys
+task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "$round_no" "$reviser_agent" "$reviser_model_arg" "$tmp/task.json" \
+  "$REVISER_NODE" "$MAX_FILES" "$MAX_FILE_BYTES" "$MAX_TOTAL_BYTES" <<'PYEOF'
+import json, sys
 
 # errors="replace": undecodable reviser bytes are an unparseable result
 # (die → exit 3 below), not a composer crash (exit 1).
 raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 task_id, skill_name, tree, round_no, reviser_agent, reviser_model_arg = sys.argv[2:8]
 task_path = sys.argv[8]
-reviser_node = os.environ.get("WORKER_ID") or os.environ.get("A2A_WORKER_ID") or "unknown"
-
-MAX_FILES = 16
-MAX_FILE_BYTES = 64 * 1024
-MAX_TOTAL_BYTES = 256 * 1024
+# Single source (#1460 P2): the shell resolved the node id once and printed
+# the same value in the prompt bindings.
+reviser_node = sys.argv[9]
+# Caps come from the shell constants that also bound the packet (#1460 P2).
+MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES = (int(v) for v in sys.argv[10:13])
 
 
 def die(message):
@@ -267,7 +399,7 @@ if outcome == "revised":
         die("revised result lacks a changeSummary")
     raw_files = result_obj.get("skillFiles")
     if not isinstance(raw_files, list) or not 1 <= len(raw_files) <= MAX_FILES:
-        die("revised result skillFiles must be a 1..16 element array")
+        die(f"revised result skillFiles must be a 1..{MAX_FILES} element array")
     seen = set()
     total = 0
     cleaned = []
@@ -283,7 +415,10 @@ if outcome == "revised":
         if path in seen:
             die(f"duplicate candidate path {path[:40]!r}")
         seen.add(path)
-        encoded = content.encode("utf-8")
+        try:
+            encoded = content.encode("utf-8")
+        except UnicodeEncodeError:
+            die(f"candidate {path[:40]!r} content is not encodable as UTF-8")
         total += len(encoded)
         if len(encoded) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
             die("revised result exceeds the packet size caps")
