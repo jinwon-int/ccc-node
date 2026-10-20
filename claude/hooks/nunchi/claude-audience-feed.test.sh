@@ -230,6 +230,66 @@ ok "an old sidecar whose session still has a pending job is kept" \
   "[ -f '$aud/shared/claude/session-map/$SID_OLD_PENDING.json' ]"
 ok "fresh sidecars are kept" "[ -f '$aud/shared/claude/session-map/$SID_ROOM.json' ]"
 
+# --- 4c. default discovery routes every frontend journal (#2350) -------------
+# No CCC_BRIDGE_DISTILL_JOURNAL: the Matrix and Telegram journals under $HOME
+# are both routed in ONE router run (repeated --journal) into their own
+# audience stores; the scoped distill-history is walked once.
+mhome="$TMP/multi-home"
+mkdir -p "$mhome/.claude/state" "$mhome/.nunchi" \
+  "$mhome/.ccc-matrix/distill-journal" "$mhome/.telegram_bot/distill-journal"
+printf 'on' > "$mhome/.claude/state/nunchi.mode"
+job "$mhome/.ccc-matrix/distill-journal/m.json" "$SID_OWNER" "multi-matrix-dm-fact" extraction_done private "$PRIV"
+job "$mhome/.telegram_bot/distill-journal/t.json" "$SID_ROOM" "multi-telegram-room-fact" extraction_done shared shared
+# One unmapped job per journal, and the scope's misplaced history item from
+# 2c (invalid): a per-journal loop would count that history item twice.
+job "$mhome/.ccc-matrix/distill-journal/um.json" "99999999-0000-4000-8000-00000000000c" "multi-unmapped-a" extraction_done private "$PRIV"
+job "$mhome/.telegram_bot/distill-journal/ut.json" "99999999-0000-4000-8000-00000000000d" "multi-unmapped-b" extraction_done shared shared
+# A pending job in the Matrix journal whose sidecar is past the prune age:
+# the run that also reads the Telegram journal must still see it as pending.
+SID_PEND_A="9a9a9a9a-0000-4000-8000-00000000000e"
+sidecar shared "$SID_PEND_A"
+touch -d '100 days ago' "$aud/shared/claude/session-map/$SID_PEND_A.json"
+job "$mhome/.ccc-matrix/distill-journal/pending.json" "$SID_PEND_A" "" running
+multi_cron() {
+  env -u CCC_BRIDGE_DISTILL_JOURNAL -u CCC_AGENT_PROVIDER -u CCC_FRONTENDS -u CCC_FRONTENDS_FILE \
+    HOME="$mhome" CCC_STATE_DIR="$mhome/.claude/state" NUNCHI_HOME="$mhome/.nunchi" \
+    CCC_BRIDGE_ENV_FILE="$TMP/no-such.env" \
+    CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT="$aud" "$@" \
+    bash "$hooks/ingest-cron.sh" >"$TMP/out" 2>"$TMP/err"
+}
+multi_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]))' "$mhome/.nunchi/ingest.status.json" "$1"; }
+: > "$TMP/calls.log"
+multi_cron
+ok "multi-journal scoped: Matrix DM job lands in the private scope" \
+  "ingests_into '$aud/$PRIV/nunchi/facts.db' | grep -q 'multi-matrix-dm-fact'"
+ok "multi-journal scoped: Telegram room job lands in the shared scope" \
+  "ingests_into '$aud/shared/nunchi/facts.db' | grep -q 'multi-telegram-room-fact'"
+ok "multi-journal scoped: both jobs are marked seen" \
+  "grep -qxF '$mhome/.ccc-matrix/distill-journal/m.json' '$mhome/.nunchi/ingested-files' && grep -qxF '$mhome/.telegram_bot/distill-journal/t.json' '$mhome/.nunchi/ingested-files'"
+ok "multi-journal scoped: scoped history counted once + two journals" \
+  "[ \"\$(multi_field sources)\" = 4 ]"
+ok "multi-journal scoped: one unmapped job per journal, counted once each" \
+  "[ \"\$(multi_field unmapped)\" = 2 ]"
+ok "multi-journal scoped: the scoped history rejection is not multiplied" \
+  "[ \"\$(multi_field invalid)\" = 1 ]"
+ok "multi-journal scoped: the pending job is deferred once" "[ \"\$(multi_field deferred)\" = 1 ]"
+ok "multi-journal scoped: an old sidecar with a pending job in another journal is kept" \
+  "[ -f '$aud/shared/claude/session-map/$SID_PEND_A.json' ]"
+ok "multi-journal scoped: no skip reason" "[ \"\$(multi_field skipped)\" = None ]"
+ok "multi-journal scoped: one router run (one snapshot per touched scope)" \
+  "[ \"\$(awk -F'\t' '\$1==\"snapshot\"' '$TMP/calls.log' | wc -l | tr -d ' ')\" = 2 ]"
+: > "$TMP/calls.log"
+multi_cron
+ok "multi-journal scoped: a second tick re-ingests nothing" \
+  "! grep -q 'multi-matrix-dm-fact\\|multi-telegram-room-fact' '$TMP/calls.log'"
+printf 'matrix\n' > "$mhome/.claude/frontends"
+job "$mhome/.telegram_bot/distill-journal/t2.json" "$SID_ROOM" "multi-retired-telegram-fact" extraction_done shared shared
+: > "$TMP/calls.log"
+multi_cron
+ok "multi-journal scoped: Telegram excluded by the frontend list is not routed" \
+  "! grep -q 'multi-retired-telegram-fact' '$TMP/calls.log'"
+rm -f "$mhome/.claude/frontends"
+
 # --- 5. the unscoped Claude lane is unchanged ---------------------------------
 : > "$TMP/calls.log"
 env -u CCC_BRIDGE_DISTILL_JOURNAL HOME="$home" CCC_STATE_DIR="$state" \

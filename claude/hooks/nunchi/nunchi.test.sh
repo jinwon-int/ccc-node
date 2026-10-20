@@ -475,7 +475,9 @@ ok "env CCC_NUNCHI_MODE overrides mode file" '[ -z "$out" ]'
 # ---- 8. ingest-cron e2e (mode on, isolated state) ---------------------------
 mkdir -p "$CCC_STATE_DIR/distill-history"
 payload cron1 fact user "크론 미러 테스트 사실" > "$CCC_STATE_DIR/distill-history/t1.json"
-bash "$HERE/ingest-cron.sh"
+# Pin the journal: the default walks every frontend journal under the real
+# $HOME (#2350), which would read live data into this fixture.
+CCC_BRIDGE_DISTILL_JOURNAL="$TMP/no-journal" bash "$HERE/ingest-cron.sh"
 out="$(python3 "$NP" recall "크론 미러 테스트" 2>&1)"
 ok "ingest-cron mirrors distill-history" 'grep -q "크론 미러" <<<"$out"'
 ok "ingest-cron marks file seen" 'grep -q "t1.json" "$NUNCHI_HOME/ingested-files"'
