@@ -59,7 +59,7 @@ class RunArgvTests(unittest.TestCase):
             seen.append(list(args))
             return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
-        with patch.object(promotion.subprocess, "run", side_effect=fake_run):
+        with patch.object(promotion, "run_with_graceful_timeout", side_effect=fake_run):
             promotion._run(argv)
         return seen[0]
 
