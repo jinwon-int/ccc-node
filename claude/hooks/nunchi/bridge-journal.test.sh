@@ -190,6 +190,94 @@ before="$(wc -l < "$TMP/ingested.log")"
 run_cron
 ok "disabled nunchi ingests nothing" "[ \$(wc -l < '$TMP/ingested.log') -eq $before ]"
 
+# ------------------------------- default journal discovery (#2350) --
+# Without CCC_BRIDGE_DISTILL_JOURNAL every existing frontend journal is a
+# source: Matrix, hande and Telegram. Telegram is skipped when the frontend
+# list (CCC_FRONTENDS, else ~/.claude/frontends) exists and does not name it.
+disc_home() {  # <name> -> prints a fresh home with nunchi enabled
+  local h="$TMP/disc-$1"
+  mkdir -p "$h/.claude/state" "$h/.nunchi"
+  printf 'on' > "$h/.claude/state/nunchi.mode"
+  printf '%s\n' "$h"
+}
+disc_job() {  # <home> <journal-dir-rel> <fact-text>
+  mkdir -p "$1/$2"
+  job extraction_done "[{\"kind\":\"fact\",\"subject\":\"node\",\"text\":\"$3\"}]" > "$1/$2/$3.json"
+}
+disc_cron() {  # <home> [env assignments...]
+  local h="$1"; shift
+  env -u CCC_BRIDGE_DISTILL_JOURNAL -u CCC_FRONTENDS -u CCC_FRONTENDS_FILE \
+    HOME="$h" CCC_STATE_DIR="$h/.claude/state" NUNCHI_HOME="$h/.nunchi" "$@" \
+    bash "$hooks/ingest-cron.sh" >"$TMP/disc.out" 2>"$TMP/disc.err"
+}
+disc_sources() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sources"])' "$1/.nunchi/ingest.status.json"
+}
+
+# Matrix-only node (Telegram retired, no frontend list): the old default
+# ingested nothing here.
+h="$(disc_home matrix-only)"
+disc_job "$h" .ccc-matrix/distill-journal matrix-only-fact
+disc_cron "$h"
+ok "matrix-only: the Matrix journal is ingested by default" "grep -q 'matrix-only-fact' '$TMP/ingested.log'"
+ok "matrix-only: the job is marked seen by its absolute path" \
+  "grep -qxF '$h/.ccc-matrix/distill-journal/matrix-only-fact.json' '$h/.nunchi/ingested-files'"
+ok "matrix-only: the receipt counts one source" "[ \"\$(disc_sources '$h')\" = 1 ]"
+ok "matrix-only: no 'no input source' warning" "! grep -q 'no input source' '$TMP/disc.err'"
+
+# Frontend list without telegram: the Telegram journal is not a source.
+h="$(disc_home tg-excluded)"
+disc_job "$h" .ccc-matrix/distill-journal excl-matrix-fact
+disc_job "$h" .telegram_bot/distill-journal excl-telegram-fact
+printf '# operator-owned\nmatrix  # telegram retired\n' > "$h/.claude/frontends"
+disc_cron "$h"
+ok "frontends without telegram: Matrix journal ingested" "grep -q 'excl-matrix-fact' '$TMP/ingested.log'"
+ok "frontends without telegram: Telegram journal skipped (even in a comment)" \
+  "! grep -q 'excl-telegram-fact' '$TMP/ingested.log'"
+ok "frontends without telegram: Telegram job not marked seen" \
+  "! grep -q 'telegram_bot' '$h/.nunchi/ingested-files'"
+ok "frontends without telegram: one source" "[ \"\$(disc_sources '$h')\" = 1 ]"
+
+# CCC_FRONTENDS wins over the file (doctor's order).
+h="$(disc_home tg-env)"
+disc_job "$h" .telegram_bot/distill-journal envlist-telegram-fact
+printf 'telegram\n' > "$h/.claude/frontends"
+disc_cron "$h" CCC_FRONTENDS="matrix,hande"
+ok "CCC_FRONTENDS without telegram overrides a file that names it" \
+  "! grep -q 'envlist-telegram-fact' '$TMP/ingested.log'"
+disc_cron "$h"
+ok "the file naming telegram keeps the Telegram journal" "grep -q 'envlist-telegram-fact' '$TMP/ingested.log'"
+
+# Every existing journal is processed in one tick.
+h="$(disc_home all)"
+disc_job "$h" .ccc-matrix/distill-journal both-matrix-fact
+disc_job "$h" .ccc-hande/distill-journal both-hande-fact
+disc_job "$h" .telegram_bot/distill-journal both-telegram-fact
+disc_cron "$h"
+ok "multi-journal: Matrix job ingested" "grep -q 'both-matrix-fact' '$TMP/ingested.log'"
+ok "multi-journal: hande job ingested" "grep -q 'both-hande-fact' '$TMP/ingested.log'"
+ok "multi-journal: Telegram job ingested (no frontend list = legacy)" "grep -q 'both-telegram-fact' '$TMP/ingested.log'"
+ok "multi-journal: the receipt counts three sources" "[ \"\$(disc_sources '$h')\" = 3 ]"
+ok "multi-journal: the tick logs all three" "grep -q 'nunchi ingest: ingested=3' '$TMP/disc.out'"
+before="$(wc -l < "$TMP/ingested.log")"
+disc_cron "$h"
+ok "multi-journal: a second tick re-ingests nothing" "[ \$(wc -l < '$TMP/ingested.log') -eq $before ]"
+
+# An explicit override keeps the single-journal behaviour.
+h="$(disc_home override)"
+disc_job "$h" .ccc-matrix/distill-journal override-default-fact
+disc_job "$TMP/override-src" journal override-chosen-fact
+disc_cron "$h" CCC_BRIDGE_DISTILL_JOURNAL="$TMP/override-src/journal"
+ok "override: the named journal is ingested" "grep -q 'override-chosen-fact' '$TMP/ingested.log'"
+ok "override: default journals are not read" "! grep -q 'override-default-fact' '$TMP/ingested.log'"
+ok "override: one source" "[ \"\$(disc_sources '$h')\" = 1 ]"
+
+# Nothing anywhere: the warning names the locations it looked in.
+h="$(disc_home none)"
+disc_cron "$h"
+ok "no journal: warns and names the Matrix location" \
+  "grep -q 'no input source' '$TMP/disc.err' && grep -qF '$h/.ccc-matrix/distill-journal' '$TMP/disc.err'"
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
