@@ -48,12 +48,14 @@ class HostCredentialsCheck(unittest.TestCase):
         self.path.chmod(mode)
 
     def login(self, *, first: str = FAKE_A, second: str | None = FAKE_R,
-              expires_ms: object = None) -> None:
+              expires_ms: object = None, chain_ms: object = None) -> None:
         expiry = int(time.time() * 1000) + 3600_000 if expires_ms is None else expires_ms
         entry: dict[str, object] = {"accessToken": first, "expiresAt": expiry,
                                     "scopes": SCOPES, "subscriptionType": "max"}
         if second is not None:
             entry = {**entry, "refreshToken": second}
+        if chain_ms is not None:
+            entry = {**entry, "refreshTokenExpiresAt": chain_ms}
         self.write({"claudeAiOauth": entry})
 
     def run_check(self) -> Row:
@@ -85,6 +87,45 @@ class HostCredentialsCheck(unittest.TestCase):
         row = self.run_check()
         self.assertEqual(row.klass, "경고")
         self.assertIn("refresh token present", row.status)
+
+    # --- /login chain end (refreshTokenExpiresAt, never extended) ------------
+
+    def chain_in(self, days: float) -> int:
+        return int(time.time() * 1000 + days * DAY_MS)
+
+    def test_refresh_chain_far_from_end_is_ok(self) -> None:
+        self.login(chain_ms=self.chain_in(20))
+        row = self.run_check()
+        self.assertEqual(row.klass, "정상")
+        self.assertIn("chain ends 20", row.status)
+
+    def test_refresh_chain_within_a_week_warns(self) -> None:
+        self.login(chain_ms=self.chain_in(5.5))
+        row = self.run_check()
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("5d left", row.status)
+        self.assertIn("auth login", row.action)
+
+    def test_refresh_chain_within_two_days_is_manual(self) -> None:
+        # 수동필요 makes doctor exit 1, which the daily fleet sweep reports.
+        self.login(chain_ms=self.chain_in(1.4))
+        row = self.run_check()
+        self.assertEqual(row.klass, "수동필요")
+        self.assertIn("h left", row.status)
+
+    def test_refresh_chain_already_ended_is_manual(self) -> None:
+        self.login(chain_ms=self.chain_in(-0.1))
+        row = self.run_check()
+        self.assertEqual(row.klass, "수동필요")
+        self.assertIn("chain ended", row.status)
+
+    def test_refresh_chain_unusable_value_falls_back_to_ok(self) -> None:
+        for bad in (0, "2026-11-10", True, float("nan"), -5):
+            with self.subTest(refreshTokenExpiresAt=bad):
+                self.login(chain_ms=bad)
+                row = self.run_check()
+                self.assertEqual(row.klass, "정상")
+                self.assertIn("chain end not recorded", row.status)
 
     # --- healthy shapes ------------------------------------------------------
 

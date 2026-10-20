@@ -222,6 +222,10 @@ def load_owner_only_json(path: Path, *, max_bytes: int) -> dict[str, Any]:
 # long-lived setup-token logins warn this many days before their 1-year expiry.
 CLAUDE_CREDENTIALS_MAX_BYTES = 64 * 1024
 CLAUDE_TOKEN_EXPIRY_WARN_DAYS = 30
+# /login chains end at refreshTokenExpiresAt (~4 weeks after login, never
+# extended by rotation): 경고 a week ahead, 수동필요 (alerting) two days ahead.
+CLAUDE_CHAIN_WARN_DAYS = 7
+CLAUDE_CHAIN_MANUAL_DAYS = 2
 CODEX_PROBE_TIMEOUT_SECONDS = 5.0
 CODEX_PROBE_TIMEOUT_MAX_SECONDS = 10.0
 # Every subprocess the doctor spawns is bounded (#1481). A wedged `git
@@ -1320,7 +1324,7 @@ class Doctor:
                      "verify with `claude -p 'Reply with exactly: ok'`; re-authenticate if it fails")
             return
         if has_refresh:
-            self.add("정상", item, "refresh login (access token auto-refreshes)", "none")
+            self._check_refresh_chain_expiry(item, oauth.get("refreshTokenExpiresAt"))
             return
         if expires_ms <= 0:
             self.add("경고", item, "long-lived token without expiresAt (CLI may treat it as expired)",
@@ -1335,6 +1339,35 @@ class Doctor:
                      "re-issue before expiry: " + reauth)
         else:
             self.add("정상", item, f"long-lived token; expires {expiry}", "none")
+
+    def _check_refresh_chain_expiry(self, item: str, chain_expires: Any) -> None:
+        """A /login chain ends at refreshTokenExpiresAt and is never extended (#2397).
+
+        Measured 2026-10-20 in an isolated CLAUDE_CONFIG_DIR: the refresh token
+        rotates on every refresh, but ``refreshTokenExpiresAt`` stayed put to
+        within 0.5 s across rotations, and observed chains end 27-29 days after
+        login. Past that instant the next refresh is rejected and the CLI wipes
+        the login, so the node must be re-logged-in before it. Within
+        CLAUDE_CHAIN_MANUAL_DAYS the row is 수동필요 so the daily fleet doctor
+        sweep alerts ahead of the outage; within CLAUDE_CHAIN_WARN_DAYS it is 경고.
+        """
+        relogin = ("re-login before the chain ends: `claude auth login --claudeai` on the node "
+                   "(owner approves the URL), then idle-restart the bridge (Wiki TM-3899, ccc-node#2397)")
+        ok = isinstance(chain_expires, (int, float)) and not isinstance(chain_expires, bool)
+        chain_ms = float(chain_expires) if ok else 0.0
+        if not math.isfinite(chain_ms) or chain_ms <= 0:
+            self.add("정상", item, "refresh login (access token auto-refreshes; chain end not recorded)", "none")
+            return
+        end = datetime.fromtimestamp(chain_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+        days_left = (chain_ms / 1000 - time.time()) / 86400
+        if days_left <= 0:
+            self.add("수동필요", item, f"refresh login chain ended {end} — next refresh wipes the login", relogin)
+        elif days_left <= CLAUDE_CHAIN_MANUAL_DAYS:
+            self.add("수동필요", item, f"refresh login chain ends {end} ({days_left * 24:.0f}h left)", relogin)
+        elif days_left <= CLAUDE_CHAIN_WARN_DAYS:
+            self.add("경고", item, f"refresh login chain ends {end} ({int(days_left)}d left)", relogin)
+        else:
+            self.add("정상", item, f"refresh login; chain ends {end}", "none")
 
     def check_provider_readiness(self) -> None:
         if self.provider == "claude":
