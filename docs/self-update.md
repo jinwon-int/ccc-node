@@ -50,8 +50,9 @@ rather than composing the steps ad hoc.
    dispatcher and handlers (the names come from its `--list`) to
    `/usr/local/sbin`, or to `~/a2a-broker-worker` on Termux / non-root nodes.
    `setup.sh` never touches those copies, so they used to drift for weeks
-   behind a current checkout. On a changed (or `--force`) tick, each of the
-   two destinations that **already holds at least one copy** is compared with
+   behind a current checkout. On a changed (or `--force`) tick **and on every
+   settled up-to-date tick** (#1460, see below), each of the two
+   destinations that **already holds at least one copy** is compared with
    the checkout's `scripts/`; when a file differs or is missing the installer
    runs with `--dest <that dir>` (old copies backed up as `*.bak-<ts>`) and
    every file is verified afterwards. A destination with no copies is never
@@ -69,6 +70,25 @@ rather than composing the steps ad hoc.
    replaces the inode so a task already running keeps its old copy. Opt out
    with `CCC_SELF_UPDATE_A2A_HANDLERS=0`. `ccc-doctor` reports the same drift
    as an `a2a-handlers` row (docs/doctor.md).
+
+   *Why up-to-date ticks too (#1460).* The tick that first pulls a commit runs
+   the **previously installed** copy of this script, so the tick that first
+   pulled #2357 had no refresh step, and every later tick was up-to-date — two
+   fleet nodes kept drifted handler copies behind a current checkout until main
+   changed again. The up-to-date step is cheap: it only `cmp`s existing copies
+   and reinstalls on drift alone (same rules: never fresh-installs, no restart,
+   opt-out honored, not-writable dest is one skip log line). It runs on the
+   up-to-date exits that represent a settled tick: `done result=up-to-date`
+   (with or without a healthy runtime probe), a successful #971 recovery
+   restart, and a reconciled pending activation. It does **not** run on
+   refusing or deferred ticks (pending-activation unsafe/incomplete or
+   interrupted, failed recovery restart, worktree gate, wrong branch, dirty
+   tree, lock/busy deferral). Log lines are the same as on a changed tick and
+   carry a trailing `tick=changed|up-to-date` field. A failure is notified
+   once per checkout SHA (dedup key `a2a-handlers-fail-<sha>`, remembered in
+   `~/.claude/state/self-update.a2a-handlers-notified` so twice-daily
+   up-to-date ticks log `a2a-handlers notify=suppressed reason=already-notified`
+   instead of re-paging); a clean pass clears the marker.
 6. restarts each service listed in the operator allowlist and verifies it is
    active again
 7. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
