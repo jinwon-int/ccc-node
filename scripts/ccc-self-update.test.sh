@@ -50,6 +50,9 @@ export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
 export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
 # And for the serving-generation check after an external restart (#2142).
 export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$TMP/no-such-serving-health.json"
+# And for the installed A2A handler refresh (#2357): never inspect or rewrite
+# the node's real /usr/local/sbin copies. The #2357 section also overrides HOME.
+export CCC_A2A_HANDLER_SYSTEM_DEST="$TMP/no-such-sbin"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
@@ -1761,6 +1764,122 @@ out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=9999 run_selfup run 2>&1)
 ok "prepare budget above 7200s is refused by run" '[ "$rc" = 2 ] && grep -q "1..7200" <<<"$out" && [ "$(git -C "$REPO" rev-parse HEAD)" = "$budget_head" ]'
 rm -f "$CLAUDE/self-update.prepare-cmd" "$CLAUDE/self-update.restart-cmd" "$STATE/self-update.pending-activation.json"
 rm -rf "$STATE"/self-update-install-rollback.*
+
+# --- #2357: refresh drifted installed A2A handler copies ----------------------
+# The installer copies the handlers; self-update must refresh copies that
+# already exist (never install fresh), idempotently, without failing the
+# update or restarting anything when the refresh itself fails.
+CLAUDE="$TMP/claude-2357"; STATE="$CLAUDE/state"; mkdir -p "$STATE"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+SBIN="$TMP/sbin-2357"; H2357="$TMP/home-2357"; mkdir -p "$SBIN" "$H2357"
+cp "$HERE/install-a2a-review-handler.sh" "$TMP/seed/scripts/"
+mapfile -t A2A_NAMES < <(bash "$TMP/seed/scripts/install-a2a-review-handler.sh" --list)
+for n in "${A2A_NAMES[@]}"; do printf '#!/bin/sh\n# %s v2\n' "$n" > "$TMP/seed/scripts/$n"; done
+bump2357() { echo "$1" > "$TMP/seed/a2a-$1.txt"; git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm "a2a-$1" && git -C "$TMP/seed" push -q origin main; }
+run2357() { HOME="$H2357" CCC_A2A_HANDLER_SYSTEM_DEST="$SBIN" run_selfup run; }
+same_as_checkout() { # <dest>: every listed handler equals the checkout copy
+  local n; for n in "${A2A_NAMES[@]}"; do cmp -s "$REPO/scripts/$n" "$1/$n" || return 1; done
+}
+seed_old_copies() { # <dest>: the 09-10 shape — all files present, one stale
+  local n; mkdir -p "$1"
+  for n in "${A2A_NAMES[@]}"; do cp "$TMP/seed/scripts/$n" "$1/$n"; done
+  printf '#!/bin/sh\n# 09-10\n' > "$1/skills-intake-revise-handler.sh"
+}
+ok "installer --list names the four handler files" '[ "${#A2A_NAMES[@]}" = 4 ] && printf "%s\n" "${A2A_NAMES[@]}" | grep -qx a2a-intent-dispatcher.sh'
+
+bump2357 not-installed
+: > "$STATE/self-update.log"; : > "$TMP/systemctl.calls"
+out="$(run2357 2>&1)"; rc=$?
+ok "no installed copies: update ok and nothing is installed fresh" \
+  '[ "$rc" = 0 ] && [ -z "$(ls -A "$SBIN")" ] && [ ! -e "$H2357/a2a-broker-worker" ]'
+ok "no installed copies: both destinations logged as not-installed" \
+  'grep -q "a2a-handlers skip reason=not-installed dest=$SBIN" "$STATE/self-update.log" && grep -q "a2a-handlers skip reason=not-installed dest=$H2357/a2a-broker-worker" "$STATE/self-update.log"'
+
+seed_old_copies "$SBIN"
+bump2357 drift
+: > "$STATE/self-update.log"; : > "$TMP/systemctl.calls"; rm -f "$TMP/spool"/*.json
+out="$(run2357 2>&1)"; rc=$?
+ok "drifted copies are reinstalled from the checkout on a changed tick" \
+  '[ "$rc" = 0 ] && same_as_checkout "$SBIN" && grep -q "a2a-handlers reinstall begin dest=$SBIN drift=skills-intake-revise-handler.sh" "$STATE/self-update.log" && grep -q "a2a-handlers reinstall ok dest=$SBIN" "$STATE/self-update.log"'
+ok "reinstall keeps the installer backup of the stale copy" 'grep -lq "09-10" "$SBIN"/skills-intake-revise-handler.sh.bak-*'
+ok "reinstall restarts nothing beyond the allowlisted services" '! grep -qv "hermes-broker" "$TMP/systemctl.calls"'
+ok "completion notice and stdout mention the handler refresh" \
+  'grep -q "A2A 핸들러 갱신 1곳" <<<"$out" && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "A2A 핸들러 갱신 1곳"'
+ok "drift refresh is not a doctor-visible abort" '! grep -q " abort reason=" "$STATE/self-update.log" && grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"ok\"" >/dev/null'
+
+# shellcheck disable=SC2034  # baks_before is read via eval inside ok()
+baks_before="$(compgen -G "$SBIN/*.bak-*" | wc -l)"
+bump2357 idempotent
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "current copies are left alone: no reinstall, no new backup" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers current dest=$SBIN files=4" "$STATE/self-update.log" && ! grep -q "reinstall" "$STATE/self-update.log" && [ "$(compgen -G "$SBIN/*.bak-*" | wc -l)" = "$baks_before" ]'
+
+printf '#!/bin/sh\n# stale\n' > "$SBIN/a2a-intent-dispatcher.sh"
+bump2357 opt-out
+: > "$STATE/self-update.log"
+out="$(CCC_SELF_UPDATE_A2A_HANDLERS=0 run2357 2>&1)"; rc=$?
+ok "CCC_SELF_UPDATE_A2A_HANDLERS=0 skips the refresh" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers skip reason=env-disabled" "$STATE/self-update.log" && grep -q "# stale" "$SBIN/a2a-intent-dispatcher.sh"'
+out="$(CCC_SELF_UPDATE_A2A_HANDLERS=0 run_selfup status 2>&1)"
+ok "status reports the opt-out" 'grep -q "installed A2A handler refresh: disabled" <<<"$out"'
+
+# Installer failure: a checkout whose installer lists the files but cannot
+# install them. The update itself must still succeed and the copy stays put.
+cp "$TMP/seed/scripts/install-a2a-review-handler.sh" "$TMP/real-installer-2357.sh"
+cat > "$TMP/seed/scripts/install-a2a-review-handler.sh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "--list" ] && { printf '%s\n' a2a-intent-dispatcher.sh danso-review-agent.sh skills-intake-review-handler.sh skills-intake-revise-handler.sh; exit 0; }
+echo "simulated install failure" >&2; exit 1
+SH
+bump2357 installer-fails
+: > "$STATE/self-update.log"; : > "$TMP/systemctl.calls"; rm -f "$TMP/spool"/*.json
+out="$(run2357 2>&1)"; rc=$?
+ok "installer failure does not fail or roll back the update" \
+  '[ "$rc" = 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ] && grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"ok\"" >/dev/null'
+ok "installer failure is logged, warned and notified" \
+  'grep -q "a2a-handlers reinstall failed dest=$SBIN rc=1" "$STATE/self-update.log" && grep -q "installed A2A handler refresh failed" <<<"$out" && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "A2A 핸들러 갱신 실패"'
+ok "installer failure leaves the installed copy untouched" 'grep -q "# stale" "$SBIN/a2a-intent-dispatcher.sh"'
+
+# A zero exit that did not actually converge the files is still a failure.
+cat > "$TMP/seed/scripts/install-a2a-review-handler.sh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "--list" ] && { printf '%s\n' a2a-intent-dispatcher.sh danso-review-agent.sh skills-intake-review-handler.sh skills-intake-revise-handler.sh; exit 0; }
+exit 0
+SH
+bump2357 installer-lies
+: > "$STATE/self-update.log"
+out="$(run2357 2>&1)"; rc=$?
+ok "a no-op installer exit 0 is caught by post-install verification" \
+  '[ "$rc" = 0 ] && grep -q "a2a-handlers reinstall failed dest=$SBIN rc=99" "$STATE/self-update.log"'
+
+# Unwritable destination (non-root tick, root-owned /usr/local/sbin): one skip
+# log line, no notification, no failure. CI runs non-root, so chmod 0555 is the
+# real check there; root ignores the mode, so a root run adds the test seam.
+cp "$TMP/real-installer-2357.sh" "$TMP/seed/scripts/install-a2a-review-handler.sh"
+chmod 0555 "$SBIN"
+unwritable_seam=""
+[ "$(id -u)" = 0 ] && unwritable_seam="$SBIN"
+bump2357 not-writable
+: > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE="$unwritable_seam" run2357 2>&1)"; rc=$?
+chmod 0755 "$SBIN"
+ok "unwritable dest is skipped with one log line and the update stays ok" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "a2a-handlers skip dest=$SBIN reason=not-writable" "$STATE/self-update.log")" = 1 ] && ! grep -q "a2a-handlers reinstall" "$STATE/self-update.log" && grep -q "# stale" "$SBIN/a2a-intent-dispatcher.sh"'
+ok "unwritable dest raises no warning or notification" \
+  '! grep -q "handler refresh failed" <<<"$out" && ! jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "A2A 핸들러 갱신 실패"'
+
+# Termux / non-root destination: ~/a2a-broker-worker follows HOME.
+rm -f "$SBIN"/*
+seed_old_copies "$H2357/a2a-broker-worker"
+bump2357 termux-dest
+: > "$STATE/self-update.log"
+run2357 >/dev/null 2>&1; rc=$?
+ok "Termux-style ~/a2a-broker-worker copies are refreshed via HOME" \
+  '[ "$rc" = 0 ] && same_as_checkout "$H2357/a2a-broker-worker" && grep -q "a2a-handlers reinstall ok dest=$H2357/a2a-broker-worker" "$STATE/self-update.log"'
+ok "refreshing the home dest does not install into the empty system dest" '[ -z "$(ls -A "$SBIN")" ]'
+rm -f "$CLAUDE/self-update.services"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

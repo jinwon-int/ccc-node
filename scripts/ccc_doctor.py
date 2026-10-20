@@ -59,6 +59,17 @@ HOOK_FILES_FALLBACK = [
 HOOK_TREE_SKIP_NAMES = {"test-stub.sh", "hooks.json", "enforcement-overlay.json"}
 HOOK_TREE_SKIP_SUFFIXES = (".test.sh", ".pyc", ".md")
 OUTPUT_STYLE_FILES = ["output-styles/ccc-report.md"]
+# Files scripts/install-a2a-review-handler.sh copies onto a worker (#2357). The
+# installer's `--list` is the source of truth; ccc_doctor_a2a_handlers_test.py
+# pins this tuple to it.
+A2A_HANDLER_FILES = (
+    "a2a-intent-dispatcher.sh",
+    "danso-review-agent.sh",
+    "skills-intake-review-handler.sh",
+    "skills-intake-revise-handler.sh",
+)
+A2A_HANDLER_INSTALLER = "scripts/install-a2a-review-handler.sh"
+A2A_HANDLER_SYSTEM_DEST = "/usr/local/sbin"
 # setup.sh installs four trees; doctor used to watch two, so a stale skill,
 # agent or slash command was invisible to both /doctor and self-update's
 # check.sh (#1037). These three are detection-only: the --fix repair path
@@ -1002,6 +1013,7 @@ class Doctor:
         self.check_skill_promotion_unpromoted()
         self.check_skill_usage_telemetry()
         self.check_self_update_stall()
+        self.check_a2a_handler_drift()
         self.check_agent_cron_prompt_success()
         self.check_push_spool_dwell()
         self.check_dns_resolver_mode()
@@ -3066,6 +3078,89 @@ class Doctor:
             "(see CONTRIBUTING.md: develop in a git worktree); "
             "the node receives no harness updates until then",
         )
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str | None:
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return None
+
+    def a2a_handler_dests(self) -> list[Path]:
+        """Known install destinations of scripts/install-a2a-review-handler.sh.
+
+        The installer's default (/usr/local/sbin; overridable for tests via
+        CCC_A2A_HANDLER_SYSTEM_DEST, the same knob ccc-self-update.sh reads)
+        and its Termux / non-root default ~/a2a-broker-worker.
+        """
+        system = os.environ.get("CCC_A2A_HANDLER_SYSTEM_DEST") or A2A_HANDLER_SYSTEM_DEST
+        dests: list[Path] = []
+        for dest in (Path(system), Path.home() / "a2a-broker-worker"):
+            if dest not in dests:
+                dests.append(dest)
+        return dests
+
+    def check_a2a_handler_drift(self) -> None:
+        """Compare installed A2A handler copies with the checkout (#2357).
+
+        The installer COPIES the skills-intake dispatcher and handlers, and
+        setup.sh never refreshes them, so a node can run weeks-old handlers
+        behind a current checkout (fleet-wide on 2026-10-17). Read-only: one
+        row per destination that holds at least one installed copy; a node
+        without copies is not drift. Drift is 경고 (ccc-self-update.sh
+        refreshes existing copies on its next changed tick).
+        """
+        item = "a2a-handlers"
+        installer = self.repo / A2A_HANDLER_INSTALLER
+        source = {name: self._file_sha256(self.repo / "scripts" / name) for name in A2A_HANDLER_FILES}
+        reported = False
+        for dest in self.a2a_handler_dests():
+            present = [name for name in A2A_HANDLER_FILES if (dest / name).is_file()]
+            if not present:
+                continue
+            reported = True
+            drifted: list[str] = []
+            missing: list[str] = []
+            for name in A2A_HANDLER_FILES:
+                if name not in present:
+                    missing.append(name)
+                    continue
+                installed = self._file_sha256(dest / name)
+                if installed is None or source[name] is None or installed != source[name]:
+                    drifted.append(name)
+            label = _printable(str(dest))
+            if not drifted and not missing:
+                self.add("정상", item, f"dest={label}; current={len(present)}/{len(A2A_HANDLER_FILES)}", "none")
+                continue
+            parts = [f"dest={label}"]
+            if drifted:
+                parts.append("drift=" + ",".join(drifted))
+            if missing:
+                parts.append("missing=" + ",".join(missing))
+            command = f"bash {_printable(str(installer))} --dest {label}"
+            if os.access(dest, os.W_OK):
+                action = (
+                    f"reinstall: {command} "
+                    "(backs up old copies; no worker restart needed — handlers run per task). "
+                    "ccc-self-update refreshes existing copies on its next changed tick "
+                    "unless CCC_SELF_UPDATE_A2A_HANDLERS=0"
+                )
+            else:
+                # ccc-self-update skips a dest it cannot write, so this row is
+                # the only signal: name who has to run the reinstall.
+                parts.append("not-writable")
+                action = (
+                    f"reinstall as the account that owns {label} (e.g. root): {command} "
+                    "(backs up old copies; no worker restart needed — handlers run per task). "
+                    "ccc-self-update running as this account skips it"
+                )
+            self.add("경고", item, "; ".join(parts), action)
+        if not reported:
+            self.add("정상", item, "not-installed", "none")
 
     _AGENT_CRON_STALE_DAYS_DEFAULT = 7
     _AGENT_CRON_STORE_MAX_BYTES = 8 * 1024 * 1024

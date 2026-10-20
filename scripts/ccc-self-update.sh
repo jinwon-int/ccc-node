@@ -54,6 +54,10 @@
 #      the recorded argv, verify the new gen; on failure restore crontab and
 #      abort (exit 12). Kill-switch: self-update.no-reapply or
 #      CCC_SELF_UPDATE_REAPPLY=0. Only runs when HEAD changed (or --force).
+#   5b. refresh installed A2A handler copies (/usr/local/sbin,
+#      ~/a2a-broker-worker) that already exist and drifted from the checkout
+#      (#2357; advisory — a failure warns but never aborts; no worker restart).
+#      Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
 #   6. restart each allowlisted service and verify it is active again
 #   7. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
@@ -793,6 +797,7 @@ if [ "$MODE" = "status" ]; then
   say "external restart command timeout: ${RESTART_COMMAND_TIMEOUT_SECONDS}s"
   say "prepare command: $(resolve_prepare_cmd >/dev/null 2>&1 && echo "configured (timeout ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)" || echo none)"
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
+  say "installed A2A handler refresh: $([ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ] && echo "disabled (CCC_SELF_UPDATE_A2A_HANDLERS=0)" || echo "enabled (existing copies only)")"
   pending_rc=0
   load_pending_activation || pending_rc=$?
   case "$pending_rc" in
@@ -1581,6 +1586,91 @@ else
   [ "$REAPPLY_COUNT" -gt 0 ] && REAPPLY_NOTE=", cron 재적용 ${REAPPLY_COUNT}건"
 fi
 
+# --- installed A2A handler refresh (#2357) ------------------------------------
+# scripts/install-a2a-review-handler.sh COPIES the skills-intake dispatcher and
+# handlers to /usr/local/sbin (Termux / non-root: ~/a2a-broker-worker). setup.sh
+# never touches those copies, so a node kept running weeks-old handlers while
+# its checkout was current. Refresh them here, but only where copies already
+# exist (never a fresh install) and only when one is missing or differs from
+# the checkout (idempotent: a current dest is not rewritten, so no new .bak).
+# Advisory: a failure is logged and notified but neither rolls anything back
+# nor changes the exit code. No restart: the worker spawns the handler per
+# task, so the next task runs the new files; `install` replaces the inode, so
+# a task already running keeps the old one. Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
+# CCC_A2A_HANDLER_SYSTEM_DEST overrides the system destination (tests).
+# A destination this account cannot write (non-root tick, root-owned
+# /usr/local/sbin) is skipped with one log line and no notification: it is not
+# this tick's to fix, and ccc-doctor keeps reporting the drift with the
+# owning-account hint. CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE is a test
+# seam only (colon-separated dirs treated as unwritable — root ignores 0555).
+A2A_HANDLER_NOTE=""
+a2a_dest_writable() { # <dir>
+  case ":${CCC_SELF_UPDATE_A2A_HANDLERS_TEST_UNWRITABLE:-}:" in *":$1:"*) return 1 ;; esac
+  [ -d "$1" ] && [ -w "$1" ]
+}
+a2a_handlers_refresh() {
+  local installer="$REPO/scripts/install-a2a-review-handler.sh"
+  local names dest name present drift rc refreshed=0 failed="" seen=" "
+  if [ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ]; then
+    log "a2a-handlers skip reason=env-disabled"; return 0
+  fi
+  [ -f "$installer" ] || { log "a2a-handlers skip reason=no-installer"; return 0; }
+  if ! names="$(bash "$installer" --list 2>>"$LOG" </dev/null)" || [ -z "$names" ] \
+     || grep -qvE '^[A-Za-z0-9][A-Za-z0-9._-]*$' <<<"$names"; then
+    log "a2a-handlers failed reason=list-failed"
+    A2A_HANDLER_FAILED_DESTS="(installer --list)"; return 0
+  fi
+  for dest in "${CCC_A2A_HANDLER_SYSTEM_DEST:-/usr/local/sbin}" "$HOME/a2a-broker-worker"; do
+    case "$seen" in *" $dest "*) continue ;; esac
+    seen="$seen$dest "
+    present=0; drift=""
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if [ -f "$dest/$name" ]; then
+        present=$((present + 1))
+        cmp -s "$REPO/scripts/$name" "$dest/$name" || drift="$drift${drift:+,}$name"
+      else
+        drift="$drift${drift:+,}$name(missing)"
+      fi
+    done <<<"$names"
+    if [ "$present" -eq 0 ]; then
+      log "a2a-handlers skip reason=not-installed dest=$dest"; continue
+    fi
+    if [ -z "$drift" ]; then
+      log "a2a-handlers current dest=$dest files=$present"; continue
+    fi
+    if ! a2a_dest_writable "$dest"; then
+      log "a2a-handlers skip dest=$dest reason=not-writable drift=$drift"; continue
+    fi
+    log "a2a-handlers reinstall begin dest=$dest drift=$drift"
+    rc=0
+    bash "$installer" --dest "$dest" >>"$LOG" 2>&1 </dev/null || rc=$?
+    # Verify rather than trust the exit code: every file must now match.
+    if [ "$rc" -eq 0 ]; then
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        cmp -s "$REPO/scripts/$name" "$dest/$name" || { rc=99; break; }
+      done <<<"$names"
+    fi
+    if [ "$rc" -ne 0 ]; then
+      log "a2a-handlers reinstall failed dest=$dest rc=$rc"
+      failed="$failed${failed:+ }$dest"
+      continue
+    fi
+    log "a2a-handlers reinstall ok dest=$dest"
+    refreshed=$((refreshed + 1))
+  done
+  A2A_HANDLER_FAILED_DESTS="$failed"
+  [ "$refreshed" -gt 0 ] && A2A_HANDLER_NOTE=", A2A 핸들러 갱신 ${refreshed}곳"
+  return 0
+}
+A2A_HANDLER_FAILED_DESTS=""
+a2a_handlers_refresh
+if [ -n "$A2A_HANDLER_FAILED_DESTS" ]; then
+  notify "self-update $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null) 경고: 설치된 A2A 핸들러 갱신 실패 (${A2A_HANDLER_FAILED_DESTS}) — 업데이트는 계속 진행되며 구버전 핸들러가 남아 있을 수 있습니다. 수동: bash scripts/install-a2a-review-handler.sh --dest <dir>. 로그: ~/.claude/state/self-update.log" "a2a-handlers-fail-$NEW_SHA"
+  say "self-update: warning — installed A2A handler refresh failed (${A2A_HANDLER_FAILED_DESTS}); continuing" >&2
+fi
+
 # --- runtime preparation (#2207 ③) --------------------------------------------
 # Termux serves a prepared generation (~/.ccc-node/preparations/<gen>), so a
 # fast-forward of the checkout changes nothing until a generation for the new
@@ -1746,7 +1836,7 @@ INSTALL_SNAPSHOT_DIR=""
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then
-  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}." "ok-$NEW_SHA"
+  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}${A2A_HANDLER_NOTE}." "ok-$NEW_SHA"
 fi
-say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED${REAPPLY_NOTE})"
+say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED${REAPPLY_NOTE}${A2A_HANDLER_NOTE})"
 exit 0

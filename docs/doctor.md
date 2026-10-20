@@ -21,6 +21,8 @@
   `gen=h_<sha256:12>` stamp of the rendering installer's content. Entries stamped by
   older code — or unstamped pre-`#1081` lines — are `경고` (non-fatal); re-apply the
   named installer to re-render. See *Cron generation drift* below.
+- **Installed A2A handler drift** (`#2357`): installed copies of the skills-intake
+  dispatcher/handlers vs the checkout's `scripts/`. See *Installed A2A handlers* below.
 - Selected agent provider. For `CCC_AGENT_PROVIDER=codex`, deterministic CLI, app-server surface, and login readiness without a model turn or Telegram access.
 
 The report is Markdown and classifies rows as:
@@ -168,6 +170,28 @@ Why this exists as a pull-based check even though #1060 already alerts: the
 alert is a one-shot event. After #1061 documented the worktree discipline the
 same stall still recurred on two nodes (#1328), because nothing surfaced a node
 that had quietly stopped updating days earlier.
+
+## Installed A2A handlers
+
+`scripts/install-a2a-review-handler.sh` copies the files its `--list` prints
+(dispatcher, review/revise handlers, danso wrapper) to `/usr/local/sbin`
+(override: `CCC_A2A_HANDLER_SYSTEM_DEST`) or, on Termux / non-root nodes,
+`~/a2a-broker-worker`. Nothing in `setup.sh` refreshes those copies; on
+2026-10-17 every reviewer/reviser node was still running its 2026-09-10 copies
+behind a current checkout (#2357). The `a2a-handlers` check compares each
+copy's sha256 with the checkout, read-only, one row per destination that holds
+at least one copy:
+
+| State | Class | Meaning |
+|---|---|---|
+| no copy in either destination | `정상` (`not-installed`) | node is not an intake reviewer/reviser; not drift |
+| every file present and equal | `정상` (`current=4/4`) | installed handlers match the checkout |
+| a file differs (`drift=`) or is absent (`missing=`) | `경고` | the row names the files and the reinstall command `bash <repo>/scripts/install-a2a-review-handler.sh --dest <dir>` |
+| drift in a dir this account cannot write | `경고` (`not-writable`) | the reinstall must run as the account that owns the dir (e.g. root); `ccc-self-update` running as this account skips it |
+
+No worker restart is needed after a reinstall: the worker spawns the handler
+per task. `ccc-self-update.sh` refreshes existing drifted copies on its next
+changed tick unless `CCC_SELF_UPDATE_A2A_HANDLERS=0` (docs/self-update.md).
 
 ## Stale memory guidance
 
