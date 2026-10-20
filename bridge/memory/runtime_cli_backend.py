@@ -273,6 +273,12 @@ def _command(
     return tuple(arguments)
 
 
+# ccc-node#2397: SIGKILL inside the claude CLI's ~0.5 s OAuth refresh window
+# loses the rotated refresh token and wipes the host login on the next call;
+# SIGTERM lets the CLI finish saving. 0.25 s was shorter than that window.
+_STOP_GRACE_SECONDS = 10.0
+
+
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -284,7 +290,7 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         except ProcessLookupError:
             pass
     try:
-        await asyncio.wait_for(process.wait(), timeout=0.25)
+        await asyncio.wait_for(process.wait(), timeout=_STOP_GRACE_SECONDS)
         return
     except TimeoutError:
         pass
