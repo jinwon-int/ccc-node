@@ -33,6 +33,30 @@ from .journal_core import JsonJournalCore
 
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DEFAULT_DISCRIMINATOR = "session-close-v1"
+# #2333: audience-routed work closed after a switch to off/curated. Stored as
+# local_sink_status=terminal_failed plus this error_code — never a new status
+# value — so a rolled-back bridge (whose parser rejects unknown statuses and
+# whose list_jobs/recover_stale_running do not skip unreadable records) still
+# reads the record; there it is plain terminal work.
+LOCAL_SINK_SUPERSEDED_ROUTE = "local_sink_superseded_route"
+
+
+def is_local_sink_superseded_route(job: DistillJob) -> bool:
+    """True for audience-routed work a global-only sink closed (#2333)."""
+
+    return (
+        job.local_sink_status is DistillLocalSinkStatus.TERMINAL_FAILED
+        and job.error_code == LOCAL_SINK_SUPERSEDED_ROUTE
+        and job.memory_audience is not None
+        and job.memory_scope is not None
+        and job.extraction_output is not None
+    )
+
+
+def _keep_superseded_marker(job: DistillJob, error_code: str | None) -> str | None:
+    """Wiki-stage writes share ``error_code``; they never erase the #2333 marker."""
+
+    return job.error_code if is_local_sink_superseded_route(job) else error_code
 # Keep the historical direct secure-fs consumer seam visible to packaging and
 # ownership tests while JsonJournalCore remains the single implementation.
 _SECURE_FS_COMPAT = secure_fs
@@ -237,12 +261,18 @@ class DistillJournal(JsonJournalCore):
         older_than_seconds: float,
         now: datetime | None = None,
         keep_unroutable: bool = False,
+        keep_superseded_route: bool = False,
     ) -> tuple[str, ...]:
         """Remove fully-terminal jobs whose last update is older than the cutoff.
 
         ``keep_unroutable`` is set while a node-global local sink exists
         (#2296): an UNROUTABLE job with extraction output is still pending
         adoption there, so it must survive retention until it is adopted.
+        ``keep_superseded_route`` is the audience-mode mirror (#2333): while
+        audience routes exist a superseded job (TERMINAL_FAILED with the
+        ``local_sink_superseded_route`` marker) is claimable again, so it
+        survives retention until it is written. Without audience routes it is
+        ordinary terminal work and ages out like DONE/UNROUTABLE.
 
         Nothing ever deleted finished jobs before, so the journal grew without
         bound and every sweep in every pipeline loop re-read and re-validated
@@ -270,6 +300,8 @@ class DistillJournal(JsonJournalCore):
                     and job.local_sink_status is DistillLocalSinkStatus.UNROUTABLE
                     and job.extraction_output is not None
                 ):
+                    continue
+                if keep_superseded_route and is_local_sink_superseded_route(job):
                     continue
                 if (current_time - updated_at).total_seconds() < older_than_seconds:
                     continue
@@ -623,6 +655,19 @@ class DistillJournal(JsonJournalCore):
         modes) claim route-free jobs, including ones extraction already marked
         UNROUTABLE — that adoption is the one-time replay of orphaned work.
         Once adopted a job is DONE or a failure state, never UNROUTABLE again.
+
+        Audience-routed work is never adopted by the node-global sink: its
+        content may belong to a non-owner audience, and the global memory is
+        the owner's own. When a node-global sink sees an audience-routed
+        PENDING/RETRYABLE_FAILED job (the node left ``audience-scoped`` mode,
+        #2333) it closes it as TERMINAL_FAILED with error_code
+        ``local_sink_superseded_route`` instead of leaving it pending forever;
+        nothing is written and the record (extraction output, route, attempt
+        counters) is kept. A claim with ``audience_routes`` treats such a
+        superseded job like PENDING (attempt counter preserved), so
+        re-enabling audience mode writes it to its original audience. Without
+        a global route (no sink composed for this mode) routed work is left
+        exactly as it was.
         """
         if not owner_token:
             raise ValueError("owner_token must not be empty")
@@ -640,9 +685,24 @@ class DistillJournal(JsonJournalCore):
             }
             if global_route and not routed:
                 claimable.add(DistillLocalSinkStatus.UNROUTABLE)
-            if job.local_sink_status not in claimable:
+            # Audience mode is back (#2333): superseded work resumes.
+            resumable = audience_routes and is_local_sink_superseded_route(job)
+            if job.local_sink_status not in claimable and not resumable:
                 return None
-            if (routed and not audience_routes) or (not routed and not global_route):
+            if routed and not audience_routes:
+                if global_route:
+                    # #2333: close, never adopt (privacy boundary) — no lease,
+                    # no attempt, no write to any sink.
+                    self._write_unlocked(
+                        replace(
+                            job,
+                            local_sink_status=DistillLocalSinkStatus.TERMINAL_FAILED,
+                            updated_at=_timestamp(current_time),
+                            error_code=LOCAL_SINK_SUPERSEDED_ROUTE,
+                        )
+                    )
+                return None
+            if not routed and not global_route:
                 return None
             if (
                 job.status is not DistillJobStatus.EXTRACTION_DONE
@@ -807,7 +867,9 @@ class DistillJournal(JsonJournalCore):
                     updated_at=_timestamp(current_time),
                     wiki_sink_owner_token=None,
                     wiki_sink_lease_expires_at=None,
-                    error_code="wiki_sink_max_attempts_exceeded",
+                    error_code=_keep_superseded_marker(
+                        job, "wiki_sink_max_attempts_exceeded"
+                    ),
                 )
                 self._write_unlocked(terminal)
                 return None
@@ -821,7 +883,7 @@ class DistillJournal(JsonJournalCore):
                 wiki_sink_lease_expires_at=_timestamp(
                     current_time + timedelta(seconds=lease_seconds)
                 ),
-                error_code=None,
+                error_code=_keep_superseded_marker(job, None),
             )
             self._write_unlocked(running)
             return running
@@ -858,7 +920,7 @@ class DistillJournal(JsonJournalCore):
                 updated_at=_timestamp(now or _utc_now()),
                 wiki_sink_owner_token=None,
                 wiki_sink_lease_expires_at=None,
-                error_code=None,
+                error_code=_keep_superseded_marker(job, None),
             )
             self._write_unlocked(done)
             return done
@@ -919,7 +981,7 @@ class DistillJournal(JsonJournalCore):
                 updated_at=_timestamp(now or _utc_now()),
                 wiki_sink_owner_token=None,
                 wiki_sink_lease_expires_at=None,
-                error_code=error_code,
+                error_code=_keep_superseded_marker(job, error_code),
             )
             self._write_unlocked(failed)
             return failed
@@ -1039,7 +1101,9 @@ class DistillJournal(JsonJournalCore):
                             updated_at=_timestamp(current_time),
                             wiki_sink_owner_token=None,
                             wiki_sink_lease_expires_at=None,
-                            error_code="wiki_sink_lease_expired",
+                            error_code=_keep_superseded_marker(
+                                updated, "wiki_sink_lease_expired"
+                            ),
                         )
                         changed += 1
                 if changed:

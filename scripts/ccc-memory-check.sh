@@ -62,7 +62,11 @@ empty_writeback_json() {
 # from input_filename, the per-file fallback binds it with --arg. Projects only
 # scalar counters and timestamps out of each record. Raw thread ids, messages,
 # extraction output, route values, and error text never enter the projected
-# records or command output.
+# records or command output. #2333: audience work closed after a switch to
+# off/curated is stored as local_sink_status=terminal_failed with
+# error_code=local_sink_superseded_route (rollback-safe, no new status value);
+# it is projected as local status "superseded_route" — neither pending nor
+# degraded, reported only under local_status_counts.
 WB_VALIDATE_JQ='
       def nnint: type == "number" and floor == . and . >= 0;
       def oneof($values): . as $value | ($values | index($value)) != null;
@@ -101,9 +105,13 @@ WB_VALIDATE_JQ='
           )
         )
       | .status as $status
-      | (.local_sink_status // null) as $local
-      | (.wiki_sink_status // null) as $wiki
       | ((.memory_audience // null) != null or (.memory_scope // null) != null) as $routed
+      | (.local_sink_status // null) as $raw_local
+      | (if $raw_local == "terminal_failed"
+            and (.error_code // null) == "local_sink_superseded_route"
+            and $routed and ((.extraction_output // null) != null)
+         then "superseded_route" else $raw_local end) as $local
+      | (.wiki_sink_status // null) as $wiki
       | {
           status:$status,
           local_status:$local,
