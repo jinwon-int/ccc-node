@@ -749,7 +749,9 @@ def test_hook_resume_capture_time_orders_bridge_sink(tmp_path: Path) -> None:
     assert "bridge session" in resume.read_text()
 
     # A bridge capture older than the CLI capture is kept out; facts merge.
-    _hook_commit(state, "later CLI session", cli_captured)
+    # (The CLI capture must now be later than the bridge one to land at all:
+    # since #2320 the hook path applies the same ordering.)
+    _hook_commit(state, "later CLI session", _iso(now - timedelta(seconds=30)))
     result = sink.write(
         extraction_output(last_activity="older bridge session", fact_text="Older fact."),
         job_id="b" * 64,
@@ -758,6 +760,76 @@ def test_hook_resume_capture_time_orders_bridge_sink(tmp_path: Path) -> None:
     assert not result.resume_written
     assert "later CLI session" in resume.read_text()
     assert "Older fact." in (state / "memory-facts.jsonl").read_text()
+
+
+def test_hook_backlog_replay_keeps_newer_bridge_resume(tmp_path: Path) -> None:
+    """#2320 repro: the bridge sink wrote a resume captured an hour ago; a
+    pending-drain replay of a 20-hour-old CLI backlog must keep it while its
+    facts still merge. A later CLI capture replaces it."""
+    from telegram_bot.memory.distill_local_sink import CodexLocalMemorySink
+    from test_distill_local_sink import extraction_output
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    resume = state / "resume.md"
+    sink = CodexLocalMemorySink(state, audience="private", resume_never_regresses=True)
+    now = datetime.now(timezone.utc)
+    assert sink.write(
+        extraction_output(last_activity="bridge session"),
+        job_id="d" * 64,
+        captured_at=_iso(now - timedelta(hours=1)),
+    ).resume_written
+    before = resume.read_bytes()
+
+    _hook_commit(state, "stale CLI backlog", _iso(now - timedelta(hours=20)))
+    assert resume.read_bytes() == before
+    assert "Fact from stale CLI backlog." in (state / "memory-facts.jsonl").read_text()
+
+    _hook_commit(state, "fresh CLI session", _iso(now - timedelta(minutes=1)))
+    assert "fresh CLI session" in resume.read_text()
+
+
+def _load_hook_commit_module() -> object:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ccc_hook_local_memory_commit", _HOOK_COMMIT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CAPTURE_HEADER_FIXTURES: tuple[bytes | None, ...] = (
+    None,
+    b"",
+    b"- \xeb\xa7\x88\xec\xa7\x80\xeb\xa7\x89 \xec\x9e\x91\xec\x97\x85: headerless\n",
+    b"<!-- ccc-node:distill captured_at=2026-10-15T01:16:45.000000Z provider=claude -->\n- x\n",
+    b"<!-- ccc-node:distill captured_at=2026-10-15T01:16:45Z schema=1 provider=claude -->\n",
+    b"<!-- ccc-node:distill schema=1 provider=codex captured_at=2026-10-15T10:16:45+09:00 -->\n",
+    b"<!-- ccc-node:distill audience=private schema=1 -->\n- legacy audience header\n",
+    b"<!-- ccc-node:distill captured_at=2026-10-15T01:16:45 provider=claude -->\n",
+    b"<!-- ccc-node:distill captured_at=not-a-time provider=claude -->\n",
+    b"<!-- ccc-node:distill captured_at=" + b"9" * 80 + b" -->\n",
+    b"<!-- ccc-node:distill captured_at=0001-01-01T00:00+05:00 -->\n",
+    b"<!-- ccc-node:distill captured_at=2026-10-15T01:16:45Z provider=claude\n",
+    b"<!-- ccc-node:distill captured_at=\xff\xfe -->\n",
+)
+
+
+def test_hook_capture_parser_agrees_with_bridge_sink() -> None:
+    """The hook mirrors the sink's header parser (it cannot import the sink at
+    runtime); both must read the same ``captured_at`` from every fixture."""
+    from telegram_bot.memory.distill_local_sink import CodexLocalMemorySink
+
+    hook = _load_hook_commit_module()
+    for payload in _CAPTURE_HEADER_FIXTURES:
+        assert hook._current_resume_captured_at(payload) == (  # type: ignore[attr-defined]
+            CodexLocalMemorySink._current_resume_captured_at(payload)
+        ), payload
+    for value in (None, "", "2026-10-15T01:16:45Z", "2026-10-15T01:16:45", "x" * 65):
+        assert hook._parse_capture_time(value) == (  # type: ignore[attr-defined]
+            CodexLocalMemorySink._parse_capture_time(value)
+        ), value
 
 
 def test_hook_resume_without_capture_time_stays_headerless(tmp_path: Path) -> None:

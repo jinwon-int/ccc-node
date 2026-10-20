@@ -150,5 +150,65 @@ rc=$?
 ok "Claude latest-head rollback restores both exact pre-images" \
   '[ "$rc" = 0 ] && [ "$(cat "$combo/memory-facts.jsonl")" = "$combo_facts_before" ] && [ "$(cat "$combo/resume.md")" = "$combo_resume_before" ]'
 
+# ---- hook resume ordering by captured_at (#2320) ---------------------------
+# A pending-drain replay of an old CLI backlog carries its original capture
+# time (CLAUDE_DISTILL_CAPTURED_AT); it must not replace a resume captured
+# later, while its facts still merge. Same rule as the bridge sink.
+order_doc() {
+  printf '{"session_id":"sess-order","trigger":"sessionend","honcho":[{"kind":"fact","text":"%s","subject":"ccc"}],"resume":{"last_activity":"%s"}}' "$1" "$2"
+}
+order_commit() {  # <state> <captured_at|""> <fact> <activity>
+  local captured="$2"
+  if [ -n "$captured" ]; then
+    order_doc "$3" "$4" | CCC_STATE_DIR="$1" CLAUDE_DISTILL_CAPTURED_AT="$captured" \
+      python3 "$HERE/local-memory-commit.py" --mode both 2>&1
+  else
+    order_doc "$3" "$4" | env -u CLAUDE_DISTILL_CAPTURED_AT CCC_STATE_DIR="$1" \
+      python3 "$HERE/local-memory-commit.py" --mode both 2>&1
+  fi
+}
+iso_ago() { python3 -c 'import sys; from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+NEWER_RESUME='<!-- ccc-node:distill captured_at=2026-10-15T01:00:00.000000Z schema=1 provider=claude thread_hash=abc trigger=auto_new -->
+- 마지막 작업: newer bridge resume'
+
+ord="$TMP/order-newer"; mkdir -m 700 "$ord"
+printf '%s\n' "$NEWER_RESUME" > "$ord/resume.md"; chmod 600 "$ord/resume.md"
+# shellcheck disable=SC2034  # ord_before is read via eval inside ok()
+ord_before="$(cat "$ord/resume.md")"
+out="$(order_commit "$ord" 2026-10-14T05:00:00Z "stale backlog fact" "stale backlog resume")"; rc=$?
+ok "older capture keeps the newer stamped resume" \
+  '[ "$rc" = 0 ] && [ "$(cat "$ord/resume.md")" = "$ord_before" ] && grep -q "resume kept reason=newer-capture" <<<"$out"'
+ok "older capture still merges its facts" \
+  'grep -q "stale backlog fact" "$ord/memory-facts.jsonl" && grep -q "targets=memory-facts.jsonl$" <<<"$out"'
+out="$(order_commit "$ord" 2026-10-15T01:00:00Z "equal capture fact" "equal capture resume")"; rc=$?
+ok "equal capture replaces the resume (later commit wins, as in the sink)" \
+  '[ "$rc" = 0 ] && grep -q "equal capture resume" "$ord/resume.md" && [ "$(head -1 "$ord/resume.md")" = "<!-- ccc-node:distill captured_at=2026-10-15T01:00:00.000000Z provider=claude -->" ] && ! grep -q "resume kept" <<<"$out"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(order_commit "$ord" 2026-10-15T02:00:00Z "newer capture fact" "newer capture resume")"; rc=$?
+ok "newer capture replaces the stamped resume" \
+  '[ "$rc" = 0 ] && grep -q "newer capture resume" "$ord/resume.md" && grep -q "newer capture fact" "$ord/memory-facts.jsonl"'
+
+# Header-less resume (pre-#2310 hook output): #2309 mtime proxy.
+hl="$TMP/order-headerless"; mkdir -m 700 "$hl"
+printf '%s\n' '- 마지막 작업: today cli resume' > "$hl/resume.md"; chmod 600 "$hl/resume.md"
+touch -d "@$(( $(date +%s) - 3600 ))" "$hl/resume.md"
+order_commit "$hl" "$(iso_ago 1440)" "day-old backlog fact" "day-old backlog resume" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "headerless resume newer by mtime is kept; facts merge" \
+  '[ "$rc" = 0 ] && grep -q "today cli resume" "$hl/resume.md" && ! grep -q "day-old backlog resume" "$hl/resume.md" && grep -q "day-old backlog fact" "$hl/memory-facts.jsonl"'
+order_commit "$hl" "$(iso_ago 1)" "fresh capture fact" "fresh capture resume" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "headerless resume older by mtime is replaced by a newer capture" \
+  '[ "$rc" = 0 ] && grep -q "fresh capture resume" "$hl/resume.md"'
+nc="$TMP/order-nocapture"; mkdir -m 700 "$nc"
+printf '%s\n' "$NEWER_RESUME" > "$nc/resume.md"; chmod 600 "$nc/resume.md"
+order_commit "$nc" "" "direct run fact" "direct run resume" >/dev/null
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "a run without a capture time still writes (no ordering basis)" \
+  '[ "$rc" = 0 ] && [ "$(cat "$nc/resume.md")" = "- 마지막 작업: direct run resume" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
