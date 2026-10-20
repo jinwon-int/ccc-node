@@ -204,6 +204,80 @@ def _clean(value: object) -> str:
 # (bridge/memory/distill_local_sink.py); load-memory.sh drops it at injection.
 _RESUME_HEADER_PREFIX = "<!-- ccc-node:distill "
 _RESUME_HEADER_SUFFIX = " -->"
+_CAPTURED_AT_KEY = "captured_at="
+
+
+# Mirrors CodexLocalMemorySink._parse_capture_time and
+# CodexLocalMemorySink._current_resume_captured_at in
+# bridge/memory/distill_local_sink.py. The hook cannot import the sink at
+# runtime: setup.sh installs only the transaction module next to the hooks and
+# the sink module needs the bridge package (pydantic). Keep the two in sync;
+# bridge/tests/test_distill_local_worker.py asserts they agree on fixtures.
+def _parse_capture_time(value: str | None) -> datetime | None:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _current_resume_captured_at(payload: bytes | None) -> datetime | None:
+    """The ``captured_at`` of the current resume.md header, if parseable."""
+    if not payload:
+        return None
+    first_line = payload.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+    if not (
+        first_line.startswith(_RESUME_HEADER_PREFIX)
+        and first_line.endswith(_RESUME_HEADER_SUFFIX)
+    ):
+        return None
+    fields = first_line[len(_RESUME_HEADER_PREFIX) : -len(_RESUME_HEADER_SUFFIX)]
+    for token in fields.split(" "):
+        if token.startswith(_CAPTURED_AT_KEY):
+            return _parse_capture_time(token[len(_CAPTURED_AT_KEY) :])
+    return None
+
+
+def _resume_mtime(path: Path) -> datetime | None:
+    try:
+        stamp = os.stat(path, follow_symlinks=False).st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(stamp, timezone.utc)
+
+
+def _keep_current_resume(
+    current: bytes | None, new_capture: datetime | None, resume_path: Path
+) -> bool:
+    """True when this job must not replace the current resume.md (#2320).
+
+    Same ordering as the bridge sink's ``write`` (resume_never_regresses), so
+    a pending-drain replay of an old CLI backlog cannot overwrite a resume
+    captured later (by the bridge or by a newer hook job):
+
+    - current header has ``captured_at`` strictly later than this job's
+      capture -> keep. Equal times write (the later commit wins, as in the
+      sink, whose comparison is also strict).
+    - current resume is non-empty without a readable ``captured_at`` (a
+      pre-#2310 hook resume or a pre-#2297 audience header) -> keep when its
+      file mtime is later than this job's capture (#2309's mtime proxy).
+    - this job has no capture time (run outside the pending journal) ->
+      write, as before #2320. Here the hook deliberately differs from the
+      sink, which keeps a stamped resume against an unstamped capture: the
+      hook path has no other ordering input and a direct run is the newest
+      session by construction.
+    """
+    if new_capture is None or not current:
+        return False
+    current_capture = _current_resume_captured_at(current)
+    if current_capture is not None:
+        return current_capture > new_capture
+    current_mtime = _resume_mtime(resume_path)
+    return current_mtime is not None and current_mtime > new_capture
 
 
 def _capture_header(value: str | None) -> bytes:
@@ -216,14 +290,8 @@ def _capture_header(value: str | None) -> bytes:
     replay keeps unchanged; it is rendered as the bridge's fixed-width UTC.
     Unset or unparseable -> no header (mtime ordering, as before).
     """
-    if not value or len(value) > 64:
-        return b""
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            return b""
-        utc = parsed.astimezone(timezone.utc)
-    except (ValueError, OverflowError):
+    utc = _parse_capture_time(value)
+    if utc is None:
         return b""
     stamp = f"{utc.year:04d}" + utc.strftime("-%m-%dT%H:%M:%S.%fZ")
     return (
@@ -273,15 +341,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         document = json.loads(sys.stdin.read())
         if not isinstance(document, dict):
             raise ValueError("distill input must be an object")
-        state_dir, _, _ = _state_paths()
+        state_dir, _, resume_path = _state_paths()
         audience = _validate_audience(state_dir)
         max_facts = int(os.environ.get("CCC_LOCAL_FACTS_MAX", "1000"))
         max_resume = int(os.environ.get("CCC_RESUME_WRITE_MAX_BYTES", "4000"))
         if max_facts <= 0 or max_resume < 256:
             raise ValueError("local-memory bounds are invalid")
         transaction_module = _load_transaction_module()
-        header = _capture_header(os.environ.get("CLAUDE_DISTILL_CAPTURED_AT"))
+        captured_at = os.environ.get("CLAUDE_DISTILL_CAPTURED_AT")
+        header = _capture_header(captured_at)
+        new_capture = _parse_capture_time(captured_at)
         facts_added = 0
+        resume_kept = False
         mode = args.mode
         if _resume_policy() == "skip" and mode in {"both", "resume"}:
             if mode == "resume":
@@ -290,7 +361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode = "facts"
 
         def transform(current: Mapping[str, bytes | None]) -> Mapping[str, bytes | None]:
-            nonlocal facts_added
+            nonlocal facts_added, resume_kept
             desired: dict[str, bytes | None] = {}
             if mode in {"both", "facts"}:
                 facts, facts_added = _render_facts(
@@ -303,7 +374,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     desired["memory-facts.jsonl"] = facts
             if mode in {"both", "resume"}:
                 resume = _render_resume(document, max_resume, header=header)
-                if resume is not None:
+                # Decided under the transaction lock against the CURRENT
+                # resume (#2320); facts above are merged either way.
+                resume_kept = resume is not None and _keep_current_resume(
+                    current["resume.md"], new_capture, resume_path
+                )
+                if resume is not None and not resume_kept:
                     desired["resume.md"] = resume
             return desired
 
@@ -318,6 +394,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         print(f"local-memory commit failed: {error}", file=sys.stderr)
         return 1
+    if resume_kept:
+        print("local-memory: resume kept reason=newer-capture")
     if facts_added:
         print(f"local-facts: appended {facts_added} fact(s) to {state_dir / 'memory-facts.jsonl'}")
     if result.action_id:
