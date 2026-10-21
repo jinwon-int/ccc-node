@@ -206,7 +206,7 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
   wiki_ans=
   # #2434 — why the Wiki layer did or did not answer. "-" = not consulted.
   # The find used to run as `timeout … | head -c`, which discarded timeout's
-  # 124: a node whose wiki-agent find takes longer than the budget (gongyung,
+  # 124: a node whose wiki-agent find takes longer than the budget (a slow Termux node,
   # 41-45s vs 40s on 2026-10-21) lost every Wiki answer and the sheet read
   # exactly like "the Wiki has nothing" — 0/48 with no trace of why.
   wiki_state=-

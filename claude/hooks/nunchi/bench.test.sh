@@ -417,7 +417,7 @@ ok "a timed-out Wiki leaves the queries counted as gate candidates" \
   'grep -q "^- unanswered (gate candidates): 5$" "$wout_slow"'
 
 # #2434 — the timeout used to be indistinguishable from "the Wiki has nothing"
-# (gongyung 2026-10-19: find 41-45s vs 40s budget, Wiki 0/48, no trace why).
+# (a slow Termux node 2026-10-19: find 41-45s vs 40s budget, Wiki 0/48, no trace why).
 ok "a timed-out Wiki row is tagged wiki=timeout before source= (#2434)" \
   '[ "$(grep -c "^## q[1-5] .*status=OK wiki=timeout source=none$" "$wout_slow")" = 5 ]'
 ok "the summary counts Wiki timeouts and names the knob (#2434)" \
