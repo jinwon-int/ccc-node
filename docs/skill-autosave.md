@@ -907,6 +907,51 @@ ssh_target_set, blocker}` — presence only, never the target or path.
 - **Revoke:** delete the flag file (or write `off`); the next sweep is back to
   the pre-L3 flow. No restart.
 
+#### A2A arbitration of unsettled intake lineages (#2435 S2, default OFF)
+
+Owner decision 2026-10-21: the intake loop's "human judgment" end states are
+replaced by one independent A2A arbitration round per skill lineage. Public
+graduation to ccc-node (P10) stays an owner decision.
+
+```bash
+# off (default/absent) | dry-run | true — owner-created, 0600
+printf 'dry-run\n' > ~/.claude/state/skill-promotion.arbitration
+chmod 600 ~/.claude/state/skill-promotion.arbitration
+# or CCC_SKILL_PROMOTION_ARBITRATION=off|dry-run|true in the publisher config file
+```
+
+- **Where:** `_sweep_arbitration` in the collect drain (nightly and the
+  15-minute results-only cycle), after the promoted/superseded sweeps.
+- **Triggers** (re-derived from the ledger every cycle for every open intake
+  PR, so pre-existing backlog is handled the same way; nothing fires while a
+  review or revise round for the head is still running):
+  `reject` (latest verdict) · `round_limit` (the revise round-limit handoff
+  comment) · `drop_recommended` · `revise_failed` (revise result
+  failed/invalid/broker-mismatch) · `review_failed` (malformed verdict after
+  the #2435 S1 infrastructure retry) · `revise_stuck` (a revise verdict whose
+  revision went nowhere for 24 h).
+- **Arbitration round:** a normal skills-intake review dispatch to a reviewer
+  that excludes the author and every node that reviewed or revised the
+  lineage, with a publisher-authored appendix (metadata-only lineage history:
+  dates, nodes, verdicts, status codes — never candidate or finding text)
+  appended to the worker procedure. Recorded as `a2a-arbitration` (request)
+  and an `a2a-dispatch` row with `arbitration: true`.
+- **Applied mechanically:** `approve` → the normal promote path; `revise` →
+  one final revise round beyond the round limit (`a2a-revise-dispatch final:
+  true`, any trusted substitute may take it), then the next review decides;
+  `reject`, an arbitration round with no verdict, or an undeliverable final
+  round → the intake PR is closed (`a2a-arbitration-closed`, lifecycle
+  `archived:arbiter-closed` / `archived:arbiter-unavailable`).
+- **Bounded:** one arbitration per lineage; a lineage unsettled again after it
+  closes as `post-arbitration-<trigger>`. A request that cannot be dispatched
+  for 48 h closes as `arbiter-unavailable`. At most 4 arbitration dispatches
+  per cycle.
+- **Reversible:** closing never deletes anything; the owner reopens the PR to
+  send it back through the normal review loop.
+- **dry-run** records nothing and reports `would-arbitrate`,
+  `would-close-after-arbitration` and `would-close-arbiter-unavailable` in the
+  collect output.
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.
