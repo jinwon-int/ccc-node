@@ -61,32 +61,65 @@ every clone made after the PR was pushed. Reproduced 2026-09-10 on a fresh
 Record for each PR: `headRefOid`, `baseRefName`, `mergeable`,
 `mergeStateStatus` (`gh pr view <PR#> --json number,title,headRefOid,baseRefName,mergeable,mergeStateStatus`).
 
-### 2. Replay the gate job's validation steps
+### 2. Replay the gate shards' validation steps
 
-There is **no single `gate.js` entrypoint** — the gate is the step list in
-`.github/workflows/gate.yml`, job `gate`. Replay the named steps in order:
+There is **no single `gate.js` entrypoint**. Since 2026-08-21 the gate is
+five parallel shard jobs in `.github/workflows/gate.yml`, plus an aggregator
+job named `gate`. `gate` is the required check; it runs with `always()` and
+succeeds only when every shard succeeded. Replay every shard; shard order does
+not matter, but steps inside a shard do. Step list as of nclex main `08f2a4d`
+(2026-10-21):
 
 ```bash
 cd "$WT/pr-$PR"
-python3 tools/validate_refs.py                      # 참고자료 manifest 검증
+# shard ko-terminology — 한국어 의학용어 정합성
 node tools/ko_terminology.test.js && node tools/ko_terminology.js
-node tools/ko_coverage.test.js  && node tools/ko_coverage.js --check
+# shard ko-coverage — 한국어 의학용어 coverage 대장
+node tools/ko_coverage.test.js && node tools/ko_coverage.js --check
+# shard similarity — 유사도 게이트
+python3 tools/similarity.py --gate
+# shard process-and-items — 출제 계약·문항·하네스
+node tools/gate_workflow.test.js                    # 게이트 워크플로 계약
+python3 tools/validate_refs.py                      # 참고자료 manifest 검증
+node tools/item_difficulty.test.js && node tools/item_difficulty.js --strict
 node tools/content_process.test.js && node tools/content_process.js \
   && python3 tools/coverage.test.py && python3 tools/coverage.py --check
-node tools/validate.js && node tools/attributions.test.js
+node tools/ref_dependency.test.js && node tools/ref_dependency.js   # 근거 자료 판 정합
+node tools/validate.js && node tools/answer_position.test.js && node tools/answer_position.js \
+  && node tools/option_shuffle.test.js && node tools/attributions.test.js
 node tools/selftest.js
 node tools/ui_mode.test.js
+# shard ui-contracts — UI·랜딩·사업화 계약
 node tools/a2a_quorum.js --list-heads | while IFS= read -r sha; do
   git fetch --no-tags origin "$sha"; done
 node tools/a2a_quorum.test.js && node tools/a2a_quorum.js --ci \
   && node tools/clinical_review_ui.test.js && node tools/paid_pool_policy.test.js \
   && node tools/commercial_gate_contract.test.js && node tools/free_pool_manifest.test.js \
-  && node tools/a2a_dispatch.test.js && node tools/a2a_receipt_check.test.js
-node tools/landing.test.js && node tools/landing-stamp.js --check \
-  && node tools/consent_snapshot.test.js && python3 -m unittest api.test_server
-python3 tools/similarity.py --gate
-node tools/commercial_readiness.test.js && node tools/commercial_readiness.js
+  && node tools/a2a_dispatch.test.js && node tools/pre_a2a_readiness.test.js \
+  && node tools/a2a_receipt_check.test.js && node tools/ko_explanation.test.js
+for t in session_catalog deploy_quiz2 diagnostic_ui diagnostic_account_ui study_start_ui \
+         diagnostic_payment_ui study_progress_ui review_jump; do node "tools/$t.test.js" || { echo "FAIL $t"; break; }; done
+node tools/ko_explanation.js --audit > /dev/null    # screening only, never a quality PASS
+node tools/landing.test.js && node tools/design_tokens.test.js \
+  && node tools/public_host_allowlist.test.js && node tools/reviewer_host_template.test.js \
+  && node tools/landing-stamp.js --check && node tools/consent_snapshot.test.js \
+  && node tools/scoring_vectors.js --check && python3 -m unittest api.test_server api.test_scoring \
+  && python3 tools/quiz2_backup.test.py && bash tools/quiz2_health_probe.test.sh
+node tools/commercial_readiness.test.js && node tools/release_lane.test.js \
+  && node tools/commercial_readiness.js
 ```
+
+Three of the `process-and-items` gates compare against the **PR base** and
+only fail **new or modified** items: `item_difficulty.js --strict` (missing or
+stale difficulty tag), `answer_position.js` (answer-position cue, #499), and
+`content_process.js`. In ledger mode, with no event variables, they audit the
+whole catalogue and only print stock statistics. The event-payload trick in
+step 4 forces PR mode for all three, not only `content_process.js`.
+
+A full local replay takes about 10 minutes on a 2-core node (in a 2026-10-21
+measurement, `ko_terminology`, `ko_coverage`, and the `ui-contracts` A2A bundle
+each took about 2 minutes, and `similarity` about 1.5 minutes). Do not run it in
+parallel with other heavy jobs.
 
 **Never run `tools/a2a_dispatch.js`.** It lives in a *separate* `a2a-dispatch`
 job (`needs: gate`, PR events only) and it **posts** an evaluation request
@@ -94,7 +127,12 @@ comment. Its `*.test.js` is part of the gate; the tool itself is not.
 
 Re-check the step list against `gate.yml` at the head being validated — the
 gate grows, and a step added after the PR branched is exactly what this skill
-exists to catch.
+exists to catch. List the shards and their `run:` lines rather than trusting the
+block above:
+
+```bash
+grep -nE '^  [a-z-]+:$|^\s+- name:|^\s+run:' .github/workflows/gate.yml
+```
 
 ### 3. Baseline against current main — inside the worktree, then abort
 
@@ -150,6 +188,10 @@ noise: name the cause (stale base / gate step added since / environment).
 | `ko_terminology.js` | new/modified `{en, ko}` pair contradicts the catalog | correct the translation; legacy pairs warn, new ones fail |
 | `ko_coverage.js --check` | new/modified pair lacks a `stage=reviewed` coverage record | see the stage contract below |
 | `content_process.js` | `data/*.js` change does not match a `reserved` record merged to main, or base is stale | re-anchor the claim, or rebase (step 4) |
+| `item_difficulty.js --strict` | new/modified item has no or a stale `refs/item-difficulty.json` tag (fingerprint moved) | tag the item in the ledger; it is not a content change |
+| `ref_dependency.js` | an item cites a reference edition whose hash no longer matches `refs/hub-manifest.sha256` | re-check the item against the current edition, update the citation |
+| `answer_position.js` | new/modified item puts the key in a cue position (#499) | reorder options / split patterns; stock items are only summarised |
+| `gate_workflow.test.js` | shard/aggregator contract of `gate.yml` broken | fix the workflow, not the content |
 | `coverage.py --check` | reference fingerprint mismatch | refresh the override / re-register |
 | `a2a_quorum.js --ci` | quorum head list or bundle target count moved | rebase and refresh the bundle |
 | `similarity.py --gate` | recreated text overlaps the source | rewrite the overlapping passage |
