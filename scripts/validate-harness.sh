@@ -630,6 +630,12 @@ else
   err "skill-promotion A2A arbitration tests failed (an unsettled intake lineage would wait for a human again, #2435)"
   tail -10 "$TMP/skill-promotion-arbitration-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_api_path_mask_test.py >"$TMP/skill-promotion-api-path-mask-test.out" 2>&1; then
+  say "  ok skill-promotion possible-token API path mask tests (#2399)"
+else
+  err "skill-promotion possible-token API path mask tests failed (a gh api path would void a valid revision, or a real token would pass, #2399)"
+  tail -10 "$TMP/skill-promotion-api-path-mask-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_config_file_test.py >"$TMP/skill-promotion-config-file-test.out" 2>&1; then
   say "  ok skill-promotion publisher config file tests (#2239)"
 else
