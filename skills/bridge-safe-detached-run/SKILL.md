@@ -1,6 +1,6 @@
 ---
 name: bridge-safe-detached-run
-description: Use when a command may outlive the session or a bridge restart (installs, indexing, builds, migrations, long tests), a background job was killed by a bridge restart, or a finished job looks failed because its watcher died. Runs it as a logged systemd transient unit with EXIT marker and job registry.
+description: Use when a command or wait may outlive the session, a bridge restart, or a bridge turn limit (installs, builds, long tests, fleet polling), a job died on restart, a turn-timeout/stall notice appeared, or a done job looks failed as its watcher died. Logged systemd unit + EXIT marker + job registry.
 ---
 
 # bridge-safe-detached-run
@@ -18,6 +18,11 @@ the process watching it did not.
 - Any command expected to run >2–3 minutes while the session or Telegram bridge might restart
 - Re-running a job that previously died with the session ("bg task killed")
 - A finished job looks failed because the process watching it died (#1258; Step 2)
+- A wait inside an interactive bridge turn (polling fleet self-updates, remote
+  builds, deployments across several nodes) could approach the bridge's turn
+  ceiling or stall probe — detach it and end the turn instead (Step 2c)
+- The bridge already posted a turn-timeout (`⏰ Timed out after …s`), turn-age
+  or stall notice and the late final answer never arrived (Step 2c)
 - `systemd-run` output mysteriously fails because `HOME` is missing (see the
   `HOME`/`PATH` injection rule in Step 1)
 
@@ -88,6 +93,42 @@ Remember `--collect` removes the unit on exit, so once the job succeeds
 `systemctl status` says "could not be found" — that is normal and is **not**
 evidence of failure. The log's `EXIT=` marker is the only durable proof.
 
+## Step 2c — Long waits inside a bridge turn: detach, checkpoint, end the turn
+
+Polling in-turn is bounded not only by the session but by the **bridge's turn
+ceiling**: the Claude path wraps the whole turn in `asyncio.wait_for` on
+`CLAUDE_PROCESS_TIMEOUT` (`bridge/runtime_config_check.py`
+`DEFAULT_PROCESS_TIMEOUT_SECONDS`; nodes override it in the bridge env file), and
+on expiry it posts `⏰ Timed out after <n>s`, claims the request's terminal
+state, and drops the agent session — a final answer that arrives afterwards is
+discarded (`bridge/core/project_chat_process.py` `_handle_turn_timeout`). Matrix
+has its own `turn_timeout_minutes`. Two more watchdogs act on quiet turns:
+`CCC_TURN_STALL_PROBE_MIN` (#1112, dead-session recovery on a confirmed-dead
+engine) and `CCC_TURN_AGE_NOTIFY_MIN` (#1111, notify-only age note). Read the
+live values before a long wait; never quote a remembered number.
+
+1. **Estimate before waiting.** If the wait (remote self-updates, multi-node
+   builds, deployments, >2–3 minutes of polling) could approach the ceiling or
+   the stall probe, do not poll in the turn.
+2. **Detach the wait itself** with Step 1 (the poll loop is the command — it
+   writes its result and `EXIT=` to the log) and **register it** with Step 2.
+3. **Checkpoint**: record the unit name, log path and the expected result in
+   `~/.claude/state/working-state.md` (목표 / 진행 / 다음 단계) so the next turn
+   or session can pick it up without the transcript.
+4. **End the turn early** with a short status: what was detached, where the
+   result lands, and the next check point. Do not wait for the EXIT marker.
+5. **In a later turn, read the registry, not memory** — `detached_jobs.py list
+   --json` (table in the next section) — then report from the log, not from
+   the transcript summary. Confirm reported versions/states on the live node.
+6. **Never re-launch while the previous unit may still be alive**; `running`
+   means wait, `lost` means investigate first. The after-the-fact question
+   "did the cut-off job finish, and is a re-run safe?" is
+   `background-task-session-recovery`.
+7. **Do not assume a timed-out turn's final answer was delivered.** Say so
+   explicitly in the next report, and never restart or interrupt the bridge to
+   clear a stuck turn — that is approval-gated and session-killing
+   (`bridge-detached-self-restart`).
+
 ## Receiving `<task-notification status=stopped>` — classify first
 
 The watcher stopping is not the job failing (ccc-node #1267): a session or
@@ -137,6 +178,8 @@ systemctl stop <job>.service                               # abort a running job
 
 - This skill detaches *execution*, not *authority*: destructive or approval-gated
   commands still need owner approval before launch — detaching does not bypass gates.
+- Detaching a wait does not license restarting the bridge or the session to
+  clear a stuck turn; that stays approval-gated (Step 2c).
 - Never put secrets in the unit name, command line, or log (unit cmdlines are
   visible in `systemctl`/journal); read keys inside the script from the node's env file, resolved at run time (`~/.hermes/.env` on most nodes, `/opt/ccc-node/bridge/.env` on others).
 - Multi-user/rootless nodes: user services may need lingering
@@ -153,3 +196,5 @@ systemctl stop <job>.service                               # abort a running job
   `done`/`running`/`lost` even if this session is gone
 - A `status=stopped` notification is answered from `list --json` without
   restarting or re-running anything
+- A long wait was handed to a unit and the turn ended before the bridge's turn
+  ceiling; the result was reported in a later turn from the log's `EXIT=` line

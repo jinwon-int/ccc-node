@@ -4,6 +4,26 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **`bridge-safe-detached-run`: long waits inside a bridge turn are a trigger,
+  and the skill now says what to do with them (Step 2c).** A 2026-10-21 session
+  polled fleet self-updates in-turn for 15+ minutes, ran into the bridge's turn
+  watchdogs, and lost the final reply; the autosave draft it produced
+  (`bridge-turn-timeout-avoidance-for-long-waits`) was prescreened `revise`
+  (major: trigger-less description, duplicate of this skill +
+  `background-task-session-recovery`) and is absorbed here instead of landing
+  as a fourth overlapping skill. The description (still ≤300 chars for the
+  core listing) now names the bridge turn ceiling, fleet polling and a posted
+  turn-timeout/stall notice as triggers. New Step 2c cites the actual
+  mechanisms by config name — `CLAUDE_PROCESS_TIMEOUT` whole-turn
+  `asyncio.wait_for` (`_handle_turn_timeout` claims the terminal state and
+  drops the late answer), Matrix `turn_timeout_minutes`,
+  `CCC_TURN_STALL_PROBE_MIN` (#1112) and `CCC_TURN_AGE_NOTIFY_MIN` (#1111) —
+  and gives the procedure: estimate, detach the poll itself (Step 1 + 2),
+  checkpoint in `working-state.md`, end the turn early, read the registry in a
+  later turn, never re-launch a possibly-live unit, never assume a timed-out
+  turn's answer was delivered, never restart the bridge to clear it. The
+  after-the-fact "did it finish?" question stays with
+  `background-task-session-recovery`, referenced rather than duplicated.
 - **Skill autosave: drafts must say WHEN to use the skill, and the install
   lint enforces it (Refs #2011).** The agent picks a skill from a per-turn
   listing that truncates descriptions, and fleet-skills #316 made
