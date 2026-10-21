@@ -125,7 +125,18 @@ NO_RECORD_RE="${NUNCHI_BENCH_NO_RECORD_RE:-기록 없음|기록이 없|근거가
 # never answer a cross-node question, which made the old gate unpassable by
 # design rather than by defect. Only consulted when nunchi found nothing.
 WIKI_CLI="${NUNCHI_BENCH_WIKI_CLI:-$(command -v wiki-agent 2>/dev/null || echo "$HOME/.wiki-agent/bin/wiki-agent")}"
-WIKI_TIMEOUT="${NUNCHI_BENCH_WIKI_TIMEOUT_SEC:-40}"
+# #2434 — a slow node needs a longer Wiki budget without editing the managed
+# cron line (install-nunchi.sh regenerates it): env wins, then a node-local
+# one-line file, then 40s. Only an integer 1..600 is accepted; anything else
+# falls back to 40 rather than disabling the timeout.
+WIKI_TIMEOUT="${NUNCHI_BENCH_WIKI_TIMEOUT_SEC:-}"
+if [ -z "$WIKI_TIMEOUT" ] && [ -f "$NUNCHI_HOME/bench-wiki-timeout-sec" ]; then
+  WIKI_TIMEOUT="$(head -c 16 "$NUNCHI_HOME/bench-wiki-timeout-sec" | tr -d '[:space:]')"
+fi
+case "$WIKI_TIMEOUT" in
+  ''|*[!0-9]*) WIKI_TIMEOUT=40 ;;
+esac
+{ [ "$WIKI_TIMEOUT" -ge 1 ] && [ "$WIKI_TIMEOUT" -le 600 ]; } 2>/dev/null || WIKI_TIMEOUT=40
 [ -f "$QSET" ] || { echo "qset missing: $QSET" >&2; exit 2; }
 
 mkdir -p "$NUNCHI_HOME"
@@ -193,19 +204,37 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
   # says nothing about retrieval, so it is never attributed to a layer.
   source=none
   wiki_ans=
+  # #2434 — why the Wiki layer did or did not answer. "-" = not consulted.
+  # The find used to run as `timeout … | head -c`, which discarded timeout's
+  # 124: a node whose wiki-agent find takes longer than the budget (a slow Termux node,
+  # 41-45s vs 40s on 2026-10-21) lost every Wiki answer and the sheet read
+  # exactly like "the Wiki has nothing" — 0/48 with no trace of why.
+  wiki_state=-
   if [ "$status" = OK ]; then
     if printf '%s' "$ans" | grep -qE "$NO_RECORD_RE"; then
       # nunchi found nothing — consult the layer TM-2029 made responsible for
       # durable cross-node knowledge before counting this against the gate.
       if [ -n "$WIKI_CLI" ] && [ -x "$WIKI_CLI" ]; then
-        wiki_ctx="$(timeout "$WIKI_TIMEOUT" "$WIKI_CLI" find "$query" </dev/null 2>/dev/null | head -c 4000)"
-        if [ -n "${wiki_ctx//[[:space:]]/}" ]; then
+        wiki_ctx="$(timeout "$WIKI_TIMEOUT" "$WIKI_CLI" find "$query" </dev/null 2>/dev/null)"
+        wiki_rc=$?
+        wiki_ctx="${wiki_ctx:0:4000}"
+        if [ "$wiki_rc" = 124 ]; then
+          wiki_state=timeout
+        elif [ -z "${wiki_ctx//[[:space:]]/}" ]; then
+          if [ "$wiki_rc" = 0 ]; then wiki_state=no-context; else wiki_state=error; fi
+        else
           wiki_ans="$(printf '%s' "$wiki_ctx" \
             | timeout "$WIKI_TIMEOUT" python3 "$HERE/nunchi.py" synthesize "$query" 2>&1)"
-          if [ -n "${wiki_ans//[[:space:]]/}" ] \
+          synth_rc=$?
+          if [ "$synth_rc" = 124 ]; then
+            wiki_state=timeout
+          elif [ -n "${wiki_ans//[[:space:]]/}" ] \
              && ! printf '%s' "$wiki_ans" | grep -qE "$NO_RECORD_RE" \
              && ! printf '%s' "$wiki_ans" | grep -qiE "$INVALID_RE"; then
             source=wiki
+            wiki_state=ok
+          else
+            wiki_state=no-record
           fi
         fi
       fi
@@ -248,17 +277,23 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
       if [ "$source" = none ]; then grade=UNANSWERED; else grade=ANSWERED; fi
     fi
   fi
-  printf '%s\t%s\t%s\t%s\t%s\n' "$qid" "$status" "$source" "$polarity" "$grade" >> "$LEDGER"
+  # Column 6 (wiki_state) is appended: the summary reads columns by position,
+  # so earlier columns keep their meaning.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$qid" "$status" "$source" "$polarity" "$grade" "$wiki_state" >> "$LEDGER"
   {
     # grade= is emitted only for negative-control rows. On a positive row it is
     # a pure restatement of source= (ANSWERED iff source!=none), so adding it
     # everywhere would be noise; on a negative row source= alone reads backwards.
     suffix=
     [ "$polarity" = negative ] && suffix=" grade=$grade"
+    # wiki= only on rows where the Wiki layer was consulted, and placed before
+    # source= so lines ending in `source=…` / `grade=…` keep their shape.
+    wiki_tag=
+    [ "$wiki_state" != - ] && wiki_tag=" wiki=$wiki_state"
     if [ -n "$reason" ]; then
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason source=$source$suffix"
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason$wiki_tag source=$source$suffix"
     else
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status source=$source$suffix"
+      echo "## $qid ($category) — ${dur}s rc=$rc status=$status$wiki_tag source=$source$suffix"
     fi
     echo "- Q: $query"
     echo "- expect: $expect"
@@ -287,6 +322,16 @@ read -r by_nunchi by_wiki answered unanswered correct_reject fabricated <<<"$(
     $5=="CORRECT-REJECT"                   {r++}
     $5=="FABRICATED"                       {f++}
     END { printf "%d %d %d %d %d %d", n+0, w+0, a+0, u+0, r+0, f+0 }
+  ' "$LEDGER"
+)"
+# #2434 — Wiki-layer outcome counts (column 6). A pre-#2434 5-column ledger
+# row has no $6 and counts as not consulted.
+read -r wiki_consulted wiki_timeouts wiki_errors <<<"$(
+  awk -F'\t' '
+    NF>=6 && $6!="-"                       {c++}
+    $6=="timeout"                          {t++}
+    $6=="error"                            {e++}
+    END { printf "%d %d %d", c+0, t+0, e+0 }
   ' "$LEDGER"
 )"
 pos_valid=$(( answered + unanswered ))
@@ -341,6 +386,13 @@ unanswered_pct=0
   echo "- answered by nunchi: $by_nunchi"
   echo "- answered by wiki: $by_wiki"
   echo "- unanswered (gate candidates): $unanswered"
+  # #2434 — a timed-out Wiki layer inflates "unanswered" without saying so.
+  # Advisory only: the verdict rules below are unchanged.
+  if [ "$wiki_consulted" -gt 0 ]; then
+    echo "- wiki layer: consulted $wiki_consulted, timeouts $wiki_timeouts, errors $wiki_errors (timeout ${WIKI_TIMEOUT}s)"
+    [ "$wiki_timeouts" -gt 0 ] \
+      && echo "- ⚠️ wiki layer timed out on $wiki_timeouts/$wiki_consulted rows — unanswered is overstated; raise NUNCHI_BENCH_WIKI_TIMEOUT_SEC or \$NUNCHI_HOME/bench-wiki-timeout-sec on this node"
+  fi
   # TM-2370 P1-A — positive and negative-control rows are scored separately.
   # A negative-control row answered by any layer is a fabrication: the question
   # has no true answer, so producing one is the failure mode the gate exists to
@@ -381,4 +433,6 @@ unanswered_pct=0
   echo
 } >> "$OUT"
 
-echo "bench written: $OUT (valid=$valid invalid=$invalid) gate=$verdict"
+wiki_note=
+[ "$wiki_timeouts" -gt 0 ] && wiki_note=" wiki_timeouts=$wiki_timeouts/$wiki_consulted"
+echo "bench written: $OUT (valid=$valid invalid=$invalid) gate=$verdict$wiki_note"

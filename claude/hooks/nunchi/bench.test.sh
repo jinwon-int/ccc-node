@@ -416,6 +416,58 @@ ok "a Wiki lookup that times out degrades to source=none and still exits 0" \
 ok "a timed-out Wiki leaves the queries counted as gate candidates" \
   'grep -q "^- unanswered (gate candidates): 5$" "$wout_slow"'
 
+# #2434 — the timeout used to be indistinguishable from "the Wiki has nothing"
+# (a slow Termux node 2026-10-19: find 41-45s vs 40s budget, Wiki 0/48, no trace why).
+ok "a timed-out Wiki row is tagged wiki=timeout before source= (#2434)" \
+  '[ "$(grep -c "^## q[1-5] .*status=OK wiki=timeout source=none$" "$wout_slow")" = 5 ]'
+ok "the summary counts Wiki timeouts and names the knob (#2434)" \
+  'grep -q "^- wiki layer: consulted 5, timeouts 5, errors 0 (timeout 1s)$" "$wout_slow" \
+   && grep -q "^- ⚠️ wiki layer timed out on 5/5 rows" "$wout_slow"'
+ok "the cron line carries wiki_timeouts so fleet roll-ups see it (#2434)" \
+  'grep -q "^bench written: .* wiki_timeouts=5/5$" "$TMP/wout-slow"'
+# The slow run above reused the same day-named sheet, so re-run the healthy CLI.
+run_wiki_bench
+ok "a healthy Wiki layer is tagged wiki=ok and reports no timeouts (#2434)" \
+  '[ "$(grep -c "^## q[1-5] .*wiki=ok source=wiki$" "$wout")" = 5 ] \
+   && grep -q "^- wiki layer: consulted 5, timeouts 0, errors 0 (timeout 40s)$" "$wout" \
+   && ! grep -q "wiki_timeouts=" "$TMP/wout"'
+
+cat > "$wbin/wiki-agent-broken" <<'EOF'
+#!/usr/bin/env bash
+exit 3
+EOF
+chmod +x "$wbin/wiki-agent-broken"
+rm -f "$wiki_nh"/bench-*.md
+HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
+  NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI="$wbin/wiki-agent-broken" \
+  bash "$wiki_hooks/bench.sh" > "$TMP/wout-broken" 2>&1
+wout_broken="$(find "$wiki_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a failing Wiki CLI is wiki=error, not a timeout (#2434)" \
+  '[ "$(grep -c "^## q[1-5] .*wiki=error source=none$" "$wout_broken")" = 5 ] \
+   && grep -q "^- wiki layer: consulted 5, timeouts 0, errors 5 " "$wout_broken"'
+
+# Node-local budget file: survives install-nunchi.sh regenerating the cron line.
+printf '2\n' > "$wiki_nh/bench-wiki-timeout-sec"
+rm -f "$wiki_nh"/bench-*.md
+HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
+  NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI="$wbin/wiki-agent-slow" \
+  bash "$wiki_hooks/bench.sh" > "$TMP/wout-file" 2>&1
+wout_file="$(find "$wiki_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "\$NUNCHI_HOME/bench-wiki-timeout-sec sets the Wiki budget (#2434)" \
+  'grep -q "^- wiki layer: consulted 5, timeouts 5, errors 0 (timeout 2s)$" "$wout_file"'
+printf 'abc\n' > "$wiki_nh/bench-wiki-timeout-sec"
+rm -f "$wiki_nh"/bench-*.md
+HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
+  NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI="$wbin/wiki-agent" \
+  bash "$wiki_hooks/bench.sh" > "$TMP/wout-badfile" 2>&1
+wout_badfile="$(find "$wiki_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a malformed budget file falls back to 40s instead of disabling the timeout (#2434)" \
+  'grep -q "(timeout 40s)$" "$wout_badfile"'
+rm -f "$wiki_nh/bench-wiki-timeout-sec"
+
 rm -f "$wiki_nh"/bench-*.md
 HOME="$wiki_home" CCC_STATE_DIR="$wiki_state" NUNCHI_HOME="$wiki_nh" \
   NUNCHI_BENCH_QSET="$wiki_hooks/bench-qset.tsv" CCC_NODE=test-node \
