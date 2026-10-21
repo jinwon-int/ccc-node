@@ -618,6 +618,12 @@ else
   err "skill-promotion dispatch-skip ledger + redispatch selection tests failed"
   tail -10 "$TMP/skill-promotion-redispatch-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_infra_retry_test.py >"$TMP/skill-promotion-infra-retry-test.out" 2>&1; then
+  say "  ok skill-promotion infrastructure-failure retry tests (#2435 S1)"
+else
+  err "skill-promotion infrastructure-failure retry tests failed (an OAuth/balance/CLI failure would fall back to human judgment, #2435)"
+  tail -10 "$TMP/skill-promotion-infra-retry-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_config_file_test.py >"$TMP/skill-promotion-config-file-test.out" 2>&1; then
   say "  ok skill-promotion publisher config file tests (#2239)"
 else
