@@ -119,6 +119,43 @@ _PUBLIC_NAMESPACE_URI_RE = re.compile(
     r"https?://(?:schemas\.openxmlformats\.org|schemas\.microsoft\.com|www\.w3\.org|purl\.org)"
     r"(?:/[A-Za-z0-9._~-]{1,39}(?![A-Za-z0-9._~+-]))+/?"
 )
+# #2399: the same false positive from scheme-less API paths (`gh api
+# repos/OWNER/REPO/actions/runners/registration-token`, fleet-skills #413). A
+# slash-joined run is masked only when it has two or more slashes, no `+`, and
+# EVERY segment is shorter than the token threshold and reads as a word: a
+# lowercase or Capitalised word (`repos`, `actions`, `Users`), an all-caps
+# letters-only placeholder (`OWNER`, `ORG_ID` is already split by `_`), or a
+# number. A random base64 secret mixes cases and digits inside a segment, so a
+# run with any such segment stays whole and is still caught; one non-word
+# segment keeps the entire run unmasked. Only scheme-less paths qualify: a
+# `scheme://host/...` URL stays out of scope, as #2371 decided.
+_SLASH_RUN_RE = re.compile(r"[A-Za-z0-9+/._~-]*/[A-Za-z0-9+/._~-]*")
+_PATH_WORD_RE = re.compile(r"[A-Za-z][a-z0-9._~-]*|[A-Z][A-Z.~-]*|[0-9][0-9._~-]*")
+
+
+def _mask_word_paths(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        run = match.group(0)
+        if run.count("/") < 2 or "+" in run or run.startswith("//"):
+            return run
+        if match.start() > 0 and text[match.start() - 1] == ":":
+            return run  # a URL (`scheme://host/...`): never masked, a webhook path can be a secret
+        segments = [segment for segment in run.split("/") if segment]
+        if segments and all(
+            len(segment) < 40 and _PATH_WORD_RE.fullmatch(segment) for segment in segments
+        ):
+            return " " * len(run)
+        return run
+
+    return _SLASH_RUN_RE.sub(replace, text)
+
+
+def _token_haystack(text: str) -> str:
+    """What the `possible-token` pattern scans: public namespace URIs (#2371)
+    and word-only slash paths (#2399) blanked, same length so lines hold."""
+    return _mask_word_paths(_PUBLIC_NAMESPACE_URI_RE.sub(lambda m: " " * len(m.group(0)), text))
+
+
 _HOME_PATH_RE = re.compile(r"(?:^|[^A-Za-z0-9_])/(?:root|home|Users)/[^\s`'\"<>]+")
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -1186,15 +1223,35 @@ def _frontmatter_fields(
         raise PromotionError(error.code) from None
 
 
+def _secret_scan_locations(
+    files: list[tuple[str, bytes]], code: str, *, limit: int = 10
+) -> list[dict[str, object]]:
+    """#2399: file, line and match length of a `secret_*` re-gating failure.
+
+    Never the matched value — only where it is and how long, so an operator
+    or arbiter can tell an API path from a credential without seeing either."""
+    pattern = dict(_CREDENTIAL_PATTERNS).get(code.removeprefix("secret_")) if code.startswith("secret_") else None
+    if pattern is None:
+        return []
+    out: list[dict[str, object]] = []
+    for path, content in files:
+        text = content.decode("utf-8", errors="replace")
+        haystack = _token_haystack(text) if code == "secret_possible-token" else text
+        for match in pattern.finditer(haystack):
+            out.append({"path": path, "line": haystack.count("\n", 0, match.start()) + 1,
+                        "length": len(match.group(0))})
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def _scan_text(payload: bytes) -> None:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
         raise PromotionError("source_not_utf8") from None
     for label, pattern in _CREDENTIAL_PATTERNS:
-        haystack = (
-            _PUBLIC_NAMESPACE_URI_RE.sub(" ", text) if label == "possible-token" else text
-        )
+        haystack = _token_haystack(text) if label == "possible-token" else text
         if pattern.search(haystack):
             raise PromotionError(f"secret_{label}")
     if _HOME_PATH_RE.search(text):
@@ -7414,12 +7471,17 @@ def _republish_revised_candidate(
         original_exec = {relative: executable for relative, _, executable in original}
         candidate = _candidate_from_revised_files(node, provider, name, revised, original_exec)
     except PromotionError as error:
+        locations = _secret_scan_locations(revised, error.code)
         _append_ledger(
             config,
             {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id,
              "status": "invalid", "node": node, "name": name, "code": error.code,
              **({"path_roots": _disallowed_path_roots([path for path, _ in revised])}
-                if error.code == "envelope_path_invalid" else {})},
+                if error.code == "envelope_path_invalid" else {}),
+             **({"locations": locations} if locations else {})},
+        )
+        where = "".join(
+            f"\n- `{item['path']}:{item['line']}` (match length {item['length']})" for item in locations
         )
         _comment_once(
             config,
@@ -7431,6 +7493,7 @@ def _republish_revised_candidate(
                 f"Revision task `{task_id}` returned files that failed re-gating (`{error.code}`) — "
                 "treated as a handler failure, not a revision. No automatic retry; human judgment "
                 "continues on this PR."
+                + (f"\n\nMatch locations (values not shown, #2399):{where}" if where else "")
             ),
         )
         return {"outcome": "revise-invalid", "task_id": task_id, "code": error.code}
