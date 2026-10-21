@@ -74,6 +74,7 @@ from telegram_bot.core.agent_runtime import (  # noqa: E402
     CompletionEvent,
     DelegatedTaskLifecycleEvent,
     ErrorEvent,
+    ResultEvent,
     SessionRequest,
     TextDeltaEvent,
 )
@@ -1170,19 +1171,211 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         await _wait_until(lambda: client.queries == ["user turn"])
 
         # The autonomous turn's terminal result arrives AFTER the user turn
-        # was submitted — the user turn must not steal it.
+        # was submitted — the user turn must not steal it. The adapter cannot
+        # yet tell this two-result shape from a CLI-merged single result
+        # (#2440), so the result is parked until the user turn's own first
+        # frame proves the shape: nothing is delivered yet, and the user turn
+        # is still open.
         client.emit_result(result=None)
+        await _wait_until(lambda: session._held_result is not None)
+        self.assertEqual(self.delivered, [])
+        self.assertFalse(turn_task.done())
+        self.assertFalse(session._unsolicited_inflight)
+
+        # Only now do the user turn's frames arrive, and they belong to it;
+        # the parked autonomous result is delivered first, on its own route.
+        client.emit_assistant("user answer")
         await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
         self.assertEqual(self.delivered, [("autonomous progress", client.session_id)])
-
-        # Only now do the user turn's frames arrive, and they belong to it.
-        client.emit_assistant("user answer")
+        self.assertIsNone(session._held_result)
         client.emit_result(result="user answer")
         events = await asyncio.wait_for(turn_task, timeout=2.0)
         texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
         self.assertEqual(texts, ["user answer"])
         self.assertIsInstance(events[-1], CompletionEvent)
         self.assertEqual(len(self.delivered), 1)
+
+    async def test_user_turn_merged_into_autonomous_turn_completes_on_grace(
+        self,
+    ) -> None:
+        """#2440: one ResultMessage ends both turns when the CLI coalesced them.
+
+        jingun 2026-10-21: a task-notification continuation was running when
+        the owner's message arrived; the CLI merged that prompt into the
+        running turn and emitted a single terminal frame, which the adapter
+        attributed to the autonomous turn — the user turn then waited forever.
+        """
+
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        session._merged_turn_grace_seconds = 0.05
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+
+        # The CLI answers the merged prompt inside the same turn and ends it
+        # with one result. No further frame ever follows.
+        client.emit_assistant("merged answer")
+        client.emit_result(result="merged answer")
+
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+        self.assertIsInstance(events[-1], CompletionEvent)
+        result_payloads = [
+            event.result for event in events if isinstance(event, ResultEvent)
+        ]
+        self.assertEqual([payload["result"] for payload in result_payloads], ["merged answer"])
+        # The answer reached the user turn, not the autonomous route: no
+        # double delivery and no orphaned request.
+        self.assertEqual(self.delivered, [])
+        self.assertIsNone(session._held_result)
+        self.assertIsNone(session._active_turn)
+        self.assertFalse(session._unsolicited_inflight)
+
+        # The session is healthy afterwards: a plain turn still round-trips.
+        events = await asyncio.wait_for(_collect(session.send_turn("next")), timeout=2.0)
+        self.assertIsInstance(events[-1], CompletionEvent)
+        self.assertEqual(self.delivered, [])
+
+    async def test_merged_result_lifecycle_end_precedes_the_park(self) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        session._merged_turn_grace_seconds = 0.05
+        phases: list[str] = []
+
+        async def lifecycle(phase: str, session_id: str | None) -> None:
+            phases.append(phase)
+
+        session.set_unsolicited_lifecycle(lifecycle)
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+        client.emit_result(result="merged answer")
+        # The autonomous window closes as soon as its terminal frame arrives;
+        # the park only decides who receives the frame.
+        await _wait_until(lambda: phases == ["start", "end"])
+        self.assertIsNotNone(session._held_result)
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+        self.assertIsInstance(events[-1], CompletionEvent)
+        self.assertEqual(phases, ["start", "end"])
+        self.assertFalse(session._unsolicited_route_open)
+
+    async def test_parked_result_is_delivered_when_the_waiter_gave_up(self) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        session._merged_turn_grace_seconds = 0.05
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+        client.turn_scripts.append("hang")
+        iterator = session.send_turn("owner question").__aiter__()
+        first_event = asyncio.create_task(iterator.__anext__())
+        await _wait_until(lambda: client.queries == ["owner question"])
+        client.emit_result(result=None)
+        await _wait_until(lambda: session._held_result is not None)
+
+        # The waiter is cancelled (stall release) while the result is parked:
+        # there is no turn left to complete, but the autonomous answer must
+        # not vanish with it.
+        first_event.cancel()
+        await asyncio.gather(first_event, return_exceptions=True)
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertEqual(self.delivered, [("autonomous progress", client.session_id)])
+        self.assertIsNone(session._held_result)
+
+    async def test_parked_result_waits_for_delegated_work_instead_of_completing(
+        self,
+    ) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        session._merged_turn_grace_seconds = 0.05
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+        # The merged turn delegated bounded work before its intermediate
+        # result; the run-ending result only comes once that work settles.
+        client.emit_task_started("agent-1", "local_agent")
+        await _wait_until(
+            lambda: session._active_turn is not None
+            and "agent-1" in session._active_turn.result_deferring_tasks
+        )
+        client.emit_result(result="intermediate")
+        await _wait_until(lambda: session._held_result is not None)
+        await asyncio.sleep(0.15)
+        # Grace expired, but the turn stays open for its delegated work.
+        self.assertIsNone(session._held_result)
+        self.assertFalse(turn_task.done())
+        self.assertEqual(self.delivered, [])
+
+        client.emit_task_notification("agent-1")
+        client.emit_assistant("final answer")
+        client.emit_result(result="final answer")
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+        self.assertIsInstance(events[-1], CompletionEvent)
+        texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
+        self.assertEqual(texts, ["final answer"])
+        self.assertEqual(self.delivered, [])
+
+    async def test_parked_result_is_delivered_when_the_reader_dies(self) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        session._merged_turn_grace_seconds = 5.0
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+        client.emit_result(result=None)
+        await _wait_until(lambda: session._held_result is not None)
+
+        # The transport stream ends while the result is parked: the user turn
+        # fails like any other connection loss, and the parked autonomous
+        # answer still reaches its route instead of dying with the stream.
+        client.emit(None)
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+        self.assertIsInstance(events[-1], ErrorEvent)
+        self.assertEqual(events[-1].code, "claude_connection_failed")
+        await asyncio.wait_for(self.delivered_event.wait(), timeout=2.0)
+        self.assertEqual(self.delivered, [("autonomous progress", client.session_id)])
+        self.assertIsNone(session._held_result)
+
+    async def test_closing_the_session_cancels_a_parked_result(self) -> None:
+        session, client = await self._start_session()
+        session.set_unsolicited_handler(self._handler)
+        session._merged_turn_grace_seconds = 0.05
+
+        client.emit_assistant("autonomous progress")
+        await _wait_until(lambda: session._unsolicited_inflight)
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+        client.emit_result(result="merged answer")
+        await _wait_until(lambda: session._held_result is not None)
+        timer = session._held_result.timer
+
+        await session.close()
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+        # Exactly one terminal event, the close's own, reached the turn.
+        terminal = [
+            event for event in events if isinstance(event, (CompletionEvent, ErrorEvent))
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertIsInstance(terminal[0], ErrorEvent)
+        self.assertEqual(terminal[0].code, "claude_runtime_closed")
+        self.assertIsNone(session._held_result)
+        await asyncio.sleep(0.1)
+        self.assertTrue(timer is None or timer.cancelled() or timer.done())
+        self.assertEqual(self.delivered, [])
 
     async def test_abandoned_turn_frames_are_swallowed_not_redelivered(self) -> None:
         session, client = await self._start_session()

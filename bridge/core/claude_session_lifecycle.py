@@ -72,6 +72,7 @@ class ClaudeSessionLifecycleMixin:
     _stderr_tail: deque[str]
     _turn_lock: asyncio.Lock | None
     _fail_active_turn: Callable[[str, str], None]
+    _cancel_held_result: Callable[[], None]
 
     if TYPE_CHECKING:
         async def _read_frames(self, client: SdkClient) -> None: ...
@@ -112,6 +113,9 @@ class ClaudeSessionLifecycleMixin:
             if self._closed:
                 return None
             self._closed = True
+            # A parked shared result (#2440) must not fire after the seal and
+            # hand the dying turn a second terminal event.
+            self._cancel_held_result()
             self._fail_active_turn("claude_runtime_closed", "Claude runtime closed")
             reader_task = self._reader_task
             if reader_task is not None:

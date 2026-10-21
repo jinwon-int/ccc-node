@@ -45,7 +45,11 @@ from .claude_session_approvals import (
 )
 from .claude_session_browser import ClaudeSessionBrowserMixin
 from .claude_session_delegated_tasks import ClaudeSessionDelegatedTasksMixin
-from .claude_session_frame_routing import ClaudeSessionFrameRoutingMixin
+from .claude_session_frame_routing import (
+    ClaudeSessionFrameRoutingMixin,
+    _HeldResult,
+    merged_turn_grace_seconds,
+)
 from .claude_session_lifecycle import (
     ClaudeSessionLifecycleMixin,
     _STDERR_TAIL_LINES,
@@ -318,6 +322,13 @@ class ClaudeSession(
         #     one "end" follows it (#2122).
         self._unsolicited_lifecycle: UnsolicitedLifecycleHandler | None = None
         self._unsolicited_route_open = False
+        #   * held_result — the autonomous turn's terminal ResultMessage parked
+        #     while a user turn submitted during that turn waits to learn
+        #     whether the CLI merged it into the same turn (#2440); the grace
+        #     bounds that wait so the user turn can never hang on a frame
+        #     that will not come.
+        self._held_result: _HeldResult | None = None
+        self._merged_turn_grace_seconds = merged_turn_grace_seconds()
         # Claude Code reports run-in-background Bash ownership in the tool
         # result and later closes it with a terminal <task-notification>.  Keep
         # Typed SDK lifecycle frames and the authoritative shell roster carry
