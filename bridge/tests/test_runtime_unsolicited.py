@@ -1200,7 +1200,8 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         """#2440: one ResultMessage ends both turns when the CLI coalesced them.
 
-        jingun 2026-10-21: a task-notification continuation was running when
+        Observed 2026-10-21 on a Matrix owner node: a task-notification
+        continuation was running when
         the owner's message arrived; the CLI merged that prompt into the
         running turn and emitted a single terminal frame, which the adapter
         attributed to the autonomous turn — the user turn then waited forever.
