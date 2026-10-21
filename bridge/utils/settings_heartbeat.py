@@ -218,6 +218,23 @@ class HeartbeatSettingsMixin:
             "retry regardless of turn_admission_retries."
         ),
     )
+    silent_turn_stall_seconds: float = Field(
+        default=900.0,
+        alias="CCC_SILENT_TURN_STALL_SECONDS",
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Release an admitted request whose agent has never produced answer "
+            "text and whose stream has been completely silent for this many "
+            "seconds with no tool running, no approval pending and no delegated "
+            "task active (#2442). CCC_TURN_ADMISSION_TIMEOUT_SECONDS is already "
+            "satisfied once any event (for example an approval request) reaches "
+            "the turn, and CCC_TERMINAL_STALL_SECONDS only arms after text, so "
+            "this is the bound between them; it is deliberately longer than "
+            "either because a slow first token must not be cut. Set 0 to "
+            "disable and fall back to the full process timeout."
+        ),
+    )
     turn_admission_timeout_seconds: float = Field(
         default=300.0,
         alias="CCC_TURN_ADMISSION_TIMEOUT_SECONDS",

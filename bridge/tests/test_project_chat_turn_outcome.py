@@ -61,6 +61,11 @@ class _Host:
     def _conversation_followers(self, key: str) -> int:
         return self._followers
 
+    # The branches extracted from _resolve_turn_outcome (#2442) are reached
+    # through the host exactly as the mixin reaches them.
+    _resolve_admission_timeout = ProjectChatProcessMixin._resolve_admission_timeout
+    _resolve_silent_stall = ProjectChatProcessMixin._resolve_silent_stall
+
 
 def _request() -> _PendingRequest:
     loop = asyncio.get_running_loop()
@@ -105,6 +110,7 @@ async def _resolve(host: _Host, outcome: TurnStreamOutcome, request: _PendingReq
         approval_grace=7.0,
         stall_grace=9.0,
         delegated_stall_grace=11.0,
+        silent_stall_grace=13.0,
     )
 
 
@@ -219,6 +225,26 @@ def test_terminal_stall_delivers_partial_text_with_the_notice() -> None:
         assert response.content == f"partial answer\n\n{TERMINAL_STALL_NOTICE}"
         assert response.error == "Agent stopped before terminal completion"
         assert response.streamed is False
+        assert request.lifecycle.phase is RequestPhase.INTERRUPTED
+        assert len(host.dropped) == 1
+
+    asyncio.run(run())
+
+
+def test_silent_stall_claims_interrupted_and_drops_the_session() -> None:
+    """#2442: admitted, never spoke, nothing running — released like a stall."""
+
+    async def run() -> None:
+        host = _Host()
+        request = _request()
+        state = TurnEventState()
+        state.mark_admitted()
+        response = await _resolve(host, TurnStreamOutcome.SILENT_STALL, request, state=state)
+        assert response.success is False
+        assert response.error == "Agent went silent for 13s without producing an answer"
+        assert response.content.startswith("⏰ ")
+        assert response.failure_class is not None
+        assert response.failure_class.startswith("silent-stall/")
         assert request.lifecycle.phase is RequestPhase.INTERRUPTED
         assert len(host.dropped) == 1
 

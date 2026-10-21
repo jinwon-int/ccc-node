@@ -45,6 +45,7 @@ class TurnStreamOutcome(str, Enum):
     APPROVAL_STALL = "approval-stall"
     TERMINAL_STALL = "terminal-stall"
     DELEGATED_TASK_STALL = "delegated-task-stall"
+    SILENT_STALL = "silent-stall"
 
 
 TurnEventEffect = Callable[[AgentEvent, float], Awaitable[TurnEventDirective]]
@@ -73,6 +74,7 @@ def _select_timeout(
     approval_stall_seconds: float,
     terminal_stall_seconds: float,
     delegated_task_stall_seconds: float,
+    silent_stall_seconds: float = 0.0,
 ) -> _TimeoutSelection | None:
     if not state.admitted and admission_timeout_seconds > 0:
         return _TimeoutSelection(
@@ -111,6 +113,27 @@ def _select_timeout(
             _TimeoutSelection(
                 max(0.0, terminal_stall_seconds - elapsed),
                 TurnStreamOutcome.TERMINAL_STALL,
+            )
+        )
+    if (
+        silent_stall_seconds > 0
+        and not has_text
+        and state.busy_depth <= 0
+        and not state.approval_pending
+        and state.delegated_tasks_active <= 0
+    ):
+        # Admitted (an approval request or tool frame reached the turn) but
+        # the agent has never spoken and nothing is running or pending: the
+        # terminal guard cannot arm without text and the admission guard is
+        # already satisfied, so without this bound the read waits for the
+        # whole process timeout (#2442). Same silence clock as the terminal
+        # guard — every accepted event re-arms it.
+        started_at = state.terminal_stall_started_at
+        elapsed = max(0.0, now - started_at) if started_at is not None else 0.0
+        candidates.append(
+            _TimeoutSelection(
+                max(0.0, silent_stall_seconds - elapsed),
+                TurnStreamOutcome.SILENT_STALL,
             )
         )
     if not candidates:
@@ -193,6 +216,7 @@ async def consume_turn_stream(
     terminal_stall_seconds: float,
     interrupt_timeout_seconds: float,
     delegated_task_stall_seconds: float = 7200.0,
+    silent_stall_seconds: float = 0.0,
 ) -> TurnStreamOutcome:
     """Consume a turn without acquiring lifecycle, ledger, or delivery authority.
 
@@ -213,6 +237,7 @@ async def consume_turn_stream(
                 approval_stall_seconds=approval_stall_seconds,
                 terminal_stall_seconds=terminal_stall_seconds,
                 delegated_task_stall_seconds=delegated_task_stall_seconds,
+                silent_stall_seconds=silent_stall_seconds,
             )
             try:
                 if timeout is None:

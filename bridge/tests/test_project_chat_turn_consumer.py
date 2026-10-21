@@ -653,3 +653,151 @@ async def test_unresolved_delegated_approval_still_trips_the_approval_stall() ->
 
     assert outcome is TurnStreamOutcome.APPROVAL_STALL
     assert state.approval_pending_label == "Bash command"
+
+
+# -- silent stall (#2442) ------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_silent_stall_releases_an_admitted_turn_that_never_spoke() -> None:
+    """Admitted by a tool frame, then nothing: no text, nothing running."""
+
+    order: list[str] = []
+    stream = ScriptedStream(
+        [
+            ToolStartedEvent(tool_call_id="t1", tool_name="Bash", arguments={}),
+            ToolCompletedEvent(tool_call_id="t1", tool_name="Bash", result=None, success=True),
+        ],
+        order=order,
+    )
+    state = TurnEventState()
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: False,
+        on_event=_observer(state),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=5.0,
+        approval_stall_seconds=5.0,
+        terminal_stall_seconds=0.001,
+        interrupt_timeout_seconds=1.0,
+        silent_stall_seconds=0.02,
+    )
+
+    assert outcome is TurnStreamOutcome.SILENT_STALL
+    assert state.admitted
+    assert order == ["interrupt", "pending-cancel", "abort", "aclose"]
+
+
+def test_silent_stall_is_not_selected_before_admission_or_once_text_exists() -> None:
+    from telegram_bot.core.project_chat_turn_consumer import _select_timeout
+
+    common = dict(
+        admission_timeout_seconds=0.0,
+        approval_stall_seconds=0.0,
+        terminal_stall_seconds=7.0,
+        delegated_task_stall_seconds=0.0,
+        silent_stall_seconds=9.0,
+    )
+    # Not admitted and no admission bound: the silent guard is the only
+    # candidate, so a turn that never sees its first event is bounded too.
+    fresh = TurnEventState()
+    selection = _select_timeout(state=fresh, has_text=False, now=0.0, **common)
+    assert selection is not None
+    assert selection.outcome is TurnStreamOutcome.SILENT_STALL
+
+    # Once text exists the terminal guard owns the silence clock.
+    admitted = TurnEventState()
+    admitted.mark_admitted()
+    admitted.terminal_stall_started_at = 0.0
+    selection = _select_timeout(state=admitted, has_text=True, now=1.0, **common)
+    assert selection is not None
+    assert selection.outcome is TurnStreamOutcome.TERMINAL_STALL
+    assert selection.seconds == pytest.approx(6.0)
+
+    # Disabled (0) leaves the previous unbounded behaviour.
+    disabled = dict(common, silent_stall_seconds=0.0)
+    assert _select_timeout(state=admitted, has_text=False, now=1.0, **disabled) is None
+
+
+@pytest.mark.parametrize("suppression", ["tool", "approval", "delegated"])
+def test_silent_stall_is_suppressed_while_work_or_approval_is_outstanding(
+    suppression: str,
+) -> None:
+    from telegram_bot.core.project_chat_turn_consumer import _select_timeout
+
+    state = TurnEventState()
+    state.mark_admitted()
+    state.terminal_stall_started_at = 0.0
+    if suppression == "tool":
+        state.observe(
+            ToolStartedEvent(tool_call_id="t1", tool_name="Bash", arguments={}),
+            observed_at=0.0,
+        )
+    elif suppression == "approval":
+        state.observe(
+            ApprovalRequestEvent(
+                request_id="r1",
+                action="Bash",
+                arguments={},
+                description="run a command",
+            ),
+            observed_at=0.0,
+        )
+    else:
+        state.observe(
+            DelegatedTaskLifecycleEvent(active_count=1, oldest_age_seconds=0.0, activity="started"),
+            observed_at=0.0,
+        )
+
+    selection = _select_timeout(
+        state=state,
+        has_text=False,
+        now=1.0,
+        admission_timeout_seconds=0.0,
+        approval_stall_seconds=0.0,
+        terminal_stall_seconds=0.0,
+        delegated_task_stall_seconds=0.0,
+        silent_stall_seconds=9.0,
+    )
+    assert selection is None
+
+
+@pytest.mark.anyio
+async def test_silent_stall_clock_rearms_on_every_accepted_event() -> None:
+    """A turn that keeps emitting non-text frames is never silent."""
+
+    order: list[str] = []
+    stream = ScriptedStream(
+        [
+            ToolStartedEvent(tool_call_id="t1", tool_name="Bash", arguments={}),
+            ToolCompletedEvent(tool_call_id="t1", tool_name="Bash", result=None, success=True),
+            ToolStartedEvent(tool_call_id="t2", tool_name="Read", arguments={}),
+            ToolCompletedEvent(tool_call_id="t2", tool_name="Read", result=None, success=True),
+            TextDeltaEvent("done"),
+            _END,
+        ],
+        order=order,
+    )
+    state = TurnEventState()
+    seen: list[AgentEvent] = []
+
+    outcome = await consume_turn_stream(
+        stream,
+        state=state,
+        has_text=lambda: any(isinstance(event, TextDeltaEvent) for event in seen),
+        on_event=_observer(state, seen),
+        interrupt=_record_action(order, "interrupt"),
+        abort_stalled_turn=_record_action(order, "abort"),
+        admission_timeout_seconds=5.0,
+        approval_stall_seconds=5.0,
+        terminal_stall_seconds=5.0,
+        interrupt_timeout_seconds=1.0,
+        silent_stall_seconds=1.0,
+    )
+
+    assert outcome is TurnStreamOutcome.COMPLETED
+    assert len(seen) == 5
+    assert order == ["aclose"]
