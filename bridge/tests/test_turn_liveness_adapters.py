@@ -642,6 +642,61 @@ async def test_claude_stale_dead_engine_end_to_end_recovery(
 
 
 @pytest.mark.anyio
+async def test_claude_exited_subprocess_is_confirmed_death_before_the_reader_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2443: a CLI subprocess that exited is dead even while the reader runs.
+
+    The reader task only ends once the stream end is observed; an exit code
+    on the transport's process is already a confirmed death, so the probe
+    recovers instead of logging "liveness unknown" every tick.
+    """
+
+    clock = FakeClock()
+    monkeypatch.setattr(
+        "telegram_bot.core.claude_runtime.time", SimpleNamespace(monotonic=clock.monotonic)
+    )
+    client = FakeClaudeSdkClient()
+    runtime = _claude_runtime(tmp_path, client)
+    recorder = Recorder()
+    try:
+        session = await runtime.start_or_resume(
+            SessionRequest(working_directory=str(tmp_path))
+        )
+        session_id = session.session_id
+        await client.frames.put(SystemMessage(subtype="x", data={"session_id": session_id}))
+        await _wait_until(lambda: session._last_activity is not None)
+        liveness = ClaudeTurnLiveness(runtime)
+
+        # Running process, running reader: still nothing to confirm.
+        client._transport = SimpleNamespace(_process=SimpleNamespace(returncode=None))
+        assert liveness.engine_verdict(session_id) == "unknown"
+
+        # The process exits; the reader has not seen the stream end yet.
+        client._transport = SimpleNamespace(_process=SimpleNamespace(returncode=1))
+        assert session._reader_task is not None and not session._reader_task.done()
+        assert liveness.engine_verdict(session_id) == "dead"
+
+        monitor = _monitor(clock, recorder, [("claude", liveness)], session_id)
+        clock.advance(700)
+        await monitor._tick()
+        assert recorder.recoveries == 1
+
+        # The SDK may also expose the code only through the exit error.
+        client._transport = SimpleNamespace(
+            _process=SimpleNamespace(returncode=None),
+            _exit_error=SimpleNamespace(exit_code=137),
+        )
+        assert liveness.engine_verdict(session_id) == "dead"
+
+        await session.close()
+        assert liveness.engine_verdict(session_id) == "unknown"  # closed: not death
+    finally:
+        unregister_turn_liveness("claude")
+        await runtime.close()
+
+
+@pytest.mark.anyio
 async def test_claude_registration_lifecycle(tmp_path: Path) -> None:
     runtime = _claude_runtime(tmp_path, FakeClaudeSdkClient())
     try:

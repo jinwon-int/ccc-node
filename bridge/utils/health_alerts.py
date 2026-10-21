@@ -102,6 +102,10 @@ class HealthSignals:
     runtime_recycles: int = 0
     codex_attachments: int = 0
     orphan_tool_loop_recent: int = 0
+    # Stall probes in the last hour that found a silent turn on an engine
+    # the adapter could not confirm dead (#2443). Count only, never an alert:
+    # a long-running tool produces the same shape.
+    stall_probe_unknown_recent: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -596,6 +600,14 @@ class HealthProbe:
         except Exception:
             orphan_tool_loop_recent = 0
 
+        stall_probe_unknown_recent = 0
+        try:
+            from telegram_bot.core.turn_stall import unknown_verdict_tracker
+
+            stall_probe_unknown_recent = unknown_verdict_tracker.recent_count(now=now)
+        except Exception:
+            stall_probe_unknown_recent = 0
+
         return HealthSignals(
             active_requests=int(active_requests),
             waiting_for_turn=max(0, waiting_for_turn),
@@ -611,4 +623,5 @@ class HealthProbe:
             runtime_recycles=max(0, int(resources.get("runtime_recycles", 0))),
             codex_attachments=max(0, int(resources.get("codex_attachments", 0))),
             orphan_tool_loop_recent=max(0, int(orphan_tool_loop_recent)),
+            stall_probe_unknown_recent=max(0, int(stall_probe_unknown_recent)),
         )

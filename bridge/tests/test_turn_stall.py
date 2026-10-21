@@ -323,8 +323,16 @@ async def test_generic_source_stale_but_alive_engine_is_a_no_op() -> None:
 
 
 @pytest.mark.anyio
-async def test_generic_source_unknown_verdict_never_recovers() -> None:
-    """Ambiguous adapter verdicts only log — never recover on a guess."""
+async def test_generic_source_unknown_verdict_never_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ambiguous adapter verdicts only log — never recover on a guess.
+
+    #2443: the log names the silence, the arm and the manual release, and
+    the verdict is counted for health; nothing else happens.
+    """
+    from telegram_bot.core import turn_stall
+
     clock = Clock()
     source = ScriptedSource(
         activities={"sess-provider-1": clock.now},
@@ -333,11 +341,68 @@ async def test_generic_source_unknown_verdict_never_recovers() -> None:
     recorder = Recorder()
     monitor = _generic_monitor(recorder, clock, [("fake-provider", source)])
     clock.advance(700)
+    turn_stall.unknown_verdict_tracker.reset()
 
-    await monitor._tick()
+    try:
+        with caplog.at_level(logging.WARNING, logger=turn_stall.logger.name):
+            await monitor._tick()
 
-    assert recorder.recoveries == 0
-    assert recorder.notifications == []
+        assert recorder.recoveries == 0
+        assert recorder.notifications == []
+        assert turn_stall.unknown_verdict_tracker.recent_count() == 1
+        messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+        assert any(
+            "liveness unknown after 700s silence" in message
+            and "arm=fake-provider" in message
+            and "/stop releases it" in message
+            for message in messages
+        ), messages
+    finally:
+        turn_stall.unknown_verdict_tracker.reset()
+
+
+def test_unknown_verdict_tracker_is_a_sliding_window() -> None:
+    from telegram_bot.core.turn_stall import UnknownVerdictTracker
+
+    clock = Clock()
+    tracker = UnknownVerdictTracker(window_seconds=100.0, clock=clock)
+    assert tracker.record(now=0.0) == 1
+    assert tracker.record(now=50.0) == 2
+    assert tracker.recent_count(now=120.0) == 1  # the first fell out of the window
+    assert tracker.recent_count(now=200.0) == 0
+    # A reference instant before a recorded stamp does not see it: the
+    # health probe's tick time never counts verdicts another clock recorded
+    # later (process-wide tracker).
+    tracker.record(now=300.0)
+    assert tracker.recent_count(now=250.0) == 0
+    assert tracker.recent_count(now=300.0) == 1
+    tracker.record()
+    tracker.reset()
+    assert tracker.recent_count() == 0
+
+
+def test_health_probe_exports_the_unknown_verdict_count() -> None:
+    from telegram_bot.core import turn_stall
+    from telegram_bot.utils.health_alerts import (
+        AlertThresholds,
+        HealthProbe,
+        evaluate_alerts,
+    )
+
+    turn_stall.unknown_verdict_tracker.reset()
+    try:
+        turn_stall.unknown_verdict_tracker.record()
+        turn_stall.unknown_verdict_tracker.record()
+        probe = HealthProbe(project_chat=None, spool_dir=Path("/nonexistent"))
+        signals = probe.collect(now=turn_stall.time.monotonic())
+        assert signals.stall_probe_unknown_recent == 2
+        assert signals.as_dict()["stall_probe_unknown_recent"] == 2
+        # Count only: an unknown verdict is also what a long tool looks like.
+        assert not any(
+            "stall" in alert.code for alert in evaluate_alerts(signals, AlertThresholds())
+        )
+    finally:
+        turn_stall.unknown_verdict_tracker.reset()
 
 
 @pytest.mark.anyio

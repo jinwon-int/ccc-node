@@ -54,6 +54,7 @@ from .claude_session_lifecycle import (
     ClaudeSessionLifecycleMixin,
     _STDERR_TAIL_LINES,
     _classify_cli_stderr as _lifecycle_classify_cli_stderr,
+    sdk_process_exit_code,
 )
 from .claude_session_observers import ClaudeSessionObserversMixin
 from .claude_session_task_tracking import ClaudeSessionTaskTrackingMixin
@@ -230,11 +231,12 @@ class ClaudeTurnLiveness:
 
     Last activity is the session's last SDK frame or prompt write, stamped
     by :class:`_LivenessSdkClient`. The engine verdict stays fail-closed:
-    the only locally confirmable death is the reader task ending while the
+    the locally confirmable deaths are the reader task ending while the
     session is open (the CLI transport stream terminated — exactly the
-    silent-death shape the probe exists for). A running reader proves
-    nothing about the process, so it reports "unknown" — logged, never
-    auto-recovered on a guess.
+    silent-death shape the probe exists for) and the CLI subprocess having
+    exited (#2443). A running process with a running reader proves nothing
+    about the turn, so it reports "unknown" — logged, never auto-recovered
+    on a guess.
     """
 
     def __init__(self, runtime: ClaudeRuntime) -> None:
@@ -258,6 +260,11 @@ class ClaudeTurnLiveness:
             return "unknown"
         reader = session._reader_task
         if reader is not None and reader.done():
+            return "dead"
+        # The CLI subprocess having exited is confirmed death even while the
+        # reader task has not yet observed the stream end (#2443). Anything
+        # less — a running process that is simply silent — stays "unknown".
+        if sdk_process_exit_code(session._client) is not None:
             return "dead"
         return "unknown"
 

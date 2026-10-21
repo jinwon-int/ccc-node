@@ -19,6 +19,32 @@ _STDERR_TAIL_LINES = 20
 _STDERR_LINE_CHARS = 400
 
 
+def sdk_process_exit_code(client: object) -> object:
+    """Exit code of the SDK client's CLI subprocess, or ``None`` while it runs.
+
+    Read through private SDK attributes because the public surface exposes
+    the code only by raising ``ProcessError`` on a call we are not making.
+    Every hop is guarded — a diagnostic that raises while reporting a
+    failure is worse than no diagnostic — and the liveness wrapper
+    (``_LivenessSdkClient``) is unwrapped first. Shared by the transport
+    diagnostics and the stall probe's engine verdict (#2443): a subprocess
+    that has exited is the one locally confirmable death besides the reader
+    task ending.
+    """
+
+    try:
+        inner = getattr(client, "_inner", None)
+        target = inner if inner is not None else client
+        transport = getattr(target, "_transport", None)
+        exit_code = getattr(getattr(transport, "_process", None), "returncode", None)
+        if exit_code is None:
+            exit_error = getattr(transport, "_exit_error", None)
+            exit_code = getattr(exit_error, "exit_code", None)
+        return exit_code
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _classify_cli_stderr(lines: Sequence[str]) -> str | None:
     """Body-free error class for CLI stderr — never leak the payload.
 
@@ -184,15 +210,7 @@ class ClaudeSessionLifecycleMixin:
         reporting a failure is worse than no diagnostic.
         """
         lines = tuple(self._stderr_tail)
-        exit_code: object = None
-        try:
-            transport = getattr(self._client, "_transport", None)
-            exit_code = getattr(getattr(transport, "_process", None), "returncode", None)
-            if exit_code is None:
-                exit_error = getattr(transport, "_exit_error", None)
-                exit_code = getattr(exit_error, "exit_code", None)
-        except Exception:  # pragma: no cover - defensive
-            exit_code = None
+        exit_code = sdk_process_exit_code(self._client)
         return {
             "exit_code": exit_code,
             "stderr_class": _classify_cli_stderr(lines),
