@@ -952,6 +952,29 @@ chmod 600 ~/.claude/state/skill-promotion.arbitration
   `would-close-after-arbitration` and `would-close-arbiter-unavailable` in the
   collect output.
 
+#### Fleet-identity generalization instead of a human draft (#2435 S4)
+
+Rides the same switch, at `true` only (and only with dispatch on). Before S4 a
+single approved candidate whose `SKILL.md` named a fleet node or product
+(`_promote_identity_hits`) turned the whole promote batch into a
+`needs-human-identity` draft.
+
+- **Hold:** `promote` un-stages such a candidate and records an
+  `a2a-identity-hold` row (intake PR, tree, line/kind/match of each hit). The
+  rest of the batch is staged without it; a held candidate takes no batch slot,
+  and an open batch that still carries hits is never reused (it is superseded
+  by the clean one).
+- **Generalize:** `_sweep_identity_holds` (every collect) dispatches one
+  revise round flagged `identity` to the author (or a trusted substitute), with
+  one blocking finding per hit line. It is outside the round limit and the
+  final round, once per lineage, and is not an arbitration trigger. A
+  republished tree returns as a fresh intake PR — re-gated, re-reviewed and
+  re-scanned at the next promote.
+- **Close:** the round ending in anything but `republished`, a hit surviving
+  the lineage's round, or no round dispatchable for 48 h closes the intake PR
+  (`a2a-arbitration-closed`, lifecycle `archived:identity-unresolved`). An
+  owner reopen is left alone. At most 4 identity dispatches per cycle.
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.
