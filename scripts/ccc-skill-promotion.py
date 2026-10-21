@@ -4206,10 +4206,16 @@ def _revise_round_gate(
     pr: str,
     head: str,
     final: bool,
+    identity: bool = False,
 ) -> dict[str, object] | None:
     """Round-limit / final-round / daily-cap gate of `_dispatch_intake_revise`.
     None = the round may be dispatched."""
-    if final:
+    if identity:
+        # #2435 S4: one fleet-identity generalization round per lineage, outside
+        # the round limit and the final round — it settles no content dispute.
+        if any(item.get("identity") for item in lineage):
+            return {"outcome": "revise-skipped", "code": "revise_identity_already"}
+    elif final:
         # #2435 S2: one arbitration-granted round beyond the limit, once per
         # lineage. It replaces the per-head guard: the head it revises may
         # already carry a drop recommendation or a failed revise.
@@ -4272,6 +4278,7 @@ def _dispatch_intake_revise(
     dry_run: bool,
     exclude: frozenset[str] = frozenset(),
     final: bool = False,
+    identity: bool = False,
 ) -> dict[str, object]:
     """Dispatch one bounded revision task to the author node. Best-effort and
     fail-safe like the review dispatch: never raises, skip codes recorded.
@@ -4295,10 +4302,12 @@ def _dispatch_intake_revise(
         and item.get("task_id") not in infra_failed
     ]
     round_no = len(lineage) + 1
-    gated = _revise_round_gate(config, rows, lineage, round_no=round_no, pr=pr, head=head, final=final)
+    gated = _revise_round_gate(
+        config, rows, lineage, round_no=round_no, pr=pr, head=head, final=final, identity=identity
+    )
     if gated is not None:
         return gated
-    if not final and _revise_dispatched(rows, pr, head):
+    if not (final or identity) and _revise_dispatched(rows, pr, head):
         return {"outcome": "revise-skipped", "code": "revise_already"}
     secret = os.environ["A2A_EDGE_SECRET"]
     # #2024: the author node may be homed on a secondary broker. Dispatch the
@@ -4309,7 +4318,7 @@ def _dispatch_intake_revise(
         return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
     try:
         revise_rb, broker_id, broker_url, reviser, substitute = _resolve_revise_target(
-            config, row, rows, node, name, reviewer, tree12, secret, exclude=exclude, final=final
+            config, row, rows, node, name, reviewer, tree12, secret, exclude=exclude, final=final or identity
         )
     except PromotionError as error:
         return {"outcome": "revise-skipped", "code": error.code}
@@ -4377,6 +4386,7 @@ def _dispatch_intake_revise(
         "tree_sha256": tree_sha256,
         "round": round_no,
         **({"final": True} if final else {}),
+        **({"identity": True} if identity else {}),
         "reviser_node": reviser,
         "substitute": reviser != node,
         **({"substitute_reason": (
@@ -4400,6 +4410,10 @@ def _dispatch_intake_revise(
                 reviewer,
                 str(row.get("dispatched_task", "")),
                 (
+                    f"fleet-identity generalization round (#2435 S4): revision task `{dispatched_task}` "
+                    f"dispatched to reviser `{reviser}` (author node: {node}); the revised tree will be "
+                    "re-gated, re-reviewed and re-scanned on a fresh intake PR"
+                    if identity else
                     f"auto-revision round {round_no}/{config.revise_round_limit}: revision task "
                     f"`{dispatched_task}` dispatched to reviser `{reviser}` (author node: {node}); the revised tree will "
                     "be re-gated and re-reviewed on a fresh intake PR"
@@ -6541,6 +6555,49 @@ def _supersede_promote_prs(
     return results
 
 
+def _promote_stage_batch(
+    config: Config,
+    rows: list[dict[str, object]],
+    work: Path,
+    pending: list[dict[str, str]],
+    nodes: list[str],
+    *,
+    generalize: bool,
+    staged: list[dict[str, object]],
+    errors: list[dict[str, str]],
+    held: list[dict[str, object]],
+) -> None:
+    """Stage each pending candidate into `work`; with #2435 S4 on, a candidate
+    whose `SKILL.md` names the fleet is un-staged and recorded as an identity
+    hold instead of turning the whole batch into a human draft."""
+    for item in pending:
+        try:
+            target, primary = _promote_stage(work, item, audience=_PROMOTE_DEFAULT_AUDIENCE)
+        except PromotionError as error:
+            errors.append({"pr": item["pr"], "name": item["name"], "code": error.code})
+            continue
+        hits = _promote_identity_hits(primary, nodes)
+        if generalize and hits:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+            hold = {"ts": _utc_now(), "kind": _IDENTITY_HOLD_KIND, "pr": item["pr"],
+                    "name": item["name"], "node": item["node"],
+                    "tree_sha256": item["tree_sha256"], "hits": hits[:_IDENTITY_MAX_FINDINGS]}
+            _append_ledger(config, hold)
+            rows.append(hold)
+            held.append({"pr": item["pr"], "name": item["name"], "hits": len(hits)})
+            continue
+        _run(["git", "add", str(target.relative_to(work))], cwd=work)
+        staged.append({
+            "pr": item["pr"], "name": item["name"], "node": item["node"],
+            "audience": _PROMOTE_DEFAULT_AUDIENCE,
+            "tree_sha256": item["tree_sha256"],
+            "identity_hits": hits,
+        })
+
+
 def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     """Open ONE draft PR staging every approved-but-unpromoted candidate.
 
@@ -6571,14 +6628,25 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     """
     rows = _ledger_rows(config)
     promoted = _promoted_source_trees(config)
-    pending = _promotable(config, rows, promoted)[:limit]
+    pending = _promotable(config, rows, promoted)
+    # #2435 S4: a candidate held for fleet-identity generalization never rides a
+    # batch (one hit used to turn the whole batch into a human draft) and does
+    # not take a batch slot; `_sweep_identity_holds` revises or closes it.
+    generalize = _identity_generalize_enabled(config)
+    if generalize:
+        held_keys = _identity_hold_keys(rows)
+        pending = [item for item in pending if (item["pr"], item["tree_sha256"]) not in held_keys]
+    pending = pending[:limit]
     if not pending:
         return {"ok": True, "mode": "promote", "staged": [], "outcome": "nothing-to-promote"}
     open_rows, unreadable = _open_promote_prs(config, rows, dry_run=dry_run)
     if unreadable:
         return {"ok": False, "mode": "promote", "staged": [],
                 "outcome": "open-promote-pr-unreadable", "prs": unreadable}
-    current = [row for row in open_rows if _promote_batch_matches(row, pending)]
+    current = [
+        row for row in open_rows
+        if _promote_batch_matches(row, pending) and not (generalize and row.get("identity_hits"))
+    ]
     if current:
         return {
             "ok": True, "mode": "promote-dry-run" if dry_run else "promote", "staged": [],
@@ -6601,6 +6669,7 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     branch = f"promote/auto-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     staged: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
+    held: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(
         prefix="skill-promote-", dir=config.promotion_state_dir
     ) as raw:
@@ -6608,24 +6677,11 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
         _run(["git", "clone", "--quiet", "--depth", "1", "--branch", config.base,
               config.remote, str(work)])
         _run(["git", "checkout", "-b", branch], cwd=work)
-        for item in pending:
-            try:
-                target, primary = _promote_stage(
-                    work, item, audience=_PROMOTE_DEFAULT_AUDIENCE
-                )
-            except PromotionError as error:
-                errors.append({"pr": item["pr"], "name": item["name"], "code": error.code})
-                continue
-            _run(["git", "add", str(target.relative_to(work))], cwd=work)
-            staged.append({
-                "pr": item["pr"], "name": item["name"], "node": item["node"],
-                "audience": _PROMOTE_DEFAULT_AUDIENCE,
-                "tree_sha256": item["tree_sha256"],
-                "identity_hits": _promote_identity_hits(primary, nodes),
-            })
+        _promote_stage_batch(config, rows, work, pending, nodes, generalize=generalize,
+                             staged=staged, errors=errors, held=held)
         if not staged:
             return {"ok": not errors, "mode": "promote", "staged": [], "errors": errors,
-                    "outcome": "nothing-staged"}
+                    "identity_held": held, "outcome": "nothing-staged"}
         _run(
             ["git", "-c", f"user.name=ccc-node skill promoter ({config.node})",
              "-c", "user.email=ccc-node-skill-promoter@users.noreply.github.com",
@@ -6675,6 +6731,10 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
                 )
     else:
         lines.append("No fleet identity found in any staged `SKILL.md`.")
+    if held:
+        lines += ["", "Held out of this batch for an automatic fleet-identity generalization "
+                  "round (#2435 S4) — each returns on a fresh intake PR or is closed:"]
+        lines += [f"- #{item['pr']} `{item['name']}` ({item['hits']} line hit(s))" for item in held]
     lines += [
         "",
         "## Provenance",
@@ -6724,7 +6784,9 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
             # The whole batch this run tried to stage (#2011 dedupe key) — not
             # just what staged: a candidate that errors every run must not
             # make each day's batch look new.
-            "candidates": _promote_candidate_keys(pending),
+            "candidates": _promote_candidate_keys(
+                [item for item in pending if item["pr"] not in {str(h["pr"]) for h in held}]
+            ),
         },
     )
     superseded = (
@@ -6733,7 +6795,8 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
         else []
     )
     return {"ok": not errors, "mode": "promote", "branch": branch, "url": url,
-            "staged": staged, "errors": errors, "superseded": superseded}
+            "staged": staged, "errors": errors, "superseded": superseded,
+            **({"identity_held": held} if held else {})}
 
 
 def _receipt_retries(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -8420,6 +8483,7 @@ def _arbitration_state(
         if index > last_review
         and row.get("kind") == "a2a-revise-dispatch" and row.get("pr") == pr and row.get("head_sha") == head
         and row.get("task_id") not in infra_failed
+        and not row.get("identity")  # #2435 S4: `_sweep_identity_holds` owns those
     ]
     if any(row.get("task_id") not in revise_results for row in revises):
         return None, arbitrated  # a revise round is still running
@@ -8527,9 +8591,17 @@ def _arbitration_close(
     reason: str,
     detail: str = "",
 ) -> dict[str, object]:
-    lifecycle = "archived:arbiter-unavailable" if reason == "arbiter-unavailable" else "archived:arbiter-closed"
+    lifecycle = (
+        "archived:arbiter-unavailable" if reason == "arbiter-unavailable"
+        else "archived:identity-unresolved" if reason.startswith("identity-")
+        else "archived:arbiter-closed"
+    )
+    headline = (
+        "플릿 식별자 일반화가 끝나지 않아 이 intake PR을 종료합니다 (#2435 S4)."
+        if reason.startswith("identity-") else "A2A 중재 결과로 이 intake PR을 종료합니다 (#2435)."
+    )
     body = (
-        "A2A 중재 결과로 이 intake PR을 종료합니다 (#2435).\n\n"
+        f"{headline}\n\n"
         f"- 사유: `{reason}`" + (f" — {detail}" if detail else "") + "\n"
         f"- 계보: `{node}` / `{name}`\n"
         "- 이 종료는 삭제가 아닙니다. 오너가 PR을 다시 열면 일반 리뷰 루프로 돌아갑니다.\n"
@@ -8705,6 +8777,151 @@ def _apply_arbitration_verdict(
     return _arbitration_close(config, rows, pr=pr, head=head, node=node, name=name, reason="arbiter-reject")
 
 
+_IDENTITY_HOLD_KIND = "a2a-identity-hold"
+_IDENTITY_MAX_FINDINGS = 12
+_IDENTITY_LIMIT = 4
+_IDENTITY_GRACE_SEC = 48 * 3600
+
+
+def _identity_generalize_enabled(config: Config) -> bool:
+    """#2435 S4 rides the arbitration switch: on only at `true` with dispatch on.
+
+    Holding a candidate out of a batch without being able to dispatch its
+    generalization round would strand it, so both are required."""
+    return getattr(config, "arbitration_mode", "off") == "true" and bool(
+        getattr(config, "dispatch_enabled", False)
+    )
+
+
+def _identity_hold_keys(rows: list[dict[str, object]]) -> set[tuple[str, str]]:
+    return {
+        (str(row.get("pr")), str(row.get("tree_sha256")))
+        for row in rows if row.get("kind") == _IDENTITY_HOLD_KIND
+    }
+
+
+def _identity_findings(hits: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Revise findings from identity hits: line, kind and the matched word only."""
+    return [
+        {
+            "severity": "blocking",
+            "area": "generalization",
+            "note": (
+                f"SKILL.md line {hit.get('line')}: fleet identity `{hit.get('match')}` "
+                f"({hit.get('kind')}). Replace it with a generic role or product-neutral wording "
+                "(for example 'the agent runtime' or 'a worker node'); policies/REVIEW.md requires "
+                "node/provider facts removed before promotion. Change nothing else."
+            ),
+        }
+        for hit in hits[:_IDENTITY_MAX_FINDINGS]
+        if isinstance(hit, dict)
+    ]
+
+
+def _identity_round_state(
+    rounds: list[dict[str, object]], pr: str, revise_results: dict[object, dict[str, object]]
+) -> str | tuple[str, str]:
+    """"dispatch", "wait", or the (reason, detail) of an identity close."""
+    here = [row for row in rounds if str(row.get("pr")) == pr]
+    if here:
+        result = revise_results.get(here[-1].get("task_id"))
+        if result is None:
+            return "wait"  # the generalization round is still running
+        status = str(result.get("status", ""))
+        if status == "republished":
+            return "wait"  # the fresh intake PR carries the lineage; this one is superseded
+        return "identity-unresolved", f"generalization round ended `{status}`"
+    if rounds:
+        return "identity-unresolved", "fleet identity still present after the lineage's generalization round"
+    return "dispatch"
+
+
+def _sweep_identity_holds(
+    config: Config, *, dry_run: bool, now: float | None = None
+) -> list[dict[str, object]]:
+    """#2435 S4: settle every approved candidate `_promote` held for fleet identity.
+
+    One generalization revise round per lineage (`identity`), outside the round
+    limit: a republished tree returns as a fresh intake PR (re-gated,
+    re-reviewed and re-scanned at the next promote). The round ending any other
+    way, a hit surviving the lineage's round, or no round dispatchable within
+    the grace window closes the intake PR (`archived:identity-unresolved`;
+    an owner reopen is left alone)."""
+    if not _identity_generalize_enabled(config):
+        return []
+    now = time.time() if now is None else now
+    rows = _ledger_rows(config)
+    states = _recorded_intake_states(rows)
+    holds: dict[str, dict[str, object]] = {}
+    first_hold: dict[str, float] = {}
+    for row in rows:
+        if row.get("kind") == _IDENTITY_HOLD_KIND:
+            pr = str(row.get("pr"))
+            holds[pr] = row
+            stamp = _iso_epoch(row.get("ts"))
+            if stamp is not None and pr not in first_hold:
+                first_hold[pr] = stamp
+    revise_results = {row.get("task_id"): row for row in rows if row.get("kind") == "a2a-revise-result"}
+    out: list[dict[str, object]] = []
+    dispatched = 0
+    for pr, hold in sorted(holds.items(), key=lambda item: int(item[0]) if item[0].isdigit() else 0):
+        if str(states.get(pr, {}).get("state", "")) in _INTAKE_TERMINAL_STATES:
+            continue
+        if any(row.get("kind") == _ARBITRATION_CLOSED_KIND and str(row.get("pr")) == pr for row in rows):
+            continue  # closed once and reopened by the owner: the owner decides
+        node, name = str(hold.get("node", "")), str(hold.get("name", ""))
+        review = next(
+            (row for row in reversed(rows)
+             if row.get("kind") == "a2a-dispatch" and _pr_number_from_url(str(row.get("pr_url", ""))) == pr),
+            None,
+        )
+        head = str(review.get("head_sha", "")) if review else ""
+        rounds = [
+            row for row in rows
+            if row.get("kind") == "a2a-revise-dispatch" and row.get("identity")
+            and row.get("node") == node and row.get("name") == name
+        ]
+        state = _identity_round_state(rounds, pr, revise_results)
+        if state == "wait":
+            continue
+        reason, detail = state if isinstance(state, tuple) else ("", "")
+        if state == "dispatch":
+            if dry_run:
+                out.append({"outcome": "would-dispatch-identity-revise", "pr": pr})
+                continue
+            if dispatched >= _IDENTITY_LIMIT:
+                out.append({"outcome": "identity-deferred", "pr": pr})
+                continue
+            dispatched += 1
+            outcome = (
+                _dispatch_intake_revise(
+                    config, review, rows, _identity_findings(list(hold.get("hits") or [])),
+                    "publisher-identity-scan", dry_run=False, identity=True,
+                )
+                if review is not None
+                else {"outcome": "revise-skipped", "code": "identity_review_missing"}
+            )
+            if outcome.get("outcome") == "revise-dispatched":
+                out.append({"outcome": "identity-revise-dispatched", "pr": pr, "revise": outcome})
+                continue
+            first = first_hold.get(pr)
+            if outcome.get("code") != "revise_identity_already" and (
+                first is None or now - first < _IDENTITY_GRACE_SEC
+            ):
+                out.append({"outcome": "identity-revise-skipped", "pr": pr, "code": outcome.get("code")})
+                continue
+            reason, detail = (
+                "identity-undeliverable",
+                f"generalization round could not be dispatched (`{outcome.get('code', '?')}`)",
+            )
+        if dry_run:
+            out.append({"outcome": "would-close-identity", "pr": pr, "reason": reason})
+            continue
+        out.append(_arbitration_close(config, rows, pr=pr, head=head, node=node, name=name,
+                                      reason=reason, detail=detail))
+    return out
+
+
 def _sweep_missing_dispatch(
     config: Config, *, dry_run: bool, now: float | None = None
 ) -> list[dict[str, object]]:
@@ -8765,6 +8982,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
     promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
     superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
     arbitration = _sweep_arbitration(config, dry_run=dry_run)
+    identity_holds = _sweep_identity_holds(config, dry_run=dry_run)
     auto_promote: dict[str, object] | None = None
     if getattr(config, "auto_promote_enabled", False):
         auto_promote = _promote(config, dry_run=dry_run, limit=8)
@@ -8774,6 +8992,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
         "promoted_intakes": promoted_intakes,
         "superseded_intakes": superseded_intakes,
         "arbitration": arbitration,
+        "identity_holds": identity_holds,
         "auto_promote": auto_promote,
         "promote_merges": _sweep_promote_merge(config, dry_run=dry_run),
     }

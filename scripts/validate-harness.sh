@@ -618,6 +618,12 @@ else
   err "skill-promotion dispatch-skip ledger + redispatch selection tests failed"
   tail -10 "$TMP/skill-promotion-redispatch-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_identity_generalize_test.py >"$TMP/skill-promotion-identity-generalize-test.out" 2>&1; then
+  say "  ok skill-promotion fleet-identity generalization tests (#2435 S4)"
+else
+  err "skill-promotion fleet-identity generalization tests failed (one identity hit would hold a whole promote batch for a human again, #2435)"
+  tail -10 "$TMP/skill-promotion-identity-generalize-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_infra_retry_test.py >"$TMP/skill-promotion-infra-retry-test.out" 2>&1; then
   say "  ok skill-promotion infrastructure-failure retry tests (#2435 S1)"
 else
