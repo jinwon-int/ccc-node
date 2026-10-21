@@ -262,6 +262,54 @@ class FinalRoundGate(unittest.TestCase):
         self.assertEqual(self.gate(two + [revise("v3", "s", final=True)], final=True)["code"],
                          "revise_final_already")
 
+    def test_no_ordinary_round_after_the_final_round(self) -> None:
+        # Field case 2026-10-21 (fleet-skills#458 -> #546): a lineage whose only
+        # round was the final one was still under the limit and got an ordinary
+        # revise round after the post-final review said `revise`.
+        with patch.object(promotion, "_comment_once", return_value=True) as comment:
+            out = promotion._revise_round_gate(self.CONFIG, [], [revise("v1", "s", final=True)], round_no=2,
+                                               pr=PR, head=HEAD, final=False)
+        self.assertEqual(out["outcome"], "revise-handoff")
+        self.assertEqual(comment.call_args.kwargs["marker"], "round-limit")
+        self.assertIsNone(self.gate([revise("v1", NODE)], final=False))  # ordinary lineage unchanged
+
+
+class ReopenAfterArbitrationClose(unittest.TestCase):
+    def test_sweep_leaves_an_owner_reopened_head_alone(self) -> None:
+        rows = [review("t1", "r1"), verdict("t1", "reject"),
+                {"kind": "a2a-arbitration-closed", "pr": PR, "head_sha": HEAD, "reason": "arbiter-reject"}]
+        out, written, dispatched, closed = SweepArbitration.run_sweep(SweepArbitration(), rows)
+        self.assertEqual((out, written, dispatched, closed), ([], [], [], []))
+
+    def poll(self, rows: list[dict], live: str):
+        written: list[dict] = []
+        polled: list[str] = []
+        config = types.SimpleNamespace(collect_window=10)
+
+        def pr_state(_config, pr):
+            polled.append(pr)
+            return live
+
+        with patch.object(promotion, "_ledger_rows", return_value=rows), \
+             patch.object(promotion, "_approve_lineage_prs", return_value={PR: "2026-10-21T05:01:16Z", "77": "x"}), \
+             patch.object(promotion, "_pr_state", side_effect=pr_state), \
+             patch.object(promotion, "_append_ledger", side_effect=lambda c, r: written.append(r)):
+            out = promotion._sweep_intake_states(config, dry_run=False)
+        return out, written, polled
+
+    def test_arbiter_closed_pr_is_repolled_and_reopen_recorded(self) -> None:
+        # Field case 2026-10-21 (fleet-skills#532): reopened after a wrong
+        # arbitration close, but the sticky CLOSED kept it out of promotion.
+        rows = [{"kind": "a2a-arbitration-closed", "pr": PR, "head_sha": HEAD},
+                {"kind": "a2a-intake-state", "pr": PR, "state": "CLOSED"},
+                {"kind": "a2a-intake-state", "pr": "77", "state": "CLOSED"}]
+        out, written, polled = self.poll(rows, "OPEN")
+        self.assertEqual(polled, [PR])  # an ordinary CLOSED stays sticky
+        self.assertEqual(written[0]["state"], "OPEN")
+        self.assertEqual(out, [{"outcome": "intake-state-recorded", "pr": PR, "state": "OPEN"}])
+        out, written, polled = self.poll(rows, "CLOSED")
+        self.assertEqual((polled, written, out), ([PR], [], []))  # unchanged: no ledger churn
+
 
 class ArbitrationDispatchGuard(unittest.TestCase):
     def attempt(self, rows: list[dict]):

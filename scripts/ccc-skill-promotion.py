@@ -4215,6 +4215,23 @@ def _revise_round_gate(
         # already carry a drop recommendation or a failed revise.
         if any(item.get("final") for item in lineage):
             return {"outcome": "revise-skipped", "code": "revise_final_already"}
+    elif any(item.get("final") for item in lineage):
+        # #2435: the review after the lineage's final round is the last word —
+        # anything but approve closes. The round-limit marker hands the head to
+        # `_arbitration_state`, which closes it as post-arbitration.
+        _comment_once(
+            config,
+            rows,
+            pr=pr,
+            head=head,
+            marker="round-limit",
+            body=(
+                "This skill lineage already used its one arbitration-granted final revision "
+                "round, and the review after it was not `approve`. No further revision; the "
+                "lineage is closed by the arbitration sweep (#2435)."
+            ),
+        )
+        return {"outcome": "revise-handoff", "round": round_no - 1, "pr": pr}
     elif round_no > config.revise_round_limit:
         next_step = (
             "An independent A2A arbitration round decides next (#2435)."
@@ -5005,11 +5022,17 @@ def _sweep_intake_states(
     row this writes.
 
     Terminal is sticky: once CLOSED/MERGED is recorded the PR is never polled
-    again. An unreadable state writes nothing at all — a transient `gh`
-    failure must not mark a still-open PR terminal, nor reopen a closed one.
+    again — except a CLOSED written by an A2A arbitration close (#2435), whose
+    comment promises that an owner reopen returns the PR to the loop; such a
+    PR is re-polled and a row is written only when the state changed. An
+    unreadable state writes nothing at all — a transient `gh` failure must
+    not mark a still-open PR terminal, nor reopen a closed one.
     """
     rows = _ledger_rows(config)
     recorded = _recorded_intake_states(rows)
+    arbiter_closed = {
+        str(row.get("pr")) for row in rows if row.get("kind") == _ARBITRATION_CLOSED_KIND
+    }
     processed: list[dict[str, object]] = []
     # Oldest approval first: the same FIFO reason as #1394. A window smaller
     # than the backlog must drain the longest-owed promotions, not the newest.
@@ -5019,7 +5042,9 @@ def _sweep_intake_states(
         if len(processed) >= config.collect_window:
             break
         previous = recorded.get(pr)
-        if previous is not None and str(previous.get("state", "")) in _INTAKE_TERMINAL_STATES:
+        previous_state = str(previous.get("state", "")) if previous is not None else ""
+        repoll = previous_state == "CLOSED" and pr in arbiter_closed
+        if previous_state in _INTAKE_TERMINAL_STATES and not repoll:
             continue
         if dry_run:
             processed.append({"outcome": "would-poll-intake-state", "pr": pr})
@@ -5027,6 +5052,8 @@ def _sweep_intake_states(
         state = _pr_state(config, pr)
         if state is None:
             processed.append({"outcome": "intake-state-unreadable", "pr": pr})
+            continue
+        if repoll and state == previous_state:
             continue
         _append_ledger(
             config,
@@ -8579,6 +8606,11 @@ def _sweep_arbitration(
         if parts is None or not number or not head:
             continue
         node, name = parts["node"], parts["name"]
+        if any(
+            row.get("kind") == _ARBITRATION_CLOSED_KIND and row.get("pr") == number and row.get("head_sha") == head
+            for row in rows
+        ):
+            continue  # closed by arbitration and reopened by the owner: the owner decides this head
         trigger, arbitrated = _arbitration_state(rows, number, head, node, name, now=now)
         if trigger is None:
             continue
