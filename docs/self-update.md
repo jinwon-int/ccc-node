@@ -29,7 +29,11 @@ rather than composing the steps ad hoc.
    the wrong home. Run the tick as the owner (`sudo -u <owner>` with the user
    bus env) or set `CCC_SELF_UPDATE_ALLOW_OWNER_MISMATCH=1` for a deliberately
    shared checkout; `setup.sh` applies the same guard
-   (`CCC_SETUP_ALLOW_OWNER_MISMATCH=1`)
+   (`CCC_SETUP_ALLOW_OWNER_MISMATCH=1`). That opt-out only covers the harness
+   install into the running account's home: the bridge systemd unit reconcile
+   and the `.git/hooks` guard install belong to the checkout owner and are
+   skipped with a note unless
+   `CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1` (#2323)
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
 4. if HEAD changed (or `run --force`): snapshot the managed Claude artifacts

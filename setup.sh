@@ -167,10 +167,20 @@ CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}"
 # operator states the checkout is deliberately shared
 # (CCC_SETUP_ALLOW_OWNER_MISMATCH=1). The test seam mirrors _ccc_is_root: it is
 # honoured only when the install target resolves under the writable temp root.
+#
+# The opt-out covers the harness install into the RUNNING account's home only
+# (#2323). Two later steps act on state that belongs to the checkout owner, not
+# to the running account: the bridge systemd main-unit reconcile (another
+# account's bridge) and the managed-checkout guard install into the shared
+# checkout's .git/hooks (root-owned files in a user-owned repo — the #1426
+# regression path). When the opt-out is what let a mismatched run through,
+# OWNER_MISMATCH_OPTOUT=1 makes both steps skip with a note.
+# CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1 forces them anyway.
+OWNER_MISMATCH_OPTOUT=0
+OWNER_MISMATCH_DESC=""
 _ccc_checkout_owner_guard() {
   local owner="" euid="" stat_bin="" id_bin=""
   [ -e "$SRC/.git" ] || return 0  # a worktree checkout has a .git FILE
-  [ "${CCC_SETUP_ALLOW_OWNER_MISMATCH:-0}" = "1" ] && return 0
   if [ -n "${CCC_SETUP_TEST_REPO_OWNER_UID:-}" ] && _ccc_setup_test_seam_ok; then
     owner="$CCC_SETUP_TEST_REPO_OWNER_UID"
   fi
@@ -179,18 +189,31 @@ _ccc_checkout_owner_guard() {
   # Say so instead of passing on empty values (#1480): a silent pass is what
   # hid the missing /usr on Termux.
   if { [ -z "$owner" ] && [ -z "$stat_bin" ]; } || [ -z "$id_bin" ]; then
-    note "owner guard skipped: stat/id not found under /usr/bin, /bin${PREFIX:+, $PREFIX/bin} (#1480)"
+    # With the opt-out set the run proceeds either way, so stay quiet as before.
+    [ "${CCC_SETUP_ALLOW_OWNER_MISMATCH:-0}" = "1" ] \
+      || note "owner guard skipped: stat/id not found under /usr/bin, /bin${PREFIX:+, $PREFIX/bin} (#1480)"
     return 0
   fi
   [ -n "$owner" ] || owner="$("$stat_bin" -c %u "$SRC/.git" 2>/dev/null || true)"
   euid="$("$id_bin" -u 2>/dev/null || true)"
   case "$owner$euid" in ''|*[!0-9]*) return 0 ;; esac
   [ "$owner" != "$euid" ] || return 0
+  if [ "${CCC_SETUP_ALLOW_OWNER_MISMATCH:-0}" = "1" ]; then
+    OWNER_MISMATCH_OPTOUT=1
+    OWNER_MISMATCH_DESC="checkout owned by uid $owner, running as uid $euid"
+    note "owner mismatch allowed by CCC_SETUP_ALLOW_OWNER_MISMATCH=1 ($OWNER_MISMATCH_DESC) — owner-side steps (bridge unit reconcile, .git/hooks guard) are skipped unless CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1 (#2323)"
+    return 0
+  fi
   echo "ERROR: checkout $SRC is owned by uid $owner but setup.sh is running as uid $euid." >&2
   echo "       Run it as the checkout owner (e.g. sudo -u <owner> ... with the user bus env), or set CCC_SETUP_ALLOW_OWNER_MISMATCH=1 for a deliberately shared checkout (#1426)." >&2
   return 1
 }
 _ccc_checkout_owner_guard || exit 2
+# rc 0 when an owner-side step must be skipped for this run (#2323).
+_ccc_skip_owner_side_effects() {
+  [ "$OWNER_MISMATCH_OPTOUT" = 1 ] \
+    && [ "${CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS:-0}" != "1" ]
+}
 MEM_DIR="$CLAUDE_DIR/memories"          # node-owned memory (Hermes-independent)
 HERMES_ROOT="${CCC_HERMES_DIR:-$HOME/.hermes}"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
@@ -1500,12 +1523,19 @@ note "Codex managed skills reconciled from compatibility catalog"
 # /work/agent-codebench/ccc-node-pr833 on 2026-08-01. Reclaiming a unit that has
 # already been taken over is deliberate and stays a separate, explicit step:
 #   <canonical checkout>/bridge/service-systemd.sh reconcile --allow-relocate
-if [ "$DRY" = 1 ]; then
+#
+# Owner mismatch (#2323): when CCC_SETUP_ALLOW_OWNER_MISMATCH=1 let a run by a
+# non-owner through, the bridge unit belongs to the checkout owner's account,
+# so it is not reconciled from here (see _ccc_checkout_owner_guard).
+if _ccc_skip_owner_side_effects; then
+  note "bridge systemd unit reconcile skipped: owner mismatch ($OWNER_MISMATCH_DESC) — the unit belongs to the checkout owner's bridge. Run setup.sh as the checkout owner (or: bridge/service-systemd.sh reconcile as that account); CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1 forces it (#2323)"
+elif [ "$DRY" = 1 ]; then
   bash "$SRC/bridge/service-systemd.sh" reconcile --dry-run
+  note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
 else
   bash "$SRC/bridge/service-systemd.sh" reconcile
+  note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
 fi
-note "Existing ccc-telegram-bridge systemd unit checked against the canonical renderer"
 
 # Managed-checkout guard hook (#1328): install a post-checkout warning into the
 # managed checkout's .git/hooks so creating/switching to a non-main branch here
@@ -1568,6 +1598,10 @@ src_gitdir="$(cd "$SRC" && git rev-parse --git-dir 2>/dev/null || true)"
 src_commondir="$(cd "$SRC" && git rev-parse --git-common-dir 2>/dev/null || true)"
 if [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ]; then
   note "managed-checkout guard: this checkout is not the self-update managed repo ($MANAGED_REPO) — skipped"
+elif _ccc_skip_owner_side_effects; then
+  # #2323: hooks written by a non-owner would land as foreign-owned files in
+  # the owner's .git/hooks (the #1426 regression path).
+  note "managed-checkout guard: .git/hooks install skipped: owner mismatch ($OWNER_MISMATCH_DESC) — hooks written now would be owned by the wrong account. Run setup.sh as the checkout owner to install them; CCC_SETUP_ALLOW_OWNER_MISMATCH_SHARED_SIDE_EFFECTS=1 forces it (#2323)"
 elif [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
   note "managed-checkout guard: running from a linked worktree/bare checkout — skipped (install from the managed checkout)"
 elif [ ! -f "$GUARD_SRC" ]; then
