@@ -236,6 +236,11 @@ class Config:
     # (default) keeps the pre-L3 flow byte-identical; "dry-run" records what
     # would be approved; "true" approves through the relay helper.
     auto_approve_mode: str = "off"
+    # #2435 S2: A2A arbitration of lineages the review loop cannot settle
+    # (reject, round limit, drop recommendation, undeliverable revise, failed
+    # review/revise). "off" (default) keeps the human-judgment flow; "dry-run"
+    # records what would be arbitrated/closed; "true" dispatches and applies.
+    arbitration_mode: str = "off"
     approve_cmd: tuple[str, ...] = ()
     approve_cmd_present: bool = False
     approve_profile: str = "seoseo-ai"
@@ -404,6 +409,14 @@ _AUTO_APPROVE_OFF = frozenset({"", "0", "false", "no", "off"})
 _APPROVE_PROFILES = frozenset({"seoseo-ai", "jinon86"})
 _APPROVE_SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
 _APPROVE_SCRIPT_REL = ("skills", "gh-pr-flow", "scripts", "approve-via-relay.sh")
+
+
+def _arbitration_mode(raw: str | None, state_file: Path, *, trust_root: Path | None = None) -> str:
+    """off | dry-run | true for #2435 S2, read exactly like the L3 switch."""
+    try:
+        return _auto_approve_mode(raw, state_file, trust_root=trust_root)
+    except PromotionError:
+        raise PromotionError("arbitration_invalid") from None
 
 
 def _auto_approve_mode(raw: str | None, state_file: Path, *, trust_root: Path | None = None) -> str:
@@ -714,6 +727,11 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         state_dir / "skill-promotion.auto-approve",
         trust_root=home,
     )
+    arbitration_mode = _arbitration_mode(
+        env.get("CCC_SKILL_PROMOTION_ARBITRATION"),
+        state_dir / "skill-promotion.arbitration",
+        trust_root=home,
+    )
     approve_cmd, approve_cmd_present = _approve_cmd(env, home)
     approve_profile = env.get("CCC_SKILL_PROMOTION_APPROVE_PROFILE", "seoseo-ai").strip()
     if approve_profile not in _APPROVE_PROFILES:
@@ -809,6 +827,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         remote_brokers=_parse_remote_brokers(env.get("CCC_SKILL_PROMOTION_REMOTE_BROKERS", "")),
         config_file=config_file,
         auto_approve_mode=auto_approve_mode,
+        arbitration_mode=arbitration_mode,
         approve_cmd=approve_cmd,
         approve_cmd_present=approve_cmd_present,
         approve_profile=approve_profile,
@@ -3013,6 +3032,7 @@ def _dispatch_intake_review(
     outcome: dict[str, object],
     *,
     transport_id: str,
+    arbitration: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Dispatch the intake review round and *record* every skip.
 
@@ -3025,7 +3045,9 @@ def _dispatch_intake_review(
     written here is what `ccc_doctor.check_skill_promotion_dispatch_gap`
     and the `_sweep_missing_dispatch` retry read.
     """
-    result = _dispatch_intake_review_attempt(config, candidate, outcome, transport_id=transport_id)
+    result = _dispatch_intake_review_attempt(
+        config, candidate, outcome, transport_id=transport_id, arbitration=arbitration
+    )
     # `dispatch_secret_missing` already writes its own durable row (#1766, inside
     # the attempt) — do not record it twice.
     if result.get("outcome") == "dispatch-skipped" and result.get("code") != "dispatch_secret_missing":
@@ -3060,6 +3082,7 @@ def _dispatch_intake_review_attempt(  # noqa: C901
     outcome: dict[str, object],
     *,
     transport_id: str,
+    arbitration: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Best-effort fail-safe: never raises, never closes the PR. Skips are
     returned (and recorded by the wrapper above) so a later collect cycle can
@@ -3114,6 +3137,10 @@ def _dispatch_intake_review_attempt(  # noqa: C901
                     if isinstance(reviewer_node, str) and reviewer_node:
                         infra_reviewers.add(reviewer_node)
                     continue
+                # #2435 S2: an arbitration round is owed even though the head
+                # was already reviewed; it is idempotent only against itself.
+                if arbitration is not None and not record.get("arbitration"):
+                    continue
                 return {"outcome": "dispatch-skipped", "code": "dispatch_already"}
     except OSError:
         pass
@@ -3132,8 +3159,14 @@ def _dispatch_intake_review_attempt(  # noqa: C901
             # #1628 B2: a republished tree keeps the original author, so the
             # node that actually wrote the revision is invisible to author-only
             # disqualification. Exclude it explicitly.
-            disqualified=_lineage_revisers(config, candidate.node, candidate.name) | infra_reviewers,
+            disqualified=(
+                _lineage_revisers(config, candidate.node, candidate.name)
+                | infra_reviewers
+                | (set(arbitration.get("exclude", ())) if arbitration is not None else set())
+            ),
         )
+        if arbitration is not None:
+            procedure = f"{procedure.rstrip()}\n\n{arbitration.get('appendix', '')}\n"
         if review_rb is None:
             nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
             if not nexus_script.is_file():
@@ -3203,6 +3236,10 @@ def _dispatch_intake_review_attempt(  # noqa: C901
             "reviewer_node": reviewer,
             "broker_id": broker_id,
             "broker": review_rb["name"] if review_rb else "primary",
+            **(
+                {"arbitration": True, "arbitration_trigger": str(arbitration.get("trigger", ""))}
+                if arbitration is not None else {}
+            ),
             "pr_url": url,
             "node": candidate.node,
             "provider": candidate.provider,
@@ -4041,6 +4078,7 @@ def _revise_substitute_for(
     secret: str,
     *,
     exclude: frozenset[str] = frozenset(),
+    final: bool = False,
 ) -> str | None:
     """The substitute for this lineage when B2 is due, else None. None covers
     every stay-normal case: feature off, skip too fresh, no online candidate,
@@ -4050,7 +4088,9 @@ def _revise_substitute_for(
     infrastructure reasons. A lineage whose *author* is excluded is eligible
     regardless of the B2 age threshold — the author is reachable but cannot
     run the round — and every excluded node is kept out of the pick."""
-    forced = node in exclude and not _revise_substitute_used(rows, node, name)
+    # #2435 S2: the arbitration's one final round may use a substitute even
+    # when the lineage already used its B2 substitute — it is the last round.
+    forced = final or (node in exclude and not _revise_substitute_used(rows, node, name))
     if not forced and not _revise_substitute_eligible(config, rows, node, name):
         return None
     return _revise_substitute_pick(
@@ -4081,6 +4121,7 @@ def _resolve_revise_target(
     secret: str,
     *,
     exclude: frozenset[str] = frozenset(),
+    final: bool = False,
 ) -> tuple[dict[str, str] | None, str, str, str, str | None]:
     """Broker, broker ids and the reviser for the next revise round. Raises
     revise_author_offline when the author is online nowhere and no substitute
@@ -4098,7 +4139,7 @@ def _resolve_revise_target(
             raise
         try:
             substitute = _revise_substitute_for(
-                config, rows, node, name, reviewer, tree12, secret, exclude=exclude
+                config, rows, node, name, reviewer, tree12, secret, exclude=exclude, final=final
             )
         except PromotionError:
             raise
@@ -4156,6 +4197,54 @@ def _run_revise_round(
             pass
 
 
+def _revise_round_gate(
+    config: Config,
+    rows: list[dict[str, object]],
+    lineage: list[dict[str, object]],
+    *,
+    round_no: int,
+    pr: str,
+    head: str,
+    final: bool,
+) -> dict[str, object] | None:
+    """Round-limit / final-round / daily-cap gate of `_dispatch_intake_revise`.
+    None = the round may be dispatched."""
+    if final:
+        # #2435 S2: one arbitration-granted round beyond the limit, once per
+        # lineage. It replaces the per-head guard: the head it revises may
+        # already carry a drop recommendation or a failed revise.
+        if any(item.get("final") for item in lineage):
+            return {"outcome": "revise-skipped", "code": "revise_final_already"}
+    elif round_no > config.revise_round_limit:
+        next_step = (
+            "An independent A2A arbitration round decides next (#2435)."
+            if getattr(config, "arbitration_mode", "off") == "true"
+            else "Per the auto-revision gate policy the PR stays open for human judgment "
+            "— no auto-close, no further automatic revision."
+        )
+        _comment_once(
+            config,
+            rows,
+            pr=pr,
+            head=head,
+            marker="round-limit",
+            body=(
+                f"Revise round limit reached ({config.revise_round_limit} rounds for this skill "
+                f"lineage). {next_step}"
+            ),
+        )
+        return {"outcome": "revise-handoff", "round": round_no - 1, "pr": pr}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = sum(
+        1
+        for item in lineage
+        if isinstance(item.get("ts"), str) and item["ts"].startswith(today)
+    )
+    if daily >= config.revise_daily_cap:
+        return {"outcome": "revise-skipped", "code": "revise_daily_cap"}
+    return None
+
+
 def _dispatch_intake_revise(
     config: Config,
     row: dict[str, object],
@@ -4165,6 +4254,7 @@ def _dispatch_intake_revise(
     *,
     dry_run: bool,
     exclude: frozenset[str] = frozenset(),
+    final: bool = False,
 ) -> dict[str, object]:
     """Dispatch one bounded revision task to the author node. Best-effort and
     fail-safe like the review dispatch: never raises, skip codes recorded.
@@ -4188,29 +4278,10 @@ def _dispatch_intake_revise(
         and item.get("task_id") not in infra_failed
     ]
     round_no = len(lineage) + 1
-    if round_no > config.revise_round_limit:
-        _comment_once(
-            config,
-            rows,
-            pr=pr,
-            head=head,
-            marker="round-limit",
-            body=(
-                f"Revise round limit reached ({config.revise_round_limit} rounds for this skill "
-                "lineage). Per the auto-revision gate policy the PR stays open for human judgment "
-                "— no auto-close, no further automatic revision."
-            ),
-        )
-        return {"outcome": "revise-handoff", "round": round_no - 1, "pr": pr}
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    daily = sum(
-        1
-        for item in lineage
-        if isinstance(item.get("ts"), str) and item["ts"].startswith(today)
-    )
-    if daily >= config.revise_daily_cap:
-        return {"outcome": "revise-skipped", "code": "revise_daily_cap"}
-    if _revise_dispatched(rows, pr, head):
+    gated = _revise_round_gate(config, rows, lineage, round_no=round_no, pr=pr, head=head, final=final)
+    if gated is not None:
+        return gated
+    if not final and _revise_dispatched(rows, pr, head):
         return {"outcome": "revise-skipped", "code": "revise_already"}
     secret = os.environ["A2A_EDGE_SECRET"]
     # #2024: the author node may be homed on a secondary broker. Dispatch the
@@ -4221,7 +4292,7 @@ def _dispatch_intake_revise(
         return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
     try:
         revise_rb, broker_id, broker_url, reviser, substitute = _resolve_revise_target(
-            config, row, rows, node, name, reviewer, tree12, secret, exclude=exclude
+            config, row, rows, node, name, reviewer, tree12, secret, exclude=exclude, final=final
         )
     except PromotionError as error:
         return {"outcome": "revise-skipped", "code": error.code}
@@ -4288,6 +4359,7 @@ def _dispatch_intake_revise(
         "name": name,
         "tree_sha256": tree_sha256,
         "round": round_no,
+        **({"final": True} if final else {}),
         "reviser_node": reviser,
         "substitute": reviser != node,
         **({"substitute_reason": (
@@ -6704,6 +6776,100 @@ def _retry_intake_receipts(config: Config, rows: list[dict[str, object]],
     return results
 
 
+def _consume_malformed_verdict(
+    config: Config,
+    rows: list[dict[str, object]],
+    row: dict[str, object],
+    task: dict[str, object],
+    *,
+    head: str,
+    dispatched: str,
+    routing: str,
+) -> list[dict[str, object]]:
+    """Record a result that is not a well-formed verdict: an infrastructure
+    failure within the retry budget (#2435 S1), otherwise `malformed` — and a
+    failed arbitration round closes its lineage (#2435 S2)."""
+    out: list[dict[str, object]] = []
+    # A malformed result is a handler failure, never a verdict — but it
+    # used to be recorded with no reason and no PR trace, so the intake
+    # PR sat with no verdict and nobody knew why (#1629).
+    reason = _malformed_verdict_reason(task, head)
+    infra_class = _infra_failure_class(task) if reason == "no_result_output" else None
+    if infra_class is not None and len(
+        _review_infra_failures(rows, row.get("transport_id"), head)
+    ) < _INFRA_RETRY_LIMIT:
+        # #2435 S1: not a verdict and not the candidate's fault. Record
+        # it so `_missing_dispatch_prs` treats the head as still owed a
+        # round and the dispatch excludes this reviewer next time.
+        infra_record = {
+            "ts": _utc_now(),
+            "kind": "a2a-verdict",
+            "task_id": dispatched,
+            "status": "infra_failed",
+            "reason": infra_class,
+            "task_status": str(task.get("status", "")),
+            "head_sha": head,
+            "transport_id": row.get("transport_id"),
+            "reviewer_node": row.get("reviewer_node"),
+        }
+        _append_ledger(config, infra_record)
+        rows.append(infra_record)
+        _comment_once(
+            config,
+            rows,
+            pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+            head=head,
+            marker=f"verdict-infra-failed:{dispatched}",
+            body=(
+                f"Review task `{dispatched}` failed on the reviewer's host before producing "
+                f"a result (`{infra_class}`). This is an infrastructure failure, not a verdict: "
+                "the review is re-dispatched automatically to a different reviewer on the next "
+                "collect (#2435)."
+            ),
+        )
+        out.append(
+            {"outcome": "verdict-infra-failed", "task_id": dispatched, "infra_class": infra_class}
+        )
+        return out
+    _append_ledger(
+        config,
+        {
+            "ts": _utc_now(),
+            "kind": "a2a-verdict",
+            "task_id": dispatched,
+            "status": "malformed",
+            "reason": reason,
+            "task_status": str(task.get("status", "")),
+            **({"broker_corrected": routing} if routing.startswith("corrected:") else {}),
+        },
+    )
+    _comment_once(
+        config,
+        rows,
+        pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+        head=head,
+        marker=f"verdict-malformed:{dispatched}",
+        body=(
+            f"Collect verdict gate: task `{dispatched}` returned a result that is not a "
+            f"well-formed verdict bound to this head (`{reason}`). The verdict is "
+            "withheld — this PR has no review outcome until a fresh review is "
+            "dispatched. An operator should inspect the broker result for this task."
+        ),
+    )
+    out.append(
+        {"outcome": "verdict-malformed", "task_id": dispatched, "reason": reason}
+    )
+    if row.get("arbitration") and getattr(config, "arbitration_mode", "off") == "true":
+        out.append(
+            _arbitration_close(
+                config, rows, pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "", head=head,
+                node=str(row.get("node", "")), name=str(row.get("name", "")),
+                reason="arbiter-unavailable", detail=f"arbitration round returned no verdict ({reason})",
+            )
+        )
+    return out
+
+
 def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
     """Poll dispatched review tasks, record verdicts, post verdict/findings
     comments (the #1357 visibility gap, extended to skipped revise dispatches
@@ -6765,74 +6931,10 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         head = row.get("head_sha") if isinstance(row.get("head_sha"), str) else ""
         verdict_data = _verdict_from_task(task, head)
         if verdict_data is None:
-            # A malformed result is a handler failure, never a verdict — but it
-            # used to be recorded with no reason and no PR trace, so the intake
-            # PR sat with no verdict and nobody knew why (#1629).
-            reason = _malformed_verdict_reason(task, head)
-            infra_class = _infra_failure_class(task) if reason == "no_result_output" else None
-            if infra_class is not None and len(
-                _review_infra_failures(rows, row.get("transport_id"), head)
-            ) < _INFRA_RETRY_LIMIT:
-                # #2435 S1: not a verdict and not the candidate's fault. Record
-                # it so `_missing_dispatch_prs` treats the head as still owed a
-                # round and the dispatch excludes this reviewer next time.
-                infra_record = {
-                    "ts": _utc_now(),
-                    "kind": "a2a-verdict",
-                    "task_id": dispatched,
-                    "status": "infra_failed",
-                    "reason": infra_class,
-                    "task_status": str(task.get("status", "")),
-                    "head_sha": head,
-                    "transport_id": row.get("transport_id"),
-                    "reviewer_node": row.get("reviewer_node"),
-                }
-                _append_ledger(config, infra_record)
-                rows.append(infra_record)
-                _comment_once(
-                    config,
-                    rows,
-                    pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
-                    head=head,
-                    marker=f"verdict-infra-failed:{dispatched}",
-                    body=(
-                        f"Review task `{dispatched}` failed on the reviewer's host before producing "
-                        f"a result (`{infra_class}`). This is an infrastructure failure, not a verdict: "
-                        "the review is re-dispatched automatically to a different reviewer on the next "
-                        "collect (#2435)."
-                    ),
+            processed.extend(
+                _consume_malformed_verdict(
+                    config, rows, row, task, head=head, dispatched=dispatched, routing=routing
                 )
-                processed.append(
-                    {"outcome": "verdict-infra-failed", "task_id": dispatched, "infra_class": infra_class}
-                )
-                continue
-            _append_ledger(
-                config,
-                {
-                    "ts": _utc_now(),
-                    "kind": "a2a-verdict",
-                    "task_id": dispatched,
-                    "status": "malformed",
-                    "reason": reason,
-                    "task_status": str(task.get("status", "")),
-                    **({"broker_corrected": routing} if routing.startswith("corrected:") else {}),
-                },
-            )
-            _comment_once(
-                config,
-                rows,
-                pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
-                head=head,
-                marker=f"verdict-malformed:{dispatched}",
-                body=(
-                    f"Collect verdict gate: task `{dispatched}` returned a result that is not a "
-                    f"well-formed verdict bound to this head (`{reason}`). The verdict is "
-                    "withheld — this PR has no review outcome until a fresh review is "
-                    "dispatched. An operator should inspect the broker result for this task."
-                ),
-            )
-            processed.append(
-                {"outcome": "verdict-malformed", "task_id": dispatched, "reason": reason}
             )
             continue
         verdict, findings = verdict_data
@@ -6855,6 +6957,11 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
         # a2a/receipts gate — the promotion precondition — to success.
         receipt_status = _project_intake_receipt(config, rows, row, task)
         note = ""
+        if row.get("arbitration") and getattr(config, "arbitration_mode", "off") == "true" and verdict != "approve":
+            processed.append(
+                _apply_arbitration_verdict(config, rows, row, head, dispatched, verdict, findings)
+            )
+            continue
         if verdict == "revise":
             revise_outcome = _dispatch_intake_revise(
                 config, row, rows, findings, str(row.get("reviewer_node", "unknown")), dry_run=False
@@ -8208,6 +8315,357 @@ def _open_intake_prs(config: Config) -> list[dict[str, object]]:
     return prs
 
 
+# ---------------------------------------------------------------------------
+# #2435 S2: A2A arbitration replaces every "human judgment" end state of the
+# intake loop (owner decision 2026-10-21). Instead of hooking each producer,
+# one sweep re-derives the unsettled state of every open intake PR from the
+# ledger each collect — so the backlog that predates this code is handled by
+# the same path as new cases. An unsettled lineage gets ONE arbitration: an
+# independent review round (author, every prior reviewer and every reviser of
+# the lineage excluded) whose verdict is applied mechanically:
+#   approve -> the normal promote path;
+#   revise  -> one final revise round beyond the round limit (any trusted
+#              substitute may take it); the next review decides;
+#   reject  -> the intake PR is closed (reopenable, never deleted).
+# A lineage that becomes unsettled again after its arbitration, or whose
+# arbitration cannot be obtained within the grace period, is closed too. P10
+# (public graduation) is out of scope and stays an owner decision.
+_ARBITRATION_KIND = "a2a-arbitration"
+_ARBITRATION_CLOSED_KIND = "a2a-arbitration-closed"
+# A revise verdict whose revision never went anywhere (author offline, the
+# lineage's substitute used up, deferred retries exhausted) is unsettled only
+# after this long — the deferred-revise sweep gets its chance first.
+_ARBITRATION_STUCK_SEC = 24 * 3600
+# An arbitration request that cannot be dispatched for this long (no eligible
+# reviewer online, broker down) closes the lineage as arbiter-unavailable.
+_ARBITRATION_GRACE_SEC = 48 * 3600
+_ARBITRATION_LIMIT = 4  # per collect; each dispatch may wait on the skills check
+_ARBITRATION_TERMINAL_REVISE = frozenset({"failed", "invalid", "drop-recommended", "broker-mismatch"})
+
+
+def _iso_epoch(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _arbitration_state(
+    rows: list[dict[str, object]], pr: str, head: str, node: str, name: str, *, now: float
+) -> tuple[str | None, bool]:
+    """(trigger, lineage_already_arbitrated) for one open intake PR head.
+
+    Pure over the ledger. The trigger is None while anything is still in
+    flight for this head (an unanswered review or revise task), or when the
+    head is in a state the normal loop settles on its own.
+    """
+    infra_failed = _infra_failed_task_ids(rows)
+    verdicts_by_task = {
+        row.get("task_id"): row for row in rows if row.get("kind") == "a2a-verdict"
+    }
+    revise_results = {
+        row.get("task_id"): row for row in rows if row.get("kind") == "a2a-revise-result"
+    }
+    dispatches = [
+        row for row in rows
+        if row.get("kind") == "a2a-dispatch" and row.get("head_sha") == head
+        and _pr_number_from_url(str(row.get("pr_url", ""))) == pr
+        and row.get("dispatched_task") not in infra_failed
+    ]
+    arbitrated = any(
+        row.get("kind") == "a2a-dispatch" and row.get("arbitration")
+        and row.get("node") == node and row.get("name") == name
+        and row.get("dispatched_task") not in infra_failed
+        for row in rows
+    )
+    if any(row.get("dispatched_task") not in verdicts_by_task for row in dispatches):
+        return None, arbitrated  # a review round is still running
+    revises = [
+        row for row in rows
+        if row.get("kind") == "a2a-revise-dispatch" and row.get("pr") == pr and row.get("head_sha") == head
+        and row.get("task_id") not in infra_failed
+    ]
+    if any(row.get("task_id") not in revise_results for row in revises):
+        return None, arbitrated  # a revise round is still running
+    # Revise outcomes on this head that leave nothing for the normal loop.
+    for row in reversed(revises):
+        status = str(revise_results[row.get("task_id")].get("status", ""))
+        if status == "drop-recommended":
+            return "drop_recommended", arbitrated
+        if status in _ARBITRATION_TERMINAL_REVISE:
+            return "revise_failed", arbitrated
+        if status == "republished":
+            return None, arbitrated  # superseded by a fresh intake PR
+    if not dispatches:
+        return None, arbitrated  # never reviewed: the missing-dispatch sweep owns it
+    last = verdicts_by_task[dispatches[-1].get("dispatched_task")]
+    status, verdict = last.get("status"), last.get("verdict")
+    if status == "malformed" or status == "broker-mismatch":
+        return "review_failed", arbitrated
+    if status != "consumed":
+        return None, arbitrated
+    if verdict == "reject":
+        return "reject", arbitrated
+    if verdict == "revise" and not revises:
+        if any(
+            row.get("kind") == "a2a-revise-comment" and row.get("pr") == pr
+            and row.get("head_sha") == head and row.get("marker") == "round-limit"
+            for row in rows
+        ):
+            return "round_limit", arbitrated
+        consumed_at = _iso_epoch(last.get("ts"))
+        if consumed_at is not None and now - consumed_at >= _ARBITRATION_STUCK_SEC:
+            return "revise_stuck", arbitrated
+    return None, arbitrated
+
+
+def _arbitration_appendix(
+    rows: list[dict[str, object]], pr: str, node: str, name: str, trigger: str
+) -> str:
+    """Publisher-authored procedure appendix for an arbitration round.
+
+    History is metadata only (dates, nodes, verdicts, statuses, stable codes):
+    no candidate text and no reviewer finding text, so nothing in it can be
+    mistaken for, or smuggle in, candidate content."""
+    lines = [
+        "## ARBITRATION ROUND (publisher-generated scaffolding, #2435)",
+        "",
+        "This is the final independent decision for this skill lineage. The automatic review",
+        f"loop could not settle it on its own (trigger: `{trigger}`). Your verdict is applied",
+        "mechanically, with no human step after it:",
+        "",
+        "- `approve`: the candidate is promoted as it is.",
+        "- `revise`: exactly ONE final revision round is dispatched with your findings; the",
+        "  next independent review then decides, and anything but `approve` closes the PR.",
+        "- `reject`: the intake PR is closed (archived; the owner can reopen it).",
+        "",
+        "Judge the candidate on its merits against the rubric, exactly as a normal review.",
+        "The history below is context only — earlier rounds may have been wrong, and a",
+        "failed round says nothing about the candidate.",
+        "",
+        f"### Lineage history for `{name}` (author node `{node}`, newest last)",
+    ]
+    pr_by_task = _pr_by_dispatched_task(rows)
+    entries: list[str] = []
+    for row in rows:
+        kind = row.get("kind")
+        stamp = str(row.get("ts", ""))[:16]
+        if kind == "a2a-dispatch" and row.get("node") == node and row.get("name") == name:
+            entries.append(
+                f"- {stamp} review dispatched to `{row.get('reviewer_node', '?')}` "
+                f"(PR #{_pr_number_from_url(str(row.get('pr_url', ''))) or '?'})"
+            )
+        elif kind == "a2a-verdict":
+            task = row.get("task_id")
+            if isinstance(task, str) and _verdict_pr(task, pr_by_task) is not None:
+                if not any(
+                    item.get("dispatched_task") == task and item.get("node") == node and item.get("name") == name
+                    for item in rows if item.get("kind") == "a2a-dispatch"
+                ):
+                    continue
+                outcome = row.get("verdict") or row.get("status")
+                reason = f" ({row.get('reason')})" if row.get("reason") else ""
+                entries.append(f"- {stamp} review result: `{outcome}`{reason}")
+        elif kind == "a2a-revise-dispatch" and row.get("node") == node and row.get("name") == name:
+            entries.append(
+                f"- {stamp} revise round {row.get('round', '?')} dispatched to `{row.get('reviser_node', '?')}`"
+            )
+        elif kind == "a2a-revise-result" and row.get("node") in (None, node) and row.get("name") in (None, name):
+            if any(
+                item.get("task_id") == row.get("task_id") and item.get("node") == node and item.get("name") == name
+                for item in rows if item.get("kind") == "a2a-revise-dispatch"
+            ):
+                entries.append(f"- {stamp} revise result: `{row.get('status', '?')}`")
+    lines.extend(entries[-24:] or ["- (no recorded history)"])
+    return "\n".join(lines)
+
+
+def _arbitration_close(
+    config: Config,
+    rows: list[dict[str, object]],
+    *,
+    pr: str,
+    head: str,
+    node: str,
+    name: str,
+    reason: str,
+    detail: str = "",
+) -> dict[str, object]:
+    lifecycle = "archived:arbiter-unavailable" if reason == "arbiter-unavailable" else "archived:arbiter-closed"
+    body = (
+        "A2A 중재 결과로 이 intake PR을 종료합니다 (#2435).\n\n"
+        f"- 사유: `{reason}`" + (f" — {detail}" if detail else "") + "\n"
+        f"- 계보: `{node}` / `{name}`\n"
+        "- 이 종료는 삭제가 아닙니다. 오너가 PR을 다시 열면 일반 리뷰 루프로 돌아갑니다.\n"
+        "- intake 브랜치는 검토 전용이므로 merge되지 않고 종료됩니다.\n"
+    )
+    try:
+        _run(["gh", "pr", "close", pr, "--repo", config.repo, "--comment", body])
+    except PromotionError as error:
+        return {"outcome": "arbitration-close-failed", "pr": pr, "code": error.code}
+    record = {"ts": _utc_now(), "kind": _ARBITRATION_CLOSED_KIND, "pr": pr, "head_sha": head,
+              "node": node, "name": name, "reason": reason, "lifecycle": lifecycle}
+    _append_ledger(config, record)
+    rows.append(record)
+    state = {"ts": _utc_now(), "kind": _INTAKE_STATE_KIND, "pr": pr, "state": "CLOSED"}
+    _append_ledger(config, state)
+    rows.append(state)
+    return {"outcome": "arbitration-closed", "pr": pr, "reason": reason}
+
+
+def _candidate_from_open_pr(config: Config, pr: dict[str, object]) -> Candidate:
+    """Rebuild an intake PR's candidate from its head through the envelope gates."""
+    parts = _intake_branch_parts(str(pr["branch"])) or {}
+    if not parts:
+        raise PromotionError("redispatch_branch_invalid")
+    candidate_id = f"{parts['name']}-{parts['suffix']}"
+    manifest_tree = _pr_manifest_tree(
+        config, node=parts["node"], provider=parts["provider"], candidate_id=candidate_id, head=str(pr["head"])
+    )
+    files = _pr_skill_files(
+        config, node=parts["node"], provider=parts["provider"], candidate_id=candidate_id, head=str(pr["head"])
+    )
+    candidate = _candidate_from_revised_files(
+        parts["node"], parts["provider"], parts["name"],
+        [(relative, content) for relative, content, _ in files],
+        {relative: executable for relative, _, executable in files},
+    )
+    if candidate.tree_sha256 != manifest_tree:
+        raise PromotionError("redispatch_tree_mismatch")
+    return candidate
+
+
+def _lineage_participants(rows: list[dict[str, object]], node: str, name: str) -> set[str]:
+    """Every node that reviewed or revised this lineage — excluded from arbitration."""
+    out: set[str] = {node}
+    for row in rows:
+        if row.get("node") != node or row.get("name") != name:
+            continue
+        if row.get("kind") == "a2a-dispatch" and isinstance(row.get("reviewer_node"), str):
+            out.add(str(row["reviewer_node"]))
+        if row.get("kind") == "a2a-revise-dispatch" and isinstance(row.get("reviser_node"), str):
+            out.add(str(row["reviser_node"]))
+    return {item for item in out if item}
+
+
+def _sweep_arbitration(
+    config: Config, *, dry_run: bool, now: float | None = None
+) -> list[dict[str, object]]:
+    """#2435 S2: arbitrate or close every open intake PR the loop cannot settle."""
+    mode = getattr(config, "arbitration_mode", "off")
+    if mode == "off" or not getattr(config, "dispatch_enabled", False):
+        return []
+    preview = dry_run or mode == "dry-run"
+    now = time.time() if now is None else now
+    rows = _ledger_rows(config)
+    try:
+        open_prs = _open_intake_prs(config)
+    except PromotionError as error:
+        return [{"outcome": "arbitration-skipped", "code": error.code}]
+    out: list[dict[str, object]] = []
+    dispatched = 0
+    for pr in sorted(open_prs, key=lambda item: float(item.get("created_at") or 0)):
+        parts = _intake_branch_parts(str(pr.get("branch", "")))
+        number, head = str(pr.get("number", "")), str(pr.get("head", ""))
+        if parts is None or not number or not head:
+            continue
+        node, name = parts["node"], parts["name"]
+        trigger, arbitrated = _arbitration_state(rows, number, head, node, name, now=now)
+        if trigger is None:
+            continue
+        if arbitrated:
+            reason = f"post-arbitration-{trigger}"
+            if preview:
+                out.append({"outcome": "would-close-after-arbitration", "pr": number, "reason": reason})
+                continue
+            out.append(_arbitration_close(config, rows, pr=number, head=head, node=node, name=name,
+                                          reason=reason))
+            continue
+        requested = [
+            row for row in rows
+            if row.get("kind") == _ARBITRATION_KIND and row.get("pr") == number and row.get("head_sha") == head
+        ]
+        first = _iso_epoch(requested[0].get("ts")) if requested else None
+        if first is not None and now - first >= _ARBITRATION_GRACE_SEC:
+            if preview:
+                out.append({"outcome": "would-close-arbiter-unavailable", "pr": number, "trigger": trigger})
+                continue
+            out.append(_arbitration_close(config, rows, pr=number, head=head, node=node, name=name,
+                                          reason="arbiter-unavailable",
+                                          detail=f"no arbitration round could be dispatched for {trigger}"))
+            continue
+        if preview:
+            out.append({"outcome": "would-arbitrate", "pr": number, "trigger": trigger})
+            continue
+        if dispatched >= _ARBITRATION_LIMIT:
+            out.append({"outcome": "arbitration-deferred", "pr": number, "trigger": trigger})
+            continue
+        if not requested:
+            record = {"ts": _utc_now(), "kind": _ARBITRATION_KIND, "pr": number, "head_sha": head,
+                      "node": node, "name": name, "trigger": trigger}
+            _append_ledger(config, record)
+            rows.append(record)
+        try:
+            candidate = _candidate_from_open_pr(config, pr)
+        except PromotionError as error:
+            out.append({"outcome": "arbitration-skipped", "pr": number, "code": error.code})
+            continue
+        dispatched += 1
+        result = _dispatch_intake_review(
+            config, candidate, {"url": pr["url"], "branch": pr["branch"]},
+            transport_id=_transport_id(candidate),
+            arbitration={
+                "trigger": trigger,
+                "exclude": sorted(_lineage_participants(rows, node, name)),
+                "appendix": _arbitration_appendix(rows, number, node, name, trigger),
+            },
+        )
+        out.append({"outcome": "arbitration-dispatch", "pr": number, "trigger": trigger, "dispatch": result})
+    return out
+
+
+def _apply_arbitration_verdict(
+    config: Config,
+    rows: list[dict[str, object]],
+    row: dict[str, object],
+    head: str,
+    dispatched: str,
+    verdict: str,
+    findings: list[dict[str, str]],
+) -> dict[str, object]:
+    """#2435 S2: apply a non-approve arbitration verdict (approve takes the
+    normal promote path). reject closes; revise dispatches the lineage's one
+    final round, and an undeliverable final round closes."""
+    pr = _pr_number_from_url(str(row.get("pr_url", ""))) or ""
+    node, name = str(row.get("node", "")), str(row.get("name", ""))
+    reviewer = str(row.get("reviewer_node", "unknown"))
+    if verdict == "revise":
+        outcome = _dispatch_intake_revise(config, row, rows, findings, reviewer, dry_run=False, final=True)
+        if outcome.get("outcome") == "revise-dispatched":
+            try:
+                _pr_comment(config, pr, _verdict_comment_body(
+                    "revise", findings, reviewer, dispatched,
+                    f"arbitration: one final revision round dispatched to `{outcome.get('reviser', '?')}` "
+                    "— the next independent review decides; anything but approve closes this lineage (#2435)",
+                ))
+            except PromotionError:
+                pass
+            return {"outcome": "arbitration-revise-dispatched", "pr": pr, "revise": outcome}
+        return _arbitration_close(
+            config, rows, pr=pr, head=head, node=node, name=name, reason="arbiter-revise-undeliverable",
+            detail=f"final revision round could not be dispatched (`{outcome.get('code', '?')}`)",
+        )
+    try:
+        _pr_comment(config, pr, _verdict_comment_body(
+            verdict, findings, reviewer, dispatched, "arbitration verdict — the intake PR is closed (#2435)",
+        ))
+    except PromotionError:
+        pass
+    return _arbitration_close(config, rows, pr=pr, head=head, node=node, name=name, reason="arbiter-reject")
+
+
 def _sweep_missing_dispatch(
     config: Config, *, dry_run: bool, now: float | None = None
 ) -> list[dict[str, object]]:
@@ -8262,11 +8720,12 @@ def _sweep_missing_dispatch(
 
 
 def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
-    """Redispatch / intake-state / autoclose / supersede / auto-promote / auto-merge."""
+    """Redispatch / intake-state / autoclose / supersede / arbitration / auto-promote / auto-merge."""
     redispatched = _sweep_missing_dispatch(config, dry_run=dry_run)
     intake_states = _sweep_intake_states(config, dry_run=dry_run)
     promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
     superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
+    arbitration = _sweep_arbitration(config, dry_run=dry_run)
     auto_promote: dict[str, object] | None = None
     if getattr(config, "auto_promote_enabled", False):
         auto_promote = _promote(config, dry_run=dry_run, limit=8)
@@ -8275,6 +8734,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
         "intake_states": intake_states,
         "promoted_intakes": promoted_intakes,
         "superseded_intakes": superseded_intakes,
+        "arbitration": arbitration,
         "auto_promote": auto_promote,
         "promote_merges": _sweep_promote_merge(config, dry_run=dry_run),
     }
