@@ -118,6 +118,22 @@ class ArbitrationState(unittest.TestCase):
         rows = [review("t1", "r1"), verdict("t1", None, status="infra_failed")]
         self.assertEqual(state(rows)[0], None)  # owed to the missing-dispatch sweep
 
+    def test_review_after_failed_revise_supersedes_it(self) -> None:
+        # Field case 2026-10-21 (fleet-skills#532): revise_failed triggered the
+        # arbitration, the arbiter approved, and the old revise_failed must not
+        # be re-read as an unsettled-after-arbitration trigger.
+        before = [review("t1", "r1"), verdict("t1", "revise"), revise("v1", NODE), revise_result("v1", "failed")]
+        self.assertEqual(state(before), ("revise_failed", False))
+        approved = before + [review("t2", "arb", arbitration=True), verdict("t2", "approve")]
+        self.assertEqual(state(approved), (None, True))
+        running = before + [review("t2", "arb", arbitration=True)]
+        self.assertEqual(state(running), (None, True))
+        rejected = before + [review("t2", "arb", arbitration=True), verdict("t2", "reject")]
+        self.assertEqual(state(rejected), ("reject", True))
+        final_failed = before + [review("t2", "arb", arbitration=True), verdict("t2", "revise"),
+                                 revise("v2", "s", final=True), revise_result("v2", "invalid")]
+        self.assertEqual(state(final_failed), ("revise_failed", True))
+
     def test_arbitrated_flag_is_lineage_wide(self) -> None:
         rows = [review("t0", "r0", arbitration=True, head="b" * 40), verdict("t0", "revise"),
                 review("t1", "r1"), verdict("t1", "reject")]

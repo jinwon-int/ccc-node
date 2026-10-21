@@ -8382,9 +8382,16 @@ def _arbitration_state(
     )
     if any(row.get("dispatched_task") not in verdicts_by_task for row in dispatches):
         return None, arbitrated  # a review round is still running
+    # Only revise rounds dispatched after the head's latest review count: a
+    # newer review (e.g. the arbitration round itself) supersedes every revise
+    # outcome before it, so an arbiter's approve is never re-read as the old
+    # `revise_failed` that triggered the arbitration.
+    review_ids = {id(row) for row in dispatches}
+    last_review = max((index for index, row in enumerate(rows) if id(row) in review_ids), default=-1)
     revises = [
-        row for row in rows
-        if row.get("kind") == "a2a-revise-dispatch" and row.get("pr") == pr and row.get("head_sha") == head
+        row for index, row in enumerate(rows)
+        if index > last_review
+        and row.get("kind") == "a2a-revise-dispatch" and row.get("pr") == pr and row.get("head_sha") == head
         and row.get("task_id") not in infra_failed
     ]
     if any(row.get("task_id") not in revise_results for row in revises):
