@@ -704,6 +704,7 @@ class HealthProbeTests(unittest.IsolatedAsyncioTestCase):
                 "runtime_recycles",
                 "session_guard_evictions",
                 "session_tree_rss_mb",
+                "stall_probe_unknown_recent",
                 "waiting_for_turn",
             ],
         )

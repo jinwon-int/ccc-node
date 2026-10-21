@@ -89,6 +89,57 @@ class OrphanLoopTracker:
 orphan_tool_loop_tracker = OrphanLoopTracker()
 
 
+UNKNOWN_VERDICT_WINDOW_SECONDS = 60 * 60.0
+
+
+class UnknownVerdictTracker:
+    """Sliding-window count of stall probes that could not judge the engine.
+
+    Count only: an "unknown" verdict is a turn that has been silent past the
+    probe threshold on an engine the adapter cannot confirm dead — which is
+    also what a long-running tool looks like — so it is surfaced in health
+    for operators and dashboards (#2443) and deliberately raises no alert.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = UNKNOWN_VERDICT_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._window = float(window_seconds)
+        self._clock = clock
+        self._events: Deque[float] = deque()
+
+    def _trim(self, now: float) -> None:
+        while self._events and now - self._events[0] > self._window:
+            self._events.popleft()
+
+    def record(self, *, now: Optional[float] = None) -> int:
+        now = self._clock() if now is None else float(now)
+        self._events.append(now)
+        self._trim(now)
+        return len(self._events)
+
+    def recent_count(self, *, now: Optional[float] = None) -> int:
+        """Verdicts within ``(now - window, now]``.
+
+        ``now`` is the reference instant, so a stamp after it is not counted:
+        the health probe passes its own tick time and must not see verdicts a
+        different clock recorded later (process-wide tracker, test isolation).
+        """
+        now = self._clock() if now is None else float(now)
+        self._trim(now)
+        return sum(1 for stamp in self._events if stamp <= now)
+
+    def reset(self) -> None:
+        self._events.clear()
+
+
+#: Process-wide sink the stall probe feeds on every "unknown" verdict.
+unknown_verdict_tracker = UnknownVerdictTracker()
+
+
 # --- stall probe -------------------------------------------------------------
 
 TurnsProvider = Callable[[], List[Tuple[int, int, Optional[str], float]]]
@@ -334,10 +385,20 @@ class StallProbeMonitor:
                 continue
             if verdict != "dead":
                 # Ambiguous liveness: never recover on a guess (fail-closed).
+                # Say what is known so the log is actionable (#2443): how
+                # long the turn has been silent, which arm judged it, and
+                # that /stop is the manual release — a silent turn behind an
+                # alive engine is what both a hung turn and a long tool look
+                # like from here.
+                unknown_verdict_tracker.record()
                 logger.warning(
-                    "Turn stall probe: liveness unknown, no recovery (user=%s chat=%s)",
+                    "Turn stall probe: liveness unknown after %ds silence, no "
+                    "recovery (user=%s chat=%s arm=%s); the turn stays occupied — "
+                    "/stop releases it if it is hung",
+                    int(silent_for),
                     user_id,
                     chat_id,
+                    generic[0] if generic is not None else "codex-rollout",
                 )
                 continue
             logger.warning(
@@ -373,11 +434,14 @@ __all__ = [
     "STALL_PROBE_ENV",
     "StallProbeMonitor",
     "TurnLivenessBinding",
+    "UNKNOWN_VERDICT_WINDOW_SECONDS",
+    "UnknownVerdictTracker",
     "TurnLivenessSource",
     "engine_dead_notification_text",
     "find_rollout",
     "orphan_tool_loop_tracker",
     "register_turn_liveness",
     "registered_turn_liveness_sources",
+    "unknown_verdict_tracker",
     "unregister_turn_liveness",
 ]
