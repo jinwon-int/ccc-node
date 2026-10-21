@@ -2835,6 +2835,53 @@ async def test_terminal_stall_preserves_interrupt_cancel_abort_close_order(
     assert session.iterator.close_calls == 1
 
 
+class SilentStallSession(OrderedStallSession):
+    """Admitted by a tool frame, then silent forever: no text ever (#2442)."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.iterator = OrderedStallIterator(
+            [
+                ToolStartedEvent(tool_call_id="t1", tool_name="Bash", arguments={}),
+                ToolCompletedEvent(
+                    tool_call_id="t1", tool_name="Bash", result=None, success=True
+                ),
+            ],
+            self.order,
+        )
+
+
+@pytest.mark.anyio
+async def test_silent_stall_releases_an_admitted_turn_without_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2442: admitted (tool frames) but never any text and nothing running.
+
+    Before the silent-stall bound the admission deadline was already
+    satisfied, the terminal guard could not arm without text, and the read
+    waited for the whole process timeout — the second axis of the 2026-10-21
+    occupied-for-hours incident (#2440).
+    """
+
+    session = SilentStallSession("thread-1")
+    handler, stalled = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
+    handler._config.terminal_stall_seconds = 0.0  # cannot arm anyway: no text
+    handler._config.silent_turn_stall_seconds = 0.05
+
+    response = await asyncio.wait_for(
+        handler.process_message("silent", 7, 70),
+        timeout=5,
+    )
+
+    assert response.success is False
+    assert response.error == "Agent went silent for 0.05s without producing an answer"
+    assert response.failure_class is not None
+    assert response.failure_class.startswith("silent-stall/")
+    assert stalled == [1]
+    assert session.order == ["interrupt", "pending-cancel", "abort", "aclose"]
+    assert session.iterator.close_calls == 1
+
+
 @pytest.mark.anyio
 async def test_expired_terminal_stall_bound_interrupts_and_aborts_without_a_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

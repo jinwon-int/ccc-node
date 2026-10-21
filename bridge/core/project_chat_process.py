@@ -1396,6 +1396,7 @@ class ProjectChatProcessMixin:
         approval_grace: float,
         stall_grace: float,
         delegated_stall_grace: float,
+        silent_stall_grace: float = 0.0,
     ) -> TurnStreamOutcome:
         """Send the turn and consume its stream under the whole-turn timeout (#896 PR2).
 
@@ -1418,9 +1419,148 @@ class ProjectChatProcessMixin:
                 approval_stall_seconds=approval_grace,
                 terminal_stall_seconds=stall_grace,
                 delegated_task_stall_seconds=delegated_stall_grace,
+                silent_stall_seconds=silent_stall_grace,
                 interrupt_timeout_seconds=self._agent_interrupt_timeout_seconds,
             ),
             timeout=self._process_timeout_seconds,
+        )
+
+    async def _resolve_admission_timeout(
+        self,
+        *,
+        key: str,
+        session: Any,
+        model: Optional[str],
+        loop: asyncio.AbstractEventLoop,
+        progress_request: Any,
+        user_id: int,
+        chat_id: int,
+        admission_grace: float,
+    ) -> ChatResponse:
+        """Reply for a turn whose provider never produced a first event.
+
+        Pure move of the ADMISSION_TIMEOUT branch out of
+        ``_resolve_turn_outcome`` (#2442 kept that method under the
+        complexity ceiling); behaviour unchanged.
+        """
+        # Collected before the session is dropped: closing the
+        # client tears down the SDK transport and takes the exit
+        # code with it.
+        diagnostics = _admission_diagnostics(
+            session,
+            provider=getattr(self._config, "agent_provider", "claude"),
+            model=model,
+            elapsed=_elapsed_since(loop, progress_request),
+            grace=admission_grace,
+        )
+        terminal_won = _claim_request_terminal(
+            progress_request,
+            RequestPhase.TIMEOUT,
+            cause="admission-timeout",
+        )
+        if terminal_won:
+            await self._drop_agent_session(key, session)
+        logger.warning(
+            "Turn admission timed out for user %s chat %s before the "
+            "runtime produced its first event "
+            "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
+            "exit_code=%s stderr_class=%s stderr_lines=%s)",
+            user_id,
+            chat_id,
+            diagnostics["provider"],
+            diagnostics["model"],
+            diagnostics["endpoint"],
+            diagnostics["elapsed"],
+            admission_grace,
+            diagnostics["exit_code"],
+            diagnostics["stderr_class"],
+            diagnostics["stderr_lines"],
+        )
+        try:
+            health_reporter.record_stalled_request()
+        except Exception:
+            pass
+        message = f"Agent turn did not start within {admission_grace:g}s"
+        return ChatResponse(
+            content=f"⏰ {message}. Please retry your request.",
+            success=False,
+            error=message,
+            failure_class=(
+                "admission-timeout/"
+                f"{diagnostics['stderr_class'] or 'silent'}"
+            ),
+            session_id=session.session_id,
+        )
+
+    async def _resolve_silent_stall(
+        self,
+        *,
+        key: str,
+        session: Any,
+        model: Optional[str],
+        loop: asyncio.AbstractEventLoop,
+        progress_request: Any,
+        streaming_handler: Any,
+        user_id: int,
+        chat_id: int,
+        silent_stall_grace: float,
+    ) -> ChatResponse:
+        """Reply for a turn released by the silent-stall bound (#2442).
+
+        Admitted by a non-text event (an approval request, a tool frame) and
+        then nothing: no text to deliver, nothing running, nothing pending.
+        Same diagnostics-before-drop order as the other stall branches (#846).
+        """
+        silent_diagnostics = _admission_diagnostics(
+            session,
+            provider=getattr(self._config, "agent_provider", "claude"),
+            model=model,
+            elapsed=_elapsed_since(loop, progress_request),
+            grace=silent_stall_grace,
+        )
+        silent_ages = _stall_ages(loop, progress_request)
+        terminal_won = _claim_request_terminal(
+            progress_request,
+            RequestPhase.INTERRUPTED,
+            cause="silent-stall",
+        )
+        if terminal_won:
+            await self._drop_agent_session(key, session)
+        if streaming_handler:
+            await streaming_handler.finalize_all()
+        logger.warning(
+            "Silent stall released agent turn for user %s chat %s: "
+            "admitted but no answer text and no activity "
+            "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
+            "silence=%ss last_tool_age=%ss "
+            "exit_code=%s stderr_class=%s stderr_lines=%s)",
+            user_id,
+            chat_id,
+            silent_diagnostics["provider"],
+            silent_diagnostics["model"],
+            silent_diagnostics["endpoint"],
+            silent_diagnostics["elapsed"],
+            silent_stall_grace,
+            silent_ages["silence"],
+            silent_ages["last_tool_age"],
+            silent_diagnostics["exit_code"],
+            silent_diagnostics["stderr_class"],
+            silent_diagnostics["stderr_lines"],
+        )
+        try:
+            health_reporter.record_stalled_request()
+        except Exception:
+            pass
+        message = f"Agent went silent for {silent_stall_grace:g}s without producing an answer"
+        return ChatResponse(
+            content=f"⏰ {message}; the turn was released. Please retry your request.",
+            success=False,
+            error=message,
+            failure_class=(
+                "silent-stall/"
+                f"{silent_diagnostics['stderr_class'] or 'silent'}"
+            ),
+            session_id=session.session_id,
         )
 
     async def _resolve_turn_outcome(
@@ -1442,6 +1582,7 @@ class ProjectChatProcessMixin:
         approval_grace: float,
         stall_grace: float,
         delegated_stall_grace: float,
+        silent_stall_grace: float = 0.0,
     ) -> Optional[ChatResponse]:
         """Turn a stalled ``TurnStreamOutcome`` into its user-facing reply (#896 PR3).
 
@@ -1455,53 +1596,15 @@ class ProjectChatProcessMixin:
         (#846) — keep the statement order.
         """
         if turn_outcome is TurnStreamOutcome.ADMISSION_TIMEOUT:
-            # Collected before the session is dropped: closing the
-            # client tears down the SDK transport and takes the exit
-            # code with it.
-            diagnostics = _admission_diagnostics(
-                session,
-                provider=getattr(self._config, "agent_provider", "claude"),
+            return await self._resolve_admission_timeout(
+                key=key,
+                session=session,
                 model=model,
-                elapsed=_elapsed_since(loop, progress_request),
-                grace=admission_grace,
-            )
-            terminal_won = _claim_request_terminal(
-                progress_request,
-                RequestPhase.TIMEOUT,
-                cause="admission-timeout",
-            )
-            if terminal_won:
-                await self._drop_agent_session(key, session)
-            logger.warning(
-                "Turn admission timed out for user %s chat %s before the "
-                "runtime produced its first event "
-                "(provider=%s model=%s endpoint=%s elapsed=%ss grace=%gs "
-                "exit_code=%s stderr_class=%s stderr_lines=%s)",
-                user_id,
-                chat_id,
-                diagnostics["provider"],
-                diagnostics["model"],
-                diagnostics["endpoint"],
-                diagnostics["elapsed"],
-                admission_grace,
-                diagnostics["exit_code"],
-                diagnostics["stderr_class"],
-                diagnostics["stderr_lines"],
-            )
-            try:
-                health_reporter.record_stalled_request()
-            except Exception:
-                pass
-            message = f"Agent turn did not start within {admission_grace:g}s"
-            return ChatResponse(
-                content=f"⏰ {message}. Please retry your request.",
-                success=False,
-                error=message,
-                failure_class=(
-                    "admission-timeout/"
-                    f"{diagnostics['stderr_class'] or 'silent'}"
-                ),
-                session_id=session.session_id,
+                loop=loop,
+                progress_request=progress_request,
+                user_id=user_id,
+                chat_id=chat_id,
+                admission_grace=admission_grace,
             )
 
         if turn_outcome is TurnStreamOutcome.APPROVAL_STALL:
@@ -1603,6 +1706,19 @@ class ProjectChatProcessMixin:
                 error=message,
                 session_id=session.session_id,
                 streamed=streamed,
+            )
+
+        if turn_outcome is TurnStreamOutcome.SILENT_STALL:
+            return await self._resolve_silent_stall(
+                key=key,
+                session=session,
+                model=model,
+                loop=loop,
+                progress_request=progress_request,
+                streaming_handler=streaming_handler,
+                user_id=user_id,
+                chat_id=chat_id,
+                silent_stall_grace=silent_stall_grace,
             )
 
         if turn_outcome is TurnStreamOutcome.DELEGATED_TASK_STALL:
@@ -2173,9 +2289,13 @@ class ProjectChatProcessMixin:
                     if admission_timeout_override is not None
                     else (getattr(self._config, "turn_admission_timeout_seconds", 0.0) or 0.0)
                 )
+                silent_stall_grace = float(
+                    getattr(self._config, "silent_turn_stall_seconds", 0.0) or 0.0
+                )
                 if getattr(self._config, "agent_provider", "claude") == "danso":
                     admission_grace = 0.0  # Tool progress may start late; subprocess owns the finite deadline.
                     stall_grace = _danso_terminal_stall_grace(stall_grace, self._config)
+                    silent_stall_grace = 0.0  # Same reason: the subprocess owns its own deadline.
 
                 approval_grace = float(
                     getattr(self._config, "approval_stall_seconds", 0.0) or 0.0
@@ -2208,6 +2328,7 @@ class ProjectChatProcessMixin:
                     approval_grace=approval_grace,
                     stall_grace=stall_grace,
                     delegated_stall_grace=delegated_stall_grace,
+                    silent_stall_grace=silent_stall_grace,
                 )
 
                 stall_response = await self._resolve_turn_outcome(
@@ -2227,6 +2348,7 @@ class ProjectChatProcessMixin:
                     approval_grace=approval_grace,
                     stall_grace=stall_grace,
                     delegated_stall_grace=delegated_stall_grace,
+                    silent_stall_grace=silent_stall_grace,
                 )
                 if stall_response is not None:
                     return stall_response
