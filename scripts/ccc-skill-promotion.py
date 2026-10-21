@@ -3089,19 +3089,31 @@ def _dispatch_intake_review_attempt(  # noqa: C901
     except PromotionError as error:
         return {"outcome": "dispatch-skipped", "code": error.code}
     # Idempotency: one dispatch per transport_id + head, crash-safe via ledger.
+    # #2435 S1: a dispatch whose round was consumed as an infrastructure
+    # failure does not count, and its reviewer is disqualified for the retry.
+    infra_reviewers: set[str] = set()
     try:
         ledger_text = (config.promotion_state_dir / "ledger.jsonl").read_text(encoding="utf-8")
+        records: list[dict[str, object]] = []
         for line in ledger_text.splitlines():
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(record, dict):
+                records.append(record)
+        infra_failed = _infra_failed_task_ids(records)
+        for record in records:
             if (
-                isinstance(record, dict)
-                and record.get("kind") == "a2a-dispatch"
+                record.get("kind") == "a2a-dispatch"
                 and record.get("transport_id") == transport_id
                 and record.get("head_sha") == head
             ):
+                if record.get("dispatched_task") in infra_failed:
+                    reviewer_node = record.get("reviewer_node")
+                    if isinstance(reviewer_node, str) and reviewer_node:
+                        infra_reviewers.add(reviewer_node)
+                    continue
                 return {"outcome": "dispatch-skipped", "code": "dispatch_already"}
     except OSError:
         pass
@@ -3120,7 +3132,7 @@ def _dispatch_intake_review_attempt(  # noqa: C901
             # #1628 B2: a republished tree keeps the original author, so the
             # node that actually wrote the revision is invisible to author-only
             # disqualification. Exclude it explicitly.
-            disqualified=_lineage_revisers(config, candidate.node, candidate.name),
+            disqualified=_lineage_revisers(config, candidate.node, candidate.name) | infra_reviewers,
         )
         if review_rb is None:
             nexus_script = config.a2a_nexus_dir / "scripts" / "a2a-dispatch-round.mjs"
@@ -3328,6 +3340,118 @@ def _malformed_verdict_reason(task: dict[str, object], expected_head: str) -> st
         # Bound to a different commit — the reviewer read a superseded tree.
         return "head_sha_mismatch"
     return "unknown"
+
+
+# #2435 S1 (absorbs #2395 items 1-2): a review/revise task that failed before
+# producing any result, for a reason that lives on the worker's host rather
+# than in the candidate, is an infrastructure failure. Field cases: Claude
+# OAuth expiry on two reviewer nodes (2026-10-07..19), a Claude Code 2.1.278
+# model incompatibility (2026-10-16) and a second worker lane whose provider
+# balance ran out (2026-10-20). Each one used to end the round as `malformed` / `failed` with
+# "no automatic retry", and the intake PR waited for an operator. The class is
+# derived from the broker task's error text only — never from candidate or
+# reviewer content — and only when the task carries no result at all.
+_INFRA_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("auth_expired", re.compile(
+        r"OAuth session expired|Failed to authenticate|authentication_error|"
+        r"invalid x-api-key|Invalid API key|Please run /login|not logged in", re.I)),
+    # Checked before rate_limited: provider balance errors also arrive as 429.
+    ("balance_exhausted", re.compile(
+        r"Insufficient balance|no resource package|\"code\"\s*:\s*\"1113\"|"
+        r"credit balance is too low", re.I)),
+    ("cli_incompatible", re.compile(
+        r"does not support|or newer is required|unrecognized_model", re.I)),
+    ("rate_limited", re.compile(r"\b429\b|rate.?limit|overloaded_error|\b529\b", re.I)),
+)
+_INFRA_TIMEOUT_CODES = frozenset({"handler_timeout", "task_timeout", "timeout", "lease_expired"})
+# One automatic retry per (lineage, head) on a *different* node. A second
+# infrastructure failure falls back to the pre-#2435 terminal record, which
+# the S2 arbiter lane picks up.
+_INFRA_RETRY_LIMIT = 1
+
+
+def _infra_failure_class(task: dict[str, object]) -> str | None:
+    """Stable infrastructure-failure code for a result-less failed task, else None."""
+    if _task_result_output(task) is not None:
+        return None
+    if task.get("status") not in {"failed", "canceled"}:
+        return None
+    error = task.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = str(error.get("code", ""))
+    if code in _INFRA_TIMEOUT_CODES:
+        return "timeout"
+    details = error.get("details")
+    excerpt = details.get("excerpt", "") if isinstance(details, dict) else ""
+    text = f"{error.get('message', '')}\n{excerpt}"[:8192]
+    for infra_class, pattern in _INFRA_FAILURE_PATTERNS:
+        if pattern.search(text):
+            return infra_class
+    return None
+
+
+def _infra_failed_task_ids(rows: list[dict[str, object]]) -> set[str]:
+    """Task ids whose round was consumed as an infrastructure failure (#2435 S1)."""
+    return {
+        str(row.get("task_id"))
+        for row in rows
+        if row.get("kind") in {"a2a-verdict", "a2a-revise-result"}
+        and row.get("status") == "infra_failed"
+        and isinstance(row.get("task_id"), str)
+    }
+
+
+def _review_infra_failures(
+    rows: list[dict[str, object]], transport_id: object, head: object
+) -> list[dict[str, object]]:
+    """Review dispatch rows for this transport id + head that ended infra_failed."""
+    failed = _infra_failed_task_ids(rows)
+    return [
+        row for row in rows
+        if row.get("kind") == "a2a-dispatch"
+        and row.get("transport_id") == transport_id
+        and row.get("head_sha") == head
+        and row.get("dispatched_task") in failed
+    ]
+
+
+def _revise_infra_failures(
+    rows: list[dict[str, object]], pr: object, head: object
+) -> list[dict[str, object]]:
+    """Revise dispatch rows for this PR + head that ended infra_failed."""
+    failed = _infra_failed_task_ids(rows)
+    return [
+        row for row in rows
+        if row.get("kind") == "a2a-revise-dispatch"
+        and row.get("pr") == pr
+        and row.get("head_sha") == head
+        and row.get("task_id") in failed
+    ]
+
+
+def _payload_findings(task: dict[str, object]) -> list[dict[str, str]]:
+    """The reviewer findings a revise task was dispatched with (its own payload)."""
+    stack: list[object] = [task.get("payload")]
+    seen = 0
+    while stack and seen < 64:
+        node = stack.pop()
+        seen += 1
+        if isinstance(node, dict):
+            findings = node.get("findings")
+            if isinstance(findings, list) and all(isinstance(item, dict) for item in findings):
+                return [
+                    {
+                        "severity": str(item.get("severity", "info"))[:16],
+                        "area": str(item.get("area", "general"))[:32],
+                        "note": str(item.get("note", ""))[:600],
+                    }
+                    for item in findings[:_MAX_VERDICT_FINDINGS]
+                ]
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return []
 
 
 def _verdict_from_task(
@@ -3581,8 +3705,12 @@ def _candidate_from_revised_files(
 
 
 def _revise_dispatched(rows: list[dict[str, object]], pr: str, head: str) -> bool:
+    # #2435 S1: a revise round consumed as an infrastructure failure never
+    # revised anything; it does not use up the one-dispatch-per-head guard.
+    infra_failed = _infra_failed_task_ids(rows)
     return any(
         row.get("kind") == "a2a-revise-dispatch" and row.get("pr") == pr and row.get("head_sha") == head
+        and row.get("task_id") not in infra_failed
         for row in rows
     )
 
@@ -3836,7 +3964,8 @@ def _revise_substitute_due(
 
 
 def _revise_substitute_pick(
-    config: Config, secret: str, node: str, reviewer: str, candidate_key: str
+    config: Config, secret: str, node: str, reviewer: str, candidate_key: str,
+    exclude: frozenset[str] = frozenset(),
 ) -> str | None:
     """Deterministic substitute pick among online keyring workers, excluding
     the author (the revise is for their candidate) and the reviewer of record
@@ -3848,7 +3977,7 @@ def _revise_substitute_pick(
     pools.extend(_remote_online_worker_ids(config, rb) for rb in config.remote_brokers)
     for pool in pools:
         for worker in pool:
-            if worker not in trusted or worker in {node, reviewer}:
+            if worker not in trusted or worker in {node, reviewer} or worker in exclude:
                 continue
             candidates.add(worker)
     if not candidates:
@@ -3861,11 +3990,16 @@ def _revise_substitute_pick(
 def _revise_substitute_used(
     rows: list[dict[str, object]], node: str, name: str
 ) -> bool:
-    """Whether a substitute has already taken a revise round on this lineage."""
+    """Whether a substitute has already taken a revise round on this lineage.
+
+    #2435 S1: a substitute round consumed as an infrastructure failure never
+    revised anything, so it does not use up the lineage's one substitute."""
+    infra_failed = _infra_failed_task_ids(rows)
     return any(
         item.get("kind") == "a2a-revise-dispatch"
         and item.get("node") == node
         and item.get("name") == name
+        and item.get("task_id") not in infra_failed
         # Dispatch records persist a boolean, not the result summary's worker
         # string. A malformed explicit marker also withholds another attempt;
         # legacy author-only rows without this field remain compatible.
@@ -3905,13 +4039,23 @@ def _revise_substitute_for(
     reviewer: str,
     tree12: str,
     secret: str,
+    *,
+    exclude: frozenset[str] = frozenset(),
 ) -> str | None:
     """The substitute for this lineage when B2 is due, else None. None covers
     every stay-normal case: feature off, skip too fresh, no online candidate,
-    reviewer collision, or a substitute already used for this lineage."""
-    if not _revise_substitute_eligible(config, rows, node, name):
+    reviewer collision, or a substitute already used for this lineage.
+
+    #2435 S1: `exclude` names nodes whose round on this head just failed for
+    infrastructure reasons. A lineage whose *author* is excluded is eligible
+    regardless of the B2 age threshold — the author is reachable but cannot
+    run the round — and every excluded node is kept out of the pick."""
+    forced = node in exclude and not _revise_substitute_used(rows, node, name)
+    if not forced and not _revise_substitute_eligible(config, rows, node, name):
         return None
-    return _revise_substitute_pick(config, secret, node, reviewer, f"{node}:{name}:{tree12}")
+    return _revise_substitute_pick(
+        config, secret, node, reviewer, f"{node}:{name}:{tree12}", exclude=exclude
+    )
 
 
 def _revise_broker_of_worker(
@@ -3935,20 +4079,26 @@ def _resolve_revise_target(
     reviewer: str,
     tree12: str,
     secret: str,
+    *,
+    exclude: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, str] | None, str, str, str, str | None]:
     """Broker, broker ids and the reviser for the next revise round. Raises
     revise_author_offline when the author is online nowhere and no substitute
-    is available (B2 off, skip too fresh, or the substitute already ran)."""
+    is available (B2 off, skip too fresh, or the substitute already ran).
+    An author in `exclude` (#2435 S1 infrastructure retry) is treated as
+    offline so the round goes to a substitute."""
     substitute: str | None = None
     revise_rb: dict[str, str] | None = None
     try:
+        if node in exclude:
+            raise PromotionError("revise_author_offline")
         revise_rb = _revise_target_broker(config, node, secret)
     except PromotionError as error:
         if error.code != "revise_author_offline":
             raise
         try:
             substitute = _revise_substitute_for(
-                config, rows, node, name, reviewer, tree12, secret
+                config, rows, node, name, reviewer, tree12, secret, exclude=exclude
             )
         except PromotionError:
             raise
@@ -4014,9 +4164,14 @@ def _dispatch_intake_revise(
     reviewer: str,
     *,
     dry_run: bool,
+    exclude: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     """Dispatch one bounded revision task to the author node. Best-effort and
-    fail-safe like the review dispatch: never raises, skip codes recorded."""
+    fail-safe like the review dispatch: never raises, skip codes recorded.
+
+    #2435 S1: `exclude` carries nodes whose previous round on this head failed
+    for infrastructure reasons; rounds consumed that way are not counted
+    against the round limit or the daily cap."""
     if not os.environ.get("A2A_EDGE_SECRET"):
         return {"outcome": "revise-skipped", "code": "revise_secret_missing"}
     target = _revise_dispatch_target(row)
@@ -4025,10 +4180,12 @@ def _dispatch_intake_revise(
     node, name, tree12, pr, provider, head, pr_url = target
     if dry_run:
         return {"outcome": "would-dispatch-revise", "pr": pr, "node": node, "name": name}
+    infra_failed = _infra_failed_task_ids(rows)
     lineage = [
         item
         for item in rows
         if item.get("kind") == "a2a-revise-dispatch" and item.get("node") == node and item.get("name") == name
+        and item.get("task_id") not in infra_failed
     ]
     round_no = len(lineage) + 1
     if round_no > config.revise_round_limit:
@@ -4064,7 +4221,7 @@ def _dispatch_intake_revise(
         return {"outcome": "revise-skipped", "code": "revise_nexus_missing"}
     try:
         revise_rb, broker_id, broker_url, reviser, substitute = _resolve_revise_target(
-            config, row, rows, node, name, reviewer, tree12, secret
+            config, row, rows, node, name, reviewer, tree12, secret, exclude=exclude
         )
     except PromotionError as error:
         return {"outcome": "revise-skipped", "code": error.code}
@@ -6612,6 +6769,43 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
             # used to be recorded with no reason and no PR trace, so the intake
             # PR sat with no verdict and nobody knew why (#1629).
             reason = _malformed_verdict_reason(task, head)
+            infra_class = _infra_failure_class(task) if reason == "no_result_output" else None
+            if infra_class is not None and len(
+                _review_infra_failures(rows, row.get("transport_id"), head)
+            ) < _INFRA_RETRY_LIMIT:
+                # #2435 S1: not a verdict and not the candidate's fault. Record
+                # it so `_missing_dispatch_prs` treats the head as still owed a
+                # round and the dispatch excludes this reviewer next time.
+                infra_record = {
+                    "ts": _utc_now(),
+                    "kind": "a2a-verdict",
+                    "task_id": dispatched,
+                    "status": "infra_failed",
+                    "reason": infra_class,
+                    "task_status": str(task.get("status", "")),
+                    "head_sha": head,
+                    "transport_id": row.get("transport_id"),
+                    "reviewer_node": row.get("reviewer_node"),
+                }
+                _append_ledger(config, infra_record)
+                rows.append(infra_record)
+                _comment_once(
+                    config,
+                    rows,
+                    pr=_pr_number_from_url(str(row.get("pr_url", ""))) or "",
+                    head=head,
+                    marker=f"verdict-infra-failed:{dispatched}",
+                    body=(
+                        f"Review task `{dispatched}` failed on the reviewer's host before producing "
+                        f"a result (`{infra_class}`). This is an infrastructure failure, not a verdict: "
+                        "the review is re-dispatched automatically to a different reviewer on the next "
+                        "collect (#2435)."
+                    ),
+                )
+                processed.append(
+                    {"outcome": "verdict-infra-failed", "task_id": dispatched, "infra_class": infra_class}
+                )
+                continue
             _append_ledger(
                 config,
                 {
@@ -6741,6 +6935,71 @@ def _process_verdicts(config: Config, *, dry_run: bool) -> list[dict[str, object
     return processed
 
 
+def _retry_infra_failed_revise(
+    config: Config,
+    rows: list[dict[str, object]],
+    row: dict[str, object],
+    task: dict[str, object],
+    *,
+    task_id: str,
+    pr: str,
+    head: str,
+    infra_class: str,
+) -> dict[str, object]:
+    """#2435 S1: consume an infrastructure-failed revise round and re-dispatch
+    it once to a different node with the same reviewer findings.
+
+    The findings come from the failed task's own payload (what the reviser was
+    asked to fix) and the origin review-dispatch row supplies the revise
+    target, exactly as a fresh revise verdict would. The failed node is
+    excluded; when it was the author, the round goes to a B2 substitute."""
+    failed_node = str(row.get("reviser_node") or row.get("node") or "")
+    record = {
+        "ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id, "status": "infra_failed",
+        "reason": infra_class, "task_status": str(task.get("status", "")), "pr": pr, "head_sha": head,
+        "reviser_node": failed_node,
+    }
+    _append_ledger(config, record)
+    rows.append(record)
+    findings = _payload_findings(task)
+    origin = next(
+        (
+            item for item in reversed(rows)
+            if item.get("kind") == "a2a-dispatch" and item.get("head_sha") == head
+            and _pr_number_from_url(str(item.get("pr_url", ""))) == pr
+        ),
+        None,
+    )
+    if not findings or origin is None:
+        outcome: dict[str, object] = {
+            "outcome": "revise-skipped",
+            "code": "revise_infra_retry_inputs_missing" if origin is not None else "revise_infra_origin_missing",
+        }
+    else:
+        outcome = _dispatch_intake_revise(
+            config, origin, rows, findings, str(origin.get("reviewer_node", "unknown")),
+            dry_run=False, exclude=frozenset({failed_node}) if failed_node else frozenset(),
+        )
+    dispatched = outcome.get("outcome") == "revise-dispatched"
+    _comment_once(
+        config,
+        rows,
+        pr=pr,
+        head=head,
+        marker=f"revise-infra-failed:{task_id}",
+        body=(
+            f"Revision task `{task_id}` failed on `{failed_node or 'the reviser'}`'s host before producing "
+            f"a result (`{infra_class}`). This is an infrastructure failure, not a revision: "
+            + (
+                f"it was re-dispatched to `{outcome.get('reviser', '?')}` (#2435)."
+                if dispatched
+                else f"the automatic retry was skipped (`{outcome.get('code', '?')}`) (#2435)."
+            )
+        ),
+    )
+    return {"outcome": "revise-infra-failed", "task_id": task_id, "infra_class": infra_class, "retry": outcome}
+
+
 def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
     """Consume terminal revision tasks: republish revised trees through the
     full gate path on a fresh intake PR, or record drop recommendations for
@@ -6797,6 +7056,15 @@ def _consume_revise_results(config: Config, *, dry_run: bool) -> list[dict[str, 
             results.append({"outcome": "revise-pending", "task_id": task_id})
             continue
         if status != "succeeded":
+            infra_class = _infra_failure_class(task)
+            if infra_class is not None and len(_revise_infra_failures(rows, pr, head)) < _INFRA_RETRY_LIMIT:
+                results.append(
+                    _retry_infra_failed_revise(
+                        config, rows, row, task, task_id=str(task_id), pr=str(pr), head=str(head),
+                        infra_class=infra_class,
+                    )
+                )
+                continue
             _append_ledger(
                 config,
                 {"ts": _utc_now(), "kind": "a2a-revise-result", "task_id": task_id, "status": "failed",
@@ -7870,12 +8138,25 @@ def _missing_dispatch_prs(
     bounds the per-cycle CI wait (each dispatch may block up to
     DISPATCH_CI_WAIT_SEC on the `skills` check).
     """
+    # #2435 S1: a round consumed as an infrastructure failure never reviewed
+    # the head, so it does not settle it — the head is owed one more round.
+    # The retry budget lives in `_process_verdicts`: past the budget the
+    # failure is recorded as `malformed`, which settles the head as before.
+    infra_failed = _infra_failed_task_ids(rows)
     settled: set[str] = set()
     for row in rows:
-        if row.get("kind") in {"a2a-dispatch", "a2a-receipt", "a2a-verdict"}:
-            head = row.get("head_sha")
-            if isinstance(head, str):
-                settled.add(head)
+        kind = row.get("kind")
+        if kind not in {"a2a-dispatch", "a2a-receipt", "a2a-verdict"}:
+            continue
+        if kind == "a2a-verdict" and row.get("status") == "infra_failed":
+            continue
+        if kind == "a2a-dispatch" and row.get("dispatched_task") in infra_failed:
+            continue
+        if kind == "a2a-receipt" and row.get("task_id") in infra_failed:
+            continue
+        head = row.get("head_sha")
+        if isinstance(head, str):
+            settled.add(head)
     owed: list[dict[str, object]] = []
     for pr in open_prs:
         head = pr.get("head")
