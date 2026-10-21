@@ -527,6 +527,34 @@ ok "memory check accepts exactly one standalone hook for a Claude feed" '[ "$rc"
   and .nunchi.standalone_sessionstart_hooks == 1
 '\'' >/dev/null <<<"$out"'
 
+# #2431: ingest-cron.sh counts history + every bridge journal present (#2401:
+# Matrix, hande, Telegram), so a healthy receipt can carry sources=3 or 4. The
+# probe used to cap sources at 2 and reported such nodes nunchi=degraded /
+# ingest-invalid (5/12 fleet nodes on 2026-10-21). Only negative or non-int
+# counts are malformed; sources=0 keeps its #1018 ingest-sourceless meaning.
+ingest_receipt="$TMP/ingest-2431.status.json"
+run_ingest_probe() {  # <sources-json-value>
+  printf '{"schema":"ccc.nunchi.ingest.v1","finished_at":190,"sources":%s,"ingested":0,"retired":0,"deferred":0,"feed":"claude"}\n' "$1" > "$ingest_receipt"
+  HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_NUNCHI_INGEST_STATUS="$ingest_receipt" \
+    CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+    CCC_NUNCHI_CRONTAB_TEXT="$claude_probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
+}
+for n_sources in 1 2 3 4 9; do
+  out="$(run_ingest_probe "$n_sources")"; rc=$?
+  ok "claude ingest receipt with sources=$n_sources is ok, not ingest-invalid (#2431)" \
+    '[ "$rc" = 0 ] && jq -e --argjson n '"$n_sources"' '\'' .nunchi.status == "ok" and .nunchi.reasons == [] and .nunchi.ingest.status == "ok" and .nunchi.ingest.sources == $n '\'' >/dev/null <<<"$out"'
+done
+for bad_sources in -1 true '"3"' 2.5; do
+  out="$(run_ingest_probe "$bad_sources")"; rc=$?
+  ok "claude ingest receipt with sources=$bad_sources stays ingest-invalid" \
+    '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "degraded" and (.nunchi.reasons | index("ingest-invalid")) != null and .nunchi.ingest.status == "invalid" '\'' >/dev/null <<<"$out"'
+done
+out="$(run_ingest_probe 0)"; rc=$?
+ok "claude ingest receipt with sources=0 is still ingest-sourceless (#1018)" \
+  '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "degraded" and (.nunchi.reasons | index("ingest-sourceless")) != null '\'' >/dev/null <<<"$out"'
+rm -f "$ingest_receipt"
+
 # A Claude audience-scoped lane has no verbatim MemPalace refresh by design
 # (install-nunchi.sh skips it: ~/.claude/projects has no per-session audience
 # router). With the mempalace CLI installed the probe used to demand exactly

@@ -787,12 +787,17 @@ def nunchi_ingest_probe(path: Path, now: int) -> dict[str, object]:
     sources = doc.get("sources")
     ingested = doc.get("ingested")
     # bool is a subclass of int in Python; readiness accepts exact integers only.
+    # `sources` has no upper bound: it counts producer inputs, and that count is
+    # a property of the node's topology, not of receipt validity. The original
+    # `<= 2` (#1027) encoded "history + one journal"; #2401 made ingest-cron.sh
+    # read every bridge journal present (Matrix, hande, Telegram), so a healthy
+    # Telegram+Matrix node writes 3 and was reported ingest-invalid (#2431).
     if (
         type(finished) is not int
         or type(sources) is not int
         or type(ingested) is not int
         or finished <= 0
-        or not 0 <= sources <= 2
+        or sources < 0
         or ingested < 0
     ):
         return {**payload, "status": "invalid"}
