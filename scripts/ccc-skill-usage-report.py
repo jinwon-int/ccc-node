@@ -17,8 +17,10 @@ report can never disagree with the lifecycle about what "unused" means.
 
 ``aggregate`` merges several node reports (collect them with e.g.
 ``ssh <node> python3 <checkout>/scripts/ccc-skill-usage-report.py node --json``)
-into archive candidates, graduation candidates, never-used skills and
-per-origin totals. Missing or unreadable usage telemetry never reads as
+into archive candidates, graduation candidates, retirement candidates
+(fleet-managed, never used on any of enough nodes — #2239 L1; the age rule is
+applied by scripts/ccc-skill-retire.py from fleet-skills approval.json),
+never-used skills and per-origin totals. Missing or unreadable usage telemetry never reads as
 non-use: a node whose ledgers cannot back an idleness judgement disqualifies
 the skills it holds from the archive/unused lists and is listed under
 ``evidence_gaps``.
@@ -51,6 +53,13 @@ DEFAULT_STALE_DAYS = 30
 DEFAULT_GRADUATION_MIN_NODES = 2
 DEFAULT_GRADUATION_MIN_USES = 3
 DEFAULT_DWELL_DAYS = 14
+# #2239 L1 (owner decision 2026-10-22, DOC-3903 P9): a fleet-managed skill never
+# used on any of at least this many nodes is a retirement candidate for the
+# fleet-skills `retired/` lane. The age rule (>= N days since `approved_at`)
+# lives in scripts/ccc-skill-retire.py, which reads the canon repo: a node's
+# `installed_at` is the fleet marker mtime, rewritten by every sync ref change,
+# so it cannot anchor "days since distribution started".
+DEFAULT_RETIRE_MIN_NODES = 3
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 # #2283 lifecycle table: cap the per-node dwell sample list (body-free ints).
 MAX_DWELL_SAMPLES = 5000
@@ -597,6 +606,34 @@ def _graduation_candidate(
     }
 
 
+def _retire_candidate(
+    name: str,
+    nodes: dict[str, dict[str, Any]],
+    *,
+    min_nodes: int,
+) -> dict[str, Any] | None:
+    """Fleet-managed on every holder, never used anywhere, enough holders.
+
+    Owner decision 2026-10-22 (#2239 L1, DOC-3903 P9): a skill the fleet-skills
+    sync installed on at least ``min_nodes`` nodes with no use recorded on any
+    of them may be moved to the fleet-skills ``retired/`` lane. Any other
+    origin on any node (an autosave original, a user copy) is value evidence
+    of a different kind and keeps the name out. The caller has already
+    required ``evidence_ok`` on every holder, so a telemetry gap never reads
+    as non-use (#1739). Usage facts only: the node ``installed_at`` is the
+    fleet marker's mtime, rewritten by every sync ref change, so the "days
+    since distribution" rule is judged by ccc-skill-retire.py from the canon
+    repo's ``approval.json`` ``approved_at``.
+    """
+    if len(nodes) < min_nodes:
+        return None
+    if any(v["origin"] != "fleet-managed" or not v["evidence_ok"] for v in nodes.values()):
+        return None
+    if any(_used(v) for v in nodes.values()):
+        return None
+    return {"name": name, "nodes": sorted(nodes), "holder_count": len(nodes)}
+
+
 def _origin_totals(by_skill: dict[str, dict[str, dict[str, Any]]]) -> dict[str, dict[str, int]]:
     totals: dict[str, dict[str, int]] = {
         origin: {"skills": 0, "installs": 0, "used_installs": 0} for origin in ORIGIN_ORDER
@@ -672,6 +709,7 @@ def build_aggregate(
     min_nodes: int,
     min_uses: int,
     dwell_days: int,
+    retire_min_nodes: int = DEFAULT_RETIRE_MIN_NODES,
 ) -> dict[str, Any]:
     latest = _latest_reports(reports)
     # "now" is the newest collection time, so a re-run over the same files is
@@ -680,6 +718,7 @@ def build_aggregate(
     by_skill, evidence_gaps = _index_skills(latest)
     archive_candidates: list[dict[str, Any]] = []
     graduation_candidates: list[dict[str, Any]] = []
+    retire_candidates: list[dict[str, Any]] = []
     unused: list[dict[str, Any]] = []
     for name, nodes in sorted(by_skill.items()):
         graduation = _graduation_candidate(
@@ -695,6 +734,10 @@ def build_aggregate(
         archive = _archive_candidate(name, nodes, now, now - timedelta(days=stale_days))
         if archive is not None:
             archive_candidates.append(archive)
+        if graduation is None:
+            retire = _retire_candidate(name, nodes, min_nodes=retire_min_nodes)
+            if retire is not None:
+                retire_candidates.append(retire)
         if not any(_used(view) for view in nodes.values()):
             unused.append(
                 {
@@ -717,10 +760,12 @@ def build_aggregate(
             "graduation_min_nodes": min_nodes,
             "graduation_min_uses": min_uses,
             "dwell_days": dwell_days,
+            "retire_min_nodes": retire_min_nodes,
             "window_days": window_days,
         },
         "archive_candidates": archive_candidates,
         "graduation_candidates": graduation_candidates,
+        "retire_candidates": retire_candidates,
         "unused": unused,
         "totals": {"by_origin": _origin_totals(by_skill), "skills": len(by_skill), "nodes": len(latest)},
         "evidence_gaps": evidence_gaps,
@@ -802,6 +847,14 @@ def render_aggregate(agg: dict[str, Any]) -> str:
                 ],
             )
         )
+    retire = agg.get("retire_candidates") or []
+    out += [
+        "",
+        f"retire candidates (fleet-managed on >= {t.get('retire_min_nodes', DEFAULT_RETIRE_MIN_NODES)} nodes, "
+        f"never used anywhere; age judged by ccc-skill-retire.py from approval.json): {len(retire)}",
+    ]
+    if retire:
+        out.append(_table(["name", "holders"], [[c["name"], c["holder_count"]] for c in retire]))
     out += ["", f"never used anywhere: {len(agg['unused'])}"]
     if agg["unused"]:
         out.append(
@@ -897,6 +950,10 @@ def _parser() -> argparse.ArgumentParser:
         "--dwell-days", type=_positive, default=DEFAULT_DWELL_DAYS,
         help=f"graduation dwell evidence threshold (default {DEFAULT_DWELL_DAYS}, docs/skill-graduation.md)",
     )
+    agg.add_argument(
+        "--retire-min-nodes", type=_positive, default=DEFAULT_RETIRE_MIN_NODES,
+        help=f"retire candidate: held by at least N nodes (default {DEFAULT_RETIRE_MIN_NODES})",
+    )
     return parser
 
 
@@ -914,6 +971,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_nodes=args.graduation_min_nodes,
                 min_uses=args.graduation_min_uses,
                 dwell_days=args.dwell_days,
+                retire_min_nodes=args.retire_min_nodes,
             )
             text = json.dumps(agg, ensure_ascii=False, sort_keys=True) if args.json else render_aggregate(agg)
     except ReportError as error:

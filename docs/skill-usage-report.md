@@ -60,7 +60,7 @@ The class is:
 - never a local curator lifecycle target. `run` reports it as `protect` with
   reason `fleet-managed`, and a manual `curator.py archive` is denied with
   `lifecycle_denied_fleet-managed`. A fleet skill is retired through the
-  fleet-skills repo (`approved/` → `retired/` or `graduated/`), and the sync
+  fleet-skills repo (`approved/` → `retired/` via `ccc-skill-retire.py`, or `graduated/`), and the sync
   then reconciles every node;
 - still pinnable and unpinnable, so a pin set while it was classified
   `user-owned` can still be removed;
@@ -115,6 +115,7 @@ result.
 |---|---|---|
 | `archive_candidates` | autosave-origin skill whose last use (or creation, or fleet install time) is at least the threshold old on every node that holds the name, under any origin. Shows `curator_state` and `stale_marked_at` per node. | `--stale-days` (30, the curator's `STALE_AFTER_DAYS`) |
 | `graduation_candidates` | fleet-managed skill used on at least N nodes inside the window, or with at least M windowed uses summed across nodes. `dwell` is `met` when the earliest install is at least the dwell age old. `unconfirmed` is not a failure; check the intake PR merge date. | `--graduation-min-nodes` (2), `--graduation-min-uses` (3), `--dwell-days` (14) |
+| `retire_candidates` | fleet-managed on **every** holder, never used on **any** node, held by at least N nodes, every holder with `ok` evidence, not a graduation candidate (#2239 L1, owner decision 2026-10-22, Wiki DOC-3903 P9). Usage facts only: `{name, nodes, holder_count}`. The age rule is applied by `ccc-skill-retire.py` (below), not here. | `--retire-min-nodes` (3) |
 | `unused` | installed on at least one node and never used on any node. Every holder must have `ok` evidence. | none |
 | `totals.by_origin` | distinct `skills`, `installs` (node × skill) and `used_installs` per origin | none |
 | `evidence_gaps` | node/provider pairs whose ledgers cannot support idleness | none |
@@ -153,6 +154,72 @@ precondition still applies: at least 30 days of post-activation records on
 more than 3 measured nodes. Archive moves remain PR-first with owner approval.
 Graduation still needs every item on the
 [`skill-graduation.md`](skill-graduation.md) checklist.
+
+## Retiring unused fleet skills (`ccc-skill-retire.py`, #2239 L1)
+
+`scripts/ccc-skill-retire.py` turns `retire_candidates` into a fleet-skills
+pull request that moves each skill from `approved/<audience>/<name>/` to
+`retired/<audience>/<name>/` (`git mv`, history and `approval.json` kept) and
+writes `retirement.json` beside it. Policy source: ccc-node#2239 L1 (owner
+decision 2026-10-22 "1"), Wiki DOC-3903 P9. The lane itself —
+`retired/` layout and its validator — is fleet-skills#565.
+
+```bash
+# usage facts from the fleet (see `aggregate` above)
+python3 scripts/ccc-skill-usage-report.py aggregate --json /tmp/skill-usage.jsonl > /tmp/aggregate.json
+# read-only plan: ages from a fresh read-only clone, or from an existing one
+python3 scripts/ccc-skill-retire.py plan --aggregate /tmp/aggregate.json
+python3 scripts/ccc-skill-retire.py plan --aggregate /tmp/aggregate.json --fleet-skills-dir ~/work/fleet-skills
+# the PR (dry run without --yes)
+python3 scripts/ccc-skill-retire.py pr --aggregate /tmp/aggregate.json
+python3 scripts/ccc-skill-retire.py pr --aggregate /tmp/aggregate.json --yes
+```
+
+Selection, in order, per candidate (names sorted): `--exclude NAME` →
+`excluded`; a directory already under `retired/*/NAME` → `already_retired`;
+no `approved/<audience>/NAME` (audiences `shared|claude|codex|piri|danso`) →
+`not_in_approved`; `approval.json` `approved_at` younger than
+`--min-idle-days` (default 60) → `approved_too_recent`; beyond `--max`
+(default 50) → `over_max`. Everything else is selected with its `audience`,
+`approved_at` and `idle_days`.
+
+**Why `approved_at` is the age anchor.** A node's `installed_at` is the
+`.ccc-fleet-skill.json` mtime, and the sync rewrites that marker on every ref
+change — after the 2026-10-21 sync all 12 nodes reported the same day for
+every fleet skill, so "days since this skill reached the fleet" cannot be
+read from node data. `approved_at` in the canon repository is when
+distribution started and is immutable on move.
+
+`retirement.json` (validated by fleet-skills; errors `retirement_missing`,
+`retirement_schema_invalid`, `retirement_reason_invalid`,
+`retirement_source_commit_invalid`, `retirement_evidence_missing`,
+`retirement_evidence_invalid`, `retired_name_still_approved`):
+
+```json
+{
+  "schema_version": 1,
+  "retired_at": "2026-10-22T09:00:00Z",
+  "reason": "unused",
+  "source_commit": "<fleet-skills HEAD at clone, 40 hex>",
+  "evidence": {
+    "report_generated_at": "<aggregate generated_at>",
+    "nodes_measured": 12,
+    "min_idle_days": 72,
+    "aggregate_sha256": "<sha256 of the aggregate file>"
+  }
+}
+```
+
+The PR is non-draft and titled `retire: N unused fleet skills (≥60d idle on
+all nodes, 0 Skill calls)`; its body is a table `name | holders | approved_at
+| idle_days | audience` plus thresholds and the aggregate sha. **It needs
+human approval (#1739)** — the tool never approves, merges or enqueues.
+Merging makes every node prune the skill on its next sync
+(`ccc-fleet-skills-sync.py` `RETIRE_PRUNE`, backup kept under the node's
+fleet-skills backups); restoring is a reverse-move PR. Output is one JSON
+object `{ok, mode, selected, skipped, pr_url?, branch?, head?}` with names
+and counters only; `pr --yes` refuses `--fleet-skills-dir` (it always works
+in a fresh 0700 clone) and reports `nothing_to_retire` when nothing qualifies.
 
 ## Two-stage curation with archive enabled
 

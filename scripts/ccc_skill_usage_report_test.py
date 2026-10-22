@@ -392,6 +392,86 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["code"], "input_not_a_node_report")
 
 
+def retire_reports() -> list[dict]:
+    """#2239 L1 retirement fixture: fleet-managed, unused, on >= 3 nodes."""
+    def fleet(name: str, **fields: object) -> dict:
+        return entry(name, "fleet-managed", created_at=None, installed_at=iso(1), **fields)
+
+    return [
+        node_report("node-a", [
+            fleet("fleet-old"), fleet("fleet-two"), fleet("fleet-used", use_count=1, last_used_at=iso(30)),
+            fleet("fleet-mixed"), fleet("fleet-gap"), fleet("fleet-viewed"),
+        ]),
+        node_report("node-b", [
+            fleet("fleet-old"), fleet("fleet-two"), fleet("fleet-used"),
+            entry("fleet-mixed", "autosave", created_at=iso(120)), fleet("fleet-gap"),
+            fleet("fleet-viewed", last_used_at=iso(3)),
+        ]),
+        node_report("node-c", [fleet("fleet-old"), fleet("fleet-used"), fleet("fleet-mixed"), fleet("fleet-viewed")]),
+        node_report("node-d", [fleet("fleet-gap")], evidence="missing"),
+    ]
+
+
+class RetireCandidateTests(unittest.TestCase):
+    """#2239 L1 (owner decision 2026-10-22, DOC-3903 P9): fleet retirement candidates.
+
+    Usage facts only. The age rule is applied by scripts/ccc-skill-retire.py
+    from fleet-skills approval.json: node installed_at is the fleet marker
+    mtime, rewritten by every sync ref change (all 12 nodes read 2026-10-21).
+    """
+
+    def aggregate(self, **overrides: int) -> dict:
+        kwargs = {"stale_days": 30, "min_nodes": 2, "min_uses": 3, "dwell_days": 14}
+        kwargs.update(overrides)
+        return report_mod.build_aggregate(retire_reports(), **kwargs)
+
+    def test_defaults_select_unused_fleet_skills_on_enough_nodes(self) -> None:
+        agg = self.aggregate()
+        self.assertEqual(agg["thresholds"]["retire_min_nodes"], 3)
+        self.assertNotIn("retire_idle_days", agg["thresholds"])
+        self.assertEqual(agg["retire_candidates"], [
+            {"name": "fleet-old", "nodes": ["node-a", "node-b", "node-c"], "holder_count": 3},
+        ])
+        self.assertNotIn("installed_at", json.dumps(agg["retire_candidates"]))
+
+    def test_exclusions(self) -> None:
+        names = {c["name"] for c in self.aggregate()["retire_candidates"]}
+        self.assertNotIn("fleet-two", names, "fewer holders than retire_min_nodes")
+        self.assertNotIn("fleet-used", names, "a single use anywhere is value evidence")
+        self.assertNotIn("fleet-viewed", names, "a last_used_at without a count still counts as use")
+        self.assertNotIn("fleet-mixed", names, "an autosave original on one node keeps the name")
+        self.assertNotIn("fleet-gap", names, "a telemetry gap never reads as non-use")
+
+    def test_min_nodes_flag(self) -> None:
+        self.assertEqual(
+            [c["name"] for c in self.aggregate(retire_min_nodes=2)["retire_candidates"]],
+            ["fleet-old", "fleet-two"],
+        )
+        self.assertEqual(self.aggregate(retire_min_nodes=4)["retire_candidates"], [])
+
+    def test_graduation_candidates_are_never_retired(self) -> None:
+        agg = report_mod.build_aggregate(fleet_reports(), stale_days=30, min_nodes=2, min_uses=3, dwell_days=14)
+        grads = {g["name"] for g in agg["graduation_candidates"]}
+        self.assertTrue(grads)
+        self.assertFalse(grads & {c["name"] for c in agg["retire_candidates"]})
+        # fleet_reports(): "never" is fleet-managed+unused on node-b only (and user on node-a).
+        self.assertEqual(agg["retire_candidates"], [])
+
+    def test_cli_flag_and_text_rendering(self) -> None:
+        lines = "\n".join(json.dumps(r) for r in retire_reports()) + "\n"
+        with patch("sys.stdin", io.StringIO(lines)), patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = report_mod.main(["aggregate", "--json", "--retire-min-nodes", "2"])
+        self.assertEqual(rc, 0)
+        agg = json.loads(out.getvalue())
+        self.assertEqual(agg["thresholds"]["retire_min_nodes"], 2)
+        self.assertEqual([c["name"] for c in agg["retire_candidates"]], ["fleet-old", "fleet-two"])
+        with patch("sys.stdin", io.StringIO(lines)), patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = report_mod.main(["aggregate"])
+        self.assertEqual(rc, 0)
+        self.assertIn("retire candidates (fleet-managed on >= 3 nodes", out.getvalue())
+        self.assertIn("fleet-old", out.getvalue())
+
+
 class LifecycleTableTests(unittest.TestCase):
     """#2283 (DOC-3903 TM-3906): node lifecycle counters + fleet lifecycle table."""
 
