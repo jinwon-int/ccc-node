@@ -24,7 +24,7 @@ tracks three shapes:
 | shape | plain bm25 | state-aware (lexical) | + vectors |
 |---|---|---|---|
 | B pooled (800 facts, one peer, same day) M_new@5 | 1/40 (400: 2.0%) | 4/40 (400: 3.0%) | 10/40 (400: 5.5%) |
-| R recent-state (M_old + 40 older distractors + M_new last) both@10 | 15/40 | 38/40 | 10/40 |
+| R recent-state (M_old + 40 older distractors + M_new last) both@10 | 15/40 | 38/40 | 37/40 |
 | A write-time detection | 0/40 | 0/40 | 0/40 |
 
 The pooled shape is adversarial for recency (every fact is the same age); the recent-state shape
