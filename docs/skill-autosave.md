@@ -621,7 +621,7 @@ On ordinary nodes `collect` reports `publisher_enabled=false` without GitHub or
 SSH access. The central live collector authenticates with `gh`, checks that
 `jinwon-int/fleet-skills` is `PRIVATE`, pulls at most a bounded number of
 envelopes with batch SSH, and opens at most one draft PR by default
-(`CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN`, range 1–3). A public or internal target
+(`CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN`, range 1–8). A public or internal target
 fails before any remote export, clone, push, or PR operation.
 
 Only unpinned, rollback-eligible schema-v2 skills with
