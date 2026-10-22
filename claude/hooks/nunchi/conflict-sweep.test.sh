@@ -174,5 +174,5 @@ PY
 PATH="$TMP/bin:$PATH" NUNCHI_JUDGE_APPLY=1 python3 "$JB" >/dev/null 2>&1
 ok "once the older partner is closed the sweep flag clears like any lonely flag" '[ "$(q "SELECT review FROM peer_facts WHERE id=$b")" = 0 ]'
 
-echo "conflict-sweep.test: $pass passed, $fail failed"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]
