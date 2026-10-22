@@ -1006,6 +1006,29 @@ single approved candidate whose `SKILL.md` named a fleet node or product
   (`a2a-arbitration-closed`, lifecycle `archived:identity-unresolved`). An
   owner reopen is left alone. At most 4 identity dispatches per cycle.
 
+#### Effect-validation (replay) gate — slice 1 (#2463, default OFF)
+
+External skill-evolution systems keep a validation gate: a change is kept only
+when a replayed task scores at least as well with the skill as without it.
+Slice 1 adds the plumbing without changing promotion:
+
+- **Switch:** `~/.claude/state/skill-promotion.replay-gate` (`off` |
+  `dry-run` | `true`, owner flag file, 0600) or
+  `CCC_SKILL_PROMOTION_REPLAY_GATE`; a typo fails the run (`replay_gate_invalid`).
+  `status` reports it as `effective.replay_gate_mode`.
+- **Eligibility:** every published intake row records `replay_eligibility`
+  (`script-bearing` = the tree has `scripts/`, `tests/` or `*.test.sh`;
+  `narrative` otherwise).
+- **Plans:** with the switch on, `_sweep_replay_plans` (every collect) writes
+  one `a2a-replay-plan` row per approved, unpromoted tree (`planned` for
+  script-bearing, `skipped-narrative` otherwise); `true` adds
+  `replay_worker_not_deployed` until the worker intent ships. The promote body
+  gains a "effect-validation gate" section listing each staged candidate's
+  eligibility. Nothing is dispatched and nothing is held.
+- **Spec:** a2a-nexus `docs/skills-intake-replay.md`
+  (`skills.skill-intake-replay.v1`); slice 2 adds the author-node replay
+  handler and the independent judge lane, slice 3 enforces the gate.
+
 ### Installing approved private skills
 
 Setup installs the consumer beside the autosave hooks, but does not run it.
