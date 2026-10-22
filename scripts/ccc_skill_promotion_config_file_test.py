@@ -216,6 +216,15 @@ class ConfigFileTests(unittest.TestCase):
             ],
         )
 
+    def test_cap_accepts_up_to_eight_and_rejects_out_of_range(self) -> None:
+        # 2026-10-22: a 3-PR nightly cap left 24 candidates queued while review
+        # and arbitration cleared 14 intake PRs in a day; the old 1-3 bound
+        # silently fell back to 1 for any larger value.
+        self.write("CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN=6\n")
+        self.assertEqual(promotion._config(self.env(CCC_SKILL_PROMOTION_ENABLED="1")).max_prs, 6)
+        self.write("CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN=9\n")
+        self.assertEqual(promotion._config(self.env(CCC_SKILL_PROMOTION_ENABLED="1")).max_prs, 1)
+
     def test_unsafe_file_never_fails_main(self) -> None:
         self.write("CCC_SKILL_PROMOTION_COLLECT_WINDOW=7\n", mode=0o644)
         with patch.dict(os.environ, self.env(), clear=True):
