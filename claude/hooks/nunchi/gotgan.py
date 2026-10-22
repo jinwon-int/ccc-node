@@ -24,6 +24,15 @@ Usage:
   gotgan.py index <claude|codex|piri> <transcript-dir> [--scope S]
   gotgan.py search <query> [-n N] [--scope S] [--json]
   gotgan.py status
+  gotgan.py prune            # drop already-indexed harness/self-prompt rows
+
+Memory bound (P3-2): one ``index`` run reads at most ``GOTGAN_RUN_BYTES`` of
+transcript bytes (default 64 MiB, floor 1 MiB) and stops; the per-file byte
+offset means the next run resumes where this one left off, so a backlog
+(first index on a node with years of rollouts) drains across hourly runs
+instead of pulling whole files into RAM at once — the Termux RSS ceiling is
+2.0 GB and the previous unbounded ``read()`` of a multi-hundred-MB rollout
+sat on top of the lexical+bigram inserts of the same file.
 """
 import argparse
 import hashlib
@@ -60,8 +69,36 @@ _SELF_PROMPTS = (
     "아래는 peer 메모리(요약 사실)와 MemPalace",
     "아래는 Family Wiki에서 검색한 근거다",
 )
+# Codex writes its own harness injections into the rollout as *user* turns:
+# the AGENTS.md/loader preamble, internal goal context, plugin and environment
+# blocks. They are prompt plumbing, not something the owner said, and they are
+# the four most frequent "USER" bodies in the shadow node's index (2026-10-18:
+# 419 / 324 / 170 / 55 rows of 17,487 codex chunks). A USER message that opens
+# with one is dropped whole; the session itself stays indexed.
+_CODEX_HARNESS_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<codex_internal_context",
+    "<recommended_plugins",
+    "<environment_context",
+    "<user_instructions",
+    "<permissions instructions",
+    "<apps_instructions",
+    "<turn_aborted",
+)
 # Automation working dirs whose transcripts are pipeline I/O, not dialogue.
 _SKIP_DIR_MARKERS = ("ccc-claude-distill", "nunchi-audit-synth")
+RUN_BYTES_DEFAULT = 64 * 1024 * 1024
+RUN_BYTES_FLOOR = 1024 * 1024
+
+
+def run_bytes_budget():
+    """Transcript bytes one ``index`` run may consume (``GOTGAN_RUN_BYTES``)."""
+    raw = os.environ.get("GOTGAN_RUN_BYTES", "").strip()
+    try:
+        n = int(raw) if raw else RUN_BYTES_DEFAULT
+    except ValueError:
+        n = RUN_BYTES_DEFAULT
+    return max(n, RUN_BYTES_FLOOR)
 _STOP = {
     "the", "a", "an", "of", "to", "in", "and", "or", "is", "are", "was", "were",
     "what", "which", "how", "when", "where", "who", "why", "did", "do", "does",
@@ -176,18 +213,7 @@ def parse_line(provider, d):
         text = _text_blocks(content, {"text"})
         return role, text, d.get("timestamp"), d.get("sessionId")
     if provider == "codex":
-        item = d.get("payload") or {}
-        if not isinstance(item, dict):
-            return None
-        if d.get("type") == "response_item" and item.get("type") == "message":
-            role = {"user": "USER", "assistant": "AGENT"}.get(str(item.get("role")))
-            if not role:
-                return None
-            text = _text_blocks(item.get("content"), {"input_text", "output_text"})
-            if role == "USER" and text.rstrip().endswith("[nunchi-codex-feed-816]"):
-                return None   # nunchi's own feed prompt, not conversation
-            return role, text, d.get("timestamp"), None
-        return None
+        return _parse_codex(d)
     if provider == "piri":
         if d.get("type") != "message":
             return None
@@ -199,6 +225,23 @@ def parse_line(provider, d):
             return None
         return role, _text_blocks(item.get("content"), {"text"}), d.get("timestamp"), None
     return None
+
+
+def _parse_codex(d):
+    item = d.get("payload") or {}
+    if not isinstance(item, dict):
+        return None
+    if d.get("type") != "response_item" or item.get("type") != "message":
+        return None
+    role = {"user": "USER", "assistant": "AGENT"}.get(str(item.get("role")))
+    if not role:
+        return None
+    text = _text_blocks(item.get("content"), {"input_text", "output_text"})
+    if role == "USER" and text.rstrip().endswith("[nunchi-codex-feed-816]"):
+        return None   # nunchi's own feed prompt, not conversation
+    if role == "USER" and text.lstrip().startswith(_CODEX_HARNESS_PREFIXES):
+        return None   # harness-injected preamble, not the owner speaking
+    return role, text, d.get("timestamp"), None
 
 
 def _safe_regular(path, root):
@@ -236,21 +279,30 @@ def _insert(c, provider, scope, session, path, seq, ts, role, body, embed_rows):
     return 1
 
 
+def _drop_chunk(c, rid):
+    body = c.execute("SELECT body FROM chunks WHERE id=?", (rid,)).fetchone()[0]
+    c.execute("INSERT INTO chunks_tri(chunks_tri, rowid, body) VALUES('delete', ?, ?)",
+              (rid, body))
+    c.execute("DELETE FROM chunks_bi WHERE rowid=?", (rid,))
+    c.execute("DELETE FROM vecs WHERE id=?", (rid,))
+    c.execute("DELETE FROM chunks WHERE id=?", (rid,))
+
+
 def _drop_path(c, path):
-    rows = [r[0] for r in c.execute("SELECT id FROM chunks WHERE path=?", (path,))]
-    for rid in rows:
-        body = c.execute("SELECT body FROM chunks WHERE id=?", (rid,)).fetchone()[0]
-        c.execute("INSERT INTO chunks_tri(chunks_tri, rowid, body) VALUES('delete', ?, ?)",
-                  (rid, body))
-        c.execute("DELETE FROM chunks_bi WHERE rowid=?", (rid,))
-        c.execute("DELETE FROM vecs WHERE id=?", (rid,))
-    c.execute("DELETE FROM chunks WHERE path=?", (path,))
+    for (rid,) in list(c.execute("SELECT id FROM chunks WHERE path=?", (path,))):
+        _drop_chunk(c, rid)
 
 
-def index_file(c, provider, path, root, scope, embed_rows):
+def index_file(c, provider, path, root, scope, embed_rows, max_bytes=None):
+    """Index the unread tail of one transcript.
+
+    Returns ``(chunks_added, bytes_consumed, pending)``; ``pending`` is True
+    when ``max_bytes`` stopped the read before EOF, i.e. the file still has
+    unread complete lines for the next run.
+    """
     st = _safe_regular(path, root)
     if st is None:
-        return 0
+        return 0, 0, False
     key = str(Path(path).absolute())
     row = c.execute("SELECT size, offset, inode, skip FROM files WHERE path=?",
                     (key,)).fetchone()
@@ -264,17 +316,26 @@ def index_file(c, provider, path, root, scope, embed_rows):
             offset = prev_off
             skip = skip or (prev_skip or 0)
     if offset == st.st_size and row:
-        return 0
+        return 0, 0, False
     seq0 = c.execute("SELECT COALESCE(MAX(seq), -1) FROM chunks WHERE path=?",
                      (key,)).fetchone()[0] + 1
     added = 0
     with open(key, "rb") as fh:
         fh.seek(offset)
-        data = fh.read()
+        if max_bytes is None:
+            data = fh.read()
+        else:
+            data = fh.read(max_bytes)
+            # A single line longer than the slice would never gain a newline
+            # and the offset would never move: finish that one line so every
+            # run makes progress, even if it overshoots the budget once.
+            if data and b"\n" not in data:
+                data += fh.readline()
+    pending = offset + len(data) < st.st_size
     # Only complete lines are consumed; a half-written tail waits for next run.
     end = data.rfind(b"\n")
     if end < 0:
-        return 0
+        return 0, 0, False
     consumed = data[:end + 1]
     session_default = Path(key).stem
     seq = seq0
@@ -301,29 +362,82 @@ def index_file(c, provider, path, root, scope, embed_rows):
         seq += 1
     c.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)",
               (key, provider, st.st_size, offset + len(consumed), st.st_ino, time.time(), skip))
-    return 0 if skip else added
+    return (0 if skip else added), len(consumed), pending
 
 
-def index_dir(provider, root, scope="", embed=None):
+def index_dir(provider, root, scope="", embed=None, run_bytes=None):
     if provider not in PROVIDERS:
         raise SystemExit(f"provider must be one of {PROVIDERS}")
     root = os.path.abspath(os.path.expanduser(root))
     c = connect()
     embed = _embedder() if embed is None else embed
-    total = files = 0
-    for p in sorted(Path(root).rglob("*.jsonl")):
+    budget = run_bytes_budget() if run_bytes is None else max(int(run_bytes), RUN_BYTES_FLOOR)
+    remaining = budget
+    total = files = bytes_read = pending_files = 0
+    paths = sorted(Path(root).rglob("*.jsonl"))
+    for i, p in enumerate(paths):
+        if remaining <= 0:
+            # Budget spent: everything not yet visited waits for the next run.
+            # Count only files that actually have unread bytes so a drained
+            # tree reports 0 pending even when the loop stopped early.
+            pending_files += sum(1 for q in paths[i:] if _has_unread(c, q, root))
+            break
         embed_rows = []
-        n = index_file(c, provider, p, root, scope, embed_rows)
+        n, used, pending = index_file(c, provider, p, root, scope, embed_rows, remaining)
         if n and embed:
             _store_vectors(c, embed, embed_rows)
         c.commit()
         total += n
         files += 1 if n else 0
+        bytes_read += used
+        remaining -= used
+        if pending:
+            pending_files += 1
     c.execute("INSERT OR REPLACE INTO meta VALUES('last_index', ?)",
               (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
     c.commit()
     c.close()
-    return {"provider": provider, "files_changed": files, "chunks_added": total}
+    return {"provider": provider, "files_changed": files, "chunks_added": total,
+            "bytes_read": bytes_read, "run_bytes": budget, "files_pending": pending_files}
+
+
+def _has_unread(c, path, root):
+    st = _safe_regular(path, root)
+    if st is None:
+        return False
+    row = c.execute("SELECT offset, inode FROM files WHERE path=?",
+                    (str(Path(path).absolute()),)).fetchone()
+    if not row:
+        return st.st_size > 0
+    return row[1] != st.st_ino or row[0] < st.st_size
+
+
+def prune():
+    """Drop rows an older indexer admitted that the current filters reject.
+
+    Index-time exclusion only protects new rows; the shadow index already
+    carried ~970 codex harness preambles and the nunchi synthesis prompts.
+    Scans USER bodies only (the filters are USER-side) and removes each
+    matching chunk with its FTS/vector rows. Idempotent; reports counts.
+    """
+    p = db_path()
+    if not os.path.exists(p):
+        return {"state": "absent", "db": p, "pruned": 0}
+    c = connect()
+    pruned = {"codex_harness": 0, "self_prompt": 0}
+    for rid, provider, body in list(c.execute(
+            "SELECT id, provider, body FROM chunks WHERE role='USER'")):
+        head = (body or "").lstrip()
+        if provider == "codex" and head.startswith(_CODEX_HARNESS_PREFIXES):
+            pruned["codex_harness"] += 1
+        elif head.startswith(_SELF_PROMPTS):
+            pruned["self_prompt"] += 1
+        else:
+            continue
+        _drop_chunk(c, rid)
+    c.commit()
+    c.close()
+    return {"state": "ok", "db": p, "pruned": sum(pruned.values()), **pruned}
 
 
 # ------------------------------------------------------------- embeddings (opt)
@@ -513,6 +627,7 @@ def main(argv=None):
     s.add_argument("--scope", default="")
     s.add_argument("--json", action="store_true")
     sub.add_parser("status")
+    sub.add_parser("prune")
     args = ap.parse_args(argv)
     if args.cmd == "index":
         print(json.dumps(index_dir(args.provider, args.dir, args.scope), ensure_ascii=False))
@@ -522,6 +637,8 @@ def main(argv=None):
             print(json.dumps(hits, ensure_ascii=False))
         else:
             print("\n".join(format_lines(hits)))
+    elif args.cmd == "prune":
+        print(json.dumps(prune(), ensure_ascii=False))
     else:
         print(json.dumps(status(), ensure_ascii=False))
     return 0

@@ -29,7 +29,7 @@ cron_store="$TMP/crontab"
 piri_sessions="$home/.piri/agent/sessions"
 mkdir -p "$hooks/nunchi" "$state" "$codex_home/sessions" "$piri_sessions" \
   "$home/.claude/projects" "$home/.local/bin" "$nunchi_home" "$fake_bin"
-cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,session-tail.py,feed-receipt.py,journal-feed.py,piri-feed.sh,danso-feed.sh,ingest-cron.sh,bridge-journal.py,feed-common.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh} "$hooks/nunchi/"
+cp "$ROOT"/claude/hooks/nunchi/{codex-loader.py,nunchi.py,judge-batch.py,wiki-promote.py,judge-verdict.schema.json,codex-feed.sh,session-tail.py,feed-receipt.py,journal-feed.py,piri-feed.sh,danso-feed.sh,ingest-cron.sh,bridge-journal.py,feed-common.sh,bench.sh,bench-qset.tsv,sessionstart.sh,mempalace-refresh.sh,gotgan.py,gotgan-refresh.sh} "$hooks/nunchi/"
 cp "$ROOT/claude/hooks/scan-injection.sh" "$hooks/scan-injection.sh"
 # session-tail.py and the feed prompts use the shared trajectory renderer that
 # setup.sh's hook-tree walk deploys under hooks/lib/ (#2388).
@@ -808,6 +808,87 @@ rc=$?
 ok "status reports backend_auth=ok once a backend is authenticated" \
   '[ "$rc" = 0 ] && grep -q "^backend_auth: ok" <<<"$out"'
 
+run_install --remove >/dev/null 2>&1
+
+# --- #2331 P3-2: --verbatim-backend wires the managed gotgan refresh lane and
+# records the choice for the SessionStart path; the hand-installed shadow line
+# (`# nunchi:gotgan-shadow`, hub node 2026-10-16) is retired by the managed one.
+# shellcheck disable=SC2034  # backend_file is read via eval inside ok()
+backend_file="$nunchi_home/verbatim-backend"
+printf '%s\n' '27 * * * * /usr/bin/bash /root/.config/ccc-node/gotgan-refresh.sh # nunchi:gotgan-shadow hub #2331' > "$cron_store"
+# shellcheck disable=SC2034
+out="$(run_install --apply --codex 2>&1)"; rc=$?
+ok "default apply keeps mempalace: no gotgan cron, no backend file, shadow line untouched" \
+  '[ "$rc" = 0 ] && ! grep -q "gotgan-refresh.sh codex" "$cron_store" && [ ! -e "$backend_file" ] && grep -q "nunchi:gotgan-shadow" "$cron_store"'
+ok "default status reports verbatim_backend=mempalace and does not count the shadow line" \
+  'st="$(run_install 2>&1)"; grep -q "^verbatim_backend: mempalace gotgan_cron=0" <<<"$st"'
+# shellcheck disable=SC2034
+out="$(run_install --apply --codex --verbatim-backend both 2>&1)"; rc=$?
+ok "--verbatim-backend both adds a managed :27 gotgan refresh beside the MemPalace sweep (4 managed lines)" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "^27 \* \* \* \* .*gotgan-refresh.sh codex $codex_home/sessions .*nunchi:#816 gen=$want_gen$" "$cron_store" && grep -q "mempalace-refresh.sh codex" "$cron_store"'
+ok "gotgan line carries db/status/timeout/flock pins" \
+  'grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_DB=$nunchi_home/gotgan.db CCC_NUNCHI_GOTGAN_STATUS=$nunchi_home/gotgan-refresh.status.json CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC=1500 CCC_NUNCHI_TIMEOUT_CLI="'
+ok "both: hand-installed gotgan-shadow line is retired" \
+  '! grep -q "nunchi:gotgan-shadow" "$cron_store" && grep -q "gotgan-shadow cron line(s) replaced" <<<"$out"'
+ok "both: bench line scores the chosen backend" 'grep "bench.sh" "$cron_store" | grep -q "CCC_NUNCHI_VERBATIM_BACKEND=both "'
+ok "both: owner-only backend file records the choice for SessionStart" \
+  '[ "$(cat "$backend_file")" = both ] && [ "$(stat -c %a "$backend_file")" = 600 ]'
+ok "both: install record materializes --verbatim-backend" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--verbatim-backend\",\"both\"]" "$nrec" >/dev/null'
+ok "status reports the backend and the gotgan cron" \
+  'st="$(run_install 2>&1)"; grep -q "^verbatim_backend: both gotgan_cron=1" <<<"$st"'
+ok "nunchi.py resolves the backend from the file when no env is set" \
+  '[ "$(env -u CCC_NUNCHI_VERBATIM_BACKEND NUNCHI_HOME="$nunchi_home" python3 -c "import sys; sys.path.insert(0, \"$hooks/nunchi\"); import nunchi; print(nunchi.verbatim_backend())")" = both ]'
+ok "env still wins over the file" \
+  '[ "$(CCC_NUNCHI_VERBATIM_BACKEND=gotgan NUNCHI_HOME="$nunchi_home" python3 -c "import sys; sys.path.insert(0, \"$hooks/nunchi\"); import nunchi; print(nunchi.verbatim_backend())")" = gotgan ]'
+# The managed line runs end to end: a codex rollout in the sweep dir lands in
+# the gotgan store and the body-free status records the run counters.
+mkdir -p "$codex_home/sessions/2026/10/18"
+printf '%s\n' '{"type":"response_item","timestamp":"2026-10-18T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"곳간 관리 레인 확인 질문"}]}}' \
+  > "$codex_home/sessions/2026/10/18/rollout-x.jsonl"
+rc=0
+HOME="$home" PATH="/usr/bin:/bin" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" GOTGAN_EMBED=off \
+  GOTGAN_DB="$nunchi_home/gotgan.db" CCC_NUNCHI_GOTGAN_STATUS="$nunchi_home/gotgan-refresh.status.json" \
+  bash "$hooks/nunchi/gotgan-refresh.sh" codex "$codex_home/sessions" >/dev/null 2>&1 || rc=$?
+ok "gotgan-refresh.sh indexes the sweep dir and writes a body-free ok status" \
+  '[ "$rc" = 0 ] && jq -e '\''.schema=="ccc.nunchi.gotgan-refresh.v1" and .provider=="codex" and .state=="ok" and .exit_code==0 and .chunks_added==1 and .files_pending==0'\'' "$nunchi_home/gotgan-refresh.status.json" >/dev/null && ! grep -q "곳간" "$nunchi_home/gotgan-refresh.status.json"'
+ok "gotgan status file is owner-only" '[ "$(stat -c %a "$nunchi_home/gotgan-refresh.status.json")" = 600 ]'
+ok "refresh honours the mode gate (mode off -> exit 0, status untouched)" \
+  'before="$(cat "$nunchi_home/gotgan-refresh.status.json")"; printf off > "$state/nunchi.mode"; HOME="$home" CCC_STATE_DIR="$state" NUNCHI_HOME="$nunchi_home" bash "$hooks/nunchi/gotgan-refresh.sh" codex "$codex_home/sessions"; r=$?; printf on > "$state/nunchi.mode"; [ "$r" = 0 ] && [ "$(cat "$nunchi_home/gotgan-refresh.status.json")" = "$before" ]'
+# Replay of the recorded argv (self-update path) keeps the lane; a deliberate
+# re-apply without the flag steps back to mempalace and clears the file.
+mapfile -t rec_argv < <(jq -r '.argv[]' "$nrec")
+run_install "${rec_argv[@]}" >/dev/null 2>&1
+ok "replaying the install record keeps exactly one gotgan line" \
+  '[ "$(grep -c "gotgan-refresh.sh codex" "$cron_store")" = 1 ] && [ "$(cat "$backend_file")" = both ]'
+# shellcheck disable=SC2034
+out="$(run_install --apply --codex --verbatim-backend gotgan 2>&1)"; rc=$?
+ok "--verbatim-backend gotgan drops the MemPalace sweep, keeps feed/gotgan/bench (3 managed lines)" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && ! grep -q "mempalace-refresh.sh" "$cron_store" && grep -q "gotgan-refresh.sh codex" "$cron_store" && grep -q "MemPalace refresh cron not installed" <<<"$out" && [ "$(cat "$backend_file")" = gotgan ]'
+run_install --apply --codex >/dev/null 2>&1
+ok "re-apply without the flag returns to mempalace (gotgan line and file gone)" \
+  '! grep -q "gotgan-refresh.sh" "$cron_store" && [ ! -e "$backend_file" ] && grep -q "mempalace-refresh.sh codex" "$cron_store" && jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
+run_install --apply --codex --verbatim-backend both >/dev/null 2>&1
+run_install --remove >/dev/null 2>&1
+ok "--remove clears the backend file with the lanes" '[ ! -e "$backend_file" ] && ! grep -q "nunchi:#816" "$cron_store"'
+cp "$cron_store" "$TMP/cron.before-bad-backend" 2>/dev/null || :
+rc=0
+# shellcheck disable=SC2034
+out="$(run_install --apply --codex --verbatim-backend bogus 2>&1)" || rc=$?
+ok "an invalid backend is a hard error (exit 2), cron untouched" \
+  '[ "$rc" = 2 ] && grep -q "invalid verbatim backend" <<<"$out" && cmp -s "$cron_store" "$TMP/cron.before-bad-backend"'
+rc=0
+# shellcheck disable=SC2034
+out="$(CCC_NUNCHI_VERBATIM_BACKEND=both run_install --apply --codex 2>&1)" || rc=$?
+ok "CCC_NUNCHI_VERBATIM_BACKEND env selects the backend like the flag" \
+  '[ "$rc" = 0 ] && grep -q "gotgan-refresh.sh codex" "$cron_store" && [ "$(cat "$backend_file")" = both ]'
+rm -f "$hooks/nunchi/gotgan-refresh.sh"
+rc=0
+# shellcheck disable=SC2034
+out="$(run_install --apply --codex --verbatim-backend both 2>&1)" || rc=$?
+ok "missing gotgan hooks fail closed (exit 2) instead of a silent mempalace-only install" \
+  '[ "$rc" = 2 ] && grep -q "gotgan hooks or transcript dir missing" <<<"$out"'
+cp "$ROOT/claude/hooks/nunchi/gotgan-refresh.sh" "$hooks/nunchi/"; chmod 755 "$hooks/nunchi/gotgan-refresh.sh"
 run_install --remove >/dev/null 2>&1
 
 # --- #2275: a HOME-less launcher (systemd-run without Environment=HOME) used

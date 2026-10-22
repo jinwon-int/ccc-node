@@ -375,6 +375,58 @@ The Telegram Codex runtime invokes the same materializer before every `thread/st
 
 There is no Codex user-session A2A launch path in current ccc-node main. The #478 Codex distill backend is an isolated extraction boundary that intentionally ignores user config/rules and is therefore **not** routed through `ccc-codex`. Any future A2A worker that starts a user-facing Codex session must use the same wrapper/materializer contract.
 
+### Managed gotgan refresh (#2331 P3-2)
+
+`gotgan` (곳간) is nunchi's own verbatim store (`hooks/nunchi/gotgan.py`,
+stdlib sqlite3 + FTS5; vectors optional). Which store the SessionStart
+dialectic and the weekly bench read is a per-node choice:
+
+```bash
+install-nunchi.sh --apply --verbatim-backend both      # MemPalace sweep + gotgan, side by side
+install-nunchi.sh --apply --verbatim-backend gotgan    # gotgan only; the MemPalace sweep cron is not installed
+install-nunchi.sh --apply                              # mempalace (default) — unchanged pre-#2331 behaviour
+```
+
+`CCC_NUNCHI_VERBATIM_BACKEND` in the installer's environment is equivalent to
+the flag. `gotgan`/`both` add one managed cron line at `:27` (offset from the
+MemPalace `:17` sweep so the two transcript readers never overlap) running
+`hooks/nunchi/gotgan-refresh.sh <provider> <transcript-dir>` under the same
+discipline as the MemPalace refresh: `nunchi.mode` gate, single-flight
+`flock`, hard `timeout` (`CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC`, default
+1500 s), owner-only body-free status at `$NUNCHI_HOME/gotgan-refresh.status.json`
+(`state`, `exit_code`, `chunks_added`, `bytes_read`, `files_pending`). A
+hand-installed `# nunchi:gotgan-shadow` line (the hub node's shadow lane from
+2026-10-16) is retired when the managed line is installed; `--remove` and a
+re-apply without the flag leave hand lines alone.
+
+The choice is materialized twice so it survives replay and reaches the hook
+path: `--verbatim-backend X` is written into the install record (a
+self-update replay that omitted it would silently drop the lane), and
+`$NUNCHI_HOME/verbatim-backend` holds the value for `nunchi.py`, whose
+`verbatim_backend()` resolves env → file → `mempalace`. The bench cron line is
+stamped with `CCC_NUNCHI_VERBATIM_BACKEND` so the weekly sheet scores what
+SessionStart reads. `install-nunchi.sh` status prints
+`verbatim_backend: <value> gotgan_cron=<n> gotgan_db=<bytes>`.
+
+Memory bound: one `gotgan.py index` run consumes at most `GOTGAN_RUN_BYTES`
+of new transcript bytes (default 64 MiB, floor 1 MiB; set it in the
+installer's environment to pin a smaller budget on Termux, where the process
+RSS ceiling is 2.0 GB). The per-file byte offset resumes where the previous
+run stopped, so a first index on a node with years of rollouts drains across
+hourly runs — `files_pending > 0` in the status means the backlog is still
+draining, not that the lane is stuck. `CCC_NUNCHI_GOTGAN_PYTHON` pins an
+interpreter (a venv carrying numpy + model2vec) for the optional vector
+layer; otherwise `~/.venv-gotgan/bin/python` is used when present, else the
+harness `python3` (lexical-only).
+
+Index-time exclusions: Codex writes its harness injections into the rollout
+as user turns (`# AGENTS.md instructions`, `<codex_internal_context>`,
+`<recommended_plugins>`, `<environment_context>`, `<user_instructions>` …);
+they are dropped the same way the nunchi feed prompt and the synthesis
+self-prompts are. `gotgan.py prune` removes rows an older indexer admitted
+and is idempotent — run it once after upgrading a node that already carried a
+gotgan store.
+
 ## Operating rules
 
 - Startup injection is fail-open and no-network.
