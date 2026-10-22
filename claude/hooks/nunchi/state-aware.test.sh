@@ -58,7 +58,7 @@ printf '%s\n' "$2"
 SH
 chmod 755 "$TMP/bin/claude"
 out="$(PATH="$TMP/bin:/usr/bin:/bin" CCC_NUNCHI_MEMPALACE_HOME="$TMP/nopalace" python3 "$NP" dialectic "$q" --target seo-jin-on 2>&1)"
-ok "dialectic lists current facts with their valid_from date" 'grep -q "^- (2026-10-20) Austin address updated" <<<"$out"'
+ok "dialectic lists current facts with their valid_from date" 'grep -q "^- \[#3|inferred\] (2026-10-20) Austin address updated" <<<"$out"'
 ok "dialectic instructs to treat the most recent fact as current" 'grep -q "가장 최근 것을 현재 상태로" <<<"$out"'
 # 6. reindex-vecs is a no-op without an embedder and never fails
 out="$(python3 "$NP" reindex-vecs 2>&1)"; rc=$?

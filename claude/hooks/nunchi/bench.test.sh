@@ -68,6 +68,36 @@ ok "a healthy run reports a fully valid summary" \
 ok "a healthy run carries no contamination warning" \
   '! grep -q "SAMPLE CONTAMINATED" "$out"'
 
+ok "an answer without [#id] citations is recorded as cited_ids=none (#2466)" \
+  '[ "$(grep -c "^## q[1-5] .* cited_ids=none rc=0 status=OK source=nunchi$" "$out")" = 5 ]'
+
+# #2466 — the row records which fact ids the answer cited, deduplicated and sorted, so a
+# usable answer that cites nothing can be told apart from a grounded one.
+home_c="$TMP/home-cited"
+hooks_c="$home_c/.claude/hooks/nunchi"
+state_c="$home_c/.claude/state"
+nunchi_home_c="$home_c/.nunchi"
+mkdir -p "$hooks_c" "$state_c" "$nunchi_home_c"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$hooks_c/bench.sh"
+chmod 700 "$hooks_c/bench.sh"
+printf 'on' > "$state_c/nunchi.mode"
+cp "$hooks/bench-qset.tsv" "$hooks_c/bench-qset.tsv"
+cat > "$hooks_c/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+
+if sys.argv[1:2] == ["dialectic"]:
+    print("주소는 Austin이다 [#12]. 이전은 Seattle [#7] [#12].")
+    print("---")
+    print("근거: #7 (fact·measured·2026-09-01~2026-10-15) · #12 (fact·measured·2026-10-15~·supersedes #7)")
+PY
+HOME="$home_c" CCC_STATE_DIR="$state_c" NUNCHI_HOME="$nunchi_home_c" \
+  NUNCHI_BENCH_QSET="$hooks_c/bench-qset.tsv" CCC_NODE=test-node \
+  bash "$hooks_c/bench.sh" > "$TMP/stdout_c" 2> "$TMP/stderr_c"
+out_c="$(find "$nunchi_home_c" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "cited [#id]s are recorded deduplicated and sorted (#2466)" \
+  '[ -n "$out_c" ] && [ "$(grep -c "^## q[1-5] .* cited_ids=7,12 rc=0 status=OK source=nunchi$" "$out_c")" = 5 ]'
+
 # #1078 regression — a logged-out provider prints its notice to stdout and
 # exits 0. Such rows contain no "기록 없음", so before this guard they scored
 # as the best-performing nodes on the Phase 2 parity gate.
