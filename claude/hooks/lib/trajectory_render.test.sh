@@ -32,7 +32,7 @@ ok "all three providers emit the same truncation markers" \
 ok "once tool names are set aside the three renderings are identical" \
   '[ "$(sed -E "s/^\[ACTION\] [a-z_A-Z]+\(/[ACTION] (/" "$TMP/claude.out")" = "$(sed -E "s/^\[ACTION\] [a-z_A-Z]+\(/[ACTION] (/" "$TMP/codex.out")" ] && [ "$(sed -E "s/^\[ACTION\] [a-z_A-Z]+\(/[ACTION] (/" "$TMP/claude.out")" = "$(sed -E "s/^\[ACTION\] [a-z_A-Z]+\(/[ACTION] (/" "$TMP/piri.out")" ]'
 ok "the tag set is the shared grammar's" \
-  '[ "$(tags "$TMP/claude.out" | sort -u | tr "\n" " ")" = "[ACTION] [ASSISTANT] [OBSERVATION ERROR] [OBSERVATION] [USER] " ]'
+  '[ "$(tags "$TMP/claude.out" | LC_ALL=C sort -u | tr "\n" " ")" = "[ACTION] [ASSISTANT] [OBSERVATION ERROR] [OBSERVATION] [USER] " ]'
 ok "injected developer noise, bookkeeping and the duplicate event_msg are absent" \
   '! grep -q "skills_instructions\|bookkeeping\|token_count" "$TMP/codex.out" "$TMP/claude.out" && [ "$(grep -c "^\[USER\]" "$TMP/codex.out")" = 1 ]'
 ok "a failed tool result keeps its error tag even with the body omitted" \
