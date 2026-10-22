@@ -1113,6 +1113,12 @@ class AndroidOwnershipTests(unittest.TestCase):
                 "created_by": "ccc-node", "provenance_revision": 1,
                 "rollback_eligible": True,
             }))
+            # #2239 L1 usage_unproven: the real helper only stages a draft the
+            # origin node has actually invoked, so prove one Skill-tool use.
+            ledger = home / ".claude/state/skill-usage/usage.jsonl"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(json.dumps({"ts": "2026-10-20T00:00:00Z", "skill": skill.name,
+                                          "tool": "Skill", "runtime": "claude"}) + "\n")
             for path in [home, *home.rglob("*")]:
                 path.chmod(0o700 if path.is_dir() else 0o600)
             cfg = promotion._config({"HOME": str(home), "CCC_NODE": "testnode",
