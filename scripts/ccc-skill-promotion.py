@@ -6655,6 +6655,56 @@ def _promote_stage_batch(
         })
 
 
+def _promote_pr_create(
+    config: Config, branch: str, reviewer: list[str], *, title: str, body: str
+) -> str:
+    """Open the promote PR and return its URL — recovering the PR when `gh pr
+    create` fails *after* creating it.
+
+    Field case 2026-10-21 (fleet-skills#556): `gh pr create --draft --reviewer
+    <profile>` created the PR, then exited non-zero (the reviewer request did
+    not attach), so `command_failed` was raised before the ledger row and the
+    PR became an orphan the ledger-based dedupe, supersede and L3 sweeps could
+    not see; the next cycle opened a duplicate batch (#557). The branch name is
+    unique per run, so an open PR on it after a failed create is this run's PR:
+    record it and continue, requesting the reviewer separately (best effort —
+    the L3 sweep re-requests a missing reviewer on its own)."""
+    argv = ["gh", "pr", "create", "--repo", config.repo, "--base", config.base,
+            "--head", branch, "--draft", *reviewer, "--title", title, "--body", body]
+    try:
+        completed = _run(argv)
+    except PromotionError as error:
+        recovered = _promote_pr_on_branch(config, branch)
+        if recovered is None:
+            raise error
+        if reviewer:
+            try:
+                _run(["gh", "pr", "edit", recovered, "--repo", config.repo, "--add-reviewer", reviewer[-1]])
+            except PromotionError:
+                pass
+        return recovered
+    try:
+        return completed.stdout.decode("utf-8").strip().splitlines()[-1]
+    except (UnicodeDecodeError, IndexError):
+        recovered = _promote_pr_on_branch(config, branch)
+        if recovered is None:
+            raise PromotionError("github_output_invalid") from None
+        return recovered
+
+
+def _promote_pr_on_branch(config: Config, branch: str) -> str | None:
+    """URL of the open PR whose head is `branch`, or None (unreadable = None)."""
+    try:
+        listed = _run(["gh", "pr", "list", "--repo", config.repo, "--head", branch, "--state", "open",
+                       "--json", "url", "--limit", "1"])
+        rows = json.loads(listed.stdout.decode("utf-8"))
+    except (PromotionError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict) and isinstance(rows[0].get("url"), str):
+        return rows[0]["url"]
+    return None
+
+
 def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     """Open ONE draft PR staging every approved-but-unpromoted candidate.
 
@@ -6807,15 +6857,10 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
     reviewer: list[str] = []
     if getattr(config, "auto_approve_mode", "off") != "off":
         reviewer = ["--reviewer", str(getattr(config, "approve_profile", "seoseo-ai"))]
-    completed = _run(
-        ["gh", "pr", "create", "--repo", config.repo, "--base", config.base,
-         "--head", branch, "--draft", *reviewer, "--title",
-         f"promote: {len(staged)} approved intake candidates", "--body", "\n".join(lines)]
+    url = _promote_pr_create(
+        config, branch, reviewer,
+        title=f"promote: {len(staged)} approved intake candidates", body="\n".join(lines),
     )
-    try:
-        url = completed.stdout.decode("utf-8").strip().splitlines()[-1]
-    except (UnicodeDecodeError, IndexError):
-        raise PromotionError("github_output_invalid") from None
     pr_number = _pr_number_from_url(url) or ""
     _append_ledger(
         config,
