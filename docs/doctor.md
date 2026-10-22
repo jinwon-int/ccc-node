@@ -24,6 +24,8 @@
 - **Installed A2A handler drift** (`#2357`): installed copies of the skills-intake
   dispatcher/handlers vs the checkout's `scripts/`. See *Installed A2A handlers* below.
 - Selected agent provider. For `CCC_AGENT_PROVIDER=codex`, deterministic CLI, app-server surface, and login readiness without a model turn or Telegram access.
+- **Hooks in a non-harness account** (`#2323`): hook wiring left in another account's
+  `~/.claude/settings*.json` is `경고`. See *Non-harness account hooks* below.
 - **Always-on budget** (`#2384`): always-on injection per source (chars/bytes, share of
   the provider cap); over cap is `경고`, or `수동필요` under `--strict`. See *Always-on budget* below.
 
@@ -253,6 +255,42 @@ the refresh are listed as `still stale, fix by hand`. Exit 0 when every present
 file is current/refreshed and clean, 1 when anything needs a hand fix, 2 when
 the repo template lacks its markers. The report names files, line numbers and
 pattern labels only. A symlinked MEMORY.md is rewritten once, at its target.
+
+## Non-harness account hooks
+
+One `nonharness-account-hooks` row (#2323). The harness account is the one
+whose home a live bridge serves (`--path`); `setup.sh` and self-update only ever
+refresh that account. Hooks wired in any other account's `~/.claude/settings.json`
+or `settings.local.json` therefore freeze at their last install, yet every Claude
+session that account opens still fires them. Observed on a node whose retired
+root lane kept 17 hooks from 09-11 and ran them once a root login was issued.
+
+Accounts scanned: `/root`, `/home/*` and the doctor's own login home, minus the
+harness: every home a live bridge serves (a `--path` inside a home counts as
+that home), the login home of every account running a bridge (so a
+`CCC_BRIDGE_DEFAULT_PATH` that is not a home still protects its owner), and any
+account whose `~/.claude` resolves to a harness `~/.claude`.
+`CCC_DOCTOR_ACCOUNT_HOMES` (`:`-separated) is the complete list when set (test seam).
+
+Files are type-checked with `lstat` and opened without following symlinks, so
+a FIFO or device node is never opened; a symlinked settings file is listed as
+`(symlink, not followed)`. Anything over 1 MiB, not JSON, or nested too deeply
+to parse is listed as unreadable — another account's file can never abort the
+doctor run. `"disableAllHooks": true` counts as no wiring. Event names are that
+account's data, so only plain ASCII words (max 40 chars, first 8) are printed;
+the rest are counted as `other=N`. Hooks that arrive through plugins
+(`enabledPlugins`) are not counted.
+
+| State | Class |
+|---|---|
+| no running bridge | `정상` (해당 없음) |
+| no other account wires hooks | `정상` — also lists accounts it could not read (`/root` from a non-root run) |
+| another account wires hooks | `경고` — path, hook count, event names (never command text) |
+
+Run the doctor as root to include `/root`. The doctor never edits another
+account's files. Remedy: back up the file and remove only its `hooks` key, or
+retire the lane per the node runbook. If the account is meant to run the
+harness too, record that on the node page.
 
 ## Push spool dwell
 
