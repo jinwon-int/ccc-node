@@ -39,6 +39,11 @@ from ccc_memory_guidance import (
     stale_memory_guidance_hits,
 )
 
+try:
+    import pwd as _pwd
+except ImportError:  # non-POSIX
+    _pwd = None  # type: ignore[assignment]
+
 # Fallback only. The live list is walked from the repo (see hook_files) using the
 # same rule as ccc_hook_tree_files in scripts/lib/harness-paths.sh, which setup.sh
 # and validate-harness.sh already share. This list used to be authoritative and
@@ -589,6 +594,95 @@ def _read_regular_text(path: Path) -> str | None:
             os.close(fd)
 
 
+# #2323: hook wiring left in an account that does not run the harness. The
+# retired root lane on one node kept a 09-11 settings.json with 17 hooks and no
+# update path; once a root Claude login was issued, root sessions fired them.
+_FOREIGN_SETTINGS_NAMES = ("settings.json", "settings.local.json")
+_FOREIGN_SETTINGS_READ_LIMIT = 1 << 20
+
+
+def _read_regular_bounded(path: Path, limit: int) -> bytes | None:
+    """Read at most ``limit`` bytes of a regular file, never following a symlink.
+
+    Same open discipline as :func:`_read_regular_text` (the file may belong to
+    another account, so a symlink or FIFO planted there is never followed or
+    blocked on). ``None`` means "not a regular file". A file larger than
+    ``limit`` raises ``OSError(EFBIG)``; any other ``OSError`` propagates.
+    The type is checked with ``lstat`` before ``open`` too, so a device node is
+    never opened (opening one can have side effects when the doctor is root).
+    """
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        return None
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENXIO, errno.EISDIR):
+            return None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        with handle:
+            payload = handle.read(limit + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(payload) > limit:
+        raise OSError(errno.EFBIG, "settings file over the read limit", str(path))
+    return payload
+
+
+_HOOK_EVENT_NAME = re.compile(r"[A-Za-z]{1,40}")
+_HOOK_EVENT_SHOWN_MAX = 8
+
+
+def hook_wiring_counts(data: Any) -> dict[str, int]:
+    """Hook commands wired per event in a Claude settings document.
+
+    Counts ``hooks.<Event>[].hooks[]`` entries only; never returns command text.
+    An event whose matchers carry no hook entry is not wiring and is omitted,
+    and ``"disableAllHooks": true`` means nothing fires, so nothing counts.
+    Keys are the other account's data: render them with
+    :func:`describe_hook_events`, never verbatim.
+    """
+    if not isinstance(data, dict) or data.get("disableAllHooks") is True:
+        return {}
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for event, matchers in hooks.items():
+        if not isinstance(matchers, list):
+            continue
+        total = 0
+        for matcher in matchers:
+            inner = matcher.get("hooks") if isinstance(matcher, dict) else None
+            if isinstance(inner, list):
+                total += sum(1 for entry in inner if isinstance(entry, dict))
+        if total:
+            counts[str(event)] = total
+    return counts
+
+
+def describe_hook_events(counts: dict[str, int]) -> str:
+    """Event names safe to print: plain ASCII words only, capped.
+
+    Anything else (newlines, ``|``, escapes, long strings) could forge report
+    rows or carry text out of another account, so it is only counted.
+    """
+    names = sorted(name for name in counts if _HOOK_EVENT_NAME.fullmatch(name))
+    other = len(counts) - len(names)
+    shown = names[:_HOOK_EVENT_SHOWN_MAX]
+    if len(names) > len(shown):
+        other += len(names) - len(shown)
+    if other:
+        shown.append(f"other={other}")
+    return ",".join(shown)
+
+
 # Always-on injection budget (#2384). Text a provider loads into EVERY session
 # whether or not the task needs it, capped per provider — values borrowed from
 # google-research/harness2 (OpenCode surface 24,000 chars; Codex surface 8,000
@@ -1086,6 +1180,7 @@ class Doctor:
         self.check_memory_cache()
         self.check_always_on_budget()
         self.check_stale_memory_guidance()
+        self.check_nonharness_account_hooks()
         self.check_nunchi_collection()
         self.check_cron_drift()
         self.check_provider_readiness()
@@ -4549,6 +4644,178 @@ class Doctor:
             "hermes/memories/MEMORY.template.md when it matches the old line exactly. Anything it "
             "refuses (customized span/line) needs the same edit by hand. Doctor never rewrites "
             "these files (ccc-node#2238)",
+        )
+
+    def running_bridge_homes(self) -> list[Path]:
+        """Every home a live bridge serves, resolved — the harness account(s).
+
+        Both the ``--path`` it serves and the home of the account running it:
+        ``CCC_BRIDGE_DEFAULT_PATH`` may point the bridge at a directory that is
+        not the owner's home, and that owner's hooks are still the harness's.
+        """
+        homes: list[Path] = []
+        for line in self.bridge_command_lines():
+            home = self.bridge_home_of(line)
+            if home:
+                with contextlib.suppress(OSError, RuntimeError):
+                    homes.append(Path(home).resolve())
+        for home_text in self.bridge_owner_homes():
+            with contextlib.suppress(OSError, RuntimeError):
+                homes.append(Path(home_text).resolve())
+        return list(dict.fromkeys(homes))
+
+    def bridge_owner_homes(self) -> list[str]:
+        """Login homes of the accounts running a live bridge process."""
+        if _pwd is None:
+            return []
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "uid=,command="], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            return []
+        homes: list[str] = []
+        for line in out.splitlines():
+            uid_text, _, command = line.strip().partition(" ")
+            if "telegram_bot" not in command or "--path" not in command or "grep" in command:
+                continue
+            with contextlib.suppress(ValueError, KeyError):
+                homes.append(_pwd.getpwuid(int(uid_text)).pw_dir)
+        return homes
+
+    def own_home(self) -> Path | None:
+        """The doctor account's login home (not ``claude_dir.parent``: that is
+        resolved, so a symlinked ``~/.claude`` would name the link target)."""
+        if _pwd is not None:
+            with contextlib.suppress(KeyError, OSError):
+                return Path(_pwd.getpwuid(os.geteuid()).pw_dir)
+        with contextlib.suppress(RuntimeError, KeyError):
+            return Path.home()
+        return None
+
+    def _account_homes(self) -> list[Path]:
+        """Account homes that may hold a Claude dir: /root, /home/*, and this one.
+
+        ``CCC_DOCTOR_ACCOUNT_HOMES`` (``os.pathsep``-separated) is the complete
+        list when set (test seam); otherwise /root + /home/* + the doctor's own
+        login home.
+        """
+        override = os.environ.get("CCC_DOCTOR_ACCOUNT_HOMES")
+        raw: list[Path]
+        if override is not None:
+            raw = [Path(part) for part in override.split(os.pathsep) if part]
+        else:
+            raw = [Path("/root")]
+            with contextlib.suppress(OSError):
+                raw.extend(sorted(Path("/home").iterdir()))
+            own = self.own_home()
+            if own is not None:
+                raw.append(own)
+        homes: list[Path] = []
+        for home in raw:
+            with contextlib.suppress(OSError, RuntimeError):
+                homes.append(home.resolve())
+        return list(dict.fromkeys(homes))
+
+    @staticmethod
+    def _scan_foreign_settings(path: Path) -> tuple[str | None, str | None]:
+        """(leftover-hooks description, unreadable note) for one settings file."""
+        try:
+            payload = _read_regular_bounded(path, _FOREIGN_SETTINGS_READ_LIMIT)
+        except (FileNotFoundError, NotADirectoryError):
+            return None, None
+        except OSError:
+            return None, str(path)
+        if payload is None:
+            return None, f"{path}(symlink, not followed)" if path.is_symlink() else None
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # RecursionError: deep nesting is the other account's data; it must
+            # not abort the whole doctor run.
+            return None, f"{path}(unparseable)"
+        counts = hook_wiring_counts(data)
+        if not counts:
+            return None, None
+        return f"{path}: hooks={sum(counts.values())} ({describe_hook_events(counts)})", None
+
+    def check_nonharness_account_hooks(self) -> None:
+        """Warn when an account that does not run the harness still wires hooks (#2323).
+
+        The harness account is the one whose home a live bridge serves
+        (``--path``). setup.sh and self-update only ever refresh that account,
+        so hooks wired in another account's ``~/.claude/settings*.json`` freeze
+        at whatever version was last installed there — and any Claude session
+        that account opens still fires them. Observed on a node whose retired
+        root lane kept 17 hooks from 09-11 and ran them once a root login was
+        issued.
+
+        Read-only and warn-only: never edits another account's files. Reports
+        path, hook count and event names only, never command text. Accounts
+        the doctor cannot read (``/root`` from a non-root run) are listed as
+        unreadable, not flagged.
+        """
+        item = "nonharness-account-hooks"
+        harness = self.running_bridge_homes()
+        if not harness:
+            self.add(
+                "정상",
+                item,
+                "해당 없음 (no running bridge; the harness account cannot be identified)",
+                "none",
+            )
+            return
+        harness_claude: set[Path] = set()
+        for home in harness:
+            with contextlib.suppress(OSError, RuntimeError):
+                harness_claude.add((home / ".claude").resolve())
+        scanned = 0
+        unreadable: list[str] = []
+        leftovers: list[str] = []
+        for home in self._account_homes():
+            if any(bridge == home or home in bridge.parents for bridge in harness):
+                continue
+            claude = home / ".claude"
+            resolved_claude: Path | None = None
+            with contextlib.suppress(OSError, RuntimeError):
+                resolved_claude = claude.resolve()
+            if resolved_claude is not None and resolved_claude in harness_claude:
+                continue
+            try:
+                mode = os.stat(claude).st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                unreadable.append(str(home))
+                continue
+            if not stat.S_ISDIR(mode):
+                continue
+            scanned += 1
+            for name in _FOREIGN_SETTINGS_NAMES:
+                leftover, skipped_note = self._scan_foreign_settings(claude / name)
+                if leftover:
+                    leftovers.append(leftover)
+                if skipped_note:
+                    unreadable.append(skipped_note)
+        served = ",".join(str(home) for home in harness)
+        skipped = f"; unreadable={','.join(unreadable)}" if unreadable else ""
+        if not leftovers:
+            self.add(
+                "정상",
+                item,
+                f"harness={served}; other accounts with ~/.claude={scanned}; leftover hooks=0{skipped}",
+                "none",
+            )
+            return
+        self.add(
+            "경고",
+            item,
+            f"harness={served}; {'; '.join(leftovers)}{skipped}",
+            "these accounts do not serve the bridge, so setup.sh/self-update never refresh "
+            "their hooks, yet every Claude session they open still fires them. Back up the "
+            "file and remove only its `hooks` key, or retire the lane per the node runbook. "
+            "If the account is meant to run the harness too, record that on the node page. "
+            "Doctor never edits another account's files (ccc-node#2323)",
         )
 
     def check_nunchi_collection(self) -> None:
