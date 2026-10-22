@@ -33,7 +33,12 @@ set -eu
 printf '%s\n' "$*" >> "$GH_TEST_STATE/calls"
 case "${1:-} ${2:-}" in
   "api user") printf '12345\ntestuser\n' ;;
-  "pr create") printf 'https://github.com/test/fleet-skills/pull/77\n' ;;
+  "pr create")
+    if [ "${GH_TEST_FAIL_PR:-}" = "1" ]; then
+      printf 'gh: HTTP 422 boom token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 Authorization: Bearer ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ tail-marker\n' >&2
+      exit 3
+    fi
+    printf 'https://github.com/test/fleet-skills/pull/77\n' ;;
   *) exit 9 ;;
 esac
 SH
@@ -153,5 +158,17 @@ jq '.retire_candidates = []' "$AGG" > "$TMP/empty-list.json"
 out="$(run_tool pr --aggregate "$TMP/empty-list.json" --yes)"; rc=$?
 ok "pr --yes with nothing selected opens no PR" '[ "$rc" = 0 ] && jq -e ".ok and .code == \"nothing_to_retire\" and .selected == []" >/dev/null <<<"$out" && [ "$(grep -c "^pr create" "$GH_STATE/calls")" = 1 ]'
 
-echo "ccc-skill-retire: pass=$pass fail=$fail"
+# --- command failures carry a redacted, body-free detail block ---------------
+jq '.generated_at = "2026-10-23T00:00:00Z"' "$AGG" > "$TMP/agg-fail.json"
+out="$(GH_TEST_FAIL_PR=1 run_tool pr --aggregate "$TMP/agg-fail.json" --yes --max 1)"; rc=$?
+ok "a failing step keeps the exit code and code" '[ "$rc" = 2 ] && jq -e ".ok == false and .code == \"command_failed\"" >/dev/null <<<"$out"'
+ok "detail names the step (2 argv tokens), rc and a stderr tail" \
+  'jq -e ".detail.argv == [\"gh\",\"pr\"] and .detail.rc == 3 and (.detail.stderr_tail | type) == \"string\" and (.detail.stderr_tail | length) <= 400 and (.detail.stderr_tail | test(\"tail-marker\")) and (.detail.stderr_tail | test(\"HTTP 422\"))" >/dev/null <<<"$out"'
+ok "detail redacts token-like and credential-like substrings" \
+  '! grep -q "ghp_abcdefghijklmnopqrstuvwxyz0123456789" <<<"$out" && ! grep -q "ZZZZZZZZZZZZ" <<<"$out" && jq -e ".detail.stderr_tail | test(\"REDACTED\")" >/dev/null <<<"$out"'
+ok "detail carries no paths, refs or repository names" '! grep -qE "retire/auto|/tmp/|fleet-skills" <<<"$(jq -c .detail <<<"$out")"'
+out="$(run_tool plan --aggregate "$AGG" --fleet-skills-dir "$CLONE")"
+ok "a successful run has no detail block" 'jq -e "has(\"detail\") | not" >/dev/null <<<"$out"'
+
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

@@ -61,15 +61,39 @@ AUDIENCES = ("shared", "claude", "codex", "piri", "danso")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_GIT_NO_BACKGROUND = ("-c", "core.hooksPath=/dev/null", "-c", "credential.helper=")
+# No hooks, no background maintenance. The credential helper stays ENABLED:
+# fleet-skills is a private repository, so an https clone/push needs the gh
+# credential helper (`credential.helper=` broke the first live run with
+# "could not read Username", 2026-10-22).
+_GIT_NO_BACKGROUND = ("-c", "core.hooksPath=/dev/null", "-c", "maintenance.auto=false", "-c", "gc.auto=0")
+
+
+STDERR_TAIL_CHARS = 400
+# Credential-shaped substrings never reach the result JSON: GitHub token
+# prefixes, bearer/basic headers, `key=value` secrets, the A2A edge header and
+# any long hex/base64 run (a token or hash we cannot tell apart from one).
+_REDACT_RES = (
+    re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{8,}"),
+    re.compile(r"(?i)\b(?:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"(?i)\b(?:token|secret|password|passwd|api[_-]?key|authorization|x-a2a-edge-secret)\s*[:=]\s*\S+"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+    re.compile(r"\b[A-Za-z0-9+/_-]{40,}={0,2}\b"),
+)
+
+
+def _redact(text: str) -> str:
+    for pattern in _REDACT_RES:
+        text = pattern.sub("[REDACTED]", text)
+    return text
 
 
 class RetireError(RuntimeError):
-    """Closed-vocabulary failure code."""
+    """Closed-vocabulary failure code, optionally with a body-free detail block."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, detail: dict[str, Any] | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 def _utc_now() -> datetime:
@@ -148,6 +172,12 @@ def _candidates(aggregate: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _run(argv: list[str], *, cwd: Path | None = None, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[bytes]:
+    # `detail.argv` names the step (program + subcommand only — never paths,
+    # refs or repository names), `rc` the exit status (null when the process
+    # could not run or timed out) and `stderr_tail` the redacted last
+    # STDERR_TAIL_CHARS characters, so a failed step is diagnosable from the
+    # result JSON without a second run.
+    head = [str(token) for token in argv[:2]]
     if argv and argv[0] == "git":
         argv = ["git", *_GIT_NO_BACKGROUND, *argv[1:]]
     try:
@@ -155,12 +185,15 @@ def _run(argv: list[str], *, cwd: Path | None = None, check: bool = True, timeou
             argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, timeout=timeout, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        raise RetireError("command_failed") from None
+    except OSError as error:
+        raise RetireError("command_failed", {"argv": head, "rc": None, "stderr_tail": _redact(type(error).__name__)}) from None
+    except subprocess.TimeoutExpired:
+        raise RetireError("command_failed", {"argv": head, "rc": None, "stderr_tail": f"timeout after {timeout}s"}) from None
     if len(completed.stdout) > MAX_COMMAND_OUTPUT or len(completed.stderr) > MAX_COMMAND_OUTPUT:
-        raise RetireError("command_output_too_large")
+        raise RetireError("command_output_too_large", {"argv": head, "rc": completed.returncode, "stderr_tail": ""})
     if check and completed.returncode != 0:
-        raise RetireError("command_failed")
+        tail = completed.stderr.decode("utf-8", "replace")[-STDERR_TAIL_CHARS:]
+        raise RetireError("command_failed", {"argv": head, "rc": completed.returncode, "stderr_tail": _redact(tail)})
     return completed
 
 
@@ -472,7 +505,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = _execute(args)
     except RetireError as error:
-        print(json.dumps({"ok": False, "code": error.code}, sort_keys=True))
+        failure: dict[str, Any] = {"ok": False, "code": error.code}
+        if error.detail is not None:
+            failure["detail"] = error.detail
+        print(json.dumps(failure, ensure_ascii=False, sort_keys=True))
         return 2
     except Exception as error:  # noqa: BLE001 — body-free failure, never a traceback with paths
         print(json.dumps({"ok": False, "code": type(error).__name__}, sort_keys=True))
