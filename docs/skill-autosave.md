@@ -625,7 +625,7 @@ differs from the curator's "missing telemetry is never zero use" rule (#1739):
 that rule protects the archive decision, whereas this gate archives nothing —
 it only keeps an unproven draft on its node until a session uses it.
 
-Why: the 2026-10-22 twelve-node audit (Wiki LOG-20261022-soonwook-4) found 448
+Why: the 2026-10-22 twelve-node audit (Family Wiki operating log, 2026-10-22 skill usage audit) found 448
 distinct auto-generated skills on the fleet of which 17 had ever been invoked
 through the Skill tool, and only 13 of 556 autosave installs were ever used on
 the node that produced them — while every staged draft was being replicated to
