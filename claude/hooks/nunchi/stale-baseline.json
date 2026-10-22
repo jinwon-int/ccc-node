@@ -1,7 +1,8 @@
 {
-  "_comment": "Ratchet floors/ceilings for stale-bench.py on stale-fixture.json (40 scenarios). Measured 2026-10-22 on nunchi.py at ccc-node 82c80cb0 (ccc-node#2464). Raise the mins when detection improves; never lower them.",
+  "_comment": "Ratchet floors/ceilings for stale-bench.py on stale-fixture.json (40 scenarios), lexical path as CI runs it (no model2vec). Measured 2026-10-22 after state-aware recall (ccc-node#2464 제안 1): plain bm25 B M_new@5 1 → state-aware 4; R both@10 15 → 38. Raise the mins when detection improves; never lower them.",
   "a_detected_min": 0,
-  "b_new_at5_min": 1,
+  "b_new_at5_min": 4,
   "b_old_closed_max": 0,
-  "b_new_flagged_max": 0
+  "b_new_flagged_max": 0,
+  "r_both_at10_min": 38
 }

@@ -5,7 +5,9 @@ Phase A (isolated): per scenario a fresh DB ingests M_old then M_new under the u
 reports whether the write gates reacted — `closed` (M_old got valid_to via G1/B2), `flagged`
 (M_new review=1 via G3) or `missed`. Phase B (pooled): every scenario's M_old then M_new in one
 DB, then `search()` with the dim1 query; reports M_new/M_old recall@5/@10, the stale-trap rate
-(only M_old in top-5) and cross-scenario gate side effects (false closes, G3 flags).
+(only M_old in top-5) and cross-scenario gate side effects (false closes, G3 flags). Phase R
+(recent-state): per scenario M_old + 40 older distractors + M_new last — the shape a real peer
+timeline has — reports whether both states reach the top-10 of the production recall path.
 
 The node's real DB is never opened: NUNCHI_DB is pointed at a private temp dir before nunchi.py
 is imported. Exit 2 when a metric regresses past `stale-baseline.json` (a ratchet, never a
@@ -76,6 +78,24 @@ def phase_a(nunchi, scenarios: list[dict], tmp: str) -> dict:
     counts["detected"] = counts["closed"] + counts["flagged"]
     return counts
 
+def _search(nunchi, con, query: str, *, state_aware: bool):
+    """Production recall path (state_aware) or plain bm25; older nunchi.py lacks the flag."""
+    try:
+        return nunchi.search(con, query, nunchi.USER_PEER, limit=10, include_history=True, state_aware=state_aware)
+    except TypeError:
+        return nunchi.search(con, query, nunchi.USER_PEER, limit=10, include_history=True)
+
+
+def _has_vectors(path: str) -> bool:
+    con = sqlite3.connect(path)
+    try:
+        return bool(con.execute("SELECT 1 FROM fact_vecs LIMIT 1").fetchone())
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
 def phase_b(nunchi, scenarios: list[dict], tmp: str) -> dict:
     path = os.path.join(tmp, "pooled.db")
     _use_db(nunchi, path)
@@ -86,6 +106,7 @@ def phase_b(nunchi, scenarios: list[dict], tmp: str) -> dict:
     rows = _rows(path)
     con = sqlite3.connect(path)
     m = {"n": len(scenarios), "new_at5": 0, "new_at10": 0, "old_at5": 0, "stale_trap_at5": 0,
+         "lex_new_at5": 0, "lex_new_at10": 0, "vectors": _has_vectors(path),
          "old_closed": 0, "new_flagged": 0, "not_stored": 0}
     try:
         for s in scenarios:
@@ -93,9 +114,12 @@ def phase_b(nunchi, scenarios: list[dict], tmp: str) -> dict:
             if old is None or new is None:
                 m["not_stored"] += 1
                 continue
-            ids = [h[0] for h in nunchi.search(con, s["dim1_query"], nunchi.USER_PEER, limit=10, include_history=True)]
+            ids = [h[0] for h in _search(nunchi, con, s["dim1_query"], state_aware=True)]
+            lex_ids = [h[0] for h in _search(nunchi, con, s["dim1_query"], state_aware=False)]
             new_rank = ids.index(new[0]) + 1 if new[0] in ids else None
             old_rank = ids.index(old[0]) + 1 if old[0] in ids else None
+            m["lex_new_at5"] += bool(new[0] in lex_ids[:5])
+            m["lex_new_at10"] += bool(new[0] in lex_ids)
             new5 = bool(new_rank and new_rank <= 5)
             old5 = bool(old_rank and old_rank <= 5)
             m["new_at5"] += new5
@@ -107,6 +131,39 @@ def phase_b(nunchi, scenarios: list[dict], tmp: str) -> dict:
     finally:
         con.close()
     return m
+
+def phase_r(nunchi, scenarios: list[dict], tmp: str, distractors: int = 40) -> dict:
+    """Recent-state shape: per scenario a fresh DB holds M_old, then `distractors` other
+    scenarios' M_old facts (older noise), then M_new last. The dim1 query is asked with the
+    production recall path. Measures whether the latest state about the peer is visible at all
+    (window/recency) when the lexical query only names the old state."""
+    m = {"n": len(scenarios), "distractors": distractors, "new_at10": 0, "old_at10": 0, "both_at10": 0, "lex_both_at10": 0, "not_stored": 0}
+    for i, s in enumerate(scenarios):
+        path = os.path.join(tmp, f"recent-{i}.db")
+        _use_db(nunchi, path)
+        _ingest(nunchi, tmp, f"rold-{i}", s["M_old"])
+        for k in range(1, distractors + 1):
+            d = scenarios[(i + k) % len(scenarios)]
+            _ingest(nunchi, tmp, f"rdis-{i}-{k}", d["M_old"])
+        _ingest(nunchi, tmp, f"rnew-{i}", s["M_new"])
+        rows = _rows(path)
+        old, new = rows.get(s["M_old"].strip()), rows.get(s["M_new"].strip())
+        if old is None or new is None:
+            m["not_stored"] += 1
+            continue
+        con = sqlite3.connect(path)
+        try:
+            ids = [h[0] for h in _search(nunchi, con, s["dim1_query"], state_aware=True)]
+            lex_ids = [h[0] for h in _search(nunchi, con, s["dim1_query"], state_aware=False)]
+        finally:
+            con.close()
+        n10, o10 = new[0] in ids, old[0] in ids
+        m["new_at10"] += n10
+        m["old_at10"] += o10
+        m["both_at10"] += n10 and o10
+        m["lex_both_at10"] += (new[0] in lex_ids) and (old[0] in lex_ids)
+    return m
+
 
 def _regressions(a: dict, b: dict, base: dict) -> list[str]:
     """Only keys present in the baseline ratchet; an empty baseline only checks storage."""
@@ -139,23 +196,30 @@ def main(argv: list[str] | None = None) -> int:
     base = {}
     if os.path.exists(args.baseline):
         with open(args.baseline, encoding="utf-8") as fh:
-            base = json.load(fh)
+            raw = fh.read().strip()
+        base = json.loads(raw) if raw else {}
     with tempfile.TemporaryDirectory(prefix="nunchi-stale-") as tmp:
         os.chmod(tmp, 0o700)
         nunchi = _load_nunchi(os.path.join(tmp, "import.db"))
         a = phase_a(nunchi, scenarios, tmp)
         b = phase_b(nunchi, scenarios, tmp)
+        r = phase_r(nunchi, scenarios, tmp)
     regressions = _regressions(a, b, base)
-    result = {"scenarios": len(scenarios), "phase_a": a, "phase_b": b, "baseline": base, "regressions": regressions}
+    if "r_both_at10_min" in base and r["both_at10"] < base["r_both_at10_min"]:
+        regressions.append(f"R both@10 {r['both_at10']} < baseline {base['r_both_at10_min']}")
+    result = {"scenarios": len(scenarios), "phase_a": a, "phase_b": b, "phase_r": r, "baseline": base, "regressions": regressions}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
         n = len(scenarios)
         print(f"stale-bench: n={n} A detected={a['detected']} (closed {a['closed']}, flagged {a['flagged']}) missed={a['missed']}")
         print(f"stale-bench: B M_new@5={b['new_at5']}/{n} M_new@10={b['new_at10']}/{n} M_old@5={b['old_at5']}/{n} "
-              f"stale_trap@5={b['stale_trap_at5']}/{n} false_closes={b['old_closed']} g3_flags={b['new_flagged']}")
-        for r in regressions:
-            print(f"REGRESSION: {r}")
+              f"stale_trap@5={b['stale_trap_at5']}/{n} false_closes={b['old_closed']} g3_flags={b['new_flagged']} "
+              f"(plain bm25: M_new@5={b['lex_new_at5']}/{n} @10={b['lex_new_at10']}/{n}; vectors={b['vectors']})")
+        print(f"stale-bench: R(recent-state, {r['distractors']} distractors) M_new@10={r['new_at10']}/{n} "
+              f"M_old@10={r['old_at10']}/{n} both@10={r['both_at10']}/{n} (plain bm25 both@10={r['lex_both_at10']}/{n})")
+        for reg in regressions:
+            print(f"REGRESSION: {reg}")
     return 2 if regressions else 0
 
 if __name__ == "__main__":
