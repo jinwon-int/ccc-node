@@ -893,7 +893,7 @@ task = {"status": "succeeded", "result": {"output": {
                   "note": "Single-incident checklist; generalize before promotion."}],
     "evidence": [{"kind": "grep", "detail": "pins one incident"}],
     "model": "test-model", "reviewer_node": "reviewer1",
-    "head_sha": head, "rubric_version": "2026-08-28.2",
+    "head_sha": head, "rubric_version": "2026-10-22.1",
 }}}
 json.dump(task, open(path, "w"))
 PY
@@ -1855,7 +1855,7 @@ m._broker_task_gated = lambda config, row, task_id, secret: ({
             "taskId": "gt-2", "verdict": "approve", "skillName": "gate-skill",
             "sourceTreeSha256": "c" * 64, "headPrefix": "aaaaaaa",
             "head_sha": "a" * 40, "head_sha2": "a" * 40,
-            "rubric_version": "2026-08-28.2", "findings": [],
+            "rubric_version": "2026-10-22.1", "findings": [],
             "reviewer_node": "reviewer1",
         },
         "validations": [{"kind": "review", "nodeId": "reviewer1", "verdict": "pass"}],

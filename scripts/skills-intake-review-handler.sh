@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # skills-intake-review-handler.sh — external task handler for the
-# skills-intake-review intent (a2a-nexus#2007, rubric 2026-08-28.2).
+# skills-intake-review intent (a2a-nexus#2007, rubric 2026-10-22.1).
 #
 # Canonical fleet source (this file). Node-local copies under
 # /usr/local/sbin (Linux) or the Termux worker root historically forked and
@@ -248,13 +248,13 @@ HDR
   echo "## Approved-skill inventory snapshot (duplication check, rubric area G)"
   if [ -s "$tmp/inventory.txt" ]; then cat "$tmp/inventory.txt"; else echo "(empty)"; fi
   echo
-  echo "## Worker procedure (rubric ${rubric_version:-2026-08-28.2})"
+  echo "## Worker procedure (rubric ${rubric_version:-2026-10-22.1})"
   cat "$tmp/procedure.txt"
   echo "## Verdict schema"
   cat "$tmp/schema.json"
   echo "## Bindings (must appear in the verdict JSON)"
   printf 'skillName: %s\nsourceTreeSha256: %s\nheadPrefix: %s\nhead_sha: %s\nreviewer_node: %s\nrubric_version: %s\n' \
-    "$skill_name" "$tree_sha" "$head_prefix" "$head_sha" "$REVIEWER_NODE" "${rubric_version:-2026-08-28.2}"
+    "$skill_name" "$tree_sha" "$head_prefix" "$head_sha" "$REVIEWER_NODE" "${rubric_version:-2026-10-22.1}"
   echo "## Machine gate results (node-side, informational)"
   cat "$tmp/meta.json"
   echo
@@ -316,7 +316,7 @@ if [ "${out_bytes:-0}" -gt "$MAX_REVIEWER_OUTPUT_BYTES" ]; then
 fi
 [ -n "$(tr -d '[:space:]' < "$tmp/model-out.txt" | head -c 1)" ] || fail "empty model output"
 
-task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "$head_prefix" "$head_sha" "${rubric_version:-2026-08-28.2}" "$review_agent" "$review_model" "$tmp/skillfiles.txt" \
+task_result="$(python3 - "$tmp/model-out.txt" "$task_id" "$skill_name" "$tree_sha" "$head_prefix" "$head_sha" "${rubric_version:-2026-10-22.1}" "$review_agent" "$review_model" "$tmp/skillfiles.txt" \
   "$REVIEWER_NODE" <<'PYEOF'
 import json, re, sys
 

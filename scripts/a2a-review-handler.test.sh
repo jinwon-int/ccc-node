@@ -33,19 +33,19 @@ cat > "$BIN/stub-agent" <<STUB
 cat >/dev/null
 case "\${REVIEW_STUB_MODE:-approve}" in
   approve)
-    printf '{"verdict":"approve","findings":[],"head_sha":"%s","skillName":"stub-skill","rubric_version":"2026-08-28.2","model":"stub-model"}' "\$REVIEW_STUB_HEAD"
+    printf '{"verdict":"approve","findings":[],"head_sha":"%s","skillName":"stub-skill","rubric_version":"2026-10-22.1","model":"stub-model"}' "\$REVIEW_STUB_HEAD"
     ;;
   wronghead)
-    printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_OTHER_HEAD"
+    printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-10-22.1"}' "\$REVIEW_STUB_OTHER_HEAD"
     ;;
   blocker)
-    printf '{"verdict":"approve","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_HEAD"
+    printf '{"verdict":"approve","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","rubric_version":"2026-10-22.1"}' "\$REVIEW_STUB_HEAD"
     ;;
   blocker_wronghead)
-    printf '{"verdict":"reject","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_OTHER_HEAD"
+    printf '{"verdict":"reject","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","rubric_version":"2026-10-22.1"}' "\$REVIEW_STUB_OTHER_HEAD"
     ;;
   blocker_wrongskill)
-    printf '{"verdict":"approve","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","skillName":"other-skill","rubric_version":"2026-08-28.2"}' "\$REVIEW_STUB_HEAD"
+    printf '{"verdict":"approve","findings":[{"severity":"blocker","area":"safety","note":"credential pattern"}],"head_sha":"%s","skillName":"other-skill","rubric_version":"2026-10-22.1"}' "\$REVIEW_STUB_HEAD"
     ;;
   prose)
     printf 'This candidate looks generally fine to me.'
@@ -63,7 +63,7 @@ chmod +x "$BIN/stub-agent"
 make_task() {
   jq -n --arg head "$1" \
     '{id:"task-1", intent:"skills_intake_review",
-      payload:{skillName:"stub-skill", rubricVersion:"2026-08-28.2",
+      payload:{skillName:"stub-skill", rubricVersion:"2026-10-22.1",
         provenance:{author_node:"authornode", head_sha:$head, source_tree_sha256:"c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"},
         workerProcedure:"## Worker procedure\nApply the rubric.",
         verdictSchema:{verdict:"approve | revise | reject"},
@@ -81,7 +81,7 @@ make_task "$HEAD_OK"
 REVIEW_STUB_MODE=approve run_handler "$TMP/task.json" > "$TMP/out-approve.json" 2>/dev/null; rc=$?
 ok "approve verdict composes a bound result" \
   '[ "$rc" = 0 ] && jq -e ".output.verdict == \"approve\" and .output.head_sha == \"$HEAD_OK\"
-    and .output.headSha == \"$HEAD_OK\" and .output.rubric_version == \"2026-08-28.2\"
+    and .output.headSha == \"$HEAD_OK\" and .output.rubric_version == \"2026-10-22.1\"
     and .output.reviewer_node == \"testnode\" and .output.model == \"stub-model\"" >/dev/null "$TMP/out-approve.json"'
 ok "approve validates as kind=review pass by the reviewer node" \
   'jq -e ".validations[0].kind == \"review\" and .validations[0].nodeId == \"testnode\" and .validations[0].verdict == \"pass\"" >/dev/null "$TMP/out-approve.json"'
@@ -90,7 +90,7 @@ REVIEW_STUB_MODE=approve run_handler "$TMP/task.json" 2>/dev/null | python3 -c '
 import json, sys
 r = json.load(sys.stdin)
 assert r["output"]["head_sha"] and r["output"]["head_sha"] != ""
-assert r["output"]["rubric_version"] == "2026-08-28.2"
+assert r["output"]["rubric_version"] == "2026-10-22.1"
 ' 2>/dev/null; rc=$?
 ok "publisher binding keys survive (head_sha/rubric_version, snake_case)" '[ "$rc" = 0 ]'
 
@@ -571,7 +571,7 @@ ok "installer Termux profile ships the revise handler (#1460)" '[ "$rc" = 0 ] &&
 cat > "$BIN/capture-agent" <<'CAPSTUB'
 #!/usr/bin/env bash
 cat > "$PROMPT_CAPTURE"
-printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-08-28.2","model":"stub-model"}' "$REVIEW_STUB_HEAD"
+printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-10-22.1","model":"stub-model"}' "$REVIEW_STUB_HEAD"
 CAPSTUB
 chmod +x "$BIN/capture-agent"
 CAPTURED="$TMP/captured-prompt.txt"
@@ -618,13 +618,13 @@ cat <<JSON
  "evidence":[{"kind":"grep","detail":"grep -F 'stub skill body line' SKILL.md"},
              {"kind":"grep","detail":"grep -F 'Do NOT|must NOT' SKILL.md"},
              {"kind":"url","detail":"https://example.invalid/not-a-grep"}],
- "head_sha":"$REVIEW_STUB_HEAD","rubric_version":"2026-08-28.2","model":"stub-model"}
+ "head_sha":"$REVIEW_STUB_HEAD","rubric_version":"2026-10-22.1","model":"stub-model"}
 JSON
 EVSTUB
 chmod +x "$BIN/evidence-agent"
 jq -n --arg head "$HEAD_OK" \
   '{id:"task-ev", intent:"skills_intake_review",
-    payload:{skillName:"stub-skill", rubricVersion:"2026-08-28.2",
+    payload:{skillName:"stub-skill", rubricVersion:"2026-10-22.1",
       provenance:{author_node:"authornode", head_sha:$head, source_tree_sha256:"c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"},
       workerProcedure:"## Worker procedure\nApply the rubric.",
       verdictSchema:{verdict:"approve | revise | reject"},
@@ -712,7 +712,7 @@ cat > "\${PROMPT_CAPTURE:-/dev/null}"
 [ -n "\${AGENT_MARKER:-}" ] && touch "\$AGENT_MARKER"
 case "\${REVIEW_STUB_MODE:-approve}" in
   approve)
-    printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-08-28.2","model":"stub-model"}' "$HEAD_OK"
+    printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-10-22.1","model":"stub-model"}' "$HEAD_OK"
     ;;
   hang-ignore-term) trap '' TERM; sleep 30 ;;
   hang) echo "\$\$" > "\$AGENT_PIDFILE"; exec sleep 30 ;;
