@@ -3455,7 +3455,11 @@ _INFRA_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"credit balance is too low", re.I)),
     ("cli_incompatible", re.compile(
         r"does not support|or newer is required|unrecognized_model", re.I)),
-    ("rate_limited", re.compile(r"\b429\b|rate.?limit|overloaded_error|\b529\b", re.I)),
+    # Claude Code's own quota message ("You've hit your session limit · resets
+    # 10:30am (UTC)", fleet-skills#538 2026-10-21) carries no 429.
+    ("rate_limited", re.compile(
+        r"\b429\b|rate.?limit|overloaded_error|\b529\b|hit your (?:session|usage) limit|"
+        r"\b(?:session|usage) limit\b", re.I)),
 )
 _INFRA_TIMEOUT_CODES = frozenset({"handler_timeout", "task_timeout", "timeout", "lease_expired"})
 # One automatic retry per (lineage, head) on a *different* node. A second
@@ -7230,9 +7234,13 @@ def _retry_infra_failed_revise(
             "code": "revise_infra_retry_inputs_missing" if origin is not None else "revise_infra_origin_missing",
         }
     else:
+        # The retry is the same kind of round as the one that failed: a final
+        # (#2435 S2) or identity (#2435 S4) round re-dispatched as an ordinary
+        # one would hit the round limit or close the lineage instead.
         outcome = _dispatch_intake_revise(
             config, origin, rows, findings, str(origin.get("reviewer_node", "unknown")),
             dry_run=False, exclude=frozenset({failed_node}) if failed_node else frozenset(),
+            final=bool(row.get("final")), identity=bool(row.get("identity")),
         )
     dispatched = outcome.get("outcome") == "revise-dispatched"
     _comment_once(
@@ -8915,6 +8923,7 @@ def _sweep_identity_holds(
     now = time.time() if now is None else now
     rows = _ledger_rows(config)
     states = _recorded_intake_states(rows)
+    infra_failed = _infra_failed_task_ids(rows)
     holds: dict[str, dict[str, object]] = {}
     first_hold: dict[str, float] = {}
     for row in rows:
@@ -8943,6 +8952,7 @@ def _sweep_identity_holds(
             row for row in rows
             if row.get("kind") == "a2a-revise-dispatch" and row.get("identity")
             and row.get("node") == node and row.get("name") == name
+            and row.get("task_id") not in infra_failed  # #2435 S1: retried, never a close reason
         ]
         state = _identity_round_state(rounds, pr, revise_results)
         if state == "wait":

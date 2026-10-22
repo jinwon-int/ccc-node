@@ -64,6 +64,10 @@ class Classifier(unittest.TestCase):
         self.assertEqual(promotion._infra_failure_class(failed_task(OAUTH)), "auth_expired")
         self.assertEqual(promotion._infra_failure_class(failed_task(CLI)), "cli_incompatible")
         self.assertEqual(promotion._infra_failure_class(failed_task("x", code="handler_timeout")), "timeout")
+        # fleet-skills#538 (2026-10-21): Claude Code quota message, no 429.
+        self.assertEqual(promotion._infra_failure_class(failed_task(
+            "reviser agent run failed (rc=1): out[You've hit your session limit · resets 10:30am (UTC) ] err[]")),
+            "rate_limited")
 
     def test_balance_wins_over_plain_429(self) -> None:
         self.assertEqual(promotion._infra_failure_class(failed_task(BALANCE)), "balance_exhausted")
@@ -202,9 +206,11 @@ class ReviseCollection(unittest.TestCase):
         calls: list[dict] = []
         config = types.SimpleNamespace(collect_window=8)
 
-        def fake_dispatch(_config, origin, _rows, findings, reviewer, *, dry_run, exclude=frozenset()):
+        def fake_dispatch(_config, origin, _rows, findings, reviewer, *, dry_run, exclude=frozenset(),
+                          final=False, identity=False):
             calls.append({"origin": origin.get("dispatched_task"), "findings": findings,
-                          "reviewer": reviewer, "exclude": set(exclude)})
+                          "reviewer": reviewer, "exclude": set(exclude),
+                          **({"final": True} if final else {}), **({"identity": True} if identity else {})})
             return {"outcome": "revise-dispatched", "reviser": "node-g", "task_id": "rv2"}
 
         with patch.object(promotion, "_ledger_rows", return_value=rows), \
@@ -223,6 +229,17 @@ class ReviseCollection(unittest.TestCase):
         self.assertEqual(written[-1]["status"], "infra_failed")
         self.assertEqual(calls, [{"origin": "r1", "reviewer": "node-e", "exclude": {"node-f"},
                                   "findings": [{"severity": "major", "area": "claims", "note": "fix it"}]}])
+
+    def test_identity_and_final_rounds_are_retried_as_the_same_kind(self) -> None:
+        # #2435 S4 field case: the #538 generalization round failed on a session
+        # limit and was re-dispatched as an ordinary round would have been.
+        for flag in ("identity", "final"):
+            with self.subTest(flag=flag):
+                rows = [review_origin(), {**revise_dispatch("rv1", "node-f"), flag: True}]
+                task = failed_task("You've hit your session limit", payload=FINDINGS_PAYLOAD["payload"])
+                results, written, calls = self.run_collect(rows, task)
+                self.assertEqual(written[-1]["status"], "infra_failed")
+                self.assertTrue(calls[0].get(flag))
 
     def test_second_infra_failure_is_terminal_failed(self) -> None:
         rows = [review_origin(), revise_dispatch("rv1", "node-f"),

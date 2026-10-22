@@ -970,6 +970,10 @@ single approved candidate whose `SKILL.md` named a fleet node or product
   final round, once per lineage, and is not an arbitration trigger. A
   republished tree returns as a fresh intake PR — re-gated, re-reviewed and
   re-scanned at the next promote.
+- **Infrastructure failures are not a verdict:** a generalization round that
+  dies on the reviser node (auth, balance, session/usage limit, timeout) is
+  consumed as `infra_failed` and re-dispatched once elsewhere, as S1 does for
+  every revise round; it never counts as a close reason.
 - **Close:** the round ending in anything but `republished`, a hit surviving
   the lineage's round, or no round dispatchable for 48 h closes the intake PR
   (`a2a-arbitration-closed`, lifecycle `archived:identity-unresolved`). An
