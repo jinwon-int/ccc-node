@@ -341,7 +341,10 @@ def test_foreground_workload_snapshot_excludes_provider_background_work(
     assert oldest == 60.0
 
 
-async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
+async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
+    # 5 s, not 1 s: on a loaded merge-group runner (three interpreters with
+    # coverage) the 1 s budget expired before the fake session even ran its
+    # first step (#2446, bridge-tests 3.11). Real hangs still fail fast.
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0)
@@ -2822,7 +2825,10 @@ async def test_terminal_stall_preserves_interrupt_cancel_abort_close_order(
 ) -> None:
     session = OrderedStallSession("thread-1")
     handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
-    _pin_terminal_stall_bound(monkeypatch, 0.05)
+    # 1.0 s, not 0.05 s: the pending-read branch needs the retained read to be
+    # parked before the bound fires; at 0.05 s a loaded full-suite runner took
+    # the no-read branch instead (#2446: merge-group 3.12, 2026-10-16 twice).
+    _pin_terminal_stall_bound(monkeypatch, 1.0)
 
     response = await asyncio.wait_for(
         handler.process_message("ordered", 7, 70),
@@ -2910,8 +2916,9 @@ async def test_cancellation_during_interrupt_reaps_read_before_iterator_close(
 ) -> None:
     session = BlockingOrderedInterruptSession("thread-1")
     handler, _ = _stall_handler(tmp_path, FakeRuntime([session]), monkeypatch)
-    # Asserts the pending read is reaped, so the read must exist (#2349).
-    _pin_terminal_stall_bound(monkeypatch, 0.05)
+    # Asserts the pending read is reaped, so the read must exist (#2349);
+    # 1.0 s for the same loaded-runner reason as the ordered test (#2446).
+    _pin_terminal_stall_bound(monkeypatch, 1.0)
     handler._agent_interrupt_timeout_seconds = 0.01
     task = asyncio.create_task(handler.process_message("cancel", 7, 70))
     await session.interrupt_started.wait()
