@@ -31,3 +31,18 @@ The pooled shape is adversarial for recency (every fact is the same age); the re
 is what a real peer timeline looks like, and there the window makes the current state visible.
 Bridging two states that share no vocabulary at write time still needs a semantic signal
 (#2464 제안 2); this change only makes the latest state reachable at read time.
+
+## Point-in-time recall, citations and `why` (#2464 제안 3, #2466)
+
+All LLM-free except the one dialectic call that already existed.
+
+| Command | What it does |
+|---|---|
+| `recall <q> --as-of TS` / `dialectic <q> --as-of TS` / `why --query <q> --as-of TS` | only facts valid at `TS` (`valid_from <= TS` and not closed at or before it). `TS` is `YYYY-MM-DD` (end of that day, UTC) or an ISO datetime (any offset, normalised to UTC). In dialectic, a fact closed *after* `TS` is listed as current, and the prompt states the reference time. |
+| `dialectic` citations | every fact line is labelled `[#id\|rank]` (`user-stated`/`measured`/`inferred`) and the model is told to cite `[#id]`. A deterministic footer follows the answer: `근거: #id (kind·rank·valid_from~valid_to·supersedes #n)` for cited, retrieved facts, `미검증 인용:` for cited ids that were not in the retrieved set, or `인용 없음` when nothing was cited. Same DB + same answer → same footer. |
+| `why <id> [--json]` | one fact's provenance on one screen: rank, validity, evidence, `because`, review flag, `source_refs` (as `refs` prints them; a pre-#1264 row says `refs 없음`), what it replaced (`supersedes` chain, ⟵), what replaced it (⟶), and open G3 review siblings (same peer/kind, `review=1`, token overlap ≥ 0.6). Shows nothing beyond the fact text and the stored refs — no transcript text. |
+| `why --query <q> [--target T] [--limit N]` | the production recall set rendered in footer form, i.e. what dialectic would have to cite, without calling the model. |
+
+`bench.sh` rows carry `cited_ids=` (sorted, deduplicated `[#id]`s in the answer, or `none`), placed
+before `rc=` so existing `rc=… status=… source=…` parsers are unaffected. A usable answer with
+`cited_ids=none` is a hallucination suspect.

@@ -62,8 +62,10 @@ Storage / concurrency (#1478):
 Usage:
   nunchi.py init
   nunchi.py ingest <distill.json | ->     # mirror distill honcho[] items
-  nunchi.py recall <query> [--target T] [--limit N]
-  nunchi.py dialectic <query> [--target T]   # facts + MemPalace + Haiku
+  nunchi.py recall <query> [--target T] [--limit N] [--as-of TS]   # TS: YYYY-MM-DD | ISO (#2464)
+  nunchi.py dialectic <query> [--target T] [--as-of TS]   # facts + MemPalace + Haiku; [#id] cite footer (#2466)
+  nunchi.py why <fact_id> [--json]           # provenance: refs, because, supersedes chain, G3 siblings (#2466)
+  nunchi.py why --query <q> [--target T] [--limit N] [--as-of TS]  # what dialectic would cite, LLM-free
   nunchi.py synthesize <query>               # answer from stdin evidence (bench Wiki layer)
   nunchi.py supersede <fact_id> <new text>   # close old, insert new
   nunchi.py merge <dup_id> --into <fact_id>  # fold a duplicate into its survivor (#1336)
@@ -1167,25 +1169,35 @@ def _state_rerank(c, rows, query, where, args, limit):
     return sorted(rows, key=lambda r: score[r[0]])[:limit]
 
 
-def _state_window(c, target, exclude_ids, n):
-    """(b): the peer's n most recent open facts regardless of lexical match."""
+def _state_window(c, target, exclude_ids, n, as_of=None):
+    """(b): the peer's n most recent open facts regardless of lexical match.
+
+    With `as_of` (#2464 제안 3) "open" means open at that instant: recorded on or before it
+    and not closed before it."""
     if not target or n <= 0:
         return []
     # Exactly the n newest open facts; the ones already retrieved add nothing. Never reach
     # past the newest n — that would append older, unrelated facts (caught by the test).
+    open_clause = ("f.valid_from <= ? AND (f.valid_to IS NULL OR f.valid_to > ?)" if as_of
+                   else "f.valid_to IS NULL")
+    args = ([as_of, as_of] if as_of else [])
     rows = c.execute(
         "SELECT id,observed,kind,fact,valid_from,valid_to,because,0 FROM peer_facts f"
-        " WHERE f.observed=? AND f.valid_to IS NULL AND f.kind NOT IN ('observation','task-progress')"
-        " ORDER BY f.valid_from DESC, f.id DESC LIMIT ?", (target, n)).fetchall()
+        f" WHERE f.observed=? AND {open_clause} AND f.kind NOT IN ('observation','task-progress')"
+        " ORDER BY f.valid_from DESC, f.id DESC LIMIT ?", [target] + args + [n]).fetchall()
     return [r for r in rows if r[0] not in exclude_ids]
 
 
-def search(c, query, target=None, limit=10, include_history=False, state_aware=False):
+def search(c, query, target=None, limit=10, include_history=False, state_aware=False, as_of=None):
     where = "f.valid_to IS NULL" if not include_history else "1=1"
     args = []
     if target:
         where += " AND f.observed = ?"
         args.append(target)
+    if as_of:
+        # #2464 제안 3 — point-in-time view: only facts that were valid at `as_of`.
+        where += " AND f.valid_from <= ? AND (f.valid_to IS NULL OR f.valid_to > ?)"
+        args.extend([as_of, as_of])
     words = _expand_query(query) + _hallway_expansions(query)
     q = " OR ".join(_fts_phrase(w) for w in words) or _fts_phrase(query)
     pool = max(limit * 4, 40) if state_aware else limit
@@ -1206,7 +1218,7 @@ def search(c, query, target=None, limit=10, include_history=False, state_aware=F
         return rows
     rows = _state_rerank(c, rows, query, where, args, limit)
     window_n = min(_env_int("NUNCHI_STATE_WINDOW", 5, 0, 50), max(1, limit // 3))
-    window = _state_window(c, target, {r[0] for r in rows}, window_n)
+    window = _state_window(c, target, {r[0] for r in rows}, window_n, as_of)
     if window:
         rows = rows[:max(0, limit - len(window))] + window
     return rows[:limit]
@@ -1239,10 +1251,231 @@ def reindex_vecs():
     print(f"reindex-vecs: embedded {n}/{len(rows)} facts")
 
 
-def recall(query, target, limit):
-    for r in search(db(), query, target, limit, include_history=True, state_aware=True):
+# ---- as-of · citations · why (ccc-node#2464 제안 3, #2466) --------------------
+# `--as-of` gives a point-in-time view of the ledger (valid_from/valid_to already exist, so
+# this is a WHERE clause, never a rewrite). Citations make dialectic's evidence visible: every
+# fact line carries `[#id|rank]`, the model is told to cite `[#id]`, and a deterministic footer
+# lists what it actually cited (and what it cited that was never retrieved). `why` renders one
+# fact's provenance chain — refs, because, supersedes both ways, open G3 siblings — so a G2
+# verdict is inspectable at read time, not only at write time.
+_CITE_RE = re.compile(r"\[#(\d+)\]")
+_RANK_LABEL = {3: "user-stated", 2: "measured", 1: "inferred"}
+_WHY_CHAIN_MAX = 20
+
+
+def _parse_as_of(raw, cmd="recall"):
+    """None → None; `YYYY-MM-DD` → end of that day UTC; ISO datetime → UTC seconds; else exit."""
+    if raw is None or raw == "":
+        return None
+    text = str(raw).strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            dt = datetime.strptime(text, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        sys.exit(f"{cmd}: invalid --as-of (use YYYY-MM-DD or ISO datetime)")
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _rank_label(rank):
+    return _RANK_LABEL.get(int(rank or 1), "inferred")
+
+
+def _fact_meta(c, ids):
+    """id → (kind, source_rank, supersedes, valid_from, valid_to) for the given ids."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return {}
+    rows = c.execute(
+        f"SELECT id, kind, COALESCE(source_rank, 1), supersedes, valid_from, valid_to FROM peer_facts"
+        f" WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
+    return {r[0]: r[1:] for r in rows}
+
+
+def _cite_label(fid, meta):
+    kind, rank, sup, vf, vt = meta
+    span = f"{(vf or '')[:10]}~{(vt or '')[:10]}"
+    tail = f"·supersedes #{sup}" if sup else ""
+    return f"#{fid} ({kind}·{_rank_label(rank)}·{span}{tail})"
+
+
+def _citation_footer(answer, retrieved_meta):
+    """Deterministic footer: cited-and-retrieved ids, cited-but-unknown ids, or none."""
+    cited = []
+    for raw in _CITE_RE.findall(answer or ""):
+        fid = int(raw)
+        if fid not in cited:
+            cited.append(fid)
+    known = [fid for fid in cited if fid in retrieved_meta]
+    unknown = [fid for fid in cited if fid not in retrieved_meta]
+    lines = ["---"]
+    if known:
+        lines.append("근거: " + " · ".join(_cite_label(fid, retrieved_meta[fid]) for fid in known))
+    else:
+        # Wording must stay clear of bench.sh NO_RECORD_RE ("근거가 없", "기록 없음", …): an
+        # uncited answer is a hallucination suspect, not a refusal, and must not grade as one.
+        lines.append("인용 없음 (답변의 [#id] 인용 0건)")
+    if unknown:
+        lines.append("미검증 인용: " + ", ".join(f"#{fid}" for fid in unknown) + " (검색 집합에 없음)")
+    return "\n".join(lines)
+
+
+def recall(query, target, limit, as_of=None):
+    for r in search(db(), query, target, limit, include_history=True, state_aware=True, as_of=as_of):
         closed = f" ~{r[5]}]" if r[5] else ""
         print(f"[#{r[0]} {r[1]} ({r[2]}) {r[4][:10]}{closed} {r[3]}{_because_suffix(r[6])}")
+
+
+def why_query(query, target, limit, as_of=None):
+    """What dialectic WOULD cite for this query — the production recall path, no LLM."""
+    c = db()
+    rows = search(c, query, target, limit, include_history=True, state_aware=True, as_of=as_of)
+    meta = _fact_meta(c, [r[0] for r in rows])
+    if as_of:
+        print(f"기준 시점: {as_of}")
+    if not rows:
+        print("(검색 결과 없음)")
+        return
+    for r in rows:
+        if r[0] in meta:
+            print(f"- {_cite_label(r[0], meta[r[0]])} {r[3]}{_because_suffix(r[6])}")
+
+
+def _has_column(c, table, column):
+    return any(row[1] == column for row in c.execute(f"PRAGMA table_info({table})"))
+
+
+def _why_chain_down(c, fid):
+    """Facts this one replaced, oldest last (follow `supersedes`; cycle/depth guarded)."""
+    out, seen, cur = [], {fid}, fid
+    while len(out) < _WHY_CHAIN_MAX:
+        row = c.execute("SELECT supersedes FROM peer_facts WHERE id=?", (cur,)).fetchone()
+        if not row or not row[0] or row[0] in seen:
+            break
+        nxt = c.execute("SELECT id, kind, fact, valid_from, valid_to FROM peer_facts WHERE id=?", (row[0],)).fetchone()
+        if not nxt:
+            break
+        out.append(nxt)
+        seen.add(nxt[0])
+        cur = nxt[0]
+    return out
+
+
+def _why_chain_up(c, fid):
+    """Facts that replaced this one (rows whose supersedes points here), newest last."""
+    out, seen, frontier = [], {fid}, [fid]
+    while frontier and len(out) < _WHY_CHAIN_MAX:
+        cur = frontier.pop(0)
+        for nxt in c.execute(
+                "SELECT id, kind, fact, valid_from, valid_to FROM peer_facts WHERE supersedes=? ORDER BY id",
+                (cur,)).fetchall():
+            if nxt[0] in seen:
+                continue
+            seen.add(nxt[0])
+            out.append(nxt)
+            frontier.append(nxt[0])
+    return out
+
+
+def _why_siblings(c, fid, observed, kind, fact):
+    """Open G3 review siblings: same peer/kind, review=1, token overlap >= 0.6 (the G3 rule)."""
+    mine = _tokens(fact)
+    out = []
+    if not mine:
+        return out
+    for row in c.execute(
+            "SELECT id, fact, valid_from FROM peer_facts WHERE observed=? AND kind=? AND review=1"
+            " AND valid_to IS NULL AND id<>? ORDER BY id", (observed, kind, fid)).fetchall():
+        theirs = _tokens(row[1])
+        if theirs and len(mine & theirs) / min(len(mine), len(theirs)) >= 0.6:
+            out.append(row)
+    return out
+
+
+def _why_refs(raw):
+    """source_refs rendered like `refs`, as a list of lines; never raises."""
+    if not raw:
+        return ["refs 없음 (pre-#1264 row)"], []
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, list):
+        return [f"source_refs: (unparsable) {str(raw)[:120]}"], []
+    lines, items = [], []
+    for r in parsed:
+        if not isinstance(r, dict):
+            continue
+        line = f"- {r.get('type', '?')}: {r.get('ref', '')}"
+        if r.get("sha256_8"):
+            line += f" (sha256_8={r['sha256_8']})"
+        lines.append(line)
+        items.append(r)
+    return (lines or ["refs 없음"]), items
+
+
+def why(fid, json_out=False):
+    """#2466 — one fact's provenance chain on one screen (LLM 0회)."""
+    c = db()
+    cols = ("id, observer, observed, kind, fact, evidence, because, source_refs, "
+            "COALESCE(source_rank, 1), COALESCE(review, 0), valid_from, valid_to, supersedes")
+    row = c.execute(f"SELECT {cols} FROM peer_facts WHERE id=?", (fid,)).fetchone()
+    if not row:
+        sys.exit(f"why: no fact #{fid}")
+    (_, observer, observed, kind, fact, evidence, because, raw_refs,
+     rank, review, vf, vt, sup) = row
+    review_reason = None
+    if _has_column(c, "peer_facts", "review_reason"):
+        rr = c.execute("SELECT review_reason FROM peer_facts WHERE id=?", (fid,)).fetchone()
+        review_reason = rr[0] if rr else None
+    down = _why_chain_down(c, fid)
+    up = _why_chain_up(c, fid)
+    siblings = _why_siblings(c, fid, observed, kind, fact)
+    ref_lines, ref_items = _why_refs(raw_refs)
+    if json_out:
+        print(json.dumps({
+            "id": fid, "kind": kind, "fact": fact, "observer": observer, "observed": observed,
+            "source_rank": rank, "rank_label": _rank_label(rank), "valid_from": vf, "valid_to": vt,
+            "evidence": evidence, "because": because, "review": int(review), "review_reason": review_reason,
+            "supersedes": sup, "replaced": [{"id": r[0], "kind": r[1], "fact": r[2], "valid_from": r[3], "valid_to": r[4]} for r in down],
+            "replaced_by": [{"id": r[0], "kind": r[1], "fact": r[2], "valid_from": r[3], "valid_to": r[4]} for r in up],
+            "review_siblings": [{"id": r[0], "fact": r[1], "valid_from": r[2]} for r in siblings],
+            "source_refs": ref_items,
+        }, ensure_ascii=False))
+        return
+    span = f"{(vf or '')[:10]}~{(vt or '')[:10]}" + ("" if vt else " (현재 유효)")
+    print(f"#{fid} [{kind}·{_rank_label(rank)}] {span} observed={observed} observer={observer}")
+    print(f"  {fact}")
+    print(f"  evidence={evidence or '-'}")
+    print(f"  because: {because or '-'}")
+    flag = "review=1" if review else "review=0"
+    if review_reason:
+        flag += f" ({review_reason})"
+    print(f"  {flag}")
+    print("  source_refs:")
+    for line in ref_lines:
+        print(f"    {line}")
+    print("  대체 이력 (이 사실이 대체한 것):")
+    if down:
+        for r in down:
+            print(f"    ⟵ #{r[0]} [{r[1]}] {(r[3] or '')[:10]}~{(r[4] or '')[:10]} {r[2]}")
+    else:
+        print("    (없음)")
+    print("  대체됨 (이 사실을 대체한 것):")
+    if up:
+        for r in up:
+            print(f"    ⟶ #{r[0]} [{r[1]}] {(r[3] or '')[:10]}~{(r[4] or '')[:10]} {r[2]}")
+    else:
+        print("    (없음)")
+    print("  열린 충돌 후보 (G3 review 형제):")
+    if siblings:
+        for r in siblings:
+            print(f"    ⚠ #{r[0]} {(r[2] or '')[:10]} {r[1]}")
+    else:
+        print("    (없음)")
 
 
 # Provider notices that mean "this backend produced no answer". Kept byte-identical
@@ -1736,15 +1969,26 @@ def synthesize_stdin(query):
     print(llm_synthesize(prompt))
 
 
-def dialectic(query, target):
+def dialectic(query, target, as_of=None):
     c = db()
-    facts = search(c, query, target, limit=12, include_history=True, state_aware=True)
-    current = [f"- ({(r[4] or '')[:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if not r[5]]
-    history = [f"- ({r[4][:10]}~{r[5][:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if r[5]]
+    facts = search(c, query, target, limit=12, include_history=True, state_aware=True, as_of=as_of)
+    meta = _fact_meta(c, [r[0] for r in facts])
+
+    def tag(r):
+        rank = meta.get(r[0], (None, 1))[1]
+        return f"[#{r[0]}|{_rank_label(rank)}]"
+    # With --as-of, a fact closed only after that instant was still current then.
+    def is_open(r):
+        return not r[5] or bool(as_of and r[5] > as_of)
+    current = [f"- {tag(r)} ({(r[4] or '')[:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if is_open(r)]
+    history = [f"- {tag(r)} ({r[4][:10]}~{r[5][:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if not is_open(r)]
     verbatim = verbatim_excerpts(query, 3)   # §3: verbatim layer, optional (#2331)
+    as_of_line = f"기준 시점: {as_of} (이 시점에 유효했던 사실만 검색됨)\n" if as_of else ""
     prompt = (
+        as_of_line +
         "아래는 peer 메모리(요약 사실)와 MemPalace(원문 발췌)에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
         "근거에 없는 내용은 지어내지 말고 '기록 없음'이라 하라. 시일이 닫힌(valid_to 있는) 사실은 과거 이력이다.\n"
+        "근거로 쓴 사실은 문장 끝에 `[#id]`로 인용하라. 인용할 근거가 없으면 '기록 없음'이라 하라.\n"
         "현재 유효 사실 앞의 날짜는 기록 시점이다. 같은 주제의 사실이 여럿이면 가장 최근 것을 현재 상태로 보고, "
         "더 오래된 사실은 갱신됐을 수 있다고 분명히 말하라(옛 사실을 현재로 단정하지 마라).\n"
         # #832 — MemPalace serves raw transcript chunks, so a chunk can carry a
@@ -1756,7 +2000,12 @@ def dialectic(query, target):
         f"질문: {query}\n\n[peer 사실 — 현재 유효]\n" + ("\n".join(current) or "(없음)") +
         "\n\n[peer 사실 — 과거 이력]\n" + ("\n".join(history) or "(없음)") +
         "\n\n[MemPalace 원문 발췌]\n" + (verbatim or "(없음)"))
-    print(llm_synthesize(prompt))
+    answer = llm_synthesize(prompt)
+    print(answer)
+    # No footer on an empty answer: bench.sh grades a blank answer INVALID(empty), and a
+    # footer alone would turn it into a "usable" row.
+    if (answer or "").strip():
+        print(_citation_footer(answer, meta))
 
 
 def annotate(fid, because):
@@ -2559,9 +2808,16 @@ if __name__ == "__main__":
     elif cmd == "ingest":
         ingest(args[0])
     elif cmd == "recall":
-        recall(args[0], flag("--target"), int(flag("--limit", 10)))
+        recall(args[0], flag("--target"), int(flag("--limit", 10)), _parse_as_of(flag("--as-of"), "recall"))
     elif cmd == "dialectic":
-        dialectic(args[0], flag("--target"))
+        dialectic(args[0], flag("--target"), _parse_as_of(flag("--as-of"), "dialectic"))
+    elif cmd == "why":
+        if "--query" in args and flag("--query"):
+            why_query(flag("--query"), flag("--target"), int(flag("--limit", 10)), _parse_as_of(flag("--as-of"), "why"))
+        elif args and args[0].lstrip("#").isdigit():
+            why(int(args[0].lstrip("#")), "--json" in args)
+        else:
+            sys.exit("usage: nunchi.py why <fact_id> [--json] | why --query <q> [--target t] [--limit n] [--as-of ts]")
     elif cmd == "synthesize":
         synthesize_stdin(args[0])
     elif cmd == "annotate":

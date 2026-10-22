@@ -277,6 +277,11 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
       if [ "$source" = none ]; then grade=UNANSWERED; else grade=ANSWERED; fi
     fi
   fi
+  # #2466 — fact ids the answer cited as [#id] (dialectic is told to cite its evidence). A usable
+  # answer that cites nothing is a hallucination suspect, the way status= flags provider failures.
+  # Placed before rc= so `rc=… status=…` and the trailing `source=…` / `grade=…` keep their shape.
+  cited_ids="$(printf '%s' "$ans" | grep -oE '\[#[0-9]+\]' | tr -d '[]#' | sort -un | paste -sd, -)"
+  [ -n "$cited_ids" ] || cited_ids=none
   # Column 6 (wiki_state) is appended: the summary reads columns by position,
   # so earlier columns keep their meaning.
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$qid" "$status" "$source" "$polarity" "$grade" "$wiki_state" >> "$LEDGER"
@@ -291,9 +296,9 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
     wiki_tag=
     [ "$wiki_state" != - ] && wiki_tag=" wiki=$wiki_state"
     if [ -n "$reason" ]; then
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status reason=$reason$wiki_tag source=$source$suffix"
+      echo "## $qid ($category) — ${dur}s cited_ids=$cited_ids rc=$rc status=$status reason=$reason$wiki_tag source=$source$suffix"
     else
-      echo "## $qid ($category) — ${dur}s rc=$rc status=$status$wiki_tag source=$source$suffix"
+      echo "## $qid ($category) — ${dur}s cited_ids=$cited_ids rc=$rc status=$status$wiki_tag source=$source$suffix"
     fi
     echo "- Q: $query"
     echo "- expect: $expect"
