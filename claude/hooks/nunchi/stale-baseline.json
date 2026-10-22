@@ -1,0 +1,7 @@
+{
+  "_comment": "Ratchet floors/ceilings for stale-bench.py on stale-fixture.json (40 scenarios). Measured 2026-10-22 on nunchi.py at ccc-node 82c80cb0 (ccc-node#2464). Raise the mins when detection improves; never lower them.",
+  "a_detected_min": 0,
+  "b_new_at5_min": 1,
+  "b_old_closed_max": 0,
+  "b_new_flagged_max": 0
+}

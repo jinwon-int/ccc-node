@@ -1,0 +1,325 @@
+{
+ "source": "STALEproj/STALE (T1_T2_400_FULL.json), arXiv:2605.06527, CC-BY-4.0 — 40-scenario subset (seed 20261022: 20 T1 + 20 T2); haystack sessions and dim2/dim3 queries omitted",
+ "scenarios": [
+  {
+   "uid": "cd3a854f-d055-49f2-9424-87f1ca8e924b",
+   "type": "T1",
+   "M_old": "My main priority right now is clearing the remaining balance on the business loan before I reinvest any profits.",
+   "M_new": "I just signed a 48‑month lease on a new car, so that fixed monthly payment is now the first thing I cover every payday before I put money anywhere else.",
+   "dim1_query": "Based on the conversation history, does the user still consider clearing the remaining balance on the business loan to be their main financial priority before reinvesting any profits?",
+   "explanation": "Current focus has shifted away from repaying a business loan balance to prioritizing servicing a newly taken-on long-term car lease obligation as the top financial target."
+  },
+  {
+   "uid": "2f07b5f8-db40-46f9-8967-bff100035cc1",
+   "type": "T1",
+   "M_old": "I've been keeping to a routine of four strength training sessions each week for quite some time now.",
+   "M_new": "After work lately I’ve only been able to squeeze in two quick full‑body lifting sessions a week, usually on Tuesday and Saturday.",
+   "dim1_query": "Based on the conversation history, does the user still follow a routine of four strength training sessions each week?",
+   "explanation": "Routine.exercise_regimen has changed from a regular four-day weekly strength training habit to a two-day-per-week lifting routine."
+  },
+  {
+   "uid": "73d16c7c-15b6-472b-ae93-6da298bff0ec",
+   "type": "T1",
+   "M_old": "I usually need to find a spot to sit down every hour or so, because my arthritis acts up if I stand too long.",
+   "M_new": "I’ve been getting back into long walks lately, and it feels good not having to hunt for a bench partway through.",
+   "dim1_query": "Based on the conversation history, does the user still need to sit down about every hour because standing too long causes their arthritis to act up?",
+   "explanation": "Chronic arthritis is no longer limiting their ability to stand/walk for extended periods (symptoms have significantly improved or gone into remission)."
+  },
+  {
+   "uid": "d9545076-78b1-4d66-9910-00a15f9b5b90",
+   "type": "T1",
+   "M_old": "My credit score has stayed around 750 for the past year, so I shouldn't have any trouble getting approved.",
+   "M_new": "I checked my report this week and it’s sitting in the low 600s now, so I’m expecting the application to be a tougher sell.",
+   "dim1_query": "Based on the conversation history, does the user still have a credit score around 750 and expect easy approval?",
+   "explanation": "Credit score has dropped to the low 600s."
+  },
+  {
+   "uid": "90797997-d232-4af2-a132-8a081a13de13",
+   "type": "T1",
+   "M_old": "My life is essentially on hold until my daughter is older because I'm the only one available to care for her.",
+   "M_new": "Since my schedule has opened up a lot lately, I’ve started signing up for weekend workshops and even penciled in a two-week trip this fall without having to coordinate anything complicated.",
+   "dim1_query": "Based on the conversation history, does the user still have to keep their life essentially on hold because they’re the only one available to provide care for their child?",
+   "explanation": "Caregiving burden has dropped from being the sole, always-on responsible party to having substantial free time and flexibility for personal commitments."
+  },
+  {
+   "uid": "3ab1d7a5-5560-4bfd-8bbd-80277deb4154",
+   "type": "T1",
+   "M_old": "I'm on Pacific Time, so my local clock is running three hours behind my NYC clients.",
+   "M_new": "Most of my client in America work happens at 9 a.m. their time — that's 2 p.m. my time, just after lunch.",
+   "dim1_query": "Based on the conversation history, is the user still on Pacific Time (three hours behind the other person)?",
+   "explanation": "User is now in a timezone that is 5 hours ahead of the client(e.g., UK time/GMT or similar), no longer Pacific Time (3 hours behind)."
+  },
+  {
+   "uid": "f7fb891b-c640-4ae1-ae78-a1b540adcf4b",
+   "type": "T1",
+   "M_old": "I'm on good enough terms with the family next door that I keep a spare key with them just in case.",
+   "M_new": "After the new couple moved in beside me, we agreed to keep things simple and just stick to quick hellos in the hallway—no swapping contact info or favors.",
+   "dim1_query": "Based on the conversation history, does the user still have a trusting enough relationship with the neighbors next door to keep a spare key with them?",
+   "explanation": "Neighbor relations have shifted from trusting/cooperative to distant and non-involved with the current adjacent neighbors."
+  },
+  {
+   "uid": "8aeb8778-861e-45f7-b8b5-224ff5eece63",
+   "type": "T1",
+   "M_old": "Honestly, after years of helping out during the block parties, most neighbors just assume my word is solid when it comes to planning events.",
+   "M_new": "At my building’s annual meeting last night, they put me on the spot to explain myself, and now anything I submit has to be verified by someone else before they’ll accept it.",
+   "dim1_query": "Based on the conversation history, does the user still have a broadly trusted reputation among their neighbors when it comes to planning events?",
+   "explanation": "Reputation has shifted from being broadly trusted and seen as reliably honest to being regarded with suspicion and requiring oversight/verification by peers in the same local community setting."
+  },
+  {
+   "uid": "18ef1a92-4489-477c-8ad7-257bc4795ee8",
+   "type": "T1",
+   "M_old": "The neighbors next door and I have been on friendly terms for years, so we make a point to check in on each other regularly.",
+   "M_new": "Since I moved into this building, I’ve mostly kept to myself—people here tend to just nod in the hallway and go on with their day.",
+   "dim1_query": "Based on the conversation history, does the user still have long-standing friendly neighbor relations where they regularly check in on each other?",
+   "explanation": "Neighbor relations have shifted from long-standing friendly, reciprocal check-ins to minimal, distant interactions with little to no rapport."
+  },
+  {
+   "uid": "7c0ae4e7-6b5a-42a2-891b-0ccf553bfe7f",
+   "type": "T1",
+   "M_old": "I've been based in Seattle for the last few years.",
+   "M_new": "I just finished updating my address after settling into my new place in Austin, and I’m trying to get set up with the local utilities and services here.",
+   "dim1_query": "Based on the conversation history, does the user still live in Seattle?",
+   "explanation": "Spatiotemporal_Context.location(city) is now Austin."
+  },
+  {
+   "uid": "fcc2ebed-5a2f-4f18-adbc-a30f0370ee8a",
+   "type": "T1",
+   "M_old": "I keep the cloud backup turned off on my end.",
+   "M_new": "I just checked my phone settings and everything's syncing to my online storage automatically now, including my photos and app data.",
+   "dim1_query": "Based on the conversation history, does the user still keep their cloud backup turned off?",
+   "explanation": "Cloud backup enabled (automatic syncing is on)."
+  },
+  {
+   "uid": "dfa3672e-efd9-44bb-a83a-2259362dcbae",
+   "type": "T1",
+   "M_old": "I told my friend I'd be there, and skipping out just because something else came up feels like a betrayal; my word has to count for something.",
+   "M_new": "This year I’ve been leaning into being more flexible—if a better opportunity comes up, I’m fine reshuffling my schedule so I can take it without feeling guilty.",
+   "dim1_query": "Based on the conversation history, does the user still believe that backing out of a commitment when something else comes up is a betrayal and that their word must be strictly kept?",
+   "explanation": "Updated moral foundation: prioritizes personal benefit/opportunity and adaptability over loyalty and strict promise-keeping."
+  },
+  {
+   "uid": "17c4192e-ee5a-442a-b492-f69641d836c3",
+   "type": "T1",
+   "M_old": "I'm currently self-employed, so my work schedule is entirely up to me.",
+   "M_new": "After orientation today, I finally got my employee badge and benefits portal set up at the company.",
+   "dim1_query": "Based on the conversation history, is the user still self-employed with a fully self-directed work schedule?",
+   "explanation": "Now employed by a company (salaried/employee) rather than self-employed."
+  },
+  {
+   "uid": "b6689bbc-d261-41e5-bd6c-cfbccc9bb5e9",
+   "type": "T1",
+   "M_old": "My routine keeps me indoors most days, so I'm not often outside.",
+   "M_new": "Ever since I took over the morning dog-walking route, I’m on my feet along the neighborhood sidewalks for hours every day before lunch.",
+   "dim1_query": "Based on the conversation history, does the user still spend most days indoors and is not often outside?",
+   "explanation": "Updated indoor_outdoor_status: Predominantly Outdoor (spends most days outside for extended daily periods)."
+  },
+  {
+   "uid": "d3c29646-a06a-46d1-9354-0a9ae8789dc3",
+   "type": "T1",
+   "M_old": "It's always been just the four of us, my wife, our two children, and me.",
+   "M_new": "Now that the baby’s here, our mornings are a lot louder—three kids under one roof is a whole new kind of busy.",
+   "dim1_query": "Based on the conversation history, does the user still have a household made up of just the user, their wife, and two children?",
+   "explanation": "Family unit has expanded to include a third child (spouse plus three children)."
+  },
+  {
+   "uid": "894c2b42-f754-4dd1-8d8b-5d835e80c0f1",
+   "type": "T1",
+   "M_old": "My parents and my brother live with me, so it's a pretty full house with four of us.",
+   "M_new": "I’ve been getting used to having the place to myself lately—coming home to a quiet, empty apartment has been a big change.",
+   "dim1_query": "Based on the conversation history, does the user still live with their parents and brother?",
+   "explanation": "Now lives alone (no longer co-resides with parents or sibling)."
+  },
+  {
+   "uid": "675032f6-94b0-407b-9260-e97bcd5aa56b",
+   "type": "T1",
+   "M_old": "I usually pick the packages with Korean text since I can verify the ingredients directly without needing to trust the translated stickers.",
+   "M_new": "At the community center today, I relied on the live captions and a bilingual volunteer to follow the announcements, since I can only really make sense of the Roman alphabet now.",
+   "dim1_query": "Based on the conversation history, does the user still reliably read Korean text well enough to verify ingredients directly on packages without needing translated stickers?",
+   "explanation": "Reading proficiency has shifted away from Hangul; the user now primarily reads only Latin-script text and needs assistance/captions for Hangul-based content."
+  },
+  {
+   "uid": "9d610c68-0c1a-4ed5-b4e2-f25b3dbe138e",
+   "type": "T1",
+   "M_old": "I'm mostly just focused on getting the client migration plans finalized for this sprint.",
+   "M_new": "I’m spending most of my time these days getting the dissertation edits wrapped up and coordinating my defense date with my committee.",
+   "dim1_query": "Based on the conversation history, does the user still say they’re mostly focused on getting the client migration plans finalized for this sprint?",
+   "explanation": "Current_Focus.work_tasks has shifted from finalizing client migration plans for a sprint to finishing dissertation revisions and scheduling a PhD defense (a mutually incompatible primary focus with sprint-based client migration planning)."
+  },
+  {
+   "uid": "5b0c6c55-107c-4bc1-bfeb-c0a00f0481ee",
+   "type": "T1",
+   "M_old": "I usually keep a pretty broad mix of apps on my phone since I find myself constantly toggling between different tools for chat, schedules, and reading.",
+   "M_new": "Lately my phone’s been so much easier to manage—I’ve basically pared it down to just a handful of essentials I use every day, like one messenger, my calendar, and a single reading app.",
+   "dim1_query": "Based on the conversation history, does the user still keep a broad mix of apps on their phone and frequently toggle between many different tools?",
+   "explanation": "Digital_Footprint.app_usage_diversity is now low; the user regularly relies on only a small set of core apps rather than 20+ across many categories."
+  },
+  {
+   "uid": "f6fa850c-8af6-4205-ab28-4a02dde899ee",
+   "type": "T1",
+   "M_old": "I've really been zeroing in on buying a permanent home for the past few years.",
+   "M_new": "I’ve been pouring my long-term planning into getting accepted into a multi-year residency program overseas, so I’m organizing everything around moving abroad for the next several years.",
+   "dim1_query": "Based on the conversation history, does the user still have buying a permanent home as their primary long-term goal?",
+   "explanation": "Current_Focus.long_term_goals has shifted from acquiring a permanent home to committing to a multi-year overseas relocation/residency."
+  },
+  {
+   "uid": "8d21e02f-37b9-49c8-9561-1c28ed677c71",
+   "type": "T2",
+   "M_old": "I'm currently in the luteal phase of my cycle, so I'm expecting my energy levels to be lower than usual for the next week.",
+   "M_new": "I had my baseline ultrasound this morning, and the nurse casually mentioned the lining was still thin and the follicles were just starting to wake up—so they told me to come back in two days for another scan before they’ll even think about scheduling anything.",
+   "dim1_query": "Based on the conversation history, does the user still appear to be in the luteal phase of their cycle?",
+   "explanation": "Attribute A update: recent clinical findings indicating an early-cycle baseline (thin uterine lining + follicles just beginning to develop). Dependency A → B: ultrasound markers of cycle stage determine hormonal_cycle_status; a thin lining with early follicular development is inconsistent with the progesterone-dominant, post-ovulation luteal phase implied by M_old. Because these observations are tied to the current state of the cycle rather than future preparation, the luteal-phase status becomes no longer feasible."
+  },
+  {
+   "uid": "546d39d6-ee7f-4cef-b457-a2f944d2543c",
+   "type": "T2",
+   "M_old": "I'm exposed to pretty intense sunlight on a daily basis since the sky here stays clear most of the time.",
+   "M_new": "I’ve started timing my dog’s walks by the tide charts—some days the boardwalk’s underwater, and on the others the air’s so thick with mist that everything a block away looks like it’s been rubbed out.",
+   "dim1_query": "Based on the conversation history, does the user still get exposed to pretty intense sunlight on a daily basis because the sky stays clear most of the time?",
+   "explanation": "Attribute A update: Location/climate has shifted to a coastal, fog-prone, tide-affected environment → dependency A → B: local climate patterns determine typical sky clarity and thus ambient sunlight exposure intensity → why B implied by M_old is no longer feasible: a place with frequent heavy mist/fog and regular overcast conditions would not support being exposed to intense sunlight daily because clear skies are not the norm."
+  },
+  {
+   "uid": "ea9f1298-5dab-46f2-a492-0c5bb69b6465",
+   "type": "T2",
+   "M_old": "I've been trying to master this chord transition for a month, but my fingers still fumble every time.",
+   "M_new": "The nurse said I can take the splint off for showers now, but I’m still not supposed to bend my left ring finger much—so I’ve been practicing opening jars one-handed while I wait for the swelling to go down.",
+   "dim1_query": "Based on the conversation history, does the user’s current frustration still center on repeatedly fumbling a specific chord transition due to technique rather than any physical limitation?",
+   "explanation": "Attribute A update: Hand/finger injury requiring a splint and limited bending. Dependency A → B: Finger mobility/hand dexterity directly affects the ability to execute precise fretting movements on guitar. Therefore the earlier frustration (persistent difficulty with a specific chord transition) is no longer feasible as the same kind of skill issue; the continued fumbling would now be attributable to restricted finger movement rather than unchanged technique."
+  },
+  {
+   "uid": "66e34cad-db2b-4aaa-b42d-b587d651c6db",
+   "type": "T2",
+   "M_old": "I handle the kids' evening routine every weekday, so I'm consistently tied up during those hours.",
+   "M_new": "I finally signed the lease on that little studio near the hospital—it's strange coming home to a place where the only thing waiting for me is a silent fridge and a stack of untouched mail.",
+   "dim1_query": "Based on the conversation history, does the user still handle the kids' evening routine every weekday and remain consistently tied up during those hours?",
+   "explanation": "Attribute A update: living arrangement changes to living alone in a separate studio → dependency A → B: living separately from the family typically implies not being the primary weekday evening caregiver in the same household → the old value (primary responsibility for weekday evening childcare) becomes no longer feasible without explicitly mentioning childcare or the kids’ routine."
+  },
+  {
+   "uid": "50ebe545-201b-486b-8c60-9792f9672204",
+   "type": "T2",
+   "M_old": "I actually gave up on those loyalty programs a long time ago; I prefer paying full price over letting them log everything I buy.",
+   "M_new": "I spent last night setting up my new bank account—turns out the cash-back card only works if you let it auto-categorize your purchases and sync with the budgeting dashboard, so I just clicked through the permissions to get it up and running.",
+   "dim1_query": "Based on the conversation history, does the user still avoid any shopping-related programs or services that log and track what they buy?",
+   "explanation": "Attribute A update: Financial setup/payment method change (adopting a cash-back card with purchase-sync budgeting features) → dependency A → B: using a card that auto-categorizes and syncs transactions necessarily creates a detailed merchant-level spending record and shares it with a commercial platform → why B is no longer feasible: the earlier stance of avoiding commercial purchase tracking via loyalty-style logging becomes inconsistent, because the new payment/budgeting setup entails allowing comprehensive purchase logging without mentioning loyalty programs or discounts."
+  },
+  {
+   "uid": "94f25542-0d99-4b36-9915-22ff163b3f50",
+   "type": "T2",
+   "M_old": "You can verify my status; I've held my card with the electrical workers' union since last year.",
+   "M_new": "I had to swing by the courthouse this morning to sign the final papers—my name’s officially changed now, so I’m spending the afternoon updating it everywhere it shows up.",
+   "dim1_query": "Based on the conversation history, can the user still verify their status with their electrical workers’ union card?",
+   "explanation": "Attribute A (legal name/identity status) updated → dependency A → B (organizational memberships and ID cards are issued under a legal name and typically require reissuance/verification when the member’s legal identity changes) → the earlier value of B (being a member holding an Electrical Workers’ Union card since last year) becomes infeasible as stated because the existing card/record under the old name would no longer cleanly verify without replacement/updates."
+  },
+  {
+   "uid": "9f814b29-e5f7-4fbb-9992-534f4830c2a8",
+   "type": "T2",
+   "M_old": "I've made a commitment to volunteer at the community center every Saturday.",
+   "M_new": "Quick note from a totally different corner of my life: I just signed the lease on a little bakery stall at the weekend market, and the vendor orientation made it clear the stallholders are expected on-site for opening, setup, and the full sales window each week.",
+   "dim1_query": "Based on the conversation history, does the user still have a standing commitment to volunteer at the community center every Saturday?",
+   "explanation": "Attribute A update: Employment/obligation change (becoming a weekend market stallholder with required on-site presence). Dependency A → B: A new role with mandatory weekly on-site hours constrains availability and effectively reshapes recurring commitments. Why B is no longer feasible: the previously stated recurring weekly volunteer commitment relied on consistent free time on that day; a required weekly market presence makes keeping that standing commitment unrealistic even though M_new never mentions the day or the volunteering."
+  },
+  {
+   "uid": "779e5fe0-3964-4078-9f51-093d75f75dae",
+   "type": "T2",
+   "M_old": "I alternate between a couple of locations every week, so I'm not always at the same place.",
+   "M_new": "Quick note: I’m in the middle of a multi‑month physical therapy program after knee surgery, so for a while I have to stay within a short ride of the clinic for early-morning sessions and follow-up checks.",
+   "dim1_query": "Based on the conversation history, does the user still alternate between a couple of locations every week?",
+   "explanation": "Attribute A update: Health/medical treatment constraints (post-surgery rehab requiring frequent, time-sensitive appointments at one clinic). Dependency A → B: Ongoing rehab with frequent early appointments typically forces a person to remain near the treatment location and maintain a stable base, which in turn makes a weekly back-and-forth between fixed locations (B: weekly alternation in location) no longer feasible."
+  },
+  {
+   "uid": "cf25e575-4665-447a-ab58-e464af6e6d2d",
+   "type": "T2",
+   "M_old": "My partner and I have been together for about four years now, so we're pretty serious about each other.",
+   "M_new": "I spent Saturday afternoon meeting with a mediator to go over a co‑parenting schedule and how we’re splitting the holidays—turns out the boring paperwork is the part that actually stings.",
+   "dim1_query": "Based on the conversation history, does the user still have a stable, serious romantic partnership with their partner of about four years?",
+   "explanation": "Attribute A update: Legal/family status shifts into separation proceedings with formalized co-parenting arrangements. Dependency A → B: entering mediation to formalize co-parenting and holiday splits typically follows a relationship breakdown, which makes the earlier implied Social_Network.lover state (a stable, committed 4-year partnership) no longer feasible at this later time, without M_new ever mentioning the partner or relationship status directly."
+  },
+  {
+   "uid": "53d876a2-e3a6-4107-848d-467a5ea117fd",
+   "type": "T2",
+   "M_old": "Go ahead and set it to 85 kilograms; I've maintained that same weight consistently for the past year.",
+   "M_new": "Sorry if I sound a little winded—my endocrinologist just switched my thyroid meds last month, and I’m still figuring out the right dose. I’ve had to punch a new notch in my belt twice since then.",
+   "dim1_query": "Based on the conversation history, does the user still weigh 85 kilograms and consider that weight to have been consistent over the past year?",
+   "explanation": "Attribute A update: thyroid medication/dosage change affecting metabolism → dependency A → body_weight stability (B). A thyroid dose adjustment commonly leads to noticeable weight change, which makes the earlier claim of maintaining 85 kg consistently for the past year no longer feasible."
+  },
+  {
+   "uid": "ed2ab471-f1e7-4f43-8d7f-c41c6f25d0a5",
+   "type": "T2",
+   "M_old": "You'll notice I keep the display case locked, since it holds the vintage ceramics I've collected from different cultures.",
+   "M_new": "I’m still getting used to the echo in this place—after the movers cleared out the last of my fragile stuff, the rooms started sounding twice as big.",
+   "dim1_query": "Based on the conversation history, does the user still keep a locked display case to protect their vintage ceramics collection from different cultures?",
+   "explanation": "Attribute A update: the user has recently moved out/removed their fragile items (A = household contents/fragile possessions status). Dependency A → B: if the fragile items have been cleared out, then maintaining a locked display case to protect a cultural collection of vintage ceramics (B) is no longer feasible, since that collection would no longer be present to justify the earlier security measure."
+  },
+  {
+   "uid": "feef3933-9375-4fa2-ba80-ae65963e7466",
+   "type": "T2",
+   "M_old": "I really need to finish insulating the window seals this weekend because the coastal dampness settles into this room as soon as the late October frost hits.",
+   "M_new": "I spent Sunday morning sweeping that endless red grit off the stucco and making sure the drip emitters for the new agave and ocotillo plants were flowing properly.",
+   "dim1_query": "Based on the conversation history, does the user still live somewhere where coastal dampness and late-October frost regularly affect their room?",
+   "explanation": "Attribute A (Geographic Location/Home Ecosystem) is updated to an arid desert environment, evidenced by the presence of red grit, stucco architecture, and native desert flora (agave and ocotillo) requiring drip irrigation. Through the dependency A → B (a region's native flora and soil are dictated by its climate), living in this inland desert environment makes it geographically and meteorologically impossible to experience the 'coastal dampness' and 'harsh, damp transition into winter' that characterized the user's previous residence in M_old."
+  },
+  {
+   "uid": "f75a2f13-6e3c-496a-b768-5aeaa6c11e27",
+   "type": "T2",
+   "M_old": "Honestly, my weight has been pretty consistent lately, hovering right around 75 kilograms.",
+   "M_new": "It’s funny—since my endocrinologist adjusted my thyroid medication this winter, my jeans have started slipping unless I cinch my belt an extra notch, and I’ve had to punch a new hole in it.",
+   "dim1_query": "Based on the conversation history, does the user’s body weight still appear to be stable at around 75 kilograms?",
+   "explanation": "Attribute A update: thyroid medication/dosage change (metabolism/hormonal regulation). Dependency A → B: thyroid function and its treatment strongly affect metabolic rate and, over time, body weight. With this adjustment, the previously implied stable weight (75 kg) becomes unlikely to remain consistent without mentioning weight directly."
+  },
+  {
+   "uid": "a2a3e641-a144-4032-9982-f2362f433690",
+   "type": "T2",
+   "M_old": "I've got a habit of not touching my phone until after breakfast.",
+   "M_new": "I finally started that early-morning bakery shift—clocking in at 5:30 means I’m out the door while it’s still dark, grabbing a quick bite whenever there’s a lull.",
+   "dim1_query": "Based on the conversation history, does the user still avoid using their phone until after breakfast?",
+   "explanation": "Attribute A (work schedule) updated to an early bakery shift → dependency A → B: an earlier, externally dictated start time reshapes morning routine structure and meal timing → the old value of B (screen time deferred until after a normal breakfast at home) becomes infeasible because breakfast is no longer a stable, first-at-home anchor in the morning routine."
+  },
+  {
+   "uid": "91c27781-fbf7-4ca6-8eca-eb4f5d07992f",
+   "type": "T2",
+   "M_old": "I'm in a stable full-time role, so my weekdays are pretty much occupied during the day.",
+   "M_new": "I spent the afternoon at the county office getting my photo taken and signing the last of the paperwork—they said the badge won’t print until my start date is in their system, so I’m just waiting on the email with my first-day instructions.",
+   "dim1_query": "Based on the conversation history, does the user still have a stable full-time role that keeps their weekdays occupied during the day?",
+   "explanation": "Attribute A update: workplace onboarding/start-of-new-job process (new employment commencement). Dependency A → B: beginning onboarding for a new job typically follows leaving or ending a prior stable full-time role; you can’t be simultaneously settled in a stable full-time position while still awaiting first-day instructions and badge printing for a new start. Thus the earlier 'employed full-time in a stable position' becomes infeasible by propagation."
+  },
+  {
+   "uid": "38c1f987-defc-43b4-a3c9-9d8bf4daa592",
+   "type": "T2",
+   "M_old": "I know that as an INFP, I tend to dwell on criticism longer than others might.",
+   "M_new": "At the hospital’s occupational health appointment, the psychologist had me redo a full personality battery for my clearance, and it turns out I’ve been answering those preference questions wrong for years—they walked me through the scoring and a couple of the sections flipped once I stopped going by my gut and started using the actual prompts.",
+   "dim1_query": "Based on the conversation history, does the user still identify as an INFP?",
+   "explanation": "Attribute A: underwent a formal, guided re-assessment/psychometric evaluation with corrected scoring/interpretation. Dependency A → B: a validated re-evaluation that corrects how the person answers and scores MBTI-type instruments can change the resulting MBTI classification. Therefore, the earlier self-identification as INFP (B) is no longer feasible, even though M_new never names the new type or mentions criticism-dwelling."
+  },
+  {
+   "uid": "2d92d1c2-6ed8-4777-bde5-225ae1a69197",
+   "type": "T2",
+   "M_old": "I generally stick to eating three times a day, rarely adding snacks or skipping a meal.",
+   "M_new": "Ever since my morning workouts got bumped to 10 a.m., I simply can’t make it from dawn till lunch on just coffee anymore.",
+   "dim1_query": "Based on the conversation history, does the user still stick to eating exactly three times a day without snacks or skipped meals?",
+   "explanation": "Attribute A update: Routine.exercise_schedule/intensity increases (early, more demanding workouts). Dependency A → B: higher energy expenditure commonly lead to needing additional food intake outside standard meals (snacks, supplemental calories), which makes the previously implied stable three-meals-only pattern no longer feasible—without directly stating meal frequency."
+  },
+  {
+   "uid": "855155ad-b03b-4b21-b336-1a3e8334acaa",
+   "type": "T2",
+   "M_old": "I keep my subscription to the cloud-based design suite active since I rely on it for rendering my models.",
+   "M_new": "Ever since I moved the workstation into the back room and cut the internet line to keep distractions down, I’ve been doing all my heavy lifting offline—queue it up, let it churn overnight, and check results in the morning.",
+   "dim1_query": "Based on the conversation history, does the user still keep their subscription to the cloud-based design suite active and rely on it for rendering their models?",
+   "explanation": "Attribute A (internet connectivity/work setup) updated to having no internet access → dependency A → ability to use cloud-based services (B) → an active subscription to a cloud-based design suite is no longer feasible/reasonable to rely on after the change, implicitly conflicting with M_old without mentioning the subscription."
+  },
+  {
+   "uid": "309111b3-4d14-46e4-bffd-3841e033a9bf",
+   "type": "T2",
+   "M_old": "It's been unusually cold for this time of year.",
+   "M_new": "I walked past the community garden this morning and the basil’s already bolting—someone even put up a little shade cloth over the tomatoes.",
+   "dim1_query": "Based on the conversation history, does the user’s earlier claim that it’s been unusually cold for this time of year still hold true?",
+   "explanation": "Attribute A update: local seasonal progression/phenology suggests sustained warmth (plants bolting, shade cloth use). Dependency A → B: phenology is driven by temperature patterns, so this implies temperatures have been warm enough that the earlier 'unusually cold' condition is no longer feasible, without stating the weather directly."
+  },
+  {
+   "uid": "ff18fa96-7612-44dd-9e4f-e47b1edc8699",
+   "type": "T2",
+   "M_old": "The humidity here is constant enough that the air feels identical every single day of the year.",
+   "M_new": "I had to dig my thick parka out of the back of the closet again—this morning the car windshield was crusted over and the salt truck had already been through our street.",
+   "dim1_query": "Based on the conversation history, does the user still live in a place where the humidity is so constant that the air feels identical every single day of the year?",
+   "explanation": "Attribute A update: current season/temperature conditions shifted to sustained freezing winter weather (implied by frost, salt trucks, parka). Dependency A → B: sustained freezing winters are incompatible with a persistent high-humidity equatorial climate; such climates don’t produce regular frost or require road salting. Therefore, the earlier claim of constant, identical-feeling humid air year-round is no longer feasible."
+  }
+ ]
+}
