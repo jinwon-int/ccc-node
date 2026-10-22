@@ -13,6 +13,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`a2a-broker-worker-watch.md`](a2a-broker-worker-watch.md) | Broker-side worker staleness watch: pages long-stale A2A workers from `GET /workers` (#2086). |
 | [`fleet-merge-metrics.md`](fleet-merge-metrics.md) | Read-only merge-pipeline metrics per repo (merge-queue wait, effective batch size, CI runs by event); baseline for the 2026-10 batching change (#2302). |
 | [`skill-autosave.md`](skill-autosave.md) | Hermes-style auto-skillification: skill-review hook, daily sweep cron, Telegram approval flow. |
+| [`nunchi-recall.md`](nunchi-recall.md) | State-aware recall for `nunchi.py recall`/`dialectic`: recency re-rank, recent-state window, optional model2vec vectors, and the STALE regression bench (#2464). |
 | [`trajectory-render.md`](trajectory-render.md) | Shared session rendering grammar (`[USER]`/`[ACTION]`/`[OBSERVATION]`…), the `…(+N chars — render truncation)` marker contract, and the `obs_trunc >= 10,000` guard for distill, skill-review and nunchi (#2388). |
 | [`skill-registry.md`](skill-registry.md) | Generated single registry over all repo skill sources; CI-enforced freshness; lifecycle `status` field (#1338). |
 | [`skill-listing-budget.md`](skill-listing-budget.md) | Deterministic skill-listing budget: core + recently used skills keep descriptions, the rest `name-only` via owned `skillOverrides` (#2011). |

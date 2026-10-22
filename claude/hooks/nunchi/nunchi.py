@@ -175,6 +175,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   fact, observed, content='peer_facts', content_rowid='id');
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON peer_facts BEGIN
   INSERT INTO facts_fts(rowid, fact, observed) VALUES (new.id, new.fact, new.observed); END;
+
+CREATE TABLE IF NOT EXISTS fact_vecs(
+  id INTEGER PRIMARY KEY,
+  v BLOB NOT NULL
+);
 """
 
 
@@ -912,6 +917,7 @@ def ingest(path):
                 (OBSERVER, observed, kind, text, evidence,
                  payload.get("distilled_at") or now(), superseded, dedup, now(),
                  rank, review, because, source_refs, mut))
+            _embed_inserted(c, dedup, text)
             n += 1
             pool.add(cur.lastrowid, observed, kind, text, rank)
         except sqlite3.IntegrityError:
@@ -1041,7 +1047,140 @@ def _like_escape(value):
     )
 
 
-def search(c, query, target=None, limit=10, include_history=False):
+# ---- state-aware recall (ccc-node#2464 제안 1) --------------------------------
+# STALE 실측(2026-10-22): bm25만으로는 "옛 상태" 어휘로 쓰인 질의가 옛 사실만 돌려줘
+# (M_old@5 98%, M_new@5 2%) dialectic이 갱신을 볼 수 없었다. state_aware 검색은
+# 세 겹을 더한다 — 모두 LLM 0회, 실패 시 기존 bm25 순서로 조용히 되돌아간다:
+#   (a) 넓은 bm25 후보 풀(limit×4)을 "bm25 순위 + 최신성 순위" 합산으로 재랭킹
+#       (NUNCHI_RECENCY_WEIGHT, 기본 0.25, 0이면 끔 — 0.5 이상은 옛 사실 정밀도를 깎음, STALE 스윕),
+#   (b) 같은 peer의 최근 열린 사실 창(NUNCHI_STATE_WINDOW, 기본 5, 0이면 끔)을
+#       어휘 일치와 무관하게 꼬리에 병합 — 최신 상태는 늘 보이게,
+#   (c) 선택: fact_vecs에 model2vec 정적 임베딩이 있으면 벡터 순위를 RRF로 융합
+#       (gotgan과 같은 모델·같은 환경변수 GOTGAN_EMBED/GOTGAN_EMBED_MODEL; 모델이나
+#       numpy가 없으면 아무것도 하지 않는다).
+# 제약 힌트 매칭(constraint block)은 id 집합만 쓰므로 state_aware를 켜지 않는다.
+_RRF_K = 60
+
+
+def _env_float(name, default, lo, hi):
+    try:
+        val = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, val))
+
+
+def _env_int(name, default, lo, hi):
+    try:
+        val = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, val))
+
+
+def _fact_embedder():
+    """model2vec static model when installed and enabled; else None (lexical-only)."""
+    if os.environ.get("GOTGAN_EMBED", "auto") == "off":
+        return None
+    try:
+        import numpy  # noqa: F401
+        from model2vec import StaticModel
+    except Exception:
+        return None
+    name = os.environ.get("GOTGAN_EMBED_MODEL", "minishlab/potion-multilingual-128M")
+    try:
+        return StaticModel.from_pretrained(name)
+    except Exception:
+        return None
+
+
+_EMBEDDER_CACHE = {}
+
+
+def _embedder_cached():
+    if "m" not in _EMBEDDER_CACHE:
+        _EMBEDDER_CACHE["m"] = _fact_embedder()
+    return _EMBEDDER_CACHE["m"]
+
+
+def _store_fact_vec(c, fid, text, model=None):
+    """Best-effort: write one normalized float16 vector; silent no-op without a model."""
+    model = _embedder_cached() if model is None else model
+    if model is None:
+        return False
+    try:
+        import numpy as np
+        v = model.encode([text])[0]
+        v = v / (np.linalg.norm(v) + 1e-9)
+        c.execute("INSERT OR REPLACE INTO fact_vecs VALUES(?,?)", (fid, v.astype("float16").tobytes()))
+        return True
+    except Exception:
+        return False
+
+
+def _vector_rank(c, model, query, where, args, limit):
+    """ids of the peer's facts (same WHERE as the lexical path) by cosine to the query."""
+    try:
+        import numpy as np
+        rows = c.execute(
+            f"SELECT v.id, v.v FROM fact_vecs v JOIN peer_facts f ON f.id=v.id WHERE {where}", args).fetchall()
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        mat = np.frombuffer(b"".join(r[1] for r in rows), dtype="float16").reshape(len(rows), -1)
+        q = model.encode([query])[0]
+        q = q / (np.linalg.norm(q) + 1e-9)
+        sims = mat.astype("float32") @ q.astype("float32")
+        return [ids[i] for i in np.argsort(-sims)[:limit]]
+    except Exception:
+        return []
+
+
+def _state_rerank(c, rows, query, where, args, limit):
+    """(a)+(c): bm25 position + recency position (+ vector RRF when vectors exist)."""
+    if not rows:
+        return rows
+    weight = _env_float("NUNCHI_RECENCY_WEIGHT", 0.25, 0.0, 10.0)
+    by_recency = sorted(rows, key=lambda r: (r[4] or "", r[0]), reverse=True)
+    rec_pos = {r[0]: i for i, r in enumerate(by_recency)}
+    score = {r[0]: i + weight * rec_pos[r[0]] for i, r in enumerate(rows)}
+    model = _embedder_cached()
+    if model is not None:
+        vec_ids = _vector_rank(c, model, query, where, args, max(limit * 4, 40))
+        if vec_ids:
+            # RRF over (lexical+recency order) and (vector order); vector-only hits join the pool
+            lex_order = sorted(rows, key=lambda r: score[r[0]])
+            fused = {}
+            for i, r in enumerate(lex_order):
+                fused[r[0]] = fused.get(r[0], 0.0) + 1.0 / (_RRF_K + i + 1)
+            for i, fid in enumerate(vec_ids):
+                fused[fid] = fused.get(fid, 0.0) + 1.0 / (_RRF_K + i + 1)
+            known = {r[0]: r for r in rows}
+            missing = [fid for fid in fused if fid not in known]
+            if missing:
+                for r in c.execute(
+                        f"SELECT id,observed,kind,fact,valid_from,valid_to,because,0 FROM peer_facts f"
+                        f" WHERE f.id IN ({','.join('?' * len(missing))})", missing).fetchall():
+                    known[r[0]] = r
+            ordered = sorted(fused, key=lambda fid: -fused[fid])
+            return [known[fid] for fid in ordered if fid in known][:limit]
+    return sorted(rows, key=lambda r: score[r[0]])[:limit]
+
+
+def _state_window(c, target, exclude_ids, n):
+    """(b): the peer's n most recent open facts regardless of lexical match."""
+    if not target or n <= 0:
+        return []
+    # Exactly the n newest open facts; the ones already retrieved add nothing. Never reach
+    # past the newest n — that would append older, unrelated facts (caught by the test).
+    rows = c.execute(
+        "SELECT id,observed,kind,fact,valid_from,valid_to,because,0 FROM peer_facts f"
+        " WHERE f.observed=? AND f.valid_to IS NULL AND f.kind NOT IN ('observation','task-progress')"
+        " ORDER BY f.valid_from DESC, f.id DESC LIMIT ?", (target, n)).fetchall()
+    return [r for r in rows if r[0] not in exclude_ids]
+
+
+def search(c, query, target=None, limit=10, include_history=False, state_aware=False):
     where = "f.valid_to IS NULL" if not include_history else "1=1"
     args = []
     if target:
@@ -1049,20 +1188,28 @@ def search(c, query, target=None, limit=10, include_history=False):
         args.append(target)
     words = _expand_query(query) + _hallway_expansions(query)
     q = " OR ".join(_fts_phrase(w) for w in words) or _fts_phrase(query)
+    pool = max(limit * 4, 40) if state_aware else limit
     try:
         rows = c.execute(
             f"SELECT f.id,f.observed,f.kind,f.fact,f.valid_from,f.valid_to,f.because,bm25(facts_fts) r"
             f" FROM facts_fts x JOIN peer_facts f ON f.id=x.rowid"
             f" WHERE facts_fts MATCH ? AND {where}"
-            f" ORDER BY r LIMIT ?", [q] + args + [limit]).fetchall()
+            f" ORDER BY r LIMIT ?", [q] + args + [pool]).fetchall()
     except sqlite3.OperationalError:
         like = f"%{_like_escape(query)}%"
         rows = c.execute(
             f"SELECT id,observed,kind,fact,valid_from,valid_to,because,0 FROM peer_facts f"
             f" WHERE (fact LIKE ? ESCAPE '\\' OR observed LIKE ? ESCAPE '\\')"
             f" AND {where} ORDER BY id DESC LIMIT ?",
-            [like, like] + args + [limit]).fetchall()
-    return rows
+            [like, like] + args + [pool]).fetchall()
+    if not state_aware:
+        return rows
+    rows = _state_rerank(c, rows, query, where, args, limit)
+    window_n = min(_env_int("NUNCHI_STATE_WINDOW", 5, 0, 50), max(1, limit // 3))
+    window = _state_window(c, target, {r[0] for r in rows}, window_n)
+    if window:
+        rows = rows[:max(0, limit - len(window))] + window
+    return rows[:limit]
 
 
 def _because_suffix(because):
@@ -1070,8 +1217,30 @@ def _because_suffix(because):
     return f" (근거: {because})" if because else ""
 
 
+def _embed_inserted(c, dedup, text):
+    """Best-effort vector for the row just written (ccc-node#2464 (c)); no-op without a model."""
+    if _embedder_cached() is None:
+        return
+    row = c.execute("SELECT id FROM peer_facts WHERE dedup=?", (dedup,)).fetchone()
+    if row:
+        _store_fact_vec(c, row[0], text)
+
+
+def reindex_vecs():
+    """Backfill fact_vecs for every fact lacking a vector (no-op without model2vec)."""
+    model = _embedder_cached()
+    if model is None:
+        print("reindex-vecs: no embedder (install numpy+model2vec or set GOTGAN_EMBED=auto)")
+        return
+    c = db()
+    rows = c.execute("SELECT id, fact FROM peer_facts WHERE id NOT IN (SELECT id FROM fact_vecs)").fetchall()
+    n = sum(1 for fid, text in rows if _store_fact_vec(c, fid, text, model))
+    c.commit()
+    print(f"reindex-vecs: embedded {n}/{len(rows)} facts")
+
+
 def recall(query, target, limit):
-    for r in search(db(), query, target, limit, include_history=True):
+    for r in search(db(), query, target, limit, include_history=True, state_aware=True):
         closed = f" ~{r[5]}]" if r[5] else ""
         print(f"[#{r[0]} {r[1]} ({r[2]}) {r[4][:10]}{closed} {r[3]}{_because_suffix(r[6])}")
 
@@ -1569,13 +1738,15 @@ def synthesize_stdin(query):
 
 def dialectic(query, target):
     c = db()
-    facts = search(c, query, target, limit=12, include_history=True)
-    current = [f"- {r[3]}{_because_suffix(r[6])}" for r in facts if not r[5]]
+    facts = search(c, query, target, limit=12, include_history=True, state_aware=True)
+    current = [f"- ({(r[4] or '')[:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if not r[5]]
     history = [f"- ({r[4][:10]}~{r[5][:10]}) {r[3]}{_because_suffix(r[6])}" for r in facts if r[5]]
     verbatim = verbatim_excerpts(query, 3)   # §3: verbatim layer, optional (#2331)
     prompt = (
         "아래는 peer 메모리(요약 사실)와 MemPalace(원문 발췌)에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
         "근거에 없는 내용은 지어내지 말고 '기록 없음'이라 하라. 시일이 닫힌(valid_to 있는) 사실은 과거 이력이다.\n"
+        "현재 유효 사실 앞의 날짜는 기록 시점이다. 같은 주제의 사실이 여럿이면 가장 최근 것을 현재 상태로 보고, "
+        "더 오래된 사실은 갱신됐을 수 있다고 분명히 말하라(옛 사실을 현재로 단정하지 마라).\n"
         # #832 — MemPalace serves raw transcript chunks, so a chunk can carry a
         # conversation that was still in flight when it was captured. gongyung's
         # 08-31 bench q48 answered a negative control by echoing an unrelated
@@ -2383,6 +2554,8 @@ if __name__ == "__main__":
     if cmd == "init":
         db()
         print(f"db ready: {DB}")
+    elif cmd == "reindex-vecs":
+        reindex_vecs()
     elif cmd == "ingest":
         ingest(args[0])
     elif cmd == "recall":
