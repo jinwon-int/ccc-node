@@ -104,6 +104,16 @@ class SweepIdentityHolds(unittest.TestCase):
         rows.append({"kind": "a2a-revise-result", "task_id": "v1", "status": "republished"})
         self.assertEqual(self.sweep(rows)[0], [])
 
+    def test_infra_failed_round_is_dispatched_again_not_closed(self) -> None:
+        # fleet-skills#538: the round died on a reviser session limit; S1 consumes
+        # it as infra_failed and the hold is served again, never closed for it.
+        rows = [hold(), review(), identity_round("v1"),
+                {"kind": "a2a-revise-result", "task_id": "v1", "status": "infra_failed"}]
+        out, _, closed, calls = self.sweep(rows)
+        self.assertEqual((out[0]["outcome"], closed, len(calls)), ("identity-revise-dispatched", [], 1))
+        retried = rows + [identity_round("v2")]
+        self.assertEqual(self.sweep(retried)[0], [])  # the retry is running: wait
+
     def test_failed_round_closes_unresolved(self) -> None:
         rows = [hold(), review(), identity_round("v1"),
                 {"kind": "a2a-revise-result", "task_id": "v1", "status": "invalid"}]
