@@ -682,6 +682,20 @@ def _apply_config_file(env: dict[str, str], home: Path) -> ConfigFile:
     )
 
 
+def _require_usage_enabled(raw: str | None) -> bool:
+    """`CCC_SKILL_PROMOTION_REQUIRE_USAGE` (#2239 L1): unset → on; an unknown
+    value fails closed as `require_usage_invalid` rather than silently
+    disabling the usage gate."""
+    if raw is None:
+        return True
+    lowered = raw.lower()
+    if lowered in {"1", "true", "yes"}:
+        return True
+    if lowered in {"0", "false", "no"}:
+        return False
+    raise PromotionError("require_usage_invalid")
+
+
 def _config(environment: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if environment is None else environment)
     home = (Path(env["HOME"]) if env.get("HOME") else Path.home()).absolute()
@@ -735,15 +749,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
     # on its origin node before it leaves for the fleet. Default ON — unlike
     # the other tri-state flags there is no state-file switch, only the env
     # knob, so a fixture or an owner can turn the gate off explicitly.
-    require_usage_raw = env.get("CCC_SKILL_PROMOTION_REQUIRE_USAGE")
-    if require_usage_raw is None:
-        require_usage = True
-    elif require_usage_raw.lower() in {"1", "true", "yes"}:
-        require_usage = True
-    elif require_usage_raw.lower() in {"0", "false", "no"}:
-        require_usage = False
-    else:
-        raise PromotionError("require_usage_invalid")
+    require_usage = _require_usage_enabled(env.get("CCC_SKILL_PROMOTION_REQUIRE_USAGE"))
     revise_enabled = _tri_state_enabled(
         env.get("CCC_SKILL_PROMOTION_REVISE"),
         state_dir / "skill-promotion.revise",
