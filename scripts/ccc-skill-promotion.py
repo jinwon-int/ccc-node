@@ -2491,7 +2491,7 @@ def _ack_result(config: Config, transport_id: str) -> dict[str, object]:
 # `reviewed_by` gate is retired once the #2024 validation window closes).
 
 _INTAKE_LANE = "skills_intake_review"
-_INTAKE_RUBRIC_VERSION = "2026-08-28.2"  # must match docs/skills-intake-review.md
+_INTAKE_RUBRIC_VERSION = "2026-10-22.1"  # must match docs/skills-intake-review.md
 _DISPATCH_DOC_START = "## Worker procedure"
 _DISPATCH_DOC_END = "## Receipt projection"
 
