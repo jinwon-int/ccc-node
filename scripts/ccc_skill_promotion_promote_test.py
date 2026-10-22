@@ -572,5 +572,73 @@ class PromoteMergeSupersededTests(unittest.TestCase):
             self.assertEqual(promotion._sweep_promote_merge(cfg, dry_run=False), [])
 
 
+
+class PromoteCreateRecoveryTests(unittest.TestCase):
+    """fleet-skills#556 (2026-10-21): `gh pr create` created the PR, then failed
+    attaching `--reviewer`; the run raised before the ledger row and the next
+    cycle opened a duplicate batch. A failed create now looks the branch up."""
+
+    def run_promote(self, *, create, listed, extra=None):
+        calls: list[list[str]] = []
+        sink: list[dict] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:3] == ["gh", "pr", "create"]:
+                if isinstance(create, Exception):
+                    raise create
+                return types.SimpleNamespace(stdout=create)
+            if args[:3] == ["gh", "pr", "list"]:
+                return types.SimpleNamespace(stdout=json.dumps(listed).encode("utf-8"))
+            if args[:3] == ["gh", "pr", "edit"] and extra and extra.get("edit_fails"):
+                raise promotion.PromotionError("command_failed")
+            return types.SimpleNamespace(stdout=b"")
+
+        cfg = types.SimpleNamespace(
+            node="primary", collect_nodes=(), repo="jinwon-int/fleet-skills",
+            base="main", remote="https://example.invalid/fleet-skills.git",
+            promotion_state_dir=Path("/tmp"), auto_approve_mode="true", approve_profile="reviewer-bot")
+        with patch.object(promotion, "_ledger_rows", return_value=lineage("140", TREE_A)), \
+             patch.object(promotion, "_promoted_source_trees", return_value={}), \
+             patch.object(promotion, "_promote_worker_nodes", return_value=["nodeb"]), \
+             patch.object(promotion, "_promote_stage",
+                          side_effect=lambda work, item, *, audience: (
+                              work / "approved" / audience / item["name"], "generic")), \
+             patch.object(promotion, "_append_ledger",
+                          side_effect=lambda _c, record: sink.append(record)), \
+             patch.object(promotion, "_run", side_effect=fake_run):
+            out = promotion._promote(cfg, dry_run=False, limit=8)
+        return out, calls, sink
+
+    def test_failed_create_with_an_open_pr_on_the_branch_is_recorded(self) -> None:
+        out, calls, sink = self.run_promote(
+            create=promotion.PromotionError("command_failed"),
+            listed=[{"url": "https://github.com/jinwon-int/fleet-skills/pull/556"}])
+        rows = [r for r in sink if r.get("kind") == promotion._PROMOTE_PR_KIND]
+        self.assertEqual((rows[0]["pr"], rows[0]["state"]), ("556", "OPEN"))
+        self.assertEqual(out["url"], "https://github.com/jinwon-int/fleet-skills/pull/556")
+        listed = [c for c in calls if c[:3] == ["gh", "pr", "list"]][0]
+        self.assertIn("--head", listed)
+        self.assertEqual([c for c in calls if c[:3] == ["gh", "pr", "edit"]][0][-2:],
+                         ["--add-reviewer", "reviewer-bot"])
+
+    def test_failed_create_without_a_pr_still_fails(self) -> None:
+        with self.assertRaises(promotion.PromotionError) as caught:
+            self.run_promote(create=promotion.PromotionError("command_failed"), listed=[])
+        self.assertEqual(caught.exception.code, "command_failed")
+
+    def test_empty_create_output_is_recovered_too(self) -> None:
+        out, _, sink = self.run_promote(
+            create=b"", listed=[{"url": "https://github.com/jinwon-int/fleet-skills/pull/556"}])
+        self.assertEqual(out["url"], "https://github.com/jinwon-int/fleet-skills/pull/556")
+        self.assertTrue(any(r.get("pr") == "556" for r in sink))
+
+    def test_reviewer_request_failure_after_recovery_is_not_fatal(self) -> None:
+        out, _, _ = self.run_promote(
+            create=promotion.PromotionError("command_failed"),
+            listed=[{"url": "https://github.com/jinwon-int/fleet-skills/pull/556"}],
+            extra={"edit_fails": True})
+        self.assertEqual(out["url"], "https://github.com/jinwon-int/fleet-skills/pull/556")
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)
