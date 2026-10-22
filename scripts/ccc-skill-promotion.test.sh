@@ -80,6 +80,8 @@ base_env=(
   "CCC_SKILL_PROMOTION_REPO=test/repo"
   "CCC_NODE=testnode"
   "PROMOTION_TEST_STATUS=$STATUS_JSON"
+  # Legacy cases predate the usage_unproven gate (#2239 L1); it has its own block.
+  "CCC_SKILL_PROMOTION_REQUIRE_USAGE=false"
 )
 
 # Disabled is the safe default and never touches the ownership tool or GitHub.
@@ -388,6 +390,52 @@ ok "#1477: collect proceeds once the lock is released" \
   '[ "$rc" = 0 ] && jq -e "(.status // \"\") != \"locked\" and .published[0].outcome == \"pr-opened\" and .published[0].name == \"lock-check\"" >/dev/null <<<"$out" && [ -f "$STATE/skill-promotion/sent/$lock_transport.json" ]'
 ok "#1477: promotion.lock stays owner-only" \
   '[ "$(stat -c %a "$STATE/skill-promotion/promotion.lock")" = 600 ]'
+
+# --- #2239 L1: usage_unproven — a draft must prove Skill-tool use on its origin node
+usage_env=("${base_env[@]}" "CCC_SKILL_PROMOTION_ENABLED=true" "CCC_SKILL_PROMOTION_REQUIRE_USAGE=true")
+USAGE_JSON="$STATE/skill-autosave-usage.json"
+USAGE_LEDGER="$STATE/skill-usage/usage.jsonl"
+write_usage_record() { # <name> <use_count>
+  local sha
+  sha="$(sha256sum "$CLAUDE_SKILLS/$1/SKILL.md" | awk '{print $1}')"
+  jq -nc --arg name "$1" --argjson uses "$2" --arg tid "target-$1" \
+    '{schema_version:1,records:{("claude:"+$name):{target_id:$tid,view_count:0,use_count:$uses,patch_count:0,
+      created_at:"2026-10-01T00:00:00Z",state:"active",last_used_at:(if $uses>0 then "2026-10-20T00:00:00Z" else null end)}}}' > "$USAGE_JSON"
+  chmod 600 "$USAGE_JSON"
+}
+rm -f "$USAGE_JSON" "$USAGE_LEDGER"
+write_skill unproven-skill ""
+write_status unproven-skill
+out="$(env "${usage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "#2239 L1: no usage ledgers → usage_unproven, nothing staged" \
+  '[ "$rc" = 0 ] && jq -e ".staged == [] and .blocked[0].code == \"usage_unproven\" and .blocked[0].uses == 0" >/dev/null <<<"$out"'
+out="$(env "${usage_env[@]}" python3 "$PROMOTER" status)"; rc=$?
+ok "#2239 L1: status exposes the gate knobs" \
+  '[ "$rc" = 0 ] && jq -e ".effective.require_usage == true and .effective.min_skill_uses == 1 and .blocked[0].code == \"usage_unproven\"" >/dev/null <<<"$out"'
+write_usage_record unproven-skill 1
+out="$(env "${usage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "#2239 L1: Skill-tool record use_count=1 proves use → staged" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].name == \"unproven-skill\" and ([.blocked[] | select(.code == \"usage_unproven\")] | length == 0)" >/dev/null <<<"$out"'
+rm -f "$USAGE_JSON"
+mkdir -p "$STATE/skill-usage" && chmod 700 "$STATE/skill-usage"
+printf '%s\n' '{"ts":"2026-10-20T00:00:00Z","skill":"unproven-skill","tool":"Skill","runtime":"claude"}' > "$USAGE_LEDGER"
+chmod 600 "$USAGE_LEDGER"
+out="$(env "${usage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "#2239 L1: one Skill row in usage.jsonl (no json record) → staged" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].name == \"unproven-skill\"" >/dev/null <<<"$out"'
+printf '%s\n' '{"ts":"2026-10-20T00:00:00Z","skill":"unproven-skill","tool":"Read","runtime":"claude"}' > "$USAGE_LEDGER"
+out="$(env "${usage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "#2239 L1: a Read-only row is not use → still blocked" \
+  '[ "$rc" = 0 ] && jq -e ".staged == [] and .blocked[0].code == \"usage_unproven\" and .blocked[0].uses == 0" >/dev/null <<<"$out"'
+printf '%s\n' '{"ts":"2026-10-20T00:00:00Z","skill":"unproven-skill","tool":"Skill","runtime":"claude"}' > "$USAGE_LEDGER"
+out="$(env "${usage_env[@]}" CCC_SKILL_PROMOTION_MIN_SKILL_USES=2 python3 "$PROMOTER" run --dry-run)"; rc=$?
+ok "#2239 L1: MIN_SKILL_USES=2 with one use → blocked with uses == 1" \
+  '[ "$rc" = 0 ] && jq -e ".staged == [] and .blocked[0].code == \"usage_unproven\" and .blocked[0].uses == 1" >/dev/null <<<"$out"'
+out="$(env "${usage_env[@]}" CCC_SKILL_PROMOTION_REQUIRE_USAGE=maybe python3 "$PROMOTER" run --dry-run 2>/dev/null)"; rc=$?
+ok "#2239 L1: an unknown REQUIRE_USAGE value fails closed" \
+  '[ "$rc" != 0 ] && jq -e ".code == \"require_usage_invalid\"" >/dev/null <<<"$out"'
+rm -f "$USAGE_JSON" "$USAGE_LEDGER"
+rm -rf "$CLAUDE_SKILLS/unproven-skill"
 
 # Fresh scans continue to fail closed before any envelope is staged.
 write_skill leaky-skill '4. token=abcdefghijklmnop1234567890'

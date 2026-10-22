@@ -233,6 +233,8 @@ class Config:
     a2a_nexus_dir: Path
     dispatch_ci_wait_sec: int
     autorepair_enabled: bool
+    require_usage: bool
+    min_skill_uses: int
     revise_enabled: bool
     revise_round_limit: int
     revise_daily_cap: int
@@ -680,6 +682,20 @@ def _apply_config_file(env: dict[str, str], home: Path) -> ConfigFile:
     )
 
 
+def _require_usage_enabled(raw: str | None) -> bool:
+    """`CCC_SKILL_PROMOTION_REQUIRE_USAGE` (#2239 L1): unset → on; an unknown
+    value fails closed as `require_usage_invalid` rather than silently
+    disabling the usage gate."""
+    if raw is None:
+        return True
+    lowered = raw.lower()
+    if lowered in {"1", "true", "yes"}:
+        return True
+    if lowered in {"0", "false", "no"}:
+        return False
+    raise PromotionError("require_usage_invalid")
+
+
 def _config(environment: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if environment is None else environment)
     home = (Path(env["HOME"]) if env.get("HOME") else Path.home()).absolute()
@@ -729,6 +745,11 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         trust_root=home,
         error_code="autorepair_invalid",
     )
+    # #2239 L1 follow-up (owner decision 2026-10-22): a draft must prove value
+    # on its origin node before it leaves for the fleet. Default ON — unlike
+    # the other tri-state flags there is no state-file switch, only the env
+    # knob, so a fixture or an owner can turn the gate off explicitly.
+    require_usage = _require_usage_enabled(env.get("CCC_SKILL_PROMOTION_REQUIRE_USAGE"))
     revise_enabled = _tri_state_enabled(
         env.get("CCC_SKILL_PROMOTION_REVISE"),
         state_dir / "skill-promotion.revise",
@@ -845,6 +866,8 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         ).absolute(),
         dispatch_ci_wait_sec=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC", 600, 60, 3600),
         autorepair_enabled=autorepair_enabled,
+        require_usage=require_usage,
+        min_skill_uses=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MIN_SKILL_USES", 1, 0, 100),
         revise_enabled=revise_enabled,
         revise_round_limit=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_ROUNDS", 2, 1, 2),
         revise_substitute_after_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_REVISE_SUBSTITUTE_DAYS", 0, 0, 30),
@@ -1392,15 +1415,97 @@ def _snapshot(config: Config, provider: str, row: dict[str, Any]) -> Candidate: 
     )
 
 
+def _load_curator_module() -> Any:
+    """The curator's ledger readers (same loader shape as ccc-skill-usage-report.py).
+
+    Reusing curator.py means this gate, the curator and the usage report can
+    never disagree about what a recorded Skill-tool use is.
+    """
+    path = Path(__file__).resolve().parents[1] / "claude" / "hooks" / "skill-review" / "curator.py"
+    spec = importlib.util.spec_from_file_location("ccc_skill_promotion_curator", path)
+    if spec is None or spec.loader is None:
+        raise PromotionError("curator_module_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001 - closed-vocabulary failure, no detail leaks
+        raise PromotionError("curator_module_unavailable") from None
+    return module
+
+
+def _skill_tool_uses(curator: Any, config: Config, provider: str) -> dict[str, int]:
+    """Recorded Skill-tool uses per skill name on THIS node (lower bound).
+
+    max(``use_count`` from skill-autosave-usage.json, Skill rows in
+    skill-usage/usage.jsonl), never their sum — the same lower-bound rule the
+    usage report applies. A missing or unreadable ledger yields no counts: for
+    this gate absence of evidence means the draft cannot prove value, which
+    only keeps it on the node. That deliberately differs from the curator's
+    "missing is never zero use" rule, which guards the archive decision; this
+    gate archives nothing.
+    """
+    # Same anchors _ownership_rows hands the ownership tool (--skills-dir /
+    # --state-dir), so the gate reads the ledgers of the node being staged —
+    # never the process environment's HOME.
+    try:
+        context = curator.ownership.Context(
+            provider=provider,
+            skills_dir=Path(os.path.abspath(config.provider_roots[provider])),
+            state_dir=Path(os.path.abspath(config.state_dir)),
+            uid=os.geteuid(),
+        )
+    except (KeyError, OSError, TypeError):
+        return {}
+    counts: dict[str, int] = {}
+    try:
+        usage = curator._load_usage(context, strict=True)
+    except curator.ContractError:
+        usage = {"records": {}}
+    prefix = f"{provider}:"
+    for key, record in usage.get("records", {}).items():
+        if isinstance(key, str) and key.startswith(prefix) and isinstance(record, dict):
+            name = key[len(prefix):]
+            uses = record.get("use_count")
+            if isinstance(uses, int) and uses > 0:
+                counts[name] = max(counts.get(name, 0), uses)
+    status, data = curator._read_ledger_tail(context.state_dir / curator._READ_LEDGER_FILE, context.uid)
+    if status == "read":
+        ledger: dict[str, int] = {}
+        for line in data.splitlines():
+            try:
+                row = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(row, dict) or row.get("tool") != "Skill":
+                continue
+            name = row.get("skill")
+            if not isinstance(name, str) or not curator.ownership._NAME_RE.fullmatch(name):
+                continue
+            ledger[name] = ledger.get(name, 0) + 1
+        for name, uses in ledger.items():
+            counts[name] = max(counts.get(name, 0), uses)
+    return counts
+
+
 def _discover(config: Config) -> tuple[list[Candidate], list[dict[str, str]], list[dict[str, str]]]:
     candidates: list[Candidate] = []
     blocked: list[dict[str, str]] = []
     repaired: list[dict[str, str]] = []
+    curator = _load_curator_module() if config.require_usage else None
     for provider in config.providers:
+        uses_by_name = _skill_tool_uses(curator, config, provider) if curator is not None else {}
         for row in _ownership_rows(config, provider):
             if row.get("classification") != "autosave-managed":
                 continue
             name = row.get("name") if isinstance(row.get("name"), str) else "invalid"
+            if curator is not None:
+                # usage_unproven (#2239 L1): no recorded Skill-tool use on the
+                # origin node → the draft stays local. Counter only, no body.
+                uses = uses_by_name.get(name, 0)
+                if uses < config.min_skill_uses:
+                    blocked.append({"provider": provider, "name": name, "code": "usage_unproven", "uses": uses})
+                    continue
             try:
                 candidates.append(_snapshot(config, provider, row))
                 continue
@@ -2166,6 +2271,8 @@ def _effective_knobs(config: Config) -> dict[str, object]:
         "remote_brokers": len(config.remote_brokers),
         "providers": list(config.providers),
         "collect_nodes": len(config.collect_nodes),
+        "require_usage": bool(getattr(config, "require_usage", True)),
+        "min_skill_uses": int(getattr(config, "min_skill_uses", 1)),
         "auto_approve": _auto_approve_summary(config),
     }
 

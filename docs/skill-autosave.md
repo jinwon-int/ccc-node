@@ -605,6 +605,33 @@ under `~/.claude/state/skill-promotion/outbox/`; `export` is a read-only SSH
 transport command, and a successful central publication moves the retained
 envelope to the owner-only `sent/` directory.
 
+### `usage_unproven`: a draft must prove use before it leaves the node (#2239 L1)
+
+`run` stages an autosave-managed skill only when its origin node has actually
+invoked it. The gate counts recorded Skill-tool uses for the name on this node
+— the larger of `use_count` in `state/skill-autosave-usage.json`
+(`<provider>:<name>`) and the `"tool":"Skill"` rows in
+`state/skill-usage/usage.jsonl` (never their sum; a lower bound, read through
+the curator's own ledger readers so curator, usage report and this gate cannot
+disagree). Fewer than `CCC_SKILL_PROMOTION_MIN_SKILL_USES` (default **1**,
+0..100) uses → the candidate is reported in `blocked` as
+`{provider, name, code: "usage_unproven", uses: N}` and no envelope is written.
+`CCC_SKILL_PROMOTION_REQUIRE_USAGE=false` turns the gate off (default on, env
+only, no state-file switch); any other value fails closed with
+`require_usage_invalid`. `status` echoes both under `effective`.
+
+A missing or unreadable ledger counts as **0 uses here**. That deliberately
+differs from the curator's "missing telemetry is never zero use" rule (#1739):
+that rule protects the archive decision, whereas this gate archives nothing —
+it only keeps an unproven draft on its node until a session uses it.
+
+Why: the 2026-10-22 twelve-node audit (Family Wiki operating log, 2026-10-22 skill usage audit) found 448
+distinct auto-generated skills on the fleet of which 17 had ever been invoked
+through the Skill tool, and only 13 of 556 autosave installs were ever used on
+the node that produced them — while every staged draft was being replicated to
+11 nodes. Owner decision (ccc-node#2239 L1 follow-up): no fleet distribution
+without usage evidence from the origin node.
+
 Exactly one central node is separately enabled as publisher. Its collector
 file contains canonical SSH aliases, one per line:
 
