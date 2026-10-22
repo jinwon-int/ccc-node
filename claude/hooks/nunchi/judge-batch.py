@@ -375,6 +375,24 @@ def live_conflict(conn, fact_id, observed, text, kind=None):
         ratio = len(new & old) / min(len(new), len(old))
         if ratio >= 0.6:
             hits.append((fid, fact, ratio))
+    # #2464 제안 2 — a conflict-sweep flag is by construction lexically disjoint
+    # from its older partner, so the G3 recheck above finds no sibling and the
+    # deterministic pass would clear it the next day. The recorded pair is the
+    # live sibling while the partner stays open; it then reaches the judge
+    # (or human hold) like any other conflict.
+    seen = {h[0] for h in hits}
+    try:
+        swept = conn.execute(
+            "SELECT p.id, p.fact FROM conflict_sweep s JOIN peer_facts p ON p.id=s.old_id"
+            " WHERE s.new_id=? AND s.verdict='conflict' AND p.valid_to IS NULL ORDER BY p.id",
+            (fact_id,)).fetchall()
+    except sqlite3.OperationalError:  # DB never opened by a nunchi.py with the ledger table
+        swept = []
+    for fid, fact in swept:
+        if fid not in seen:
+            old = nunchi._tokens(fact)
+            ratio = len(new & old) / min(len(new), len(old)) if old else 0.0
+            hits.append((fid, fact, ratio))
     return hits
 
 
