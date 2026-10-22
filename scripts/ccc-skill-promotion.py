@@ -280,6 +280,11 @@ class Config:
     # review/revise). "off" (default) keeps the human-judgment flow; "dry-run"
     # records what would be arbitrated/closed; "true" dispatches and applies.
     arbitration_mode: str = "off"
+    # #2463 G1 slice 1: effect-validation (replay) gate. "off" (default) is
+    # today's behaviour; "dry-run" records a replay plan per approved candidate
+    # and promotes unchanged; "true" is accepted but, until the worker intent
+    # ships (slice 2), behaves like dry-run with `replay_worker_not_deployed`.
+    replay_gate_mode: str = "off"
     approve_cmd: tuple[str, ...] = ()
     approve_cmd_present: bool = False
     approve_profile: str = "seoseo-ai"
@@ -448,6 +453,14 @@ _AUTO_APPROVE_OFF = frozenset({"", "0", "false", "no", "off"})
 _APPROVE_PROFILES = frozenset({"seoseo-ai", "jinon86"})
 _APPROVE_SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
 _APPROVE_SCRIPT_REL = ("skills", "gh-pr-flow", "scripts", "approve-via-relay.sh")
+
+
+def _replay_gate_mode(raw: str | None, state_file: Path, *, trust_root: Path | None = None) -> str:
+    """off | dry-run | true for #2463 slice 1, read exactly like the L3 switch."""
+    try:
+        return _auto_approve_mode(raw, state_file, trust_root=trust_root)
+    except PromotionError:
+        raise PromotionError("replay_gate_invalid") from None
 
 
 def _arbitration_mode(raw: str | None, state_file: Path, *, trust_root: Path | None = None) -> str:
@@ -790,6 +803,11 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         state_dir / "skill-promotion.arbitration",
         trust_root=home,
     )
+    replay_gate_mode = _replay_gate_mode(
+        env.get("CCC_SKILL_PROMOTION_REPLAY_GATE"),
+        state_dir / "skill-promotion.replay-gate",
+        trust_root=home,
+    )
     approve_cmd, approve_cmd_present = _approve_cmd(env, home)
     approve_profile = env.get("CCC_SKILL_PROMOTION_APPROVE_PROFILE", "seoseo-ai").strip()
     if approve_profile not in _APPROVE_PROFILES:
@@ -888,6 +906,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         config_file=config_file,
         auto_approve_mode=auto_approve_mode,
         arbitration_mode=arbitration_mode,
+        replay_gate_mode=replay_gate_mode,
         approve_cmd=approve_cmd,
         approve_cmd_present=approve_cmd_present,
         approve_profile=approve_profile,
@@ -1845,6 +1864,8 @@ def _publish(
         "url": url,
         "state": "OPEN",
         "draft": "true",
+        # #2463: what the effect-validation gate could do with this tree.
+        "replay_eligibility": _replay_eligibility([item.relative for item in candidate.files]),
     }
 
 
@@ -2273,6 +2294,7 @@ def _effective_knobs(config: Config) -> dict[str, object]:
         "collect_nodes": len(config.collect_nodes),
         "require_usage": bool(getattr(config, "require_usage", True)),
         "min_skill_uses": int(getattr(config, "min_skill_uses", 1)),
+        "replay_gate_mode": str(getattr(config, "replay_gate_mode", "off")),
         "auto_approve": _auto_approve_summary(config),
     }
 
@@ -6953,6 +6975,7 @@ def _promote(config: Config, *, dry_run: bool, limit: int) -> dict[str, object]:
         lines += ["", "Held out of this batch for an automatic fleet-identity generalization "
                   "round (#2435 S4) — each returns on a fresh intake PR or is closed:"]
         lines += [f"- #{item['pr']} `{item['name']}` ({item['hits']} line hit(s))" for item in held]
+    lines += _replay_body_lines(rows, staged, str(getattr(config, "replay_gate_mode", "off")))
     lines += [
         "",
         "## Provenance",
@@ -9147,6 +9170,91 @@ def _sweep_identity_holds(
     return out
 
 
+_REPLAY_PLAN_KIND = "a2a-replay-plan"
+_REPLAY_SCRIPT_PREFIXES = ("scripts/", "tests/")
+
+
+def _replay_eligibility(paths: list[str]) -> str:
+    """#2463: `script-bearing` when the tree carries something a replay can
+    check mechanically (`scripts/`, `tests/`, `*.test.sh`), else `narrative`."""
+    for path in paths:
+        if path.startswith(_REPLAY_SCRIPT_PREFIXES) or path.endswith(".test.sh"):
+            return "script-bearing"
+    return "narrative"
+
+
+def _replay_eligibility_by_pr(rows: list[dict[str, object]]) -> dict[str, str]:
+    """Latest recorded eligibility per intake PR: plan rows win over the
+    publish row that first recorded it."""
+    out: dict[str, str] = {}
+    for row in rows:
+        if row.get("kind") is None and row.get("url") and row.get("replay_eligibility"):
+            pr = _pr_number_from_url(str(row.get("url", "")))
+            if pr:
+                out[pr] = str(row["replay_eligibility"])
+    for row in rows:
+        if row.get("kind") == _REPLAY_PLAN_KIND and row.get("pr") and row.get("eligibility"):
+            out[str(row["pr"])] = str(row["eligibility"])
+    return out
+
+
+def _replay_body_lines(rows: list[dict[str, object]], staged: list[dict[str, object]], mode: str) -> list[str]:
+    """Promote-PR body section for the replay gate (empty when off)."""
+    if mode == "off":
+        return []
+    eligibility = _replay_eligibility_by_pr(rows)
+    lines = ["", f"## 3. effect-validation gate — `{mode}` (#2463, slice 1: plans only)", ""]
+    lines.append(
+        "No candidate is held by this gate yet. Eligibility is what the replay "
+        "worker (slice 2) could check for each tree: `script-bearing` = a bundled "
+        "script/test exit code, `narrative` = an independent judge."
+    )
+    lines.append("")
+    for row in staged:
+        lines.append(f"- #{row['pr']} `{row['name']}`: `{eligibility.get(str(row['pr']), 'unknown')}`")
+    return lines
+
+
+def _sweep_replay_plans(config: Config, *, dry_run: bool) -> list[dict[str, object]]:
+    """#2463 slice 1: record one `a2a-replay-plan` per approved, unpromoted
+    candidate tree. Nothing is dispatched and promotion is unchanged; the rows
+    are the inventory slice 2 will drain."""
+    mode = str(getattr(config, "replay_gate_mode", "off"))
+    if mode == "off":
+        return []
+    rows = _ledger_rows(config)
+    try:
+        promoted = _promoted_source_trees(config)
+    except PromotionError as error:
+        return [{"outcome": "replay-plan-skipped", "code": error.code}]
+    planned = {
+        (str(row.get("pr")), str(row.get("tree_sha256")))
+        for row in rows if row.get("kind") == _REPLAY_PLAN_KIND
+    }
+    eligibility = _replay_eligibility_by_pr(rows)
+    out: list[dict[str, object]] = []
+    for item in _promotable(config, rows, promoted)[: config.collect_window]:
+        key = (str(item["pr"]), str(item["tree_sha256"]))
+        if key in planned:
+            continue
+        kind = eligibility.get(str(item["pr"]), "unknown")
+        status = "planned" if kind == "script-bearing" else f"skipped-{kind}"
+        if dry_run:
+            out.append({"outcome": "would-plan-replay", "pr": item["pr"], "eligibility": kind})
+            continue
+        record: dict[str, object] = {
+            "ts": _utc_now(), "kind": _REPLAY_PLAN_KIND, "pr": item["pr"],
+            "tree_sha256": item["tree_sha256"], "node": item["node"], "name": item["name"],
+            "eligibility": kind, "mode": mode, "status": status,
+            **({"note": "replay_worker_not_deployed"} if mode == "true" else {}),
+        }
+        _append_ledger(config, record)
+        rows.append(record)
+        planned.add(key)
+        out.append({"outcome": "replay-planned", "pr": item["pr"], "eligibility": kind, "status": status})
+    return out
+
+
 def _sweep_missing_dispatch(
     config: Config, *, dry_run: bool, now: float | None = None
 ) -> list[dict[str, object]]:
@@ -9208,6 +9316,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
     superseded_intakes = _sweep_superseded_intakes(config, dry_run=dry_run)
     arbitration = _sweep_arbitration(config, dry_run=dry_run)
     identity_holds = _sweep_identity_holds(config, dry_run=dry_run)
+    replay_plans = _sweep_replay_plans(config, dry_run=dry_run)
     auto_promote: dict[str, object] | None = None
     if getattr(config, "auto_promote_enabled", False):
         auto_promote = _promote(config, dry_run=dry_run, limit=8)
@@ -9218,6 +9327,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
         "superseded_intakes": superseded_intakes,
         "arbitration": arbitration,
         "identity_holds": identity_holds,
+        "replay_plans": replay_plans,
         "auto_promote": auto_promote,
         "promote_merges": _sweep_promote_merge(config, dry_run=dry_run),
     }

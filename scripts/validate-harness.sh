@@ -630,6 +630,12 @@ else
   err "skill-promotion fleet-identity generalization tests failed (one identity hit would hold a whole promote batch for a human again, #2435)"
   tail -10 "$TMP/skill-promotion-identity-generalize-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_replay_gate_test.py >"$TMP/skill-promotion-replay-gate-test.out" 2>&1; then
+  say "  ok skill-promotion effect-validation gate slice-1 tests (#2463)"
+else
+  err "skill-promotion effect-validation gate slice-1 tests failed (the replay switch or plan rows would drift from the spec, #2463)"
+  tail -10 "$TMP/skill-promotion-replay-gate-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_infra_retry_test.py >"$TMP/skill-promotion-infra-retry-test.out" 2>&1; then
   say "  ok skill-promotion infrastructure-failure retry tests (#2435 S1)"
 else
