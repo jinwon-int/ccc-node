@@ -1,0 +1,21 @@
+# A2A Terminal Brief -> Matrix fleet alerts (ccc-node#2498, a2a-nexus#2460).
+# Install on a broker host (root, next to the broker and the ccc-matrix-bridge):
+#   install -m 0644 scripts/a2a-terminal-brief-fleet-notify.service.example /etc/systemd/system/a2a-terminal-brief-fleet-notify.service
+#   install -m 0644 scripts/a2a-terminal-brief-fleet-notify.timer.example   /etc/systemd/system/a2a-terminal-brief-fleet-notify.timer
+#   systemctl daemon-reload && systemctl enable --now a2a-terminal-brief-fleet-notify.timer
+# The first run only pins the cursor at the end of the outbox (the backlog is never sent).
+[Unit]
+Description=A2A Terminal Brief -> Matrix fleet alerts (broker terminal outbox consumer)
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=root
+# Node label shown in the fleet room; set per host.
+Environment=A2A_TB_NOTIFY_NODE=%H
+Environment=A2A_TB_NOTIFY_BROKER_URL=http://127.0.0.1:8787
+Environment=A2A_TB_NOTIFY_BROKER_ENV_FILE=/root/work/a2a/a2a-nexus/packages/broker/.env
+Environment=CCC_PUSH_SPOOL=/root/.claude/state/telegram-spool
+ExecStart=/usr/bin/python3 /root/ccc-node/scripts/a2a-terminal-brief-fleet-notify.py
+NoNewPrivileges=yes
+PrivateTmp=yes
