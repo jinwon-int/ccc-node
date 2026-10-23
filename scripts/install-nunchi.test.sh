@@ -256,6 +256,68 @@ ok "stepping down also rewrites the install record to --wiki-promote" \
   'jq -e ".argv==[\"--apply\",\"--codex\",\"--wiki-promote\"]" "$nrec" >/dev/null'
 run_install --apply --codex >/dev/null 2>&1
 
+# --- Conflict-sweep (#2479): opt-in daily line. Flag-only by construction
+# (review=1 + pair ledger, never closes), so the cron always runs --apply and
+# there is no separate APPLY flag. Same replay contract as --judge (#1264).
+unset NUNCHI_SYNTH_ORDER NUNCHI_PIRI NUNCHI_PIRI_ARGS CCC_NUNCHI_CONFLICT_SWEEP
+ok "plain --apply installs no conflict-sweep line (opt-in)" \
+  '! grep -q " conflict-sweep " "$cron_store"'
+out="$(run_install --apply --codex --conflict-sweep 2>&1)"; rc=$?
+ok "--conflict-sweep adds a 4th managed line, daily 04:53" \
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep " conflict-sweep " "$cron_store" | grep -qE "^53 4 \\* \\* \\* "'
+ok "conflict-sweep line runs the installed nunchi.py with the exact args, log and gen stamp" \
+  'grep -qE "nunchi/nunchi\\.py conflict-sweep --apply --since-days 2 --max-pairs 100 >> [^ ]*/\\.nunchi/conflict-sweep\\.cron\\.log 2>&1 # nunchi:#816 gen=h_[0-9a-f]{12}$" "$cron_store"'
+ok "conflict-sweep line carries the store env like the judge line" \
+  'grep " conflict-sweep " "$cron_store" | grep -q "CCC_STATE_DIR=$state NUNCHI_HOME=$nunchi_home NUNCHI_DB=$nunchi_home/facts.db NUNCHI_SNAPSHOT=$nunchi_home/snapshot.md "'
+ok "--conflict-sweep announces flag-only behaviour" 'grep -q "daily conflict-sweep cron added (04:53, flag review=1 only, never closes)" <<<"$out"'
+ok "status counts the conflict-sweep line" 'grep -q "^conflict_sweep_cron: 1 line(s)" <<<"$out"'
+ok "install record materializes --conflict-sweep so a self-update replay keeps it" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--conflict-sweep\"]" "$nrec" >/dev/null'
+ok "replaying the recorded argv keeps exactly one conflict-sweep line" \
+  'run_install --apply --codex --conflict-sweep >/dev/null 2>&1 && [ "$(grep -c " conflict-sweep " "$cron_store")" = 1 ]'
+# The rendered argv must be one the subcommand accepts. Run it LLM-free
+# (--judge none, no --apply) against the fixture DB the apply just initialised.
+# shellcheck disable=SC2034  # sweep_argv is read via eval inside ok()
+sweep_argv="$(grep " conflict-sweep " "$cron_store" | python3 -c '
+import shlex, sys
+toks = shlex.split(sys.stdin.read().split(" # nunchi:#816")[0].split(None, 5)[5])
+i = next(n for n, t in enumerate(toks) if "=" not in t)
+cmd = toks[i:toks.index(">>")]
+print(" ".join(cmd[2:]))')"
+ok "rendered argv is conflict-sweep --apply --since-days 2 --max-pairs 100" \
+  '[ "$sweep_argv" = "conflict-sweep --apply --since-days 2 --max-pairs 100" ]'
+env HOME="$home" NUNCHI_HOME="$nunchi_home" NUNCHI_DB="$nunchi_home/facts.db" NUNCHI_SNAPSHOT="$nunchi_home/snapshot.md" \
+  python3 "$hooks/nunchi/nunchi.py" conflict-sweep --since-days 2 --max-pairs 100 --judge none >/dev/null 2>&1; rc=$?
+ok "the installed subcommand accepts those args (LLM-free dry run exits 0)" '[ "$rc" = 0 ]'
+ok "a deliberate re-apply without --conflict-sweep removes the line" \
+  'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c " conflict-sweep " "$cron_store")" = 0 ]'
+ok "opting out also drops --conflict-sweep from the install record" \
+  'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
+out="$(CCC_NUNCHI_CONFLICT_SWEEP=1 run_install --apply --codex 2>&1)"; rc=$?
+ok "CCC_NUNCHI_CONFLICT_SWEEP=1 enables the line without the flag" \
+  '[ "$rc" = 0 ] && [ "$(grep -c " conflict-sweep " "$cron_store")" = 1 ]'
+ok "the env form is materialized as --conflict-sweep in the record" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--conflict-sweep\"]" "$nrec" >/dev/null'
+cp "$cron_store" "$TMP/cron.before"
+out="$(CCC_NUNCHI_CONFLICT_SWEEP=yes run_install --apply --codex 2>&1)"; rc=$?
+ok "an invalid CCC_NUNCHI_CONFLICT_SWEEP exits 2 and leaves the crontab untouched" \
+  '[ "$rc" = 2 ] && grep -q "CCC_NUNCHI_CONFLICT_SWEEP=.yes. invalid (0|1)" <<<"$out" && cmp -s "$TMP/cron.before" "$cron_store"'
+out="$(NUNCHI_SYNTH_ORDER="piri,claude" NUNCHI_PIRI_ARGS="--provider openai-codex --model gpt-x" run_install --apply --codex --conflict-sweep 2>&1)"; rc=$?
+ok "per-node synthesis knobs set at install time are stamped on the sweep line" \
+  '[ "$rc" = 0 ] && grep " conflict-sweep " "$cron_store" | grep -q "NUNCHI_SYNTH_ORDER=piri,claude NUNCHI_PIRI_ARGS='"'"'--provider openai-codex --model gpt-x'"'"' "'
+ok "synthesis knobs stay off the other managed lines" \
+  '[ "$(grep -c "NUNCHI_SYNTH_ORDER" "$cron_store")" = 1 ]'
+# A hook tree older than #2474 has no subcommand: refuse BEFORE strip_cron so
+# the node keeps its previous managed lines instead of a half re-render.
+cp "$hooks/nunchi/nunchi.py" "$TMP/nunchi.py.keep"
+sed 's/"conflict-sweep"/"conflict-sweep-gone"/' "$TMP/nunchi.py.keep" > "$hooks/nunchi/nunchi.py"
+cp "$cron_store" "$TMP/cron.before"
+out="$(run_install --apply --codex --conflict-sweep 2>&1)"; rc=$?
+ok "stale hooks without the subcommand: exit 2, crontab untouched" \
+  '[ "$rc" = 2 ] && grep -q "has no conflict-sweep subcommand" <<<"$out" && cmp -s "$TMP/cron.before" "$cron_store"'
+cp "$TMP/nunchi.py.keep" "$hooks/nunchi/nunchi.py"
+run_install --apply --codex >/dev/null 2>&1
+
 # --- Piri lane: Piri has no distill feed, so its lane runs a per-session
 # extractor (piri-feed.sh) and mines transcripts with the conversation miner
 # attributed to the piri wing (--wing piri), mirroring the Codex lane.

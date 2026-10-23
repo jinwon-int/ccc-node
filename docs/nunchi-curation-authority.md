@@ -27,6 +27,7 @@ passes add and update, deletion is a human-confirmed proposal.
 | B2 correction | inside ingest | close the single best-matching open fact a `kind=correction` replaces (token overlap ≥ 0.5) | `nunchi.py` `_auto_supersede` |
 | observation TTL | ingest, `snapshot`, `assemble` | close `kind=observation` facts older than `NUNCHI_OBSERVATION_TTL_DAYS` (7; ≤0 disables) | `nunchi.py` `_close_expired_observations` |
 | judge-batch | hourly cron (`install-nunchi.sh`, managed marker) | `review=0` only, and only with `NUNCHI_JUDGE_APPLY=1`; supersede appears as proposal text | `judge-batch.py` `apply_clear` |
+| conflict-sweep (opt-in) | daily cron when installed with `install-nunchi.sh --conflict-sweep` (#2479) | `review=1` on the newer fact plus a `conflict_sweep` ledger row; never closes | `nunchi.py` `conflict_sweep` |
 | schema migration | first open | backfill derived columns (`mutability`) | `nunchi.py` `_migrate_gate_cols` |
 
 A lower-rank fact never closes a higher-rank one (G2), so an agent inference cannot bury a user
@@ -40,8 +41,11 @@ statement through G1 or B2.
 | `constraints-triage [--apply]` | fold near-duplicate constraints into a survivor (`merged-away:#id`) and close phase-scoped ones (`because` records why) |
 | `conflict-sweep [--apply]` | `review=1` on the newer fact plus a `conflict_sweep` ledger row; **never closes** ([nunchi-conflict-sweep.md](nunchi-conflict-sweep.md)) |
 
-None of these is scheduled by cron. Scheduling one turns it into a Tier 1 pass, so it then has to
-meet the Tier 1 rule: a sweep that closes facts cannot simply be put on a cron line.
+Scheduling one of these turns it into a Tier 1 pass, so it then has to meet the Tier 1 rule: a
+sweep that closes facts cannot simply be put on a cron line. `review-stale` and
+`constraints-triage` close facts and stay owner-invoked. `conflict-sweep` only flags, so it may be
+scheduled: `install-nunchi.sh --apply --conflict-sweep` adds an opt-in daily line (#2479, see the
+Tier 1 table), and the enforcement test below keeps that line flag-only.
 
 ## Tier 3 — owner per-fact commands
 
