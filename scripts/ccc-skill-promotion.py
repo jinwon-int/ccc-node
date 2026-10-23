@@ -4469,13 +4469,20 @@ def _dispatch_intake_revise(
     exclude: frozenset[str] = frozenset(),
     final: bool = False,
     identity: bool = False,
+    lineage_from: int = 0,
 ) -> dict[str, object]:
     """Dispatch one bounded revision task to the author node. Best-effort and
     fail-safe like the review dispatch: never raises, skip codes recorded.
 
     #2435 S1: `exclude` carries nodes whose previous round on this head failed
     for infrastructure reasons; rounds consumed that way are not counted
-    against the round limit or the daily cap."""
+    against the round limit or the daily cap.
+
+    #2476: `lineage_from` is the ledger index past which rounds count. An
+    owner reopen after an arbitration close restarts the lineage budget for
+    the identity round, so `_sweep_identity_holds` passes the reopen row's
+    index and the round that preceded the close no longer trips
+    `revise_identity_already`."""
     if not os.environ.get("A2A_EDGE_SECRET"):
         return {"outcome": "revise-skipped", "code": "revise_secret_missing"}
     target = _revise_dispatch_target(row)
@@ -4487,8 +4494,9 @@ def _dispatch_intake_revise(
     infra_failed = _infra_failed_task_ids(rows)
     lineage = [
         item
-        for item in rows
-        if item.get("kind") == "a2a-revise-dispatch" and item.get("node") == node and item.get("name") == name
+        for index, item in enumerate(rows)
+        if index >= lineage_from
+        and item.get("kind") == "a2a-revise-dispatch" and item.get("node") == node and item.get("name") == name
         and item.get("task_id") not in infra_failed
     ]
     round_no = len(lineage) + 1
@@ -9082,6 +9090,24 @@ def _identity_round_state(
     return "dispatch"
 
 
+def _owner_reopen_index(rows: list[dict[str, object]], pr: str) -> int | None:
+    """#2476: index of the `a2a-intake-state` OPEN row that `collect` wrote
+    after the PR's latest `a2a-arbitration-closed` row — the owner reopened
+    it. None when the PR was never closed by arbitration, or has not been
+    seen open again since (the close itself writes a CLOSED state row)."""
+    closed_at: int | None = None
+    for index, row in enumerate(rows):
+        if row.get("kind") == _ARBITRATION_CLOSED_KIND and str(row.get("pr")) == pr:
+            closed_at = index
+    if closed_at is None:
+        return None
+    for index in range(len(rows) - 1, closed_at, -1):
+        row = rows[index]
+        if row.get("kind") == _INTAKE_STATE_KIND and str(row.get("pr")) == pr:
+            return index if str(row.get("state", "")) == "OPEN" else None
+    return None
+
+
 def _sweep_identity_holds(
     config: Config, *, dry_run: bool, now: float | None = None
 ) -> list[dict[str, object]]:
@@ -9091,8 +9117,14 @@ def _sweep_identity_holds(
     limit: a republished tree returns as a fresh intake PR (re-gated,
     re-reviewed and re-scanned at the next promote). The round ending any other
     way, a hit surviving the lineage's round, or no round dispatchable within
-    the grace window closes the intake PR (`archived:identity-unresolved`;
-    an owner reopen is left alone)."""
+    the grace window closes the intake PR (`archived:identity-unresolved`).
+
+    #2476: the close comment promises that an owner reopen returns the PR to
+    the loop, so a reopen (`collect` records the PR OPEN again after the
+    arbitration close) grants exactly one more generalization round: only
+    rounds after the reopen row count, and the new round's outcome settles the
+    hold again the same way. A PR closed by arbitration and not seen open
+    since is left alone."""
     if not _identity_generalize_enabled(config):
         return []
     now = time.time() if now is None else now
@@ -9114,8 +9146,12 @@ def _sweep_identity_holds(
     for pr, hold in sorted(holds.items(), key=lambda item: int(item[0]) if item[0].isdigit() else 0):
         if str(states.get(pr, {}).get("state", "")) in _INTAKE_TERMINAL_STATES:
             continue
-        if any(row.get("kind") == _ARBITRATION_CLOSED_KIND and str(row.get("pr")) == pr for row in rows):
-            continue  # closed once and reopened by the owner: the owner decides
+        reopened_at = _owner_reopen_index(rows, pr)
+        if reopened_at is None and any(
+            row.get("kind") == _ARBITRATION_CLOSED_KIND and str(row.get("pr")) == pr for row in rows
+        ):
+            continue  # closed by arbitration and not recorded open again: nothing to serve
+        lineage_from = reopened_at + 1 if reopened_at is not None else 0  # #2476
         node, name = str(hold.get("node", "")), str(hold.get("name", ""))
         review = next(
             (row for row in reversed(rows)
@@ -9124,8 +9160,9 @@ def _sweep_identity_holds(
         )
         head = str(review.get("head_sha", "")) if review else ""
         rounds = [
-            row for row in rows
-            if row.get("kind") == "a2a-revise-dispatch" and row.get("identity")
+            row for index, row in enumerate(rows)
+            if index >= lineage_from  # #2476: rounds before an owner reopen are spent
+            and row.get("kind") == "a2a-revise-dispatch" and row.get("identity")
             and row.get("node") == node and row.get("name") == name
             and row.get("task_id") not in infra_failed  # #2435 S1: retried, never a close reason
         ]
@@ -9144,7 +9181,7 @@ def _sweep_identity_holds(
             outcome = (
                 _dispatch_intake_revise(
                     config, review, rows, _identity_findings(list(hold.get("hits") or [])),
-                    "publisher-identity-scan", dry_run=False, identity=True,
+                    "publisher-identity-scan", dry_run=False, identity=True, lineage_from=lineage_from,
                 )
                 if review is not None
                 else {"outcome": "revise-skipped", "code": "identity_review_missing"}

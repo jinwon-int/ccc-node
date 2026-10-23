@@ -1003,8 +1003,15 @@ single approved candidate whose `SKILL.md` named a fleet node or product
   every revise round; it never counts as a close reason.
 - **Close:** the round ending in anything but `republished`, a hit surviving
   the lineage's round, or no round dispatchable for 48 h closes the intake PR
-  (`a2a-arbitration-closed`, lifecycle `archived:identity-unresolved`). An
-  owner reopen is left alone. At most 4 identity dispatches per cycle.
+  (`a2a-arbitration-closed`, lifecycle `archived:identity-unresolved`). At
+  most 4 identity dispatches per cycle.
+- **Owner reopen (#2476):** the close comment promises that reopening returns
+  the PR to the loop, so once `collect` records the PR OPEN again after the
+  close, the sweep grants exactly one more generalization round — rounds
+  before the reopen are spent, the dispatch gate sees only rounds after it
+  (`lineage_from`), and the new round's outcome settles the hold the same way
+  (a second failure closes it again; a second reopen grants one more). A PR
+  closed by arbitration and not seen open again is left alone.
 
 #### Effect-validation (replay) gate — slice 1 (#2463, default OFF)
 

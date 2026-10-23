@@ -12,7 +12,12 @@ switch at `true`, these tests pin:
 - `_sweep_identity_holds` dispatches one `identity` generalization revise per
   lineage (outside the round limit and the final round), waits while it runs
   or once it republished, and otherwise closes the intake PR as
-  `archived:identity-unresolved` (an owner reopen is left alone);
+  `archived:identity-unresolved`;
+- #2476: an owner reopen after that close (`collect` records the PR OPEN
+  again) grants exactly one more generalization round — rounds before the
+  reopen are spent, the dispatch gate sees only rounds after it, and the new
+  round's outcome settles the hold again; a PR closed and not seen open
+  again is left alone;
 - `_arbitration_state` ignores identity rounds.
 """
 
@@ -138,11 +143,48 @@ class SweepIdentityHolds(unittest.TestCase):
         self.assertEqual(out[0]["reason"], "identity-undeliverable")
         self.assertEqual(written[0]["lifecycle"], "archived:identity-unresolved")
 
-    def test_terminal_or_owner_reopened_is_left_alone(self) -> None:
+    def test_terminal_or_arbitration_closed_is_left_alone(self) -> None:
         closed_state = {"kind": "a2a-intake-state", "pr": PR, "state": "CLOSED"}
         self.assertEqual(self.sweep([hold(), review(), closed_state])[0], [])
-        reopened = {"kind": "a2a-arbitration-closed", "pr": PR, "head_sha": HEAD}
-        self.assertEqual(self.sweep([hold(), review(), reopened])[0], [])
+        closed = {"kind": "a2a-arbitration-closed", "pr": PR, "head_sha": HEAD}
+        # closed by arbitration, never recorded open again: nothing to serve
+        self.assertEqual(self.sweep([hold(), review(), closed])[0], [])
+        self.assertEqual(self.sweep([hold(), review(), closed, closed_state])[0], [])
+
+    def owner_reopened(self) -> list[dict]:
+        # fleet-skills#538 (ccc-node#2476): the identity round failed, arbitration
+        # closed the PR, the owner reopened it and `collect` recorded it OPEN again.
+        return [hold(), review(), identity_round("v1"),
+                {"kind": "a2a-revise-result", "task_id": "v1", "status": "failed"},
+                {"kind": "a2a-arbitration-closed", "pr": PR, "head_sha": HEAD, "reason": "identity-unresolved"},
+                {"kind": "a2a-intake-state", "pr": PR, "state": "CLOSED"},
+                {"kind": "a2a-intake-state", "pr": PR, "state": "OPEN"}]
+
+    def test_owner_reopen_grants_one_more_identity_round(self) -> None:
+        rows = self.owner_reopened()
+        out, _, closed, calls = self.sweep(rows)
+        self.assertEqual((out[0]["outcome"], closed, len(calls)), ("identity-revise-dispatched", [], 1))
+        self.assertTrue(calls[0]["identity"])
+        # the dispatch gate only sees rounds after the reopen row, so the spent
+        # round "v1" no longer trips `revise_identity_already`
+        self.assertEqual(calls[0]["lineage_from"], len(rows))
+        self.assertEqual(promotion._owner_reopen_index(rows, PR), len(rows) - 1)
+
+    def test_reopened_round_settles_the_hold_again(self) -> None:
+        rows = self.owner_reopened() + [identity_round("v2")]
+        self.assertEqual(self.sweep(rows)[0], [])  # the granted round is running: wait
+        rows.append({"kind": "a2a-revise-result", "task_id": "v2", "status": "republished"})
+        self.assertEqual(self.sweep(rows)[0], [])  # superseded by the republished tree
+        failed = self.owner_reopened() + [identity_round("v2"),
+                                          {"kind": "a2a-revise-result", "task_id": "v2", "status": "failed"}]
+        out, written, closed, calls = self.sweep(failed)
+        self.assertEqual((out[0]["reason"], written[0]["lifecycle"], len(closed), calls),
+                         ("identity-unresolved", "archived:identity-unresolved", 1, []))
+        # ...and a second reopen grants one round again, never more than one per reopen
+        again = failed + [{"kind": "a2a-arbitration-closed", "pr": PR, "head_sha": HEAD},
+                          {"kind": "a2a-intake-state", "pr": PR, "state": "CLOSED"},
+                          {"kind": "a2a-intake-state", "pr": PR, "state": "OPEN"}]
+        self.assertEqual(self.sweep(again)[0][0]["outcome"], "identity-revise-dispatched")
 
 
 class IdentityRoundGate(unittest.TestCase):
@@ -155,6 +197,26 @@ class IdentityRoundGate(unittest.TestCase):
         full = [{"node": NODE}, {"node": NODE}, {"node": NODE, "final": True}]
         self.assertIsNone(self.gate(full))
         self.assertEqual(self.gate(full + [{"identity": True}])["code"], "revise_identity_already")
+
+    def test_lineage_from_hides_spent_rounds_from_the_gate(self) -> None:
+        # #2476: `_dispatch_intake_revise` builds the lineage from `lineage_from`
+        # on, so an identity round before an owner reopen is not "already".
+        spent = {"kind": "a2a-revise-dispatch", "task_id": "v1", "node": NODE, "name": NAME, "identity": True}
+        rows = [spent, {"kind": "a2a-intake-state", "pr": PR, "state": "OPEN"}]
+        seen: list[list[dict]] = []
+
+        def gate(_config, _rows, lineage, **kw):
+            seen.append(list(lineage))
+            return {"outcome": "revise-skipped", "code": "stop-here"}
+
+        target = (NODE, NAME, TREE[:12], PR, "claude", HEAD, URL)
+        with patch.dict("os.environ", {"A2A_EDGE_SECRET": "x"}), \
+             patch.object(promotion, "_revise_dispatch_target", return_value=target), \
+             patch.object(promotion, "_revise_round_gate", side_effect=gate):
+            promotion._dispatch_intake_revise(config(), review(), rows, [], "r", dry_run=False, identity=True)
+            promotion._dispatch_intake_revise(config(), review(), rows, [], "r", dry_run=False, identity=True,
+                                              lineage_from=len(rows))
+        self.assertEqual([len(lineage) for lineage in seen], [1, 0])
 
 
 class ArbitrationIgnoresIdentityRounds(unittest.TestCase):
