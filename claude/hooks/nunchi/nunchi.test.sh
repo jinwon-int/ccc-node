@@ -1046,6 +1046,41 @@ out="$(hstatus)"
 ok "backend-status clears back to ok once the primary is healthy again" \
   'grep -q "^state: ok" <<<"$out"'
 
+# #2496 — an aged history is `stale`, but the ⟳ recheck line is only for an
+# aged *failure* (#2129). The weekly bench is usually the only caller and the
+# cutoff is 24h, so an aged healthy history must not warn every session.
+HHEALTH="$health_home/.nunchi/backend-health.json"
+hwrite() {  # winners for 5 aged entries, primary is claude; "none" = no answer
+  python3 - "$HHEALTH" "$@" <<'PY'
+import json, sys
+path, winners = sys.argv[1], sys.argv[2:]
+hist = [{"ts": f"2000-01-01T00:0{i}:00+00:00", "primary": "claude",
+         "winner": None if w == "none" else w, "attempts": None if w != "none" else "claude:exit-1"}
+        for i, w in enumerate(winners)]
+json.dump({"history": hist}, open(path, "w"))
+PY
+}
+hwrite claude claude claude claude claude
+out="$(hstatus)"; snap="$(hsnapshot)"
+ok "aged healthy history still reads stale in backend-status (#2496)" \
+  'grep -q "^state: stale" <<<"$out"'
+ok "aged healthy history adds no recheck line to the snapshot (#2496)" \
+  '! grep -q "합성 상태 재확인" <<<"$snap"'
+hwrite claude claude claude claude codex
+snap="$(hsnapshot)"
+ok "aged fallback history keeps the recheck line (#2496)" \
+  'grep -q "⟳ 합성 상태 재확인 필요" <<<"$snap"'
+hwrite claude claude claude claude none
+snap="$(hsnapshot)"
+ok "aged outage history keeps the recheck line (#2496)" \
+  'grep -q "⟳ 합성 상태 재확인 필요" <<<"$snap"'
+hwrite codex codex codex claude claude
+# shellcheck disable=SC2034  # snap is read via eval inside ok()
+snap="$(hsnapshot)"
+ok "aged degraded window keeps the recheck line even if the last call recovered (#2496)" \
+  'grep -q "⟳ 합성 상태 재확인 필요" <<<"$snap"'
+rm -f "$HHEALTH"
+
 # Cross-file constant check, same precedent as SYNTH_UNAVAILABLE_RE (#1072):
 # a no-record phrasing known to one file and not the other silently rescores
 # retrieval quality — that is exactly how gwakga's q6 paraphrase was counted
