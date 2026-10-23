@@ -985,6 +985,7 @@ for iso_kind in review revise; do
   ok "$iso_kind: the tool lock is still judged on operator tokens only (no lock -> exit 1, agent not run) (#2491)" \
     '[ "$rc" = 1 ] && [ ! -e "$TMP/iso-argv.txt" ] && grep -q "lacks a total tool lock" "$TMP/iso-err.txt"'
 
+  # shellcheck disable=SC2034  # rc is read via eval inside ok()
   iso_run "$iso_kind" REVIEW_AGENT_BIN="$I_BIN/pi-agent" REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-test"; rc=$?
   ok "$iso_kind: a non-claude agent keeps its exact argv and the inherited cwd (#2491)" \
     '[ "$rc" = 0 ] && iso_argv_is -p --no-tools --model xai/grok-test && [ "$(cat "$TMP/iso-pwd.txt")" = "$I_WORKER_REAL" ]'
