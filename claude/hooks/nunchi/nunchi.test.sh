@@ -1365,5 +1365,84 @@ ok "#2222 lineage: merge markers on both sides, retire reason in because" \
 out="$(NUNCHI_DB="$TRI_DB" python3 "$NP" constraints-triage --apply 2>&1)"
 ok "#2222 second apply is a no-op" 'grep -q "fold=0 retire=0 open_after=6" <<<"$out" && [ "$(tri_open)" = "3,4,5,7,8,9" ]'
 
+# --- #2221 Tier C g5-legacy-close: deterministic, LLM-free cleanup of the
+# 2026-08 legacy G5 backlog; retag log-shaped rows, policy reason for the rest.
+G5_DB="$TMP/g5legacy.db"
+NUNCHI_DB="$G5_DB" python3 "$NP" init >/dev/null 2>&1
+python3 - "$G5_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+aug, sep = "2026-08-20T03:00:00+00:00", "2026-09-15T03:00:00+00:00"
+refs = '[{"type":"session","ref":"s-new"}]'
+rows = [
+    # id, observer, kind, fact, evidence, created, rank, review, because, refs, valid_to
+    (1, "family-assistant", "decision", "캐시 계층은 SQLite 단일 파일로 간다", "distill:s1", aug, 1, 1, None, None, None),
+    (2, "family-assistant", "decision", "H2 구현을 작업 노드에 인계 — 작업지시서 작성 완료", "distill:s1", aug, 2, 0, None, None, None),
+    (3, "family-assistant", "decision", "배포는 주말에만 한다", "distill:s2", aug, 3, 1, None, None, None),
+    (4, "family-assistant", "decision", "로그 보존 기간은 30일로 둔다", "distill:s-new", sep, 1, 1, None, refs, None),
+    (5, "family-assistant", "decision", "큐 백엔드는 SQLite로 둔다", "distill:s3", aug, 1, 0, "cost", None, None),
+    (6, "family-assistant", "decision", "비용 때문에 캐시 TTL을 줄인다", "distill:s3", aug, 1, 0, None, None, None),
+    (7, "family-assistant", "decision", "PR #12는 squash로 하기로 결정 — 머지 완료", "auto:update:s4", aug, 2, 1, None, None, None),
+    (8, "family-assistant", "decision", "임시 디렉터리는 /tmp에 둔다", "distill:s4", aug, 1, 1, None, None, "2026-08-30T00:00:00+00:00"),
+    (9, "family-assistant", "decision", "모니터링은 주 1회 본다", "manual:supersede", aug, 1, 0, None, None, None),
+    (10, "family-assistant", "constraint", "토큰 값은 위키에 기록 금지", "distill:s5", aug, 1, 0, None, None, None),
+]
+for r in rows:
+    c.execute("INSERT INTO peer_facts(id,observer,observed,kind,fact,evidence,valid_from,dedup,created_at,"
+              "source_rank,review,because,source_refs,valid_to,mutability) VALUES"
+              " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (r[0], r[1], "session:x", r[2], r[3], r[4], r[5], f"g{r[0]}", r[5], r[6], r[7], r[8], r[9], r[10],
+               "static"))
+c.commit()
+PY
+g5_dump() { python3 -c "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);print('\n'.join(repr(r) for r in c.execute('SELECT id,kind,fact,because,review,valid_to,mutability,evidence,source_rank FROM peer_facts WHERE id IN ('+sys.argv[2]+') ORDER BY id')))" "$G5_DB" "$1"; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+g5_all_before="$(g5_dump 1,2,3,4,5,6,7,8,9,10)"
+out="$(NUNCHI_DB="$G5_DB" python3 "$NP" g5-legacy-close 2>&1)"; rc=$?
+ok "#2221 dry-run reports per-action counts" \
+  '[ "$rc" = 0 ] && grep -q "g5_open=6 retag=1 close=2 kept_user_stated=1 kept_not_legacy=2" <<<"$out"'
+ok "#2221 dry-run reports per-rank and queue counts" \
+  "grep -qF \"retag_by_rank={'1': 0, '2': 1}, close_by_rank={'1': 1, '2': 1}, review_flagged retag=0 close=2\" <<<\"\$out\""
+ok "#2221 dry-run samples ids with truncated text" \
+  'grep -q "retag #2 rank=2 -> task-progress: H2 구현을" <<<"$out" && grep -q "close #1 rank=1:" <<<"$out" && grep -q "close #7 rank=2:" <<<"$out"'
+ok "#2221 decision verb vetoes the retag (#7 closes instead)" '! grep -q "retag #7 " <<<"$out"'
+ok "#2221 dry-run changes nothing" '[ "$(g5_dump 1,2,3,4,5,6,7,8,9,10)" = "$g5_all_before" ]'
+ok "#2221 dry-run creates no ledger" \
+  '[ "$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute(\"SELECT COUNT(*) FROM sqlite_master WHERE name=\x27g5_legacy_close\x27\").fetchone()[0])" "$G5_DB")" = 0 ]'
+out="$(NUNCHI_DB="$G5_DB" python3 "$NP" g5-legacy-close --close-only --json --sample 1 2>&1)"
+ok "#2221 --close-only folds the log row into the policy close" \
+  'grep -q "\"retag\": 0" <<<"$out" && grep -q "\"close\": 3" <<<"$out" && [ "$(grep -c "\"id\":" <<<"$out")" = 1 ]'
+out="$(NUNCHI_DB="$G5_DB" python3 "$NP" g5-legacy-close --close-only --retag-only 2>&1)"; rc=$?
+ok "#2221 --close-only/--retag-only are exclusive" '[ "$rc" != 0 ] && grep -q "exclusive" <<<"$out"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+g5_untouched_before="$(g5_dump 3,4,5,6,8,9,10)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+g5_rows_before="$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('SELECT COUNT(*) FROM peer_facts').fetchone()[0])" "$G5_DB")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(NUNCHI_DB="$G5_DB" python3 "$NP" g5-legacy-close --apply 2>&1)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
+ok "#2221 apply reports changes and the remaining G5 count" \
+  '[ "$rc" = 0 ] && grep -q "applied: retagged 1, closed 2; G5 open decisions now 3" <<<"$out"'
+g5_q() { python3 -c "import sqlite3,sys;r=sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone();print('|'.join(str(x) for x in r))" "$G5_DB" "$1"; }
+ok "#2221 legacy reasonless decision closed with the policy reason, review flag kept" \
+  '[ "$(g5_q "SELECT kind,because,review,valid_to FROM peer_facts WHERE id=1")" = "decision|legacy backfill 2026-08: original reasoning not recoverable (no transcript); closed by #2221 Tier C|1|None" ]'
+ok "#2221 log-shaped row retagged to task-progress (mutability recalculated)" \
+  '[ "$(g5_q "SELECT kind,mutability,because,valid_to FROM peer_facts WHERE id=2")" = "task-progress|volatile|None|None" ]'
+ok "#2221 vetoed log row gets the policy reason" \
+  '[ "$(g5_q "SELECT kind,because IS NOT NULL FROM peer_facts WHERE id=7")" = "decision|1" ]'
+ok "#2221 user-stated / non-legacy / reasoned / closed / manual / constraint rows untouched" \
+  '[ "$(g5_dump 3,4,5,6,8,9,10)" = "$g5_untouched_before" ]'
+ok "#2221 apply never deletes or closes rows" \
+  '[ "$(g5_q "SELECT COUNT(*) FROM peer_facts")" = "$g5_rows_before" ] && [ "$(g5_q "SELECT COUNT(*) FROM peer_facts WHERE id IN (1,2,7) AND valid_to IS NOT NULL")" = 0 ]'
+ok "#2221 ledger records each change" \
+  '[ "$(g5_q "SELECT GROUP_CONCAT(fact_id||\":\"||action||\":\"||new_kind||\":\"||source_rank||\":\"||review, \",\") FROM (SELECT * FROM g5_legacy_close ORDER BY fact_id)")" = "1:policy-close:decision:1:1,2:retag:task-progress:2:0,7:policy-close:decision:2:1" ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+g5_after_first="$(g5_dump 1,2,3,4,5,6,7,8,9,10)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(NUNCHI_DB="$G5_DB" python3 "$NP" g5-legacy-close --apply 2>&1)"
+ok "#2221 second apply is a no-op" \
+  'grep -q "g5_open=3 retag=0 close=0 kept_user_stated=1 kept_not_legacy=2" <<<"$out" && [ "$(g5_dump 1,2,3,4,5,6,7,8,9,10)" = "$g5_after_first" ] && [ "$(g5_q "SELECT COUNT(*) FROM g5_legacy_close")" = 3 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
