@@ -409,12 +409,14 @@ SessionStart reads. `install-nunchi.sh` status prints
 `verbatim_backend: <value> gotgan_cron=<n> gotgan_db=<bytes>`.
 
 Memory bound: one `gotgan.py index` run consumes at most `GOTGAN_RUN_BYTES`
-of new transcript bytes (default 64 MiB, floor 1 MiB; set it in the
-installer's environment to pin a smaller budget on Termux, where the process
-RSS ceiling is 2.0 GB). The per-file byte offset resumes where the previous
+of new transcript bytes (default 64 MiB, floor 1 MiB; pin a smaller budget on
+Termux, where the process RSS ceiling is 2.0 GB, with
+`install-nunchi.sh --gotgan-run-bytes N` or `GOTGAN_RUN_BYTES` in the
+installer's environment — either way the value is recorded in the install
+record, so a self-update replay keeps it, #2475). The per-file byte offset resumes where the previous
 run stopped, so a first index on a node with years of rollouts drains across
 hourly runs — `files_pending > 0` in the status means the backlog is still
-draining, not that the lane is stuck. `CCC_NUNCHI_GOTGAN_PYTHON` pins an
+draining, not that the lane is stuck. `CCC_NUNCHI_GOTGAN_PYTHON` (or `--gotgan-python /abs/path`) pins an
 interpreter (a venv carrying numpy + model2vec) for the optional vector
 layer; otherwise `~/.venv-gotgan/bin/python` is used when present, else the
 harness `python3` (lexical-only).

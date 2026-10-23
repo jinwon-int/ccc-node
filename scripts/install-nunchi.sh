@@ -100,6 +100,11 @@ AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
 # changes nothing; `gotgan` drops the MemPalace sweep in favour of nunchi's own
 # store; `both` runs the two side by side (shadow comparison).
 VERBATIM_BACKEND="${CCC_NUNCHI_VERBATIM_BACKEND:-mempalace}"
+# Per-node gotgan budget/interpreter (#2475). The env values stay the
+# defaults; the flags exist so the install record can carry them — an env-only
+# setting is lost when self-update replays the recorded argv without it.
+GOTGAN_RUN_BYTES_PIN="${GOTGAN_RUN_BYTES:-}"
+GOTGAN_PYTHON_PIN="${CCC_NUNCHI_GOTGAN_PYTHON:-}"
 ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -127,6 +132,12 @@ while [ $# -gt 0 ]; do
     --verbatim-backend)
       [ $# -ge 2 ] || { echo "--verbatim-backend requires mempalace|gotgan|both" >&2; exit 2; }
       VERBATIM_BACKEND="$2"; shift ;;
+    --gotgan-run-bytes)
+      [ $# -ge 2 ] || { echo "--gotgan-run-bytes requires a positive integer" >&2; exit 2; }
+      GOTGAN_RUN_BYTES_PIN="$2"; shift ;;
+    --gotgan-python)
+      [ $# -ge 2 ] || { echo "--gotgan-python requires an absolute path" >&2; exit 2; }
+      GOTGAN_PYTHON_PIN="$2"; shift ;;
     --help|-h)
       sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -140,6 +151,14 @@ esac
 case "$VERBATIM_BACKEND" in
   mempalace|gotgan|both) ;;
   *) echo "invalid verbatim backend: $VERBATIM_BACKEND (mempalace|gotgan|both)" >&2; exit 2 ;;
+esac
+case "$GOTGAN_RUN_BYTES_PIN" in
+  '') ;;
+  0*|*[!0-9]*) echo "invalid gotgan run bytes: $GOTGAN_RUN_BYTES_PIN (positive integer)" >&2; exit 2 ;;
+esac
+case "$GOTGAN_PYTHON_PIN" in
+  ''|/*) ;;
+  *) echo "invalid gotgan python: $GOTGAN_PYTHON_PIN (absolute path)" >&2; exit 2 ;;
 esac
 
 # A bridge may run as a non-root service user even when the operator connects
@@ -170,6 +189,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     CCC_NUNCHI_AUDIENCE_SCOPED="$AUDIENCE_SCOPED" \
     CCC_NUNCHI_AUDIENCE_ROOT="$AUDIENCE_ROOT" \
     CCC_NUNCHI_VERBATIM_BACKEND="$VERBATIM_BACKEND" \
+    GOTGAN_RUN_BYTES="$GOTGAN_RUN_BYTES_PIN" CCC_NUNCHI_GOTGAN_PYTHON="$GOTGAN_PYTHON_PIN" \
     CCC_CLAUDE_DIR="$target_claude_dir" CODEX_HOME="$target_codex_home" CCC_STATE_DIR="$target_state_dir" \
     NUNCHI_HOME="$target_nunchi_home" NUNCHI_DB="${NUNCHI_DB:-$target_nunchi_home/facts.db}" \
     NUNCHI_SNAPSHOT="${NUNCHI_SNAPSHOT:-$target_nunchi_home/snapshot.md}" \
@@ -858,9 +878,9 @@ case "$ACTION" in
     if [ "$gotgan_ready" = 1 ]; then
       strip_gotgan_shadow
       gotgan_budget_env=""
-      if [ -n "${GOTGAN_RUN_BYTES:-}" ]; then gotgan_budget_env="GOTGAN_RUN_BYTES=$(cron_quote "$GOTGAN_RUN_BYTES") "; fi
+      if [ -n "$GOTGAN_RUN_BYTES_PIN" ]; then gotgan_budget_env="GOTGAN_RUN_BYTES=$(cron_quote "$GOTGAN_RUN_BYTES_PIN") "; fi
       gotgan_py_env=""
-      if [ -n "${CCC_NUNCHI_GOTGAN_PYTHON:-}" ]; then gotgan_py_env="CCC_NUNCHI_GOTGAN_PYTHON=$(cron_quote "$CCC_NUNCHI_GOTGAN_PYTHON") "; fi
+      if [ -n "$GOTGAN_PYTHON_PIN" ]; then gotgan_py_env="CCC_NUNCHI_GOTGAN_PYTHON=$(cron_quote "$GOTGAN_PYTHON_PIN") "; fi
       append_cron_line "27 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${gotgan_budget_env}${gotgan_py_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") GOTGAN_DB=$(cron_quote "$GOTGAN_DB_PATH") CCC_NUNCHI_GOTGAN_STATUS=$(cron_quote "$GOTGAN_STATUS") CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC=$(cron_quote "$GOTGAN_TIMEOUT") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$gotgan_refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/gotgan-refresh.cron.log") 2>&1 $MARK gen=$GEN"
       echo "gotgan hourly refresh cron added (:27, $resolved_provider: $sweep_dir, backend=$VERBATIM_BACKEND)"
     fi
@@ -985,6 +1005,12 @@ case "$ACTION" in
     # --verbatim-backend is opt-in like --judge: a replay that omits it would
     # drop the gotgan lane and silently fall back to MemPalace.
     if [ "$VERBATIM_BACKEND" != mempalace ]; then record_argv+=(--verbatim-backend "$VERBATIM_BACKEND"); fi
+    # #2475: the per-node gotgan budget/interpreter used to be env-only, so a
+    # self-update replay (which runs the recorded argv, not the operator's
+    # env) silently dropped them from the :27 line — a Termux node pinned to
+    # 32 MiB went back to the 64 MiB default. Materialize whatever was set.
+    if [ -n "$GOTGAN_RUN_BYTES_PIN" ]; then record_argv+=(--gotgan-run-bytes "$GOTGAN_RUN_BYTES_PIN"); fi
+    if [ -n "$GOTGAN_PYTHON_PIN" ]; then record_argv+=(--gotgan-python "$GOTGAN_PYTHON_PIN"); fi
     ccc_installer_record_write "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh" "$MARK" "$GEN" -- \
       "${record_argv[@]}" \
       || echo "WARNING: install record write failed — self-update re-apply will not track these entries" >&2
