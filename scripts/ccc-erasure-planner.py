@@ -50,10 +50,24 @@ A path a non-retention class resolves as
 live — matched by path, realpath and inode, so symlinked and hard-linked
 live files count — is never a retention target, and the legacy ~/.nunchi
 store stays claimed live regardless of NUNCHI_* env until the operator
-creates ~/.nunchi/.legacy-retired. Eligibility is only a plan state:
+creates ~/.nunchi/.legacy-retired. A class flagged "sqlite_sidecars" also
+owns the -wal/-shm/-journal siblings of its files; sidecars of a live file
+are claimed live, and in a retention class a sidecar shares its DB's
+verdict. Eligibility is only a plan state:
 destruction still happens exclusively through ccc-erasure-apply.py (digest
 + blockers + owner-only + rollback-first, ERASURE_APPLY=1), which needs a
 separate per-node owner approval.
+
+Operator scratch (#1468, owner decision 2026-10-23): a retention class with
+a "fallback_scope" owns every file directly under its scope roots that
+matches NO other inventory class — it is a fallback, never a catch-all
+regex, so a file another class claims keeps that class. Subdirectories are
+never entered (the same one-level rule as the unknown-artifact sweep) and
+orphan SQLite sidecars stay blockers. A class flagged "scheduler_guard" keeps
+any file the current crontab, the agent-cron task store or a systemd unit
+file names ("retain (scheduler-referenced)"); when one of those sources can
+not be read, nothing in the class is eligible and the plan says why. The
+guard only reads (`$CCC_CRONTAB_CMD -l`, the task store, unit files).
 
 Exit codes: 0 plan (blockers allowed, they are reported), 2 usage, 3 unknown
 request type. Read-only is contractual — this script never writes, never
@@ -65,6 +79,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -98,6 +113,20 @@ KEY_FILE_TOKENS = (
 BUILTIN_KEY_FILE_PATTERNS = (
     r"(?:^|[._-])(?:" + "|".join(KEY_FILE_TOKENS) + r")(?:[._-]|$)",
 )
+# SQLite keeps uncheckpointed/committed state beside a DB: a sidecar must
+# share its DB's fate (never deleted while the DB is live, never outlive it).
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+# Scheduler-reference guard (#1468 operator scratch). Read-only sources: the
+# current user's crontab (CCC_CRONTAB_CMD is the repo's crontab test seam),
+# the agent-cron task store (agent_cron.py: CCC_AGENT_CRON_STORE, default
+# ~/.claude/state/agent-cron/tasks.json) and systemd unit files.
+CRONTAB_CMD_ENV = "CCC_CRONTAB_CMD"
+AGENT_CRON_STORE_ENV = "CCC_AGENT_CRON_STORE"
+SYSTEMD_UNIT_DIRS = ("~/.config/systemd/user", "/etc/systemd/system")
+SYSTEMD_UNIT_SUFFIXES = (".service", ".socket", ".timer", ".path", ".mount",
+                         ".swap", ".conf")
+SCHEDULER_READ_LIMIT = 4 * 1024 * 1024   # bytes per source file
 
 REQUESTS = {
     "audience-erasure": {"arg": "--audience"},
@@ -171,14 +200,30 @@ def _pattern_specs(entry: dict) -> list[tuple[str, re.Pattern[str]]]:
     return specs
 
 
+def sqlite_sidecar_names(path: str) -> list[str]:
+    """The -wal/-shm/-journal names SQLite may keep beside ``path``."""
+    return [path + suffix for suffix in SQLITE_SIDECAR_SUFFIXES]
+
+
+def sidecar_base(path: str) -> str | None:
+    """The DB path a sidecar name belongs to, or None for a plain file."""
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        if path.endswith(suffix) and len(path) > len(suffix):
+            return path[:-len(suffix)]
+    return None
+
+
 def secondary_paths(entry: dict) -> list[str]:
     """Every existing file that belongs to this class BEYOND the primary
-    resolution: extra_paths literals + pattern matches.
+    resolution: extra_paths literals + pattern matches (+ SQLite sidecars).
 
     extra_paths are additional literal candidates with the same shape as
     resolve.candidates — multi-file classes (the managed cron logs, the
-    runtime locks) register every file they write. Returns deduplicated
-    absolute paths; the primary resolve_entry path is NOT included.
+    runtime locks) register every file they write. A class flagged
+    ``sqlite_sidecars`` also owns the existing -wal/-shm/-journal siblings
+    of its primary and of every other file it owns, so they follow their
+    DB (#1468 c-batch-2). Returns deduplicated absolute paths; the primary
+    resolve_entry path is NOT included.
     """
     primary = resolve_entry(entry)
     primary_path = os.path.abspath(primary) if primary else None
@@ -206,7 +251,20 @@ def secondary_paths(entry: dict) -> list[str]:
                 continue
             if p not in out:
                 out.append(p)
+    if entry.get("sqlite_sidecars"):
+        _append_sidecars(out, primary_path)
     return out
+
+
+def _append_sidecars(out: list[str], primary_path: str | None) -> None:
+    """Add the existing SQLite sidecars of the primary and of every path
+    already in ``out`` (in place, deduplicated, primary excluded)."""
+    bases = ([primary_path] if primary_path and os.path.isfile(primary_path)
+             else []) + list(out)
+    for base in bases:
+        for p in sqlite_sidecar_names(base):
+            if os.path.isfile(p) and p != primary_path and p not in out:
+                out.append(p)
 
 
 def resolve_entry(entry: dict) -> str | None:
@@ -316,8 +374,11 @@ class _Claims:
         self.dirs: list[str] = []
 
     def add_file(self, path: str) -> None:
-        self.paths.add(os.path.abspath(path))
-        self.paths.add(os.path.realpath(path))
+        for p in (os.path.abspath(path), os.path.realpath(path)):
+            self.paths.add(p)
+            # A live DB's -wal/-shm/-journal are live too: deleting a WAL
+            # under an open DB loses committed rows.
+            self.paths.update(sqlite_sidecar_names(p))
         try:
             meta = os.stat(path)
         except OSError:
@@ -391,9 +452,13 @@ def _live_claims(inventory: dict) -> _Claims:
 
 def retention_paths(inventory: dict, entry: dict,
                     claims: _Claims | None = None) -> list[str]:
-    """Secondary paths of a retention class minus live-claimed ones."""
+    """Secondary paths of a retention class minus live-claimed ones. A
+    fallback class (operator scratch) owns the files the unknown-artifact
+    sweep finds in its scope roots instead of pattern matches."""
     claims = claims if claims is not None else _live_claims(inventory)
-    return [p for p in secondary_paths(entry) if not claims.covers(p)]
+    paths = (fallback_paths(inventory, entry) if is_fallback(entry)
+             else secondary_paths(entry))
+    return [p for p in paths if not claims.covers(p)]
 
 
 def _age_basis(meta: os.stat_result) -> float:
@@ -404,9 +469,13 @@ def _age_basis(meta: os.stat_result) -> float:
 
 
 def retention_verdict(inventory: dict, entry: dict, path: str,
-                      now: float | None = None) -> dict:
+                      now: float | None = None,
+                      guard: dict | None = None) -> dict:
     """Age verdict for one file of a retention class. Body-free: name and
-    inode times only — the file is never opened."""
+    inode times only — the file is never opened. ``guard`` (scheduler
+    references) keeps a referenced file, and keeps EVERY file while a
+    scheduler source is unreadable; key files and symlinks are checked
+    first."""
     policy = entry.get("retention_policy") or {}
     days = retention_days(inventory, entry)
     verdict = {"group": policy.get("group"), "max_age_days": days,
@@ -429,6 +498,13 @@ def retention_verdict(inventory: dict, entry: dict, path: str,
     if os.path.islink(path):
         verdict["reason"] = "symlink"           # never a destruction target
         return verdict
+    if guard is not None:
+        if guard["summary"]["status"] != "ok":
+            verdict["reason"] = "scheduler-guard-unavailable"   # err: keep
+            return verdict
+        if scheduler_referenced(path, guard):
+            verdict["reason"] = "scheduler-referenced"          # any age
+            return verdict
     verdict["eligible"] = current >= eligible_at
     verdict["reason"] = "retention-expired" if verdict["eligible"] \
         else "within-retention"
@@ -450,7 +526,8 @@ def _live_counterpart_missing(entry: dict, path: str) -> bool:
 
 
 def retention_verdicts(inventory: dict, entry: dict, claims: _Claims,
-                       now: float) -> list[tuple[str, dict]]:
+                       now: float, cache: dict | None = None
+                       ) -> list[tuple[str, dict]]:
     """(path, verdict) for every non-claimed file of one retention class,
     with the last-copy guard applied: when the live counterpart is absent,
     the NEWEST copy per directory is retained even past its retention.
@@ -460,11 +537,24 @@ def retention_verdicts(inventory: dict, entry: dict, claims: _Claims,
     re-review N1). Recency is (st_mtime, st_ctime, path): ctime gates the
     eligibility AGE only; an rsync -a / cp -a / chmod sweep equalises every
     ctime, so it must never decide which copy is newest (re-review N2).
+
+    A class flagged ``scheduler_guard`` reads the scheduler references once
+    per ``cache`` (one plan/report) and only when it has files to judge.
     """
-    out = [(p, retention_verdict(inventory, entry, p, now))
-           for p in retention_paths(inventory, entry, claims)]
+    paths = retention_paths(inventory, entry, claims)
+    guard = None
+    if entry.get("scheduler_guard") and paths:
+        cache = cache if cache is not None else {}
+        if "guard" not in cache:
+            cache["guard"] = scheduler_references()
+        guard = cache["guard"]
+    out = [(p, retention_verdict(inventory, entry, p, now, guard))
+           for p in paths]
+    by_path = dict(out)
     newest: dict[str, tuple[float, float, str]] = {}
     for path, _verdict in out:
+        if sidecar_base(path) in by_path:
+            continue                    # a sidecar is never a "copy"
         if not _live_counterpart_missing(entry, path):
             continue
         try:
@@ -481,6 +571,16 @@ def retention_verdicts(inventory: dict, entry: dict, claims: _Claims,
     for path, verdict in out:
         if path in keep and verdict["eligible"]:
             verdict.update(eligible=False, reason="last-copy-live-missing")
+    # SQLite sidecars share their DB's verdict (#1468 c-batch-2): a -wal is
+    # destroyed together with its DB, never earlier and never left behind
+    # with committed frames once the DB is gone.
+    for path, verdict in out:
+        base = sidecar_base(path)
+        if base in by_path and verdict["reason"] in ("within-retention",
+                                                     "retention-expired"):
+            db = by_path[base]
+            verdict.update(eligible=db["eligible"], reason=db["reason"],
+                           eligible_at=db["eligible_at"])
     return out
 
 
@@ -489,6 +589,8 @@ _RETAIN_LABELS = {
     "symlink": "retain (symlink)",
     "unreadable": "retain (unreadable)",
     "last-copy-live-missing": "retain (last copy; live missing)",
+    "scheduler-referenced": "retain (scheduler-referenced)",
+    "scheduler-guard-unavailable": "retain (scheduler references unreadable)",
 }
 
 
@@ -542,36 +644,225 @@ def _scan(inventory: dict) -> tuple[set[str], set[str], list[str]]:
     return known_files, known_dirs, roots
 
 
-def _unknown_blockers(inventory: dict, max_blockers: int = 20) -> list[dict]:
-    """Unclassified files inside managed state roots (#873 blockers).
+def is_fallback(entry: dict) -> bool:
+    return isinstance(entry.get("fallback_scope"), dict)
+
+
+def fallback_roots(entry: dict) -> list[str]:
+    """Realpaths of the directories a fallback class covers: per root spec,
+    the first existing kind=dir candidate (the same env chain the owning
+    component uses, e.g. CCC_STATE_DIR then ~/.claude/state)."""
+    out: list[str] = []
+    for spec in (entry.get("fallback_scope") or {}).get("roots", []):
+        if not isinstance(spec, dict):
+            continue
+        resolved = resolve_entry({"resolve": spec})
+        if resolved and os.path.isdir(resolved):
+            real = os.path.realpath(resolved)
+            if real not in out:
+                out.append(real)
+    return out
+
+
+def _fallback_candidate(path: str) -> bool:
+    """Only regular files and symlinks fall back to a scratch class; an
+    orphan SQLite sidecar (its DB is gone) and special files stay blockers."""
+    try:
+        meta = os.lstat(path)
+    except OSError:
+        return False
+    if not (stat.S_ISREG(meta.st_mode) or stat.S_ISLNK(meta.st_mode)):
+        return False
+    base = sidecar_base(path)
+    return not (base and not os.path.isfile(base))
+
+
+def _sweep(inventory: dict):
+    """Yield (path, fallback_id | None) for every file inside a managed state
+    root that matches no inventory class (#873 blockers).
 
     One directory level only — subdirectories of managed roots are their own
-    inventoried classes' business. Capped so a chaotic state dir cannot turn
-    the plan into a wall of names.
+    inventoried classes' business, and fallback classes never descend
+    either. fallback_id names the fallback class (#1468 operator scratch)
+    whose scope root holds the file; None means the file is a blocker.
     """
     known_files, known_dirs, roots = _scan(inventory)
-    blockers: list[dict] = []
-    truncated = False
+    owners: dict[str, str] = {}
+    for entry in inventory.get("artifacts", []):
+        if is_fallback(entry):
+            for root in fallback_roots(entry):
+                owners.setdefault(root, entry["id"])
+    seen: set[str] = set()
     for root in roots:
         if not os.path.isdir(root):
             continue
+        owner = owners.get(os.path.realpath(root))
         for name in sorted(os.listdir(root)):
             path = os.path.abspath(os.path.join(root, name))
-            if path in known_files or path in known_dirs:
+            if path in seen or path in known_files or path in known_dirs:
                 continue
             if any(path.startswith(kd + os.sep) for kd in known_dirs):
                 continue
             if os.path.isdir(path):
                 continue
-            if len(blockers) >= max_blockers:
-                truncated = True
-                break
-            blockers.append({"path": path, "reason": "not-in-inventory"})
-        if truncated:
+            seen.add(path)
+            yield path, (owner if owner and _fallback_candidate(path) else None)
+
+
+def fallback_paths(inventory: dict, entry: dict) -> list[str]:
+    """Files a fallback class owns: the would-be blockers of its roots."""
+    return [p for p, owner in _sweep(inventory) if owner == entry.get("id")]
+
+
+def _unknown_blockers(inventory: dict, max_blockers: int = 20) -> list[dict]:
+    """Unclassified files inside managed state roots (#873 blockers).
+
+    Files a fallback class owns are classified, not blockers. Capped so a
+    chaotic state dir cannot turn the plan into a wall of names.
+    """
+    blockers: list[dict] = []
+    truncated = False
+    for path, owner in _sweep(inventory):
+        if owner:
+            continue
+        if len(blockers) >= max_blockers:
+            truncated = True
             break
+        blockers.append({"path": path, "reason": "not-in-inventory"})
     if truncated:
         blockers.append({"path": "(…more)", "reason": "blocker-list-truncated"})
     return blockers
+
+
+def _read_capped(path: str) -> str:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read(SCHEDULER_READ_LIMIT)
+
+
+def _read_crontab(texts: list[str], sources: list[str],
+                  errors: list[str]) -> None:
+    cmd = os.environ.get(CRONTAB_CMD_ENV) or "crontab"
+    try:
+        proc = subprocess.run([cmd, "-l"], capture_output=True, text=True,
+                              errors="replace", timeout=10,
+                              stdin=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append(f"crontab: {type(exc).__name__}")
+        return
+    if proc.returncode == 0:
+        texts.append(proc.stdout)
+        sources.append("crontab")
+    elif "no crontab for" in (proc.stderr or "").lower():
+        sources.append("crontab (none installed)")
+    else:
+        errors.append(f"crontab: exit {proc.returncode}")
+
+
+def _agent_cron_stores() -> list[str]:
+    """Every place agent_cron.py may keep its task store (env first)."""
+    out = []
+    for env, suffix in ((AGENT_CRON_STORE_ENV, None),
+                        ("CCC_STATE_DIR", "agent-cron/tasks.json")):
+        value = os.environ.get(env)
+        if value:
+            out.append(_expand(os.path.join(value, suffix) if suffix else value))
+    out.append(_expand("~/.claude/state/agent-cron/tasks.json"))
+    return list(dict.fromkeys(os.path.abspath(p) for p in out))
+
+
+def _read_agent_cron(texts: list[str], sources: list[str],
+                     errors: list[str]) -> None:
+    for store in _agent_cron_stores():
+        if not os.path.lexists(store):
+            continue                     # no store = no agent-cron tasks
+        try:
+            text = _read_capped(store)
+            json.loads(text)
+        except (OSError, ValueError) as exc:
+            errors.append(f"agent-cron store {store}: {type(exc).__name__}")
+            continue
+        texts.append(text)
+        sources.append(f"agent-cron:{store}")
+
+
+def _read_systemd(texts: list[str], sources: list[str],
+                  errors: list[str]) -> None:
+    for raw in SYSTEMD_UNIT_DIRS:
+        base = _expand(raw)
+        if not os.path.isdir(base):
+            continue
+        count = 0
+
+        def _walk_error(exc: OSError, base: str = base) -> None:
+            errors.append(f"systemd dir {base}: {type(exc).__name__}")
+
+        for root, _dirs, names in os.walk(base, onerror=_walk_error):
+            for name in sorted(names):
+                if not name.endswith(SYSTEMD_UNIT_SUFFIXES):
+                    continue
+                path = os.path.join(root, name)
+                if not os.path.isfile(path):
+                    continue             # masked (/dev/null) or dangling link
+                try:
+                    text = _read_capped(path)
+                except OSError as exc:
+                    errors.append(f"systemd unit {path}: {type(exc).__name__}")
+                    continue
+                texts.append("\n".join(
+                    line for line in text.splitlines()
+                    if not line.lstrip().startswith(("#", ";"))))
+                count += 1
+        sources.append(f"systemd:{base} ({count} unit file(s))")
+
+
+def scheduler_references() -> dict:
+    """Read-only, failure-tolerant snapshot of what schedulers run.
+
+    Returns {"summary": body-free status for the plan, "blob": text}. The
+    blob (crontab lines, task store, unit files) is matched against paths
+    only and NEVER printed. Any unreadable source sets status
+    "unavailable", which keeps every guarded file (errs toward keeping).
+    """
+    texts: list[str] = []
+    sources: list[str] = []
+    errors: list[str] = []
+    for reader in (_read_crontab, _read_agent_cron, _read_systemd):
+        try:
+            reader(texts, sources, errors)
+        except Exception as exc:  # noqa: BLE001 - any failure must keep files
+            errors.append(f"{reader.__name__}: {type(exc).__name__}")
+    return {"summary": {"status": "unavailable" if errors else "ok",
+                        "sources": sources, "errors": errors},
+            "blob": "\n".join(texts)}
+
+
+def _reference_forms(path: str) -> set[str]:
+    """Spellings a scheduler line may use for ``path``: absolute, realpath,
+    and the home-relative ~/, $HOME/, ${HOME}/ and systemd %h/ forms."""
+    home = _expand("~/").rstrip("/")
+    forms: set[str] = set()
+    for p in (os.path.abspath(path), os.path.realpath(path)):
+        forms.add(p)
+        if home and p.startswith(home + "/"):
+            rel = p[len(home) + 1:]
+            forms.update(f"{prefix}{rel}" for prefix in
+                         ("~/", "$HOME/", "${HOME}/", "%h/"))
+    return forms
+
+
+def scheduler_referenced(path: str, guard: dict) -> bool:
+    """Is ``path`` named by a scheduler? Any full spelling counts, and so
+    does the bare file name as a whole token (cd/env-var indirection such
+    as ``cd ~/.claude/state && ./x.sh``). A false positive only keeps a
+    file longer."""
+    blob = guard.get("blob") or ""
+    if not blob:
+        return False
+    if any(form in blob for form in _reference_forms(path)):
+        return True
+    name = re.escape(os.path.basename(path))
+    return re.search(r"(?<![A-Za-z0-9._-])" + name + r"(?![A-Za-z0-9._-])",
+                     blob) is not None
 
 
 def _estimate_entry(entry: dict, resolved: str | None) -> dict:
@@ -615,7 +906,7 @@ def _secondary_targets(inventory: dict, entry: dict, action: str,
         if "claims" not in cache:
             cache["claims"] = _live_claims(inventory)
         for path, verdict in retention_verdicts(inventory, entry,
-                                                cache["claims"], now):
+                                                cache["claims"], now, cache):
             out.append({"artifact": entry["id"], "path": path, "present": True,
                         "action": gated_action(action, verdict),
                         "estimate": _estimate(path), "retention": verdict})
@@ -654,6 +945,8 @@ def plan(request: str, inventory: dict, audience: str | None,
             resolved = os.path.join(resolved, audience)
         present = bool(resolved and (os.path.isdir(resolved)
                                      or os.path.isfile(resolved)))
+        # A fallback class has no resolve candidates, so its primary row is
+        # path=None/absent (apply skips it): it never targets its scope root.
         targets.append({
             "artifact": entry["id"],
             "path": resolved,
@@ -664,7 +957,7 @@ def plan(request: str, inventory: dict, audience: str | None,
         # Multi-file classes (extra_paths + pattern matches) target per path:
         # an apply slice must name every file it would touch, never a class.
         targets.extend(_secondary_targets(inventory, entry, action, cache, now))
-    return {
+    doc = {
         "schema": SCHEMA,
         "request": request,
         "key": key or audience,
@@ -673,6 +966,10 @@ def plan(request: str, inventory: dict, audience: str | None,
         "external_handoff": external,
         "blockers": _unknown_blockers(inventory),
     }
+    if "guard" in cache:
+        # Body-free: sources and error kinds only, never scheduler text.
+        doc["scheduler_guard"] = cache["guard"]["summary"]
+    return doc
 
 
 def _outbox_depths(inventory: dict) -> list[dict]:
@@ -710,7 +1007,13 @@ def _run_scan(inventory: dict) -> dict:
     known_files, known_dirs, roots = _scan(inventory)
     unknown = _unknown_blockers(inventory)
     absent = []
+    fallback = []
     for entry in inventory.get("artifacts", []):
+        if is_fallback(entry):
+            fallback.append({"artifact": entry["id"],
+                             "roots": fallback_roots(entry),
+                             "files": len(fallback_paths(inventory, entry))})
+            continue
         resolved = resolve_entry(entry)
         if not resolved or not (os.path.isdir(resolved)
                                 or os.path.isfile(resolved)):
@@ -723,6 +1026,7 @@ def _run_scan(inventory: dict) -> dict:
         "known_files_count": len(known_files),
         "unknown": unknown,
         "absent": absent,
+        "fallback": fallback,
         "outbox_depths": _outbox_depths(inventory),
     }
 
@@ -732,12 +1036,14 @@ def retention_report(inventory: dict) -> dict:
     Read-only, body-free (paths, dates, counts)."""
     now = _now()
     claims = _live_claims(inventory)
+    cache: dict = {}
     entries = []
     for entry in inventory.get("artifacts", []):
         if not entry.get("retention_policy"):
             continue
         action = (entry.get("requests") or {}).get("prune-expired", "retain")
-        for path, verdict in retention_verdicts(inventory, entry, claims, now):
+        for path, verdict in retention_verdicts(inventory, entry, claims, now,
+                                                cache):
             planned = gated_action(action, verdict)
             if verdict["eligible"] and not planned.startswith("delete"):
                 # Age passed, but the class itself never destroys (retain).
@@ -746,7 +1052,7 @@ def retention_report(inventory: dict) -> dict:
                             "planned_action": planned})
     eligible = sum(1 for e in entries if e["eligible"])
     keys = sum(1 for e in entries if e["reason"] == "key-file")
-    return {
+    doc = {
         "schema": RETENTION_SCHEMA,
         "read_only": True,
         "generated_at": _iso(now),
@@ -759,6 +1065,9 @@ def retention_report(inventory: dict) -> dict:
                        "ccc-erasure-apply.py with ERASURE_APPLY=1 and a "
                        "separate per-node owner approval"),
     }
+    if "guard" in cache:
+        doc["scheduler_guard"] = cache["guard"]["summary"]
+    return doc
 
 
 def _print_retention_human(doc: dict) -> None:
@@ -776,7 +1085,18 @@ def _print_retention_human(doc: dict) -> None:
             state = f"retained ({e['reason']})"
         print(f"  - [{group}] {e['artifact']}: {state}")
         print(f"      {e['path']}")
+    _print_guard_human(doc)
     print(f"  note: {doc['apply_note']}")
+
+
+def _print_guard_human(doc: dict) -> None:
+    guard = doc.get("scheduler_guard")
+    if not guard:
+        return
+    print(f"  scheduler guard: {guard['status']} "
+          f"({len(guard['sources'])} source(s) read)")
+    for err in guard["errors"]:
+        print(f"  ! scheduler guard: {err} — operator scratch is kept")
 
 
 def _print_plan_human(doc: dict) -> None:
@@ -793,6 +1113,7 @@ def _print_plan_human(doc: dict) -> None:
         print(f"  - external handoff: {h['artifact']} (owner={h['owner']})")
     for b in doc["blockers"]:
         print(f"  ! blocker: {b['path']} — {b['reason']}")
+    _print_guard_human(doc)
     if doc["blockers"]:
         print(f"  {len(doc['blockers'])} blocker(s): an apply slice must stop "
               "until these are classified.")

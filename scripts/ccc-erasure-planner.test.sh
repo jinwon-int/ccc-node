@@ -30,12 +30,20 @@ export NUNCHI_SNAPSHOT="$FIX/home/.nunchi/snapshot.md"
 export CCC_BOT_DATA_DIR="$FIX/bot"
 export CCC_MEMORY_AUDIENCE_ROOT="$FIX/aud"
 export MEMPALACE_PALACE_PATH="$FIX/home/.mempalace/palace"
+# Scheduler-guard sources stay hermetic: a stub crontab (the repo's
+# CCC_CRONTAB_CMD seam) that prints $TMP/crontab.txt when it exists.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\n[ -f "%s" ] && cat "%s"\nexit 0\n' "$TMP/crontab.txt" "$TMP/crontab.txt" > "$TMP/bin/crontab"
+chmod 700 "$TMP/bin/crontab"
+export CCC_CRONTAB_CMD="$TMP/bin/crontab"
 
 printf 'facts' > "$NUNCHI_DB"
 printf '{}\n' > "$CCC_STATE_DIR/autonomy-ledger.jsonl"
 printf 'wait' > "$FIX/bot/external-wait/w1.json"
 printf 'candidate' > "$FIX/bot/wiki-candidates/c1.json"
-printf 'mystery' > "$CCC_STATE_DIR/mystery-orphan.bin"   # unknown artifact → blocker
+# Unknown artifact → blocker. ~/.nunchi has no operator-scratch fallback
+# (private memory), so it keeps blocking; the state dir would fall back.
+printf 'mystery' > "$NUNCHI_HOME/mystery-orphan.bin"
 printf 'transcript' > "$FIX/home/.claude/projects/s1.jsonl"
 
 # baseline checksums of the whole fixture tree (READ-ONLY contract)
@@ -209,6 +217,73 @@ ok "prune-expired plans retain for the key backup" 'grep -qx "retain" <<<"$actio
 after3="$(fix3_sum)"
 ok "READ-ONLY: fixture tree byte-identical after retention dry-runs" '[ "$before3" = "$after3" ]'
 ok "retention fixtures (python)" 'python3 "$ROOT/scripts/ccc_erasure_retention_test.py" >"$TMP/retention-test.out" 2>&1 || { cat "$TMP/retention-test.out"; false; }'
+
+# --- 8) c-batch-2: harness runtime artifacts + SQLite sidecars (#1468) -------
+# The 2026-10-23 fleet scan found the same harness-written files on most nodes
+# (nunchi feed status/locks/receipts, gotgan + jev-review stores, autosave and
+# self-update state). They classify through the same env chains as their
+# component; SQLite -wal/-shm siblings follow their DB; lookalikes and
+# operator one-offs keep blocking.
+for n in gotgan.db gotgan.db-wal gotgan.db-shm jev-review.db ingest.status.json \
+         journal-receipts.jsonl .journal-feed.lock gotgan-refresh.cron.log verbatim-backend \
+         facts.db-wal; do printf 'x' > "$NUNCHI_HOME/$n"; done
+for n in prescreen-last.json self-update.pending-activation.json repo-commands.manifest \
+         skill-listing-policy.json distill.log.1.gz; do printf 'x' > "$CCC_STATE_DIR/$n"; done
+printf 'x' > "$NUNCHI_HOME/gotgan.db.old"                 # lookalike
+printf 'x' > "$CCC_STATE_DIR/label-restart.sh"            # operator one-off
+# shellcheck disable=SC2034  # before8 is read via eval inside ok()
+before8="$(tree_sum)"
+out="$(run scan --json)"
+# shellcheck disable=SC2034  # scan_unknowns is read via eval inside ok()
+scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
+ok "c-batch-2: nunchi stores, status, receipts, locks, logs classified" \
+  '! grep -qE "/(gotgan\.db(-wal|-shm)?|jev-review\.db|ingest\.status\.json|journal-receipts\.jsonl|\.journal-feed\.lock|gotgan-refresh\.cron\.log|verbatim-backend)$" <<<"$scan_unknowns"'
+ok "c-batch-2: live facts.db WAL follows its DB" '! grep -qF "facts.db-wal" <<<"$scan_unknowns"'
+ok "c-batch-2: state-dir harness files classified" \
+  '! grep -qE "/(prescreen-last\.json|self-update\.pending-activation\.json|repo-commands\.manifest|skill-listing-policy\.json|distill\.log\.1\.gz)$" <<<"$scan_unknowns"'
+ok "c-batch-2: nunchi lookalike still blocks" 'grep -qF "gotgan.db.old" <<<"$scan_unknowns"'
+ok "operator scratch: state-dir one-off is no longer a blocker" '! grep -qF "label-restart.sh" <<<"$scan_unknowns"'
+out="$(run node-decommission --json)"
+# shellcheck disable=SC2034  # actions8 is read via eval inside ok()
+actions8="$(python3 -c 'import json,sys,os; print("\n".join(os.path.basename(t["path"])+" "+t["action"] for t in json.load(sys.stdin)["targets"] if t["present"]))' <<<"$out")"
+ok "c-batch-2: gotgan store + sidecars decommission together" \
+  'grep -qx "gotgan.db delete" <<<"$actions8" && grep -qx "gotgan.db-wal delete" <<<"$actions8" && grep -qx "gotgan.db-shm delete" <<<"$actions8"'
+ok "c-batch-2: facts.db WAL keeps the DB handoff contract" 'grep -qx "facts.db-wal handoff-or-drop" <<<"$actions8"'
+# shellcheck disable=SC2034  # after8 is read via eval inside ok()
+after8="$(tree_sum)"
+ok "READ-ONLY: fixture tree byte-identical after c-batch-2 scans" '[ "$before8" = "$after8" ]'
+
+# --- 9) operator scratch fallback + scheduler guard (#1468, 2026-10-23) -----
+# Unknown files directly under the state dir fall back to operator scratch
+# (90 days); a file a scheduler names is kept at any age; an unreadable
+# crontab keeps everything; ~/.nunchi keeps blocking.
+old_stamp="$(date -d '-120 days' '+%Y%m%d%H%M' 2>/dev/null || date -v-120d '+%Y%m%d%H%M')"
+for f in old-one-off.sh cron-watch.sh; do
+  printf 'x' > "$CCC_STATE_DIR/$f"; chmod 600 "$CCC_STATE_DIR/$f"; touch -t "$old_stamp" "$CCC_STATE_DIR/$f"
+done
+printf 'x' > "$CCC_STATE_DIR/fresh-handover.md"
+printf '*/5 * * * * bash ~/.claude/state/cron-watch.sh\n' > "$TMP/crontab.txt"
+scratch_actions() { python3 -c 'import json,sys,os; d=json.load(sys.stdin); print("\n".join(os.path.basename(t["path"])+" "+t["action"] for t in d["targets"] if t["artifact"]=="state.operator_scratch" and t["present"])); print("guard "+d.get("scheduler_guard",{}).get("status","-")); print("blockers "+" ".join(os.path.basename(b["path"]) for b in d["blockers"]))'; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+acts9="$(run prune-expired --json | scratch_actions)"
+# ctime is now, so even a backdated mtime is within 90 days — the age gate
+# is max(mtime, ctime); the Python fixtures cover expiry with a test clock.
+ok "scratch: unknown state file planned as operator scratch (retain-until)" \
+  'grep -q "^old-one-off.sh retain-until:" <<<"$acts9" && grep -q "^fresh-handover.md retain-until:" <<<"$acts9"'
+ok "scratch: crontab-referenced script retained (scheduler-referenced)" \
+  'grep -qx "cron-watch.sh retain (scheduler-referenced)" <<<"$acts9"'
+ok "scratch: guard status ok with a readable crontab" 'grep -qx "guard ok" <<<"$acts9"'
+ok "scratch: state-dir scratch never a blocker, nunchi orphan still is" \
+  '! grep -q "^blockers.*\(old-one-off\|fresh-handover\|cron-watch\)" <<<"$acts9" && grep -q "^blockers.*mystery-orphan.bin" <<<"$acts9"'
+printf '#!/bin/sh\necho denied >&2\nexit 2\n' > "$TMP/bin/crontab-broken"; chmod 700 "$TMP/bin/crontab-broken"
+# shellcheck disable=SC2034  # read via eval inside ok()
+acts9b="$(CCC_CRONTAB_CMD="$TMP/bin/crontab-broken" run prune-expired --json | scratch_actions)"
+ok "scratch: unreadable crontab keeps every scratch file + reports why" \
+  'grep -qx "guard unavailable" <<<"$acts9b" && grep -qx "old-one-off.sh retain (scheduler references unreadable)" <<<"$acts9b" && ! grep -q " delete$" <<<"$acts9b"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+human9="$(CCC_CRONTAB_CMD="$TMP/bin/crontab-broken" run prune-expired)"
+ok "scratch: human plan names the guard failure, never crontab text" \
+  'grep -qF "scheduler guard: crontab: exit 2" <<<"$human9" && ! grep -qF "*/5" <<<"$human9" && ! grep -qF "bash ~/" <<<"$human9"'
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"

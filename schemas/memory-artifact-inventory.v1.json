@@ -1,6 +1,6 @@
 {
   "schema": "ccc.memory-artifact-inventory.v1",
-  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown. extra_paths (optional, file-kind entries): additional literal candidates owned by the SAME class (multi-file classes like the managed cron logs) — classified, estimated and targeted per path. resolve candidates may also carry kind=pattern: an ANCHORED regex over sibling file names under the candidate's base (join form: env is the base; absolute form: dirname is the base) — lets one class own dated artifacts (bench-YYYYMMDD.md) without inventing files; name matching only, never glob expansion. retention_policy (optional, #1468): marks an age-gated retention class (group a = legacy unscoped stores, group b = sensitive backups). Its resolve candidates are kind=pattern only; each matched file keeps a delete action only once max(mtime, ctime) is older than max_age_days (copies made with cp -p/rsync -a carry an old mtime, so ctime bounds the age) (retention_defaults.max_age_days, default 30; CCC_ERASURE_RETENTION_DAYS may only lengthen it), younger files plan as retain-until:<date>, key files (case-insensitive key tokens on [._-] boundaries: the planner's built-in list plus retention_defaults.key_file_patterns) plan as retain at any age, and a path a non-retention class resolves as live — matched by path, realpath and inode — is never a retention target. live_until_retired (optional): {marker, paths} — the listed paths stay claimed live regardless of env until the marker file exists (default absent). last_copy_guard (optional): {counterpart: <sibling live file name>|null} — while that live file is absent (null = not checkable), the newest copy per directory is retained past its retention. Destruction still runs only through ccc-erasure-apply.py under a separate per-node approval.",
+  "note": "#873 step-1 inventory. Machine-readable policy registration for every private/body-bearing artifact class the harness writes. Paths are RESOLVER CHAINS (first existing candidate wins), never globs — an apply slice must go through these same chains, never raw $HOME expansion. Fields: role (source|derived|outbox|audit|index|operational), owner, requests (lifecycle request -> action; 'external-handoff' means a node-local run must not touch it). related_dirs (optional, dir-kind entries): sibling directories owned by the same class — classified alongside the resolved dir, never flagged unknown. extra_paths (optional, file-kind entries): additional literal candidates owned by the SAME class (multi-file classes like the managed cron logs) — classified, estimated and targeted per path. resolve candidates may also carry kind=pattern: an ANCHORED regex over sibling file names under the candidate's base (join form: env is the base; absolute form: dirname is the base) — lets one class own dated artifacts (bench-YYYYMMDD.md) without inventing files; name matching only, never glob expansion. retention_policy (optional, #1468): marks an age-gated retention class (group a = legacy unscoped stores, group b = sensitive backups). Its resolve candidates are kind=pattern only; each matched file keeps a delete action only once max(mtime, ctime) is older than max_age_days (copies made with cp -p/rsync -a carry an old mtime, so ctime bounds the age) (retention_defaults.max_age_days, default 30; CCC_ERASURE_RETENTION_DAYS may only lengthen it), younger files plan as retain-until:<date>, key files (case-insensitive key tokens on [._-] boundaries: the planner's built-in list plus retention_defaults.key_file_patterns) plan as retain at any age, and a path a non-retention class resolves as live — matched by path, realpath and inode — is never a retention target. live_until_retired (optional): {marker, paths} — the listed paths stay claimed live regardless of env until the marker file exists (default absent). last_copy_guard (optional): {counterpart: <sibling live file name>|null} — while that live file is absent (null = not checkable), the newest copy per directory is retained past its retention. sqlite_sidecars (optional, true): the class also owns the existing <file>-wal/-shm/-journal siblings of every file it resolves; in a retention class a sidecar shares its DB's verdict, and a sidecar of any live-claimed file is claimed live too. Destruction still runs only through ccc-erasure-apply.py under a separate per-node approval. fallback_scope (optional, #1468 operator scratch): {roots: [{candidates: [kind=dir resolve candidates]}]} — the class owns every file DIRECTLY under a root (first existing candidate per root) that matches NO other entry; it is a fallback, never a pattern, so a file another class claims keeps that class. Subdirectories are never entered and orphan SQLite sidecars stay blockers. A fallback class has no resolve candidates (no primary path). scheduler_guard (optional, true): a file named by the current crontab (CCC_CRONTAB_CMD seam), the agent-cron task store or a systemd unit file is retained at any age; an unreadable source keeps every file of the class.",
   "retention_defaults": {
     "max_age_days": 30,
     "age_source": "max(mtime,ctime)",
@@ -38,7 +38,8 @@
       "derived_copies": [
         "facts_fts"
       ],
-      "verification": "row-count + sqlite integrity"
+      "verification": "row-count + sqlite integrity",
+      "sqlite_sidecars": true
     },
     {
       "id": "nunchi.snapshot",
@@ -237,6 +238,86 @@
         },
         {
           "path": "~/.nunchi/mempalace-mine.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "gotgan-refresh.cron.log"
+        },
+        {
+          "path": "~/.nunchi/gotgan-refresh.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "conflict-sweep.cron.log"
+        },
+        {
+          "path": "~/.nunchi/conflict-sweep.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "journal-feed.log"
+        },
+        {
+          "path": "~/.nunchi/journal-feed.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "jev-review.log"
+        },
+        {
+          "path": "~/.nunchi/jev-review.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "journal-feed.py.log"
+        },
+        {
+          "path": "~/.nunchi/journal-feed.py.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "jev-review.py.log"
+        },
+        {
+          "path": "~/.nunchi/jev-review.py.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "matrix-ingest.log"
+        },
+        {
+          "path": "~/.nunchi/matrix-ingest.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "ingest.cron.log"
+        },
+        {
+          "path": "~/.nunchi/ingest.cron.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "matrix-jev.log"
+        },
+        {
+          "path": "~/.nunchi/matrix-jev.log"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "matrix-judge.log"
+        },
+        {
+          "path": "~/.nunchi/matrix-judge.log"
         }
       ],
       "retention": "regenerable runtime output",
@@ -308,6 +389,54 @@
         },
         {
           "path": "~/.nunchi/.codex-feed.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".jev-review.lock"
+        },
+        {
+          "path": "~/.nunchi/.jev-review.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".journal-feed.lock"
+        },
+        {
+          "path": "~/.nunchi/.journal-feed.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".auto-distill-feed.lock"
+        },
+        {
+          "path": "~/.nunchi/.auto-distill-feed.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": ".danso-feed.lock"
+        },
+        {
+          "path": "~/.nunchi/.danso-feed.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "gotgan-refresh.lock"
+        },
+        {
+          "path": "~/.nunchi/gotgan-refresh.lock"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "backend-health.json.lock"
+        },
+        {
+          "path": "~/.nunchi/backend-health.json.lock"
         }
       ],
       "retention": "runtime-scoped; content-free flock anchors",
@@ -354,6 +483,98 @@
       ]
     },
     {
+      "id": "nunchi.feed_status",
+      "path_class": "node-local operational",
+      "contains": [
+        "feed-run-status",
+        "error-classes",
+        "held-counters"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "ingest.status.json"
+          },
+          {
+            "path": "~/.nunchi/ingest.status.json"
+          }
+        ]
+      },
+      "retention": "latest-run only; body-free counters (ingest-cron/codex/piri/danso feeds, journal-feed per channel, judge, gotgan refresh)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete",
+        "cache-rebuild": "rebuild"
+      },
+      "derived_copies": [],
+      "verification": "json-parses",
+      "extra_paths": [
+        {
+          "path": "~/.nunchi/ingest.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "judge.status.json"
+        },
+        {
+          "path": "~/.nunchi/judge.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "journal-feed.status.json"
+        },
+        {
+          "path": "~/.nunchi/journal-feed.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "telegram-journal-feed.status.json"
+        },
+        {
+          "path": "~/.nunchi/telegram-journal-feed.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "matrix-journal-feed.status.json"
+        },
+        {
+          "path": "~/.nunchi/matrix-journal-feed.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "gotgan-refresh.status.json"
+        },
+        {
+          "path": "~/.nunchi/gotgan-refresh.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "matrix-ingest.status.json"
+        },
+        {
+          "path": "~/.nunchi/matrix-ingest.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "ingest.matrix.status.json"
+        },
+        {
+          "path": "~/.nunchi/ingest.matrix.status.json"
+        }
+      ]
+    },
+    {
       "id": "nunchi.ingest_seen_state",
       "path_class": "node-local operational",
       "contains": [
@@ -384,6 +605,30 @@
         },
         {
           "path": "~/.nunchi/piri-seen"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "codex-seen"
+        },
+        {
+          "path": "~/.nunchi/codex-seen"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "danso-seen"
+        },
+        {
+          "path": "~/.nunchi/danso-seen"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "auto-distill-feed.state.json"
+        },
+        {
+          "path": "~/.nunchi/auto-distill-feed.state.json"
         }
       ],
       "retention": "dedup ledgers; loss is benign (re-ingestion re-dedupes against the store itself)",
@@ -393,6 +638,103 @@
       },
       "derived_copies": [],
       "verification": "file presence + line count"
+    },
+    {
+      "id": "nunchi.feed_receipts",
+      "path_class": "node-local operational ledger",
+      "contains": [
+        "source-path-hashes",
+        "inode-size-mtime-fingerprints",
+        "retry-attempts"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "journal-receipts.jsonl"
+          },
+          {
+            "path": "~/.nunchi/journal-receipts.jsonl"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "journal-(configured|telegram|matrix)-[0-9a-f]{16}-receipts\\.jsonl"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/journal-(configured|telegram|matrix)-[0-9a-f]{16}-receipts\\.jsonl"
+          }
+        ]
+      },
+      "retention": "fingerprint receipt ledgers (feed-receipt.py): sha256 path keys + inode/size/mtime fingerprints, no bodies; loss is benign (re-ingestion re-dedupes against the store itself)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "jsonl line count",
+      "extra_paths": [
+        {
+          "path": "~/.nunchi/journal-receipts.jsonl"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "codex-receipts.jsonl"
+        },
+        {
+          "path": "~/.nunchi/codex-receipts.jsonl"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "piri-receipts.jsonl"
+        },
+        {
+          "path": "~/.nunchi/piri-receipts.jsonl"
+        }
+      ]
+    },
+    {
+      "id": "nunchi.jev_review_ledger",
+      "path_class": "node-local audit",
+      "contains": [
+        "per-db-cursors",
+        "fact-references",
+        "advisory-kind-verdicts"
+      ],
+      "role": "audit",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "jev-review.db"
+          },
+          {
+            "path": "~/.nunchi/jev-review.db"
+          }
+        ]
+      },
+      "sqlite_sidecars": true,
+      "retention": "advisory review ledger (jev-review.py): cursors + (db path, fact id, fingerprint, kind, choice, confidence) — no fact bodies; loss re-establishes high-water marks (no backfill)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "sqlite integrity + row count",
+      "extra_paths": [
+        {
+          "path": "~/.nunchi/jev-review.db"
+        }
+      ]
     },
     {
       "id": "erasure.handoff_manifests",
@@ -575,7 +917,7 @@
           }
         ]
       },
-      "retention": "until human review (external handoff once promoted); .bak-* copies are owner-decision blockers",
+      "retention": "until human review (external handoff once promoted); .bak* copies fall back to state.operator_scratch (owner decision 2026-10-23)",
       "requests": {
         "node-decommission": "external-handoff",
         "prune-expired": "prune-stale-candidates"
@@ -799,7 +1141,17 @@
       },
       "derived_copies": [],
       "verification": "json-parses",
-      "note": "representative file (sessions.json); tasks.json / usage-meter.json / cost-ledger share the same policy"
+      "note": "representative file (sessions.json); tasks.json / usage-meter.json / cost-ledger share the same policy",
+      "extra_paths": [
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "sessions.json.bak"
+        },
+        {
+          "path": "~/.telegram_bot/sessions.json.bak"
+        }
+      ]
     },
     {
       "id": "skill.autosave_lifecycle",
@@ -859,6 +1211,57 @@
         "chroma index"
       ],
       "verification": "re-index diff"
+    },
+    {
+      "id": "nunchi.gotgan_store",
+      "path_class": "node-local derived index",
+      "contains": [
+        "transcript-excerpts",
+        "verbatim-message-chunks",
+        "fts-trigram-bigram",
+        "embedding-vectors"
+      ],
+      "role": "index",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "GOTGAN_DB",
+            "path": "~/.nunchi/gotgan.db"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "path": "gotgan.db"
+          },
+          {
+            "path": "~/.nunchi/gotgan.db"
+          }
+        ]
+      },
+      "sqlite_sidecars": true,
+      "retention": "verbatim transcript store (#2331), rebuildable from transcripts (source upstream); body-bearing private memory",
+      "requests": {
+        "audience-erasure": "delete-entries-by-scope",
+        "node-decommission": "delete",
+        "cache-rebuild": "re-index"
+      },
+      "derived_copies": [
+        "chunks_tri fts",
+        "chunks_bi fts",
+        "vecs"
+      ],
+      "verification": "re-index diff",
+      "extra_paths": [
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "gotgan.db"
+        },
+        {
+          "path": "~/.nunchi/gotgan.db"
+        }
+      ]
     },
     {
       "id": "upstream.session_transcripts",
@@ -944,6 +1347,14 @@
         },
         {
           "path": "~/.claude/state/.local-memory-sink.lock"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": ".skill-listing-policy.lock"
+        },
+        {
+          "path": "~/.claude/state/.skill-listing-policy.lock"
         }
       ]
     },
@@ -966,6 +1377,16 @@
           {
             "kind": "pattern",
             "path": "~/.claude/state/[a-z0-9][a-z0-9.-]*\\.log"
+          },
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "[a-z0-9][a-z0-9.-]*\\.log\\.[0-9]+(\\.gz)?"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/[a-z0-9][a-z0-9.-]*\\.log\\.[0-9]+(\\.gz)?"
           }
         ]
       },
@@ -1006,7 +1427,17 @@
         "node-decommission": "delete"
       },
       "derived_copies": [],
-      "verification": "json-parses"
+      "verification": "json-parses",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave-cron.history.jsonl"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave-cron.history.jsonl"
+        }
+      ]
     },
     {
       "id": "state.memory_lane",
@@ -1115,6 +1546,30 @@
         },
         {
           "path": "~/.claude/state/distill-last.json"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "distill.scope"
+        },
+        {
+          "path": "~/.claude/state/distill.scope"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "distill.disabled"
+        },
+        {
+          "path": "~/.claude/state/distill.disabled"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "distill.dryrun"
+        },
+        {
+          "path": "~/.claude/state/distill.dryrun"
         }
       ]
     },
@@ -1144,7 +1599,17 @@
         "node-decommission": "delete"
       },
       "derived_copies": [],
-      "verification": "file presence"
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "self-update.pending-activation.json"
+        },
+        {
+          "path": "~/.claude/state/self-update.pending-activation.json"
+        }
+      ]
     },
     {
       "id": "state.detached_jobs",
@@ -1278,6 +1743,38 @@
         },
         {
           "path": "~/.claude/state/nunchi.mode"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "nunchi-judge-human.flag"
+        },
+        {
+          "path": "~/.claude/state/nunchi-judge-human.flag"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "nunchi-wiki-promote-report.md"
+        },
+        {
+          "path": "~/.claude/state/nunchi-wiki-promote-report.md"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "nunchi.auto-distill-feed"
+        },
+        {
+          "path": "~/.claude/state/nunchi.auto-distill-feed"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "verbatim-backend"
+        },
+        {
+          "path": "~/.nunchi/verbatim-backend"
         }
       ]
     },
@@ -1399,6 +1896,46 @@
         },
         {
           "path": "~/.claude/state/skill-promotion.enabled"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "prescreen-last.json"
+        },
+        {
+          "path": "~/.claude/state/prescreen-last.json"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave-curator-state.json"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave-curator-state.json"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave.codex-seen"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave.codex-seen"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave.piri-seen"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave.piri-seen"
+        },
+        {
+          "env": "CCC_STATE_DIR",
+          "join": true,
+          "path": "skill-autosave.danso-seen"
+        },
+        {
+          "path": "~/.claude/state/skill-autosave.danso-seen"
         }
       ]
     },
@@ -1531,6 +2068,14 @@
         },
         {
           "path": "~/.telegram_bot/usage-meter.json.lock"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "tasks.json.bak"
+        },
+        {
+          "path": "~/.telegram_bot/tasks.json.bak"
         }
       ]
     },
@@ -1555,7 +2100,44 @@
         "node-decommission": "delete"
       },
       "derived_copies": [],
-      "verification": "file presence"
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "path": "~/.claude/state/repo-commands.manifest"
+        },
+        {
+          "path": "~/.claude/state/repo-output-styles.manifest"
+        }
+      ]
+    },
+    {
+      "id": "state.skill_listing_policy",
+      "path_class": "node-local operational",
+      "contains": [
+        "skill-listing-overrides",
+        "operator-entries"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "path": "skill-listing-policy.json"
+          },
+          {
+            "path": "~/.claude/state/skill-listing-policy.json"
+          }
+        ]
+      },
+      "retention": "applied by setup.sh (ccc-skill-listing-policy.py); operator-written entries are preserved across applies",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "json-parses"
     },
     {
       "id": "bot.env_config",
@@ -1618,6 +2200,67 @@
       "verification": "file presence"
     },
     {
+      "id": "bot.jev_skill_advice_config",
+      "path_class": "node-local config",
+      "contains": [
+        "feature-opt-in",
+        "allowed-user-ids"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "jev-skill-advice.json"
+          },
+          {
+            "path": "~/.telegram_bot/jev-skill-advice.json"
+          }
+        ]
+      },
+      "retention": "operator-provisioned opt-in config (docs/jev-skill-advice.md); the API key lives elsewhere ($HOME/.secrets)",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "delete",
+        "telegram-user-erasure": "redact-user-ids"
+      },
+      "derived_copies": [],
+      "verification": "json-parses"
+    },
+    {
+      "id": "skill.review_zai_env",
+      "path_class": "node-local config",
+      "contains": [
+        "provider-endpoint",
+        "credential"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_SKILL_REVIEW_ZAI_ENV",
+            "path": "~/.claude/state/skill-review.zai.env"
+          }
+        ]
+      },
+      "retention": "live credential config for the skill-review zai fallback (extract.sh) — rotate via the credential manager (FW-03); never delete via erasure",
+      "requests": {
+        "audience-erasure": "retain",
+        "node-decommission": "retain",
+        "telegram-user-erasure": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "path": "~/.claude/state/skill-review.zai.env"
+        }
+      ]
+    },
+    {
       "id": "legacy.nunchi_unscoped_db",
       "path_class": "node-local legacy",
       "contains": [
@@ -1652,7 +2295,8 @@
       "derived_copies": [
         "facts_fts"
       ],
-      "verification": "retirement marker + age, body-free"
+      "verification": "retirement marker + age, body-free",
+      "sqlite_sidecars": true
     },
     {
       "id": "legacy.nunchi_unscoped_store",
@@ -1732,28 +2376,28 @@
             "env": "CCC_BOT_DATA_DIR",
             "join": true,
             "kind": "pattern",
-            "path": "\\.env\\.bak-[A-Za-z0-9._-]+"
+            "path": "\\.env\\.bak[.-][A-Za-z0-9._+-]+"
           },
           {
             "kind": "pattern",
-            "path": "~/.telegram_bot/\\.env\\.bak-[A-Za-z0-9._-]+"
+            "path": "~/.telegram_bot/\\.env\\.bak[.-][A-Za-z0-9._+-]+"
           },
           {
             "env": "CCC_BOT_DATA_DIR",
             "join": true,
             "kind": "pattern",
-            "path": "\\.env\\.pre-[A-Za-z0-9._-]+"
+            "path": "\\.env\\.pre-[A-Za-z0-9._+-]+"
           },
           {
             "kind": "pattern",
-            "path": "~/.telegram_bot/\\.env\\.pre-[A-Za-z0-9._-]+"
+            "path": "~/.telegram_bot/\\.env\\.pre-[A-Za-z0-9._+-]+"
           }
         ]
       },
       "retention_policy": {
         "group": "b-sensitive-backup"
       },
-      "retention": "group b (#1468): 30 days from mtime, then eligible for destruction at the apply boundary; the live .env is bot.env_config (retain)",
+      "retention": "group b (#1468): 30 days from max(mtime,ctime), then eligible for destruction at the apply boundary; the live .env is bot.env_config (retain)",
       "requests": {
         "prune-expired": "delete",
         "node-decommission": "delete"
@@ -1779,18 +2423,18 @@
             "env": "CCC_BOT_DATA_DIR",
             "join": true,
             "kind": "pattern",
-            "path": "sessions\\.json\\.bak-[A-Za-z0-9._-]+"
+            "path": "sessions\\.json\\.bak-[A-Za-z0-9._+-]+"
           },
           {
             "kind": "pattern",
-            "path": "~/.telegram_bot/sessions\\.json\\.bak-[A-Za-z0-9._-]+"
+            "path": "~/.telegram_bot/sessions\\.json\\.bak-[A-Za-z0-9._+-]+"
           }
         ]
       },
       "retention_policy": {
         "group": "b-sensitive-backup"
       },
-      "retention": "group b (#1468): 30 days from mtime, then eligible for destruction at the apply boundary",
+      "retention": "group b (#1468): 30 days from max(mtime,ctime), then eligible for destruction at the apply boundary",
       "requests": {
         "prune-expired": "delete",
         "node-decommission": "delete"
@@ -1815,28 +2459,48 @@
             "env": "CCC_BOT_DATA_DIR",
             "join": true,
             "kind": "pattern",
-            "path": "crontab\\.bak-[A-Za-z0-9._-]+"
+            "path": "crontab\\.bak[.-][A-Za-z0-9._+-]+"
           },
           {
             "kind": "pattern",
-            "path": "~/.telegram_bot/crontab\\.bak-[A-Za-z0-9._-]+"
+            "path": "~/.telegram_bot/crontab\\.bak[.-][A-Za-z0-9._+-]+"
           },
           {
             "env": "CCC_STATE_DIR",
             "join": true,
             "kind": "pattern",
-            "path": "crontab\\.bak-[A-Za-z0-9._-]+"
+            "path": "crontab\\.bak[.-][A-Za-z0-9._+-]+"
           },
           {
             "kind": "pattern",
-            "path": "~/.claude/state/crontab\\.bak-[A-Za-z0-9._-]+"
+            "path": "~/.claude/state/crontab\\.bak[.-][A-Za-z0-9._+-]+"
+          },
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "crontab-backup-[0-9][A-Za-z0-9._+-]*\\.txt"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/crontab-backup-[0-9][A-Za-z0-9._+-]*\\.txt"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "crontab\\.bak[.-][A-Za-z0-9._+-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/crontab\\.bak[.-][A-Za-z0-9._+-]+"
           }
         ]
       },
       "retention_policy": {
         "group": "b-sensitive-backup"
       },
-      "retention": "group b (#1468): 30 days from mtime, then eligible for destruction at the apply boundary",
+      "retention": "group b (#1468): 30 days from max(mtime,ctime), then eligible for destruction at the apply boundary",
       "requests": {
         "prune-expired": "delete",
         "node-decommission": "delete"
@@ -1845,6 +2509,42 @@
       "verification": "mtime age, body-free",
       "last_copy_guard": {
         "counterpart": null
+      }
+    },
+    {
+      "id": "state.memory_facts_backups",
+      "path_class": "node-local operational backup",
+      "contains": [
+        "distilled-local-facts-copy"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "memory-facts\\.jsonl\\.bak-[A-Za-z0-9._+-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/memory-facts\\.jsonl\\.bak-[A-Za-z0-9._+-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "group b (#1468): copies of the local memory lane (state.memory_lane); 30 days from max(mtime,ctime), then eligible for destruction at the apply boundary",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "mtime age, body-free",
+      "last_copy_guard": {
+        "counterpart": "memory-facts.jsonl"
       }
     },
     {
@@ -1879,6 +2579,115 @@
       },
       "derived_copies": [],
       "verification": "file presence"
+    },
+    {
+      "id": "state.cert_backups",
+      "path_class": "node-local config backup",
+      "contains": [
+        "certificate-or-key-material-copy"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "cert\\.pem\\.bak-[A-Za-z0-9._+-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/cert\\.pem\\.bak-[A-Za-z0-9._+-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "PEM material (#1468): classified with group b but ALWAYS kept — the key-file rule (pem) overrides age; retire via the credential manager (FW-03)",
+      "requests": {
+        "prune-expired": "retain",
+        "node-decommission": "retain"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "state.timed_test_notify_state",
+      "path_class": "node-local operational",
+      "contains": [
+        "notified-finding-fingerprints"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_STATE_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "timed-test-deadline-scan\\.notify-[a-z]+\\.json"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.claude/state/timed-test-deadline-scan\\.notify-[a-z]+\\.json"
+          }
+        ]
+      },
+      "retention": "latest notify run only (scripts/timed_test_deadline_scan.py dedup state; loss re-sends one notice)",
+      "requests": {
+        "audience-erasure": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence"
+    },
+    {
+      "id": "state.operator_scratch",
+      "path_class": "node-local operational scratch",
+      "contains": [
+        "operator-one-off-scripts",
+        "handover-notes",
+        "one-time-logs",
+        "manual-backups-and-archives",
+        "producer-less-files"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": []
+      },
+      "fallback_scope": {
+        "roots": [
+          {
+            "candidates": [
+              {
+                "env": "CCC_STATE_DIR",
+                "kind": "dir",
+                "path": "~/.claude/state"
+              },
+              {
+                "kind": "dir",
+                "path": "~/.claude/state"
+              }
+            ]
+          }
+        ],
+        "excluded": "~/.nunchi and the bot data dir (~/.telegram_bot) hold private memory and credentials: an unknown file there stays a blocker"
+      },
+      "scheduler_guard": true,
+      "retention_policy": {
+        "group": "operator-scratch",
+        "max_age_days": 90
+      },
+      "retention": "operator scratch (#1468, owner decision 2026-10-23): any file directly under the harness state dir that matches no other class — ad-hoc scripts, handover notes, one-time logs, manual backups (wiki-candidates.md.bak*, working-state.md.bak*, skill-autosave.mode.bak-auto-*), producer-less files; 90 days from max(mtime,ctime), then eligible for destruction at the apply boundary; key files and scheduler-referenced files are always kept",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "max(mtime,ctime) age + scheduler references, body-free"
     }
   ]
 }

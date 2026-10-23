@@ -54,10 +54,37 @@ before deletion.
 
 Owner decision (2026-09-29, option ②): group a (legacy unscoped stores,
 e.g. `~/.nunchi/{facts.db,backend-health.json,snapshot.md}` once the live
-resolver points elsewhere) and group b (sensitive backups: `.env.bak-*`,
-`.env.pre-*`, `sessions.json.bak-*`, `crontab.bak-*`) are kept **30 days**,
-then become **eligible** for destruction at the apply boundary. Key files are
-always kept.
+resolver points elsewhere) and group b (sensitive backups) are kept **30
+days**, then become **eligible** for destruction at the apply boundary. Key
+files are always kept.
+
+Group b name families (anchored regexes over file names; `+` is allowed so
+`…+0900` stamps match):
+
+| class | directory | names |
+|---|---|---|
+| `bot.env_backups` | bot data dir | `.env.bak-*`, `.env.bak.*`, `.env.pre-*` |
+| `bot.sessions_backups` | bot data dir | `sessions.json.bak-*` |
+| `state.crontab_backups` | bot data dir, `~/.claude/state`, `~/.nunchi` | `crontab.bak-*`, `crontab.bak.*`; state dir also `crontab-backup-<digit>….txt` |
+| `state.memory_facts_backups` | `~/.claude/state` | `memory-facts.jsonl.bak-*` (last-copy counterpart `memory-facts.jsonl`) |
+| `bot.credential_key_backups` | bot data dir | `memory-audience.key.{bak,pre}-*` — explicit `retain` |
+| `state.cert_backups` | `~/.claude/state` | `cert.pem.bak-*` — explicit `retain`; `pem` is a key token anyway |
+
+Not group b, on purpose:
+
+- `sessions.json.bak` and `tasks.json.bak` with **no suffix** are the
+  bridge's previous-good recovery copies (session store and task ledger).
+  They are rewritten on every save and read back when the primary is corrupt.
+  They belong to the live classes (`telegram.sessions_tasks_usage`,
+  `bot.runtime_state`), so they are claimed live and never age out.
+- `~/.claude/state/skill-review.zai.env` is the live credential file for the
+  skill-review zai fallback. It is registered as `skill.review_zai_env` with
+  `retain` for every request (rotate it via FW-03), so erasure never
+  deletes it.
+- A bare `.env.bak`, `.env.backup`, `memory-facts.jsonl.bak`, or a
+  `crontab-backup-*.txt` that does not start with a digit matches no group b
+  family. In the bot data dir it stays a blocker; in `~/.claude/state` it
+  falls back to operator scratch (see below).
 
 - Inventory: entries with a `retention_policy` object (`group`, optional
   `max_age_days`); defaults live in `retention_defaults` (`max_age_days: 30`,
@@ -99,7 +126,8 @@ always kept.
   `manifest.json`). Removing the marker afterwards does not bring deleted
   files back.
 - Last copy: while a backup family's live counterpart is absent (`.env` for
-  `.env.bak-*`/`.env.pre-*`, `sessions.json` for its backups; crontab has no
+  `.env.bak-*`/`.env.pre-*`, `sessions.json` and `memory-facts.jsonl` for
+  their backups; crontab has no
   checkable file, so it always counts as absent), the newest copy per
   directory is planned as `retain (last copy; live missing)` even past
   retention. Only regular, non-symlink files can be that kept copy (a
@@ -112,12 +140,145 @@ always kept.
   `node-decommission` plans carry `delete` only for expired files; younger
   ones plan as `retain-until:<ISO date>`, which apply skips.
 
+- SQLite sidecars: a class flagged `sqlite_sidecars` (`nunchi.peer_facts`,
+  `legacy.nunchi_unscoped_db`, `nunchi.gotgan_store`,
+  `nunchi.jev_review_ledger`) also owns the existing `-wal`/`-shm`/`-journal`
+  siblings of its files. A sidecar of any live-claimed file is claimed live
+  as well. In a retention class a sidecar takes its DB's verdict, so a WAL is
+  never deleted before its DB and never left behind after it. An orphan
+  sidecar with no DB stays a blocker.
+
 **Out of scope here:** actually deleting anything on a node. Eligible files
 are destroyed only by a `prune-expired` plan run through
 `ccc-erasure-apply.py` with `ERASURE_APPLY=1` (digest, blockers, owner-only,
 rollback-first), and every such per-node run needs its **own fresh owner
 approval**. Measuring the two Termux nodes is also still
 open (#1468).
+
+## Inventory c-batch-2 (#1468)
+
+The read-only fleet scan on 2026-10-23 found the same harness-written files on
+most nodes, and they blocked every apply. They are now classified through
+their component's own env chain (`NUNCHI_HOME`, `CCC_STATE_DIR`,
+`CCC_BOT_DATA_DIR`, `GOTGAN_DB`), with the default-home literal added as well:
+
+- **New classes:**
+  - `nunchi.gotgan_store` holds verbatim transcript chunks, so it is a
+    body-bearing private index, handled like `mempalace.palace`
+    (`delete-entries-by-scope` / `delete` / `re-index`).
+  - `nunchi.jev_review_ledger` holds cursors and advisory verdicts, with no
+    fact bodies.
+  - `nunchi.feed_receipts` holds fingerprint receipts: sha256 path keys and
+    inode/size/mtime, with no bodies.
+  - `nunchi.feed_status` holds body-free run status for the feeds, judge,
+    journal channels and gotgan refresh.
+  - `state.skill_listing_policy`.
+  - `bot.jev_skill_advice_config`, the opt-in config with allowed user IDs.
+  - `skill.review_zai_env`, which is always retained.
+- **Extended classes:**
+  - Nunchi cron logs, including the documented repair and channel cron names.
+  - Nunchi runtime locks.
+  - Ingest dedup state.
+  - Nunchi runtime state (judge flag, wiki-promote report, auto-distill
+    marker, `verbatim-backend`).
+  - State locks.
+  - Rotated `*.log.N[.gz]` files.
+  - The autosave cron history, as an installer record.
+  - Distill scope and toggles.
+  - Self-update pending activation.
+  - Autosave prescreen, curator and per-provider seen ledgers.
+  - Repo command and output-style manifests.
+
+The operator one-offs that remained blockers after this batch now fall back
+to operator scratch in the state dir (next section). In `~/.nunchi` and the
+bot data dir they still block.
+
+## Operator scratch (#1468, owner decision 2026-10-23)
+
+Owner decision (2026-10-23, option 1, "권장대로 진행"): operator one-off files
+in the harness state dir form the `operator-scratch` retention class
+(`state.operator_scratch`). They are kept **90 days**, then become eligible
+for destruction at the same apply boundary as groups a/b. The class covers
+these files:
+
+- ad-hoc restart/rollout/apply scripts (`*.sh`, `*.py`)
+- handover notes, and issue- or node-named files
+- one-time logs: `manual-self-update-<ts>.log`, `*.log.validate`,
+  `*.log.telegram`
+- manual toggle archives (`distill.*.archive-*`)
+- `self-update.lock.stalefile-removed-*`
+- files with no producer in this repo (`mcp-discover-verdicts.json`,
+  `working-state*.lock`, `fleet-idle-finalize.no-services`)
+- the backups that used to be owner-decision blockers:
+  `wiki-candidates.md.bak*`, `working-state.md.bak*` and
+  `skill-autosave.mode.bak-auto-*`
+
+- **Fallback, not a pattern.** The entry has no resolve candidates. Its
+  `fallback_scope.roots` names the state dir through the harness chain
+  (`CCC_STATE_DIR`, then `~/.claude/state`; the first existing directory
+  wins). The planner gives the class every file directly under that root
+  that the unknown-artifact sweep would otherwise report as a blocker. A
+  file that any other class matches keeps that class, so the fallback never
+  causes a "conflicting actions" block. The rules follow the sweep:
+  - Subdirectories are never entered, so the agent-cron store and the skills
+    directories stay with their own classes.
+  - Only regular files and symlinks qualify. Symlinks are always kept.
+  - An orphan SQLite sidecar (its DB is gone) stays a blocker. A sidecar
+    whose DB is also scratch shares the DB's verdict.
+- **Scope.** The fallback covers only the state dir. `~/.nunchi` holds
+  private memory (facts DB, transcript index) and the bot data dir holds
+  credentials (`.env`, `memory-audience.key`), so an unknown file in either
+  stays a **blocker**. A stray file next to private memory or credentials
+  needs an explicit class, not a silent 90-day clock.
+- **Order of rules.**
+  1. Live claims come first (a path another class resolves as live is never
+     a target).
+  2. The key-file rule: `retain (key-file)` at any age.
+  3. Symlinks are kept.
+  4. The scheduler guard, below.
+  5. Age: `max(mtime, ctime)` against 90 days. `CCC_ERASURE_RETENTION_DAYS`
+     may only lengthen it.
+- **Scheduler guard** (`"scheduler_guard": true`). A scratch file that a
+  scheduler names is planned as `retain (scheduler-referenced)` at any age.
+  The guard reads three sources, read-only:
+  - the current user's crontab, via `$CCC_CRONTAB_CMD -l` (default
+    `crontab`, the repo's test seam). "no crontab for <user>" counts as
+    empty.
+  - the agent-cron task store: `CCC_AGENT_CRON_STORE`,
+    `$CCC_STATE_DIR/agent-cron/tasks.json` and
+    `~/.claude/state/agent-cron/tasks.json`. A missing store means no tasks.
+  - the non-comment lines of systemd unit and drop-in files under
+    `~/.config/systemd/user/` and `/etc/systemd/system/`.
+
+  A match is the absolute path, the realpath, or a `~/`, `$HOME/`,
+  `${HOME}/` or `%h/` form of it. The bare file name as a whole token also
+  matches, which covers `cd … && ./x.sh` and env-var indirection. A false
+  positive only keeps a file longer.
+- **Fail toward keeping.** If any of these sources cannot be read (crontab
+  missing or erroring, task store unreadable or not JSON, unit file
+  unreadable), no scratch file is eligible. Each one is planned as
+  `retain (scheduler references unreadable)`. The plan and the retention
+  report carry a body-free `scheduler_guard` block
+  (`status`/`sources`/`errors`). Scheduler text is never printed.
+- **Lifecycle requests.**
+
+  | request | scratch files |
+  |---|---|
+  | `prune-expired` | `delete` once expired and not referenced; otherwise a retain variant |
+  | `node-decommission` | `delete`, under the same age, guard and key-file gate as group b on decommission. Key files are never deleted |
+  | `audience-erasure`, `telegram-user-erasure`, `cache-rebuild` | not targeted, so kept. Scratch is not audience- or user-scoped data |
+- **New harness class found while scoping.**
+  `timed-test-deadline-scan.notify-<level>.json` is written by
+  `scripts/timed_test_deadline_scan.py`. It now has its own class
+  (`state.timed_test_notify_state`) instead of aging out as scratch.
+- **Apply caveat.** The apply boundary still refuses any target with
+  group/other permission bits, and that refusal blocks the whole run.
+  Operator scripts are often `0755`. A `chmod 600` refreshes ctime, which
+  restarts the 90-day clock (the rule errs toward keeping).
+
+Nothing is deleted by the planner. Destruction still needs a `prune-expired`
+plan run through `ccc-erasure-apply.py` with `ERASURE_APPLY=1`, and a fresh
+per-node owner approval.
 
 ## Wiki promotion records (#1447 batch)
 
