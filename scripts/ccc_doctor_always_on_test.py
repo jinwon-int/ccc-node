@@ -231,9 +231,9 @@ class AlwaysOnBudget(unittest.TestCase):
         self.write_local(["bash '/root/.claude/hooks/nunchi/sessionstart.sh'"])
         doctor = self.run_check()
         row = self.source_rows(doctor)["nunchi working memory"]
-        self.assertIn("6,000 chars / 12,000 B", row)
+        self.assertIn("7,500 chars / 15,000 B", row)
         self.assertIn("estimated (budget ceiling)", row)
-        self.assertIn("total 6,000 chars", self.verdict(doctor).status)
+        self.assertIn("total 7,500 chars", self.verdict(doctor).status)
 
     def test_nunchi_budget_env_overrides(self) -> None:
         self.arm_nunchi("a" * 10)
@@ -241,7 +241,7 @@ class AlwaysOnBudget(unittest.TestCase):
         row = self.source_rows(self.run_check({
             "CCC_NUNCHI_CONSTRAINT_BUDGET": "1000", "CCC_NUNCHI_ASSEMBLE_BUDGET": "2500",
         }))["nunchi working memory"]
-        self.assertIn("2,500 chars / 2,500 B", row)
+        self.assertIn("3,500 chars / 3,500 B", row)
         legacy = self.source_rows(self.run_check({"CCC_NUNCHI_ASSEMBLE": "0"}))["nunchi working memory"]
         self.assertIn("10 chars", legacy)
         self.assertIn("cached (snapshot.md head -c 3000)", legacy)
@@ -258,7 +258,7 @@ class AlwaysOnBudget(unittest.TestCase):
         self.write_local(["bash /root/.claude/hooks/nunchi/sessionstart.sh"])
         verdict = self.verdict(self.run_check())
         self.assertEqual(verdict.klass, "경고")
-        self.assertIn("cut 3,000 chars, largest first: CLAUDE.md -3,000", verdict.action)
+        self.assertIn("cut 6,000 chars, largest first: CLAUDE.md -6,000", verdict.action)
         verdict = self.verdict(self.run_check({"CCC_ALWAYS_ON_MAX_CHARS": "5000"}))
         self.assertIn("nunchi working memory -", verdict.action)
 

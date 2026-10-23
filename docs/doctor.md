@@ -355,7 +355,8 @@ hot memory and section headers are not counted.
 
 The nunchi row is not executed either, and nothing writes the hook's output to
 disk. It reports the byte ceiling of `nunchi.py assemble` —
-`max(CCC_NUNCHI_ASSEMBLE_BUDGET (3000), CCC_NUNCHI_CONSTRAINT_BUDGET (12000))`
+`CCC_NUNCHI_ASSEMBLE_BUDGET (3000) + CCC_NUNCHI_CONSTRAINT_BUDGET (12000)`
+(the fact block has its own budget since #2500)
 — converted to chars with `snapshot.md`'s char/byte ratio, labelled
 `estimated (budget ceiling)`. With `CCC_NUNCHI_ASSEMBLE=0`, the hook injects
 `head -c 3000 snapshot.md`, which is read as `cached`. The row is `inactive` when

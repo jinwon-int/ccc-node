@@ -216,6 +216,31 @@ ok "snapshot labels and caps auto rows (P1-b)" \
 asmc="$(python3 "$NP" assemble --budget 3000)"
 ok "assemble keeps conversation memory beside a long constraint list (P2-a)" 'grep -q "CONV" <<<"$asmc"'
 
+# #2500 — live regime: the constraint block alone exceeds the fact budget
+# (every measured node: 12000 B constraint budget vs 3000 B fact budget).
+# The fact block must keep its own budget instead of collapsing to the one
+# guaranteed line with a 0-byte auto-distill share.
+python3 - "$NUNCHI_DB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+ins = ("INSERT INTO peer_facts(observer,observed,kind,fact,evidence,valid_from,dedup,created_at,source_rank,review,mutability)"
+       " VALUES ('family-assistant','node-a','constraint',?,?,'2026-10-08T00:00:00Z',?,'2026-10-08T00:00:00Z',1,0,'static')")
+for i in range(40):
+    c.execute(ins, (f"규칙{i} " + " ".join(f"w{i}t{j}" for j in range(20)), f"distill:big{i}", f"big{i}"))
+c.commit()
+PY
+asml="$(python3 "$NP" assemble --budget 3000)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cons_bytes="$(grep '^- \[제약' <<<"$asml" | wc -c)"
+# shellcheck disable=SC2034
+fact_n="$(grep -cE '^- (⟳ )?\([^)]*\) ' <<<"$asml")"
+# shellcheck disable=SC2034
+auto_l="$(grep '·auto' <<<"$asml" | wc -c)"
+ok "fixture: constraint block exceeds the fact budget (#2500)" '[ "$cons_bytes" -gt 3000 ]'
+ok "fact block keeps its own budget under a large constraint block (#2500)" '[ "$fact_n" -gt 5 ] && grep -q "CONV" <<<"$asml"'
+ok "auto-distill share is non-zero and capped under a large constraint block (#2500)" \
+  '[ "$auto_l" -gt 0 ] && [ "$auto_l" -le 990 ]'
+
 out="$(feed --backfill-days 7)"
 ok "backfill on an initialised feed says it was ignored (P2-b)" 'grep -q "backfill-days ignored" <<<"$out"'
 python3 - "$NUNCHI_HOME/.auto-distill-feed.lock" <<'PY' &
