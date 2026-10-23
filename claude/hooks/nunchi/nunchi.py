@@ -1744,6 +1744,28 @@ def backend_health_state():
     return "ok", ""
 
 
+def _backend_stale_was_healthy():
+    """#2496 — True when a `stale` history ended healthy.
+
+    `stale` only says "no synthesis call inside the cutoff". The weekly bench
+    is usually the only caller while the cutoff is 24h, so a healthy node
+    reads stale ~6 days in 7. The ⟳ header line exists to soften an *old
+    failure* (#2129); an old success needs no recheck notice. Healthy here
+    means the window would have read `ok` when it was recorded: the last call
+    was answered by its primary and fallbacks stayed under the degraded bar.
+    """
+    hist = _load_backend_health()["history"]
+    if not hist:
+        return True
+    last = hist[-1]
+    if not last.get("winner") or last.get("winner") != last.get("primary"):
+        return False
+    window = hist[-_BACKEND_DEGRADED_WINDOW:]
+    fallbacks = sum(1 for h in window
+                    if h.get("winner") and h.get("winner") != h.get("primary"))
+    return fallbacks < _BACKEND_DEGRADED_MIN
+
+
 def backend_status():
     """Human-readable backend health for `nunchi.py backend-status` (#1263)."""
     hist = _load_backend_health()["history"]
@@ -2183,7 +2205,7 @@ def _snapshot_header(c):
         lines.append(
             f"- ⚠ nunchi 합성 백엔드가 fallback으로 강등됨({backend_detail}) —"
             " 1순위 인증 재확인 필요, `nunchi.py backend-status`로 확인")
-    elif backend_state == "stale":
+    elif backend_state == "stale" and not _backend_stale_was_healthy():
         lines.append(
             f"- ⟳ 합성 상태 재확인 필요 — 마지막 실측 {backend_detail};"
             " 과거 결과로 현재 장애를 단정하지 않는다.")
