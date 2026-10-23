@@ -930,6 +930,32 @@ ok "--verbatim-backend gotgan drops the MemPalace sweep, keeps feed/gotgan/bench
 run_install --apply --codex >/dev/null 2>&1
 ok "re-apply without the flag returns to mempalace (gotgan line and file gone)" \
   '! grep -q "gotgan-refresh.sh" "$cron_store" && [ ! -e "$backend_file" ] && grep -q "mempalace-refresh.sh codex" "$cron_store" && jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
+# --- #2475: the per-node gotgan budget/interpreter survive a self-update
+# replay. Set via env (the documented Termux path) the values used to reach
+# only the :27 line, so replaying the record without that env dropped them.
+GOTGAN_RUN_BYTES=33554432 CCC_NUNCHI_GOTGAN_PYTHON=/usr/bin/python3 \
+  run_install --apply --codex --verbatim-backend both >/dev/null 2>&1; rc=$?
+ok "env-pinned gotgan budget/interpreter reach the :27 line" \
+  '[ "$rc" = 0 ] && grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=33554432 CCC_NUNCHI_GOTGAN_PYTHON=/usr/bin/python3 "'
+ok "install record materializes --gotgan-run-bytes / --gotgan-python" \
+  'jq -e ".argv==[\"--apply\",\"--codex\",\"--verbatim-backend\",\"both\",\"--gotgan-run-bytes\",\"33554432\",\"--gotgan-python\",\"/usr/bin/python3\"]" "$nrec" >/dev/null'
+mapfile -t rec_argv < <(jq -r '.argv[]' "$nrec")
+env -u GOTGAN_RUN_BYTES -u CCC_NUNCHI_GOTGAN_PYTHON "${common_env[@]}" \
+  bash "$ROOT/scripts/install-nunchi.sh" "${rec_argv[@]}" >/dev/null 2>&1
+ok "replaying the record without the env keeps the pinned budget on exactly one :27 line" \
+  '[ "$(grep -c "gotgan-refresh.sh codex" "$cron_store")" = 1 ] && grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=33554432 CCC_NUNCHI_GOTGAN_PYTHON=/usr/bin/python3 "'
+run_install --apply --codex --verbatim-backend both --gotgan-run-bytes 16777216 >/dev/null 2>&1
+ok "the flag sets the budget directly and wins over nothing in env" \
+  'grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=16777216 " && ! grep "gotgan-refresh.sh" "$cron_store" | grep -q "CCC_NUNCHI_GOTGAN_PYTHON=" && jq -e ".argv==[\"--apply\",\"--codex\",\"--verbatim-backend\",\"both\",\"--gotgan-run-bytes\",\"16777216\"]" "$nrec" >/dev/null'
+run_install --apply --codex --verbatim-backend both >/dev/null 2>&1
+ok "unset budget leaves the line and the record unchanged (no pin)" \
+  '! grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=" && jq -e ".argv==[\"--apply\",\"--codex\",\"--verbatim-backend\",\"both\"]" "$nrec" >/dev/null'
+rc=0; run_install --apply --codex --gotgan-run-bytes 0 >/dev/null 2>&1 || rc=$?
+ok "--gotgan-run-bytes rejects zero" '[ "$rc" = 2 ]'
+rc=0; run_install --apply --codex --gotgan-run-bytes 32M >/dev/null 2>&1 || rc=$?
+ok "--gotgan-run-bytes rejects a non-integer" '[ "$rc" = 2 ]'
+rc=0; run_install --apply --codex --gotgan-python python3 >/dev/null 2>&1 || rc=$?
+ok "--gotgan-python rejects a relative path" '[ "$rc" = 2 ]'
 run_install --apply --codex --verbatim-backend both >/dev/null 2>&1
 run_install --remove >/dev/null 2>&1
 ok "--remove clears the backend file with the lanes" '[ ! -e "$backend_file" ] && ! grep -q "nunchi:#816" "$cron_store"'
