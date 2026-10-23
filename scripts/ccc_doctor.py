@@ -4302,9 +4302,10 @@ class Doctor:
 
         The hook prints ``nunchi.py assemble`` output: header + open constraints
         bounded by CCC_NUNCHI_CONSTRAINT_BUDGET (default 12000 B, 0 = unbounded)
-        + facts filling what is left of CCC_NUNCHI_ASSEMBLE_BUDGET (default
-        3000 B). Nothing writes that output to disk, so the row reports the
-        byte ceiling ``max(assemble, constraint)``, converted to chars with
+        + header and facts bounded by CCC_NUNCHI_ASSEMBLE_BUDGET (default
+        3000 B; the constraint block is not charged against it — #2500).
+        Nothing writes that output to disk, so the row reports the byte
+        ceiling ``assemble + constraint``, converted to chars with
         snapshot.md's char/byte ratio. With CCC_NUNCHI_ASSEMBLE=0 the hook
         injects ``head -c 3000 snapshot.md``, which is read directly.
         """
@@ -4333,7 +4334,7 @@ class Doctor:
         except ValueError:
             constraint = 12000
         constraint = constraint if constraint >= 0 else 12000
-        ceiling = max(int(raw_budget), constraint)
+        ceiling = int(raw_budget) + constraint
         state = "estimated (budget ceiling)"
         if constraint == 0:
             state = "estimated (fact budget only; CCC_NUNCHI_CONSTRAINT_BUDGET=0 leaves constraints unbounded)"

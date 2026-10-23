@@ -2849,7 +2849,9 @@ def assemble(budget, hint, limit=25):
          remains. Each fact line keeps its P1-4 ⟳ live-check marker inline
          so the verification contract survives reordering.
 
-    The budget bounds the FACT block best-effort: a line that does not fit
+    The budget bounds the header + FACT block best-effort; the constraint
+    block is not charged against it (#2500), so the SessionStart ceiling is
+    constraint budget + fact budget. A fact line that does not fit
     is skipped (a later, shorter line can still fit); when nothing has been
     added yet the first line is always taken, so a tiny budget degrades to
     one fact instead of an empty block. Prints to STDOUT — the static
@@ -2864,8 +2866,13 @@ def assemble(budget, hint, limit=25):
     hint_ids = []
     if hint:
         hint_ids = [r[0] for r in search(c, hint, limit=limit, include_history=False)]
-    lines.extend(_constraint_lines(c, hint_ids, _constraint_budget()))
+    # #2500 — the fact budget is charged for the header only. The constraint
+    # block has had its own byte budget since #2216 (default 12000), so
+    # charging it here as well left `budget - used` negative on every live
+    # node: the fact block shrank to the one guaranteed line and the
+    # auto-distill share computed to 0 bytes.
     used = sum(len(ln.encode()) + 1 for ln in lines)
+    lines.extend(_constraint_lines(c, hint_ids, _constraint_budget()))
     rest_rows = c.execute(
         "SELECT id,observed,kind,fact,mutability,evidence FROM peer_facts WHERE valid_to IS NULL"
         " AND kind NOT IN ('constraint','observation') ORDER BY id DESC", ()).fetchall()
@@ -2882,9 +2889,9 @@ def assemble(budget, hint, limit=25):
     # #2186 — machine-extracted auto-distill rows are labelled `·auto` and
     # capped to a share of the budget, after relevance ordering, so they add
     # recall without displacing conversation memory.
-    # Share of the FACT block (budget left after header + constraints), so a
-    # long constraint list cannot let auto rows take the whole block (#2186
-    # review P2-a).
+    # Share of the FACT block (budget left after the header; the constraint
+    # block is bounded separately — #2500), so auto rows can never take the
+    # whole block and conversation memory keeps the rest (#2186 review P2-a).
     auto_cap = int(max(0, budget - used) * _auto_distill_share())
     auto_used = 0
     fact_lines = []  # (rendered line, is_live) — budget-filtered in order
