@@ -80,7 +80,9 @@ Usage:
   nunchi.py constraints-triage [--apply] [--threshold F] [--retire-age-days N]
             [--fold-only|--retire-only] [--include-user-stated] [--sample N] [--json]
                                              # fold near-dup / retire phase constraints (#2222)
-  nunchi.py metrics                          # body-free counters for bench
+  nunchi.py g5-legacy-close [--apply] [--close-only|--retag-only] [--sample N] [--json]
+                                             # G5 legacy backlog: retag logs / policy reason (#2221)
+  nunchi.py metrics                         # body-free counters for bench
   nunchi.py backend-status                   # synthesis backend health (#1263)
   nunchi.py stats
 
@@ -89,7 +91,8 @@ Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
   reversible. Tier 1 unattended passes (ingest, judge-batch cron, snapshot)
   only add facts, close under a deterministic gate (G1, B2, observation TTL)
   and set/clear review flags. Tier 2 bulk closes (review-stale, constraints-
-  triage) are owner-invoked and dry-run by default; conflict-sweep only flags.
+  triage) are owner-invoked and dry-run by default; conflict-sweep only flags;
+  g5-legacy-close only sets because/kind on the G5 legacy backlog.
   Tier 3 per-fact edits (supersede, merge, retag, annotate, review --clear)
   are owner commands. curation-authority.test.sh enforces the boundary.
 """
@@ -2623,6 +2626,186 @@ def constraints_triage(apply=False, threshold=TRIAGE_THRESHOLD_DEFAULT,
     return report
 
 
+# ---- #2221 Tier C — deterministic cleanup of the G5 legacy backlog ------------
+# Measured (2026-10-10, read-only copy of one node's DB): 425 open decisions fail
+# G5, all created 2026-08 by the pre-G5 distill backfill, none with source_refs
+# (P1-3 landed 2026-09-03) and no surviving transcript (0/60 sampled sessions).
+# Deterministic reason extraction (Tier A) found a reason clause in only 30, and
+# many rows are progress/hand-off logs mis-kinded as decisions. Owner decision
+# 2026-10-23: no LLM — retag log-shaped rows to task-progress, close the rest
+# with a fixed policy reason. User-stated rows (rank 3) are never touched (G2).
+G5_LEGACY_POLICY = ("legacy backfill 2026-08: original reasoning not recoverable"
+                    " (no transcript); closed by #2221 Tier C")
+_G5_LEGACY_MONTH = "2026-08"
+# Evidence written by the distill ingest path (plain and G1 auto-update rows).
+# manual:* rows are owner-written and auto-distill:* rows are a later feed.
+_G5_LEGACY_EVIDENCE = ("distill:", "auto:update:")
+_G5_RETAG_KIND = "task-progress"
+# A log-shaped decision ENDS on a completion / hand-off / in-flight marker
+# ("... 작업지시서 작성 완료", "... 인계함", "... 착수"). Anchored to the end of
+# the sentence (after a trailing parenthetical) so "완료 후 X로 간다" stays a
+# decision. Deliberately narrower than the G1 markers: _DONE has 확정 and
+# _PROGRESS has 보류/예정, which are decision words.
+_PROGRESS_LOG_END = re.compile(
+    r"(?:완료|인계|착수|진행\s?중|작업\s?중|(?:머지|병합|배포|반영)\s?됨"
+    r"|(?:머지|병합|배포|반영|작성|등록|생성|제출|전달|기록|보고)함)"
+    r"(?:함|했음|했다|하였다|했습니다|됨|됐다|되었다|되었습니다)?$"
+    r"|\b(?:done|completed|merged|deployed|handed off|in progress)$", re.IGNORECASE)
+# Any decision verb vetoes the retag: such a row is a real decision whose reason
+# is missing, so it gets the policy close instead (precision over recall — a
+# wrong retag hides a decision, a policy close only states what is known).
+_DECISION_VERB = re.compile(
+    r"결정|채택|선택|하기로|기로\s?(?:함|했|하|정|결)|확정|기각|거절|폐기|보류|유지"
+    r"|금지|방침|정책|원칙|승인|대신|말고|decid|chose|adopt|reject", re.IGNORECASE)
+_TRAILING_PAREN = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
+_TRAILING_PUNCT = re.compile(r"[\s.。!…·]+$")
+_G5_LEDGER_DDL = (
+    "CREATE TABLE IF NOT EXISTS g5_legacy_close("
+    " fact_id INTEGER PRIMARY KEY, action TEXT NOT NULL, old_kind TEXT NOT NULL,"
+    " new_kind TEXT NOT NULL, because_set TEXT, source_rank INTEGER, review INTEGER,"
+    " applied_at TEXT NOT NULL)")
+
+
+def _g5_legacy_row(observer, evidence, created_at, source_refs):
+    """The 2026-08 pre-G5 distill backfill: distill author, distill evidence,
+    created in 2026-08, and no source_refs (rows before P1-3 carry none, so no
+    transcript pointer exists to recover a reason from)."""
+    return (observer == OBSERVER
+            and str(created_at or "").startswith(_G5_LEGACY_MONTH)
+            and not (source_refs or "").strip()
+            and str(evidence or "").startswith(_G5_LEGACY_EVIDENCE))
+
+
+def _progress_log_like(text):
+    """Deterministic 'this decision row is a progress/hand-off log' test."""
+    body = str(text or "").strip()
+    body = _TRAILING_PUNCT.sub("", _TRAILING_PAREN.sub("", body))
+    return bool(_PROGRESS_LOG_END.search(body)) and not _DECISION_VERB.search(text or "")
+
+
+def _g5_legacy_plan(c, do_retag=True, do_close=True):
+    """Classify every open G5-reasonless decision. The G5 test is the shared
+    `_g5_reasonless_decision`, never a SQL re-expression (judge-batch rule)."""
+    plan = {"g5_open": 0, "user_stated": [], "not_legacy": [], "retag": [], "close": []}
+    for row in c.execute(
+            "SELECT id, observer, kind, fact, because, evidence, created_at, source_refs,"
+            " COALESCE(source_rank, 1), COALESCE(review, 0)"
+            " FROM peer_facts WHERE valid_to IS NULL AND kind='decision' ORDER BY id"):
+        fid, observer, kind, fact, because, evidence, created, refs_, rank, rev = row
+        if not _g5_reasonless_decision(kind, fact, because):
+            continue
+        plan["g5_open"] += 1
+        item = (fid, fact, int(rank), int(rev))
+        if int(rank) >= 3:
+            plan["user_stated"].append(item)
+        elif not _g5_legacy_row(observer, evidence, created, refs_):
+            plan["not_legacy"].append(item)
+        elif do_retag and _progress_log_like(fact):
+            plan["retag"].append(item)
+        elif do_close:
+            plan["close"].append(item)
+    return plan
+
+
+def _g5_open_count(c):
+    return sum(1 for k, f, b in c.execute(
+        "SELECT kind, fact, because FROM peer_facts WHERE valid_to IS NULL AND kind='decision'")
+        if _g5_reasonless_decision(k, f, b))
+
+
+def g5_legacy_close(apply=False, sample=20, do_retag=True, do_close=True, as_json=False):
+    """`g5-legacy-close` — #2221 Tier C, deterministic and LLM-free.
+
+    Scope: open `kind='decision'` rows failing G5, below rank 3, from the
+    2026-08 legacy backfill (`_g5_legacy_row`). Log-shaped rows are retagged
+    to task-progress (mutability recalculated, like `retag`); the rest get the
+    fixed G5_LEGACY_POLICY reason (like `annotate`). The review flag is left
+    as is, exactly like `annotate`: it may also owe to G2/G3, and judge-batch
+    re-triages the row once G5 no longer holds it out. No row is closed or
+    deleted. `--apply` mutates in one transaction with a mutation-time recheck
+    and records each change in the append-only `g5_legacy_close` ledger; a
+    second run finds nothing in scope. Dry-run by default.
+    """
+    c = db()
+    plan = _g5_legacy_plan(c, do_retag, do_close)
+
+    def by_rank(items):
+        return {str(k): sum(1 for i in items if i[2] == k) for k in (1, 2)}
+
+    def queued(items):
+        return sum(1 for i in items if i[3])
+
+    report = {
+        "mode": "apply" if apply else "dry-run",
+        "g5_open_decisions": plan["g5_open"],
+        "kept_user_stated": len(plan["user_stated"]),
+        "kept_not_legacy": len(plan["not_legacy"]),
+        "retag": len(plan["retag"]),
+        "retag_by_rank": by_rank(plan["retag"]),
+        "retag_review_flagged": queued(plan["retag"]),
+        "close": len(plan["close"]),
+        "close_by_rank": by_rank(plan["close"]),
+        "close_review_flagged": queued(plan["close"]),
+        "policy": G5_LEGACY_POLICY,
+        "retag_sample": [{"id": i[0], "rank": i[2], "text": i[1][:120]}
+                         for i in plan["retag"]][:sample],
+        "close_sample": [{"id": i[0], "rank": i[2], "text": i[1][:120]}
+                         for i in plan["close"]][:sample],
+    }
+    if apply:
+        stamp = now()
+        guard = (" WHERE id=? AND valid_to IS NULL AND kind='decision'"
+                 " AND (because IS NULL OR TRIM(because)='') AND COALESCE(source_rank, 1) < 3")
+        retagged = closed = 0
+        if c.in_transaction:
+            c.commit()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(_G5_LEDGER_DDL)
+            for fid, _f, rank, rev in plan["retag"]:
+                if c.execute("UPDATE peer_facts SET kind=?, mutability=?" + guard,
+                             (_G5_RETAG_KIND, _mutability(_G5_RETAG_KIND), fid)).rowcount:
+                    retagged += c.execute(
+                        "INSERT OR IGNORE INTO g5_legacy_close VALUES (?,?,?,?,?,?,?,?)",
+                        (fid, "retag", "decision", _G5_RETAG_KIND, None, rank, rev, stamp)).rowcount
+            for fid, _f, rank, rev in plan["close"]:
+                if c.execute("UPDATE peer_facts SET because=?" + guard,
+                             (G5_LEGACY_POLICY, fid)).rowcount:
+                    closed += c.execute(
+                        "INSERT OR IGNORE INTO g5_legacy_close VALUES (?,?,?,?,?,?,?,?)",
+                        (fid, "policy-close", "decision", "decision", G5_LEGACY_POLICY,
+                         rank, rev, stamp)).rowcount
+            c.commit()
+        except sqlite3.Error:
+            c.rollback()
+            raise
+        report["applied_retag"] = retagged
+        report["applied_close"] = closed
+        report["g5_open_after"] = _g5_open_count(c)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return report
+    print(f"g5-legacy-close ({report['mode']}): g5_open={plan['g5_open']}"
+          f" retag={report['retag']} close={report['close']}"
+          f" kept_user_stated={report['kept_user_stated']}"
+          f" kept_not_legacy={report['kept_not_legacy']}"
+          f" (retag_by_rank={report['retag_by_rank']}, close_by_rank={report['close_by_rank']},"
+          f" review_flagged retag={report['retag_review_flagged']}"
+          f" close={report['close_review_flagged']})")
+    for item in report["retag_sample"]:
+        print(f"  retag #{item['id']} rank={item['rank']} -> {_G5_RETAG_KIND}: {item['text']}")
+    for item in report["close_sample"]:
+        print(f"  close #{item['id']} rank={item['rank']}: {item['text']}")
+    if apply:
+        print(f"applied: retagged {report['applied_retag']}, closed {report['applied_close']};"
+              f" G5 open decisions now {report['g5_open_after']}"
+              " (ledger: g5_legacy_close; review flags unchanged — judge-batch re-triages them)")
+    else:
+        print(f"policy reason: {G5_LEGACY_POLICY}")
+        print("dry-run — nothing changed. Back up the DB, then: nunchi.py g5-legacy-close --apply")
+    return report
+
+
 def assemble(budget, hint, limit=25):
     """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
 
@@ -3047,6 +3230,18 @@ if __name__ == "__main__":
                            sample=sample_n, do_fold="--retire-only" not in args,
                            do_retire="--fold-only" not in args, as_json="--json" in args,
                            include_user_stated="--include-user-stated" in args)
+    elif cmd == "g5-legacy-close":
+        if "--close-only" in args and "--retag-only" in args:
+            sys.exit("g5-legacy-close: --close-only and --retag-only are exclusive")
+        try:
+            sample_n = int(flag("--sample", "20"))
+        except ValueError:
+            sys.exit("g5-legacy-close: --sample is an integer")
+        if sample_n < 0:
+            sys.exit("g5-legacy-close: need --sample >= 0")
+        g5_legacy_close(apply="--apply" in args, sample=sample_n,
+                        do_retag="--close-only" not in args,
+                        do_close="--retag-only" not in args, as_json="--json" in args)
     elif cmd == "review":
         pos = [a for a in args if not a.startswith("--")]
         review(int(pos[0]) if pos else None, clear="--clear" in args)

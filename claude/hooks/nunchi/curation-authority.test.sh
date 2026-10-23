@@ -45,11 +45,26 @@ ok "conflict_sweep function found" '[ -n "$sweep_src" ]'
 ok "conflict_sweep never writes valid_to" '! grep -qE "SET[^\"]*valid_to[[:space:]]*=" <<<"$sweep_src"'
 ok "conflict_sweep sets review=1" 'grep -q "SET review=1" <<<"$sweep_src"'
 
+# ---- rule 3b: g5-legacy-close (#2221) sets because/kind only, never closes or flags ----
+g5_src="$(python3 - "$NP" <<'PY'
+import ast, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for node in ast.parse(src).body:
+    if isinstance(node, ast.FunctionDef) and node.name == "g5_legacy_close":
+        print(ast.get_source_segment(src, node))
+PY
+)"
+ok "g5_legacy_close function found" '[ -n "$g5_src" ]'
+ok "g5_legacy_close never writes valid_to" '! grep -qE "SET[^\"]*valid_to[[:space:]]*=" <<<"$g5_src"'
+ok "g5_legacy_close never writes the review flag" '! grep -qE "SET[^\"]*review[[:space:]]*=" <<<"$g5_src"'
+ok "g5_legacy_close peer_facts writes are because/kind only" \
+  '[ -z "$(grep -oE "UPDATE peer_facts SET [a-z_=?, ]+" <<<"$g5_src" | grep -vE "^UPDATE peer_facts SET (because=\?|kind=\?, mutability=\?)$")" ]'
+
 # ---- the boundary is stated where the owner reads it ------------------------------------
 ok "usage text carries the curation authority block" 'grep -q "^Curation authority (#2464 제안 4" "$NP"'
 ok "usage lists review and retag" 'grep -qE "^  nunchi.py review \[" "$NP" && grep -qE "^  nunchi.py retag " "$NP"'
 ok "authority doc exists" '[ -f "$DOC" ]'
-for cmd in review-stale constraints-triage conflict-sweep supersede merge annotate retag "review <id> --clear"; do
+for cmd in review-stale constraints-triage conflict-sweep g5-legacy-close supersede merge annotate retag "review <id> --clear"; do
   ok "doc names owner command: $cmd" 'grep -qF -- "$cmd" "$DOC"'
 done
 ok "docs index links the authority page" 'grep -qF "(nunchi-curation-authority.md)" "$ROOT/docs/README.md"'
