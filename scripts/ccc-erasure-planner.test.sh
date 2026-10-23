@@ -261,7 +261,9 @@ old_stamp="$(date -d '-120 days' '+%Y%m%d%H%M' 2>/dev/null || date -v-120d '+%Y%
 for f in old-one-off.sh cron-watch.sh; do
   printf 'x' > "$CCC_STATE_DIR/$f"; chmod 600 "$CCC_STATE_DIR/$f"; touch -t "$old_stamp" "$CCC_STATE_DIR/$f"
 done
-printf 'x' > "$CCC_STATE_DIR/fresh-handover.md"
+printf 'x' > "$CCC_STATE_DIR/fresh-handover.md"; chmod 600 "$CCC_STATE_DIR/fresh-handover.md"
+# Not owner-only (umask 022 default): kept, never planned (#1468 option 2).
+printf 'x' > "$CCC_STATE_DIR/shared-notes.md"; chmod 644 "$CCC_STATE_DIR/shared-notes.md"
 printf '*/5 * * * * bash ~/.claude/state/cron-watch.sh\n' > "$TMP/crontab.txt"
 scratch_actions() { python3 -c 'import json,sys,os; d=json.load(sys.stdin); print("\n".join(os.path.basename(t["path"])+" "+t["action"] for t in d["targets"] if t["artifact"]=="state.operator_scratch" and t["present"])); print("guard "+d.get("scheduler_guard",{}).get("status","-")); print("blockers "+" ".join(os.path.basename(b["path"]) for b in d["blockers"]))'; }
 # shellcheck disable=SC2034  # read via eval inside ok()
@@ -270,6 +272,8 @@ acts9="$(run prune-expired --json | scratch_actions)"
 # is max(mtime, ctime); the Python fixtures cover expiry with a test clock.
 ok "scratch: unknown state file planned as operator scratch (retain-until)" \
   'grep -q "^old-one-off.sh retain-until:" <<<"$acts9" && grep -q "^fresh-handover.md retain-until:" <<<"$acts9"'
+ok "scratch: a 0644 scratch file is kept as not owner-only" \
+  'grep -qx "shared-notes.md retain (not owner-only)" <<<"$acts9"'
 ok "scratch: crontab-referenced script retained (scheduler-referenced)" \
   'grep -qx "cron-watch.sh retain (scheduler-referenced)" <<<"$acts9"'
 ok "scratch: guard status ok with a readable crontab" 'grep -qx "guard ok" <<<"$acts9"'

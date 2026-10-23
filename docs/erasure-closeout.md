@@ -235,8 +235,18 @@ these files:
      a target).
   2. The key-file rule: `retain (key-file)` at any age.
   3. Symlinks are kept.
-  4. The scheduler guard, below.
-  5. Age: `max(mtime, ctime)` against 90 days. `CCC_ERASURE_RETENTION_DAYS`
+  4. Owner-only: a scratch file that is not owned by the effective uid, or
+     carries any group/other permission bit, is planned as
+     `retain (not owner-only)` at any age (owner decision 2026-10-23,
+     option 2). `ccc-erasure-apply.py` refuses a whole run when any target
+     fails the same check (`group-other-bits-on-target` /
+     `owner-not-euid`), and a `chmod 600` to fix it would refresh ctime and
+     restart the 90-day clock. So only owner-only scratch is ever planned
+     for deletion; others stay until the operator tightens or removes them
+     by hand. The rule applies to operator scratch only, not to the named
+     retention classes.
+  5. The scheduler guard, below.
+  6. Age: `max(mtime, ctime)` against 90 days. `CCC_ERASURE_RETENTION_DAYS`
      may only lengthen it.
 - **Scheduler guard** (`"scheduler_guard": true`). A scratch file that a
   scheduler names is planned as `retain (scheduler-referenced)` at any age.

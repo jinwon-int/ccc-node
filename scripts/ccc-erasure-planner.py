@@ -468,6 +468,12 @@ def _age_basis(meta: os.stat_result) -> float:
     return max(meta.st_mtime, meta.st_ctime)
 
 
+def _owner_only(meta: os.stat_result) -> bool:
+    """Same target test as ccc-erasure-apply.py's owner-only verification:
+    owned by the effective uid and no group/other permission bits."""
+    return meta.st_uid == os.geteuid() and not (stat.S_IMODE(meta.st_mode) & 0o077)
+
+
 def retention_verdict(inventory: dict, entry: dict, path: str,
                       now: float | None = None,
                       guard: dict | None = None) -> dict:
@@ -497,6 +503,13 @@ def retention_verdict(inventory: dict, entry: dict, path: str,
     verdict["eligible_at"] = _iso(eligible_at)
     if os.path.islink(path):
         verdict["reason"] = "symlink"           # never a destruction target
+        return verdict
+    if entry.get("fallback_scope") and not _owner_only(meta):
+        # #1468 owner decision 2026-10-23 (option 2): ccc-erasure-apply.py
+        # refuses a whole run when any target is not owner-only, and a
+        # chmod to fix it would restart the 90-day clock (ctime). Operator
+        # scratch that is not owner-only is therefore kept, not planned.
+        verdict["reason"] = "not-owner-only"
         return verdict
     if guard is not None:
         if guard["summary"]["status"] != "ok":
@@ -591,6 +604,7 @@ _RETAIN_LABELS = {
     "last-copy-live-missing": "retain (last copy; live missing)",
     "scheduler-referenced": "retain (scheduler-referenced)",
     "scheduler-guard-unavailable": "retain (scheduler references unreadable)",
+    "not-owner-only": "retain (not owner-only)",
 }
 
 
