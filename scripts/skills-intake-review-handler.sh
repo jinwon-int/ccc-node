@@ -279,7 +279,11 @@ for _tok in "${review_args_tokens[@]}"; do
       --model=*) review_model="${_tok#--model=}" ;;
       --model) : ;; # value taken on the next token
     esac
-    if [ "$_prev_arg" = "--model" ] && [ -z "$review_model" ]; then review_model="$_tok"; fi
+    # #1460 P3: a flag right after a bare `--model` (`--model --verbose`) is
+    # not a model value; leave it empty so the self-report fills it.
+    if [ "$_prev_arg" = "--model" ] && [ -z "$review_model" ]; then
+      case "$_tok" in -*) ;; *) review_model="$_tok" ;; esac
+    fi
   fi
   _prev_arg="$_tok"
 done

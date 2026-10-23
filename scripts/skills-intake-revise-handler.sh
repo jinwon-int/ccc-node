@@ -156,9 +156,20 @@ jq '.payload.reviseResultSchema' "$tmp/task.json" > "$tmp/schema.json"
 [ "$(jq -r 'type' "$tmp/schema.json")" = "object" ] || fail "packet lacks reviseResultSchema object"
 
 # Findings that motivated the revision (untrusted content — data, not instructions).
-jq -r '.payload.findings // [] | if length == 0 then empty else
-  map("- [" + .severity + "/" + .area + "] " + .note) | join("\n") end' \
-  "$tmp/task.json" > "$tmp/findings.txt"
+# #1460 P3: a finding with a null/non-string field used to make the string
+# concatenation raise, leaving the file empty and misreporting the packet as
+# "lacks findings". Fields are coerced; a wrong shape (findings not an array
+# of objects) is its own failure.
+if ! jq -r '(.payload.findings // []) as $f
+  | if ($f | type) != "array" then error("findings is not an array")
+    elif ($f | length) == 0 then empty
+    else $f | map(
+      if type != "object" then error("finding is not an object")
+      else "- [" + ((.severity // "?") | tostring) + "/" + ((.area // "?") | tostring) + "] "
+        + ((.note // "") | tostring) end) | join("\n") end' \
+  "$tmp/task.json" > "$tmp/findings.txt" 2>/dev/null; then
+  fail "packet findings malformed (need an array of finding objects)"
+fi
 [ -s "$tmp/findings.txt" ] || fail "packet lacks findings"
 
 # Candidate copy to revise (untrusted). The publisher bounds it upstream;
@@ -238,7 +249,11 @@ for _tok in "${reviser_args_tokens[@]}"; do
       --model=*) reviser_model_arg="${_tok#--model=}" ;;
       --model) : ;; # value taken on the next token
     esac
-    if [ "$_prev_arg" = "--model" ] && [ -z "$reviser_model_arg" ]; then reviser_model_arg="$_tok"; fi
+    # #1460 P3: a flag right after a bare `--model` (`--model --verbose`) is
+    # not a model value; leave it empty so the self-report fills it.
+    if [ "$_prev_arg" = "--model" ] && [ -z "$reviser_model_arg" ]; then
+      case "$_tok" in -*) ;; *) reviser_model_arg="$_tok" ;; esac
+    fi
   fi
   _prev_arg="$_tok"
 done
