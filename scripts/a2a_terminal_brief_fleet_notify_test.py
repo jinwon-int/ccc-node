@@ -109,7 +109,7 @@ class FleetNotifyTest(unittest.TestCase):
             "A2A_TB_NOTIFY_EDGE_SECRET_FILE": str(secret),
             "A2A_TB_NOTIFY_STATE_FILE": str(self.state),
             "CCC_PUSH_SPOOL": str(self.spool),
-            "A2A_TB_NOTIFY_NODE": "seoseo",
+            "A2A_TB_NOTIFY_NODE": "broker-a",
         }
 
     def tearDown(self):
@@ -144,19 +144,19 @@ class FleetNotifyTest(unittest.TestCase):
         self.broker.events += [
             row("terminal:new-op", iso(5), terminalBriefTitle="A2A Terminal Brief 완료: workerzeta(완료 2/4)",
                 taskBrief="fix flaky test", doneUrl="https://github.com/acme/x/issues/1#issuecomment-2"),
-            row("terminal:new-evidence", iso(6), notificationOwnership={"scope": "parent-broker-only", "ownerBrokerId": "gwakga"}),
+            row("terminal:new-evidence", iso(6), notificationOwnership={"scope": "parent-broker-only", "ownerBrokerId": "broker-b"}),
         ]
         summary = self.run_once()
         self.assertEqual((summary["sent"], summary["skipped"]), (1, 1))
         [record] = self.spool_records()
         self.assertEqual(record["event"], "A2ATerminalBrief")
-        self.assertEqual(record["node"], "seoseo")
-        self.assertEqual(record["dedup"], "A2ATerminalBrief:seoseo:terminal:new-op")
+        self.assertEqual(record["node"], "broker-a")
+        self.assertEqual(record["dedup"], "A2ATerminalBrief:broker-a:terminal:new-op")
         self.assertEqual(record["text"].splitlines(), [
             "A2A Terminal Brief 완료: workerzeta(완료 2/4)",
             "fix flaky test",
             "https://github.com/acme/x/issues/1#issuecomment-2",
-            "broker seoseo · task new-op",
+            "broker broker-a · task new-op",
         ])
         self.assertEqual(self.broker.receipts, [{"id": "terminal:new-op", "receipt": {
             "status": "produced", "note": "queued to the Matrix fleet-alert room via the ccc push spool"}}])
@@ -197,13 +197,13 @@ class FleetNotifyTest(unittest.TestCase):
         self.broker.events.append(row(
             "terminal:fallback", iso(5),
             terminalBriefTitle="A2A Terminal Brief relay failure: workerzeta (missing_parent)",
-            relayFallback={"lastErrorCode": "missing_parent", "parentBrokerId": "seoseo", "parentRoundId": "r-1"},
+            relayFallback={"lastErrorCode": "missing_parent", "parentBrokerId": "broker-a", "parentRoundId": "r-1"},
             doneUrl="http://insecure.example/x",
         ))
         self.run_once()
         [record] = self.spool_records()
         lines = record["text"].splitlines()
-        self.assertIn("relay failure: missing_parent (parent seoseo, round r-1)", lines)
+        self.assertIn("relay failure: missing_parent (parent broker-a, round r-1)", lines)
         self.assertFalse(any(line.startswith("http://") for line in lines))
 
     def test_dry_run_writes_nothing(self):
