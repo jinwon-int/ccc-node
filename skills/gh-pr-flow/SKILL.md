@@ -491,7 +491,14 @@ helper ensures a `protected-branch-NAME` ruleset on `refs/heads/NAME`:
 deletion and force-push blocked, plus a pull request with one approval from
 someone other than the last pusher (stale approvals dismissed, merge commits
 only, no bypass actors). Promotion then becomes a PR into that branch,
-reviewed cross-account like any other. The helper refuses `master`/`main` (any
+reviewed cross-account like any other: `approve-via-relay.sh` takes
+`--base NAME` for it (#2492) and accepts the PR only when its base is `NAME`
+and `NAME` really carries that shape (deletion + non_fast_forward + a
+pull_request rule requiring an approval; an unreadable rule set fails closed),
+evaluating required checks against `NAME`; without `--base` a non-default base
+is still refused, and `master`/`main` are never a valid `--base`. The promoted
+head still needs exact-head checks, so the repository's CI must run on PRs into
+`NAME`. The hygiene helper refuses `master`/`main` (any
 case) locally and the repository's actual default branch remotely, because a
 PR requirement there would break node automation; an unknown default branch
 fails closed the same way. An existing ruleset of that name is accepted only

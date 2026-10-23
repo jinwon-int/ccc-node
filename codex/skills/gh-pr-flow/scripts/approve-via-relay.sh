@@ -7,7 +7,12 @@ usage() {
   cat <<'EOF'
 Usage: approve-via-relay.sh --review-profile seoseo-ai|jinon86 \
   --repo jinwon-int/REPO --pr NUMBER --expected-head 40_HEX_SHA \
-  --operator-approved [--ssh-target HOST] [--dry-run]
+  --operator-approved [--base PROMOTION_BRANCH] [--ssh-target HOST] [--dry-run]
+
+--base reviews a PR into a promotion branch (e.g. stable, #2292) instead of
+the default branch. It is accepted only when that branch carries the
+protected-branch ruleset shape (deletion + non_fast_forward + a pull_request
+rule requiring at least one approval); master/main are always refused (#2492).
 EOF
 }
 
@@ -24,6 +29,7 @@ profile_seen=0
 ssh_target="${CCC_RELAY_SSH_TARGET:-relay}"
 approved=0
 dry_run=0
+promotion_base=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -37,6 +43,7 @@ while [ "$#" -gt 0 ]; do
     --pr) pr="${2:-}"; shift 2 ;;
     --expected-head) expected_head="${2:-}"; shift 2 ;;
     --ssh-target) ssh_target="${2:-}"; shift 2 ;;
+    --base) promotion_base="${2:-}"; shift 2 ;;
     --operator-approved) approved=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -70,6 +77,15 @@ esac
   || die "expected head must be a full 40-character SHA"
 [[ "$ssh_target" =~ ^[A-Za-z0-9_.@-]+$ ]] \
   || die "invalid SSH target"
+# A promotion branch (#2492) is named explicitly; master/main never qualify —
+# those are default branches whose approvals go through the ordinary path.
+if [ -n "$promotion_base" ]; then
+  [[ "$promotion_base" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "--base must be a plain branch name"
+  case "${promotion_base,,}" in
+    master|main) die "--base must not be master/main; omit it for default-branch PRs" ;;
+  esac
+fi
 [[ "$review_config" =~ ^/[A-Za-z0-9_./-]+$ ]] \
   || die "invalid remote gh config directory"
 [[ "/$review_config/" != *"/../"* ]] \
@@ -78,7 +94,7 @@ command -v ssh >/dev/null 2>&1 || die "ssh is unavailable" 69
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" bash -s -- \
   "$repo" "$pr" "${expected_head,,}" "$review_config" "$dry_run" \
-  "$expected_actor" "$expected_author" <<'REMOTE'
+  "$expected_actor" "$expected_author" "$promotion_base" <<'REMOTE'
 set -euo pipefail
 
 repo="$1"
@@ -88,6 +104,7 @@ review_config="$4"
 dry_run="$5"
 expected_actor="$6"
 expected_author="$7"
+promotion_base="${8:-}"
 credential_file="$review_config/hosts.yml"
 
 command -v gh >/dev/null 2>&1 \
@@ -120,13 +137,36 @@ default_branch="$(review_gh api "repos/$repo" --jq .default_branch)"
 [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] \
   || { echo "ERROR: repository default branch is invalid" >&2; exit 65; }
 
+# The branch this approval targets. Without --base it is the default branch,
+# exactly as before. With --base (#2492) it is a promotion branch (#2292) that
+# must really be protected the way repo-hygiene-via-relay.sh sets it up:
+# deletion and force-push blocked and a pull request with at least one
+# approval required. An unreadable rule set fails closed.
+target_base="$default_branch"
+if [ -n "$promotion_base" ]; then
+  [ "$promotion_base" != "$default_branch" ] \
+    || { echo "ERROR: --base names the default branch; omit it" >&2; exit 65; }
+  promotion_ok="$(review_gh api "repos/$repo/rules/branches/$promotion_base" \
+    --jq '([.[]? | .type] | (index("deletion") != null) and (index("non_fast_forward") != null))
+      and (([.[]? | select(.type == "pull_request") | (.parameters.required_approving_review_count // 0)] | max // 0) >= 1)')" \
+    || { echo "ERROR: could not read the promotion branch's rules" >&2; exit 65; }
+  [ "$promotion_ok" = "true" ] \
+    || { echo "ERROR: --base $promotion_base is not a protected promotion branch (needs deletion, non_fast_forward and a pull_request rule requiring an approval)" >&2; exit 65; }
+  target_base="$promotion_base"
+fi
+
 pr_json="$(review_gh pr view "$pr" --repo "$repo" \
   --json author,baseRefName,state,isDraft,headRefOid,mergeable,reviewRequests,statusCheckRollup)"
 
 [ "$(jq -r '.author.login' <<<"$pr_json")" = "$expected_author" ] \
   || { echo "ERROR: expected PR author $expected_author" >&2; exit 65; }
-[ "$(jq -r '.baseRefName' <<<"$pr_json")" = "$default_branch" ] \
-  || { echo "ERROR: review target base is not the repository default branch" >&2; exit 65; }
+if [ -z "$promotion_base" ]; then
+  [ "$(jq -r '.baseRefName' <<<"$pr_json")" = "$default_branch" ] \
+    || { echo "ERROR: review target base is not the repository default branch" >&2; exit 65; }
+else
+  [ "$(jq -r '.baseRefName' <<<"$pr_json")" = "$target_base" ] \
+    || { echo "ERROR: review target base is not the requested promotion branch $target_base" >&2; exit 65; }
+fi
 [ "$(jq -r '.state' <<<"$pr_json")" = "OPEN" ] \
   || { echo "ERROR: review target is not open" >&2; exit 65; }
 [ "$(jq -r '.isDraft' <<<"$pr_json")" = "false" ] \
@@ -191,10 +231,10 @@ bad_checks="$(jq '[.statusCheckRollup[]? | select(
 # every required context of the base branch (classic protection, readable
 # without admin through the branch endpoint, plus rulesets) must be present.
 # An unreadable required set fails closed.
-required_classic="$(review_gh api "repos/$repo/branches/$default_branch" \
+required_classic="$(review_gh api "repos/$repo/branches/$target_base" \
   --jq '[.protection.required_status_checks.contexts // [] | .[]]')" \
   || { echo "ERROR: could not read the base branch's required checks" >&2; exit 65; }
-required_rules="$(review_gh api "repos/$repo/rules/branches/$default_branch" \
+required_rules="$(review_gh api "repos/$repo/rules/branches/$target_base" \
   --jq '[.[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context]')" \
   || { echo "ERROR: could not read the base branch's rulesets" >&2; exit 65; }
 missing_required="$(jq -r --argjson a "$required_classic" --argjson b "$required_rules" \
@@ -208,8 +248,9 @@ missing_required="$(jq -r --argjson a "$required_classic" --argjson b "$required
 if [ "$dry_run" -eq 1 ]; then
   jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \
     --arg author "$expected_author" --arg head "$expected_head" \
-    --arg base "$default_branch" --argjson checks "$check_count" \
-    '{ok:true,dry_run:true,repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,check_count:$checks}'
+    --arg base "$target_base" --argjson checks "$check_count" \
+    --argjson promotion "$([ -n "$promotion_base" ] && echo true || echo false)" \
+    '{ok:true,dry_run:true,repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,promotion:$promotion,check_count:$checks}'
   exit 0
 fi
 
@@ -245,7 +286,8 @@ recorded="$(jq --arg actor "$actor" --arg head "$expected_head" \
 
 jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \
   --arg author "$expected_author" --arg head "$expected_head" \
-  --arg base "$default_branch" --argjson checks "$check_count" \
+  --arg base "$target_base" --argjson checks "$check_count" \
   --argjson already "$already" \
-  '{ok:true,approved:true,already_approved:($already > 0),repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,check_count:$checks}'
+  --argjson promotion "$([ -n "$promotion_base" ] && echo true || echo false)" \
+  '{ok:true,approved:true,already_approved:($already > 0),repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,promotion:$promotion,check_count:$checks}'
 REMOTE

@@ -52,6 +52,10 @@ elif [ "$1" = "api" ] && [[ "$2" == repos/*/commits/* ]]; then
   # `-`, not `:-`: an explicitly empty value must stay empty, or the case that
   # sets it to "" silently gets the default and tests nothing.
   printf '%s\n' "${MOCK_HEAD_COMMITTED_AT-2026-09-16T10:23:31Z}"
+elif [ "$1" = "api" ] && [[ "$2" == repos/*/rules/branches/* ]] && [[ " $* " == *required_approving_review_count* ]]; then
+  # Promotion-branch protection shape (#2492): the helper's jq yields true/false.
+  [ "${MOCK_PROMOTION_RULES-true}" != FAIL ] || exit 1
+  printf '%s\n' "${MOCK_PROMOTION_RULES-true}"
 elif [ "$1" = "api" ] && [[ "$2" == repos/*/rules/branches/* ]]; then
   # Ruleset-required contexts (#2200); "FAIL" simulates an unreadable answer.
   [ "${MOCK_REQUIRED_RULES-[]}" != FAIL ] || exit 1
@@ -392,6 +396,91 @@ if grep -Fq 'auth token' "$MOCK_GH_LOG"; then
 else
   ok
 fi
+
+#2492: a promotion-branch PR (e.g. wiki-agent -> stable, #2292) is reviewable
+# only with an explicit --base whose branch really carries the protected-branch
+# rule shape; everything else keeps the default-branch behaviour.
+rm -f "$MOCK_REVIEW_MARKER"; : >"$MOCK_GH_LOG"
+if MOCK_BASE=stable run_helper --base stable --dry-run >"$TMP/promo-ok.out" \
+   && jq -e '.ok == true and .dry_run == true and .base == "stable" and .promotion == true' \
+     "$TMP/promo-ok.out" >/dev/null \
+   && grep -Fq 'repos/jinwon-int/ccc-node/branches/stable' "$MOCK_GH_LOG" \
+   && grep -q 'repos/jinwon-int/ccc-node/rules/branches/stable .*required_status_checks' "$MOCK_GH_LOG" \
+   && [ ! -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "protected promotion branch PR was refused or required checks were read from the wrong base"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BASE=stable run_helper --base stable >"$TMP/promo-approve.out" \
+   && jq -e '.ok == true and .approved == true and .base == "stable" and .promotion == true' \
+     "$TMP/promo-approve.out" >/dev/null \
+   && [ -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "protected promotion branch PR was not approved"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BASE=stable run_helper >"$TMP/promo-no-flag.out" 2>&1; then
+  bad "a non-default base was accepted without --base"
+elif grep -Fq "review target base is not the repository default branch" "$TMP/promo-no-flag.out" \
+   && [ ! -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "non-default base without --base failed for the wrong reason"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BASE=stable MOCK_PROMOTION_RULES=false run_helper --base stable >"$TMP/promo-unprotected.out" 2>&1; then
+  bad "an unprotected --base branch was accepted"
+elif grep -Fq "is not a protected promotion branch" "$TMP/promo-unprotected.out" \
+   && [ ! -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "unprotected --base failed for the wrong reason"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BASE=stable MOCK_PROMOTION_RULES=FAIL run_helper --base stable >"$TMP/promo-unreadable.out" 2>&1; then
+  bad "an unreadable promotion rule set was accepted"
+elif grep -Fq "could not read the promotion branch's rules" "$TMP/promo-unreadable.out" \
+   && [ ! -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "unreadable promotion rules failed for the wrong reason"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_BASE=main run_helper --base stable >"$TMP/promo-mismatch.out" 2>&1; then
+  bad "--base stable approved a PR whose base is main"
+elif grep -Fq "is not the requested promotion branch stable" "$TMP/promo-mismatch.out" \
+   && [ ! -e "$MOCK_REVIEW_MARKER" ]; then
+  ok
+else
+  bad "base mismatch failed for the wrong reason"
+fi
+
+rm -f "$MOCK_REVIEW_MARKER"
+if MOCK_DEFAULT_BRANCH=stable MOCK_BASE=stable run_helper --base stable >"$TMP/promo-default.out" 2>&1; then
+  bad "--base naming the default branch was accepted"
+elif grep -Fq "names the default branch" "$TMP/promo-default.out"; then
+  ok
+else
+  bad "--base equal to the default branch failed for the wrong reason"
+fi
+
+for bad_base in master MAIN 'refs/heads/stable' 'origin/stable'; do
+  rm -f "$MOCK_SSH_MARKER"
+  if run_helper --base "$bad_base" >"$TMP/promo-local.out" 2>&1; then
+    bad "--base $bad_base was accepted"
+  elif [ -e "$MOCK_SSH_MARKER" ]; then
+    bad "--base $bad_base reached the relay before local validation"
+  else
+    ok
+  fi
+done
 
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
