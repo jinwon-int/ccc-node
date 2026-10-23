@@ -1339,6 +1339,7 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("절대 종료시각 없음 1건", record["text"])
         self.assertIn("jinwon-int/ccc-node#104 · 절대시각 없음", record["text"])
         self.assertTrue((self.state / "timed-test-deadline-scan.notify-relative.json").is_file())
+        self.assertIn("전체 목록: timed-test-deadline-scan.cron.log", record["text"])
 
 
     def test_followup_mode_uses_its_own_state_and_wording(self) -> None:
@@ -1349,6 +1350,9 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("판정 후 후속 기한 경과 1건", record["text"])
         self.assertIn(f"{FU_REPO}#42 · 후속 2026-10-14 09:00 KST · 경과 1일", record["text"])
         self.assertTrue((self.state / "timed-test-deadline-scan.notify-followup.json").is_file())
+        # Followup mode runs from its own installer and log (#2324).
+        self.assertIn("전체 목록: timed-followup-scan.cron.log", record["text"])
+        self.assertNotIn("timed-test-deadline-scan.cron.log", record["text"])
 
 
 

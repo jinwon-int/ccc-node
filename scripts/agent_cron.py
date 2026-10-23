@@ -72,6 +72,7 @@ import os
 import re
 import shlex
 import socket
+import stat as _stat
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -1507,42 +1508,133 @@ def fleet_rows_first(text):
     return '\n'.join(counted + other + ok)
 
 
+# The owner body keeps at most this many characters per stream.
+OWNER_BODY_STREAM_LIMIT = 900
+
+
 def build_owner_text(task_id, run_id, scheduled_at, status, headless):
+    return _owner_text_parts(task_id, run_id, scheduled_at, status, headless)[0]
+
+
+def _owner_text_parts(task_id, run_id, scheduled_at, status, headless):
+    """Return ``(text, full_text)`` for the owner notice.
+
+    ``full_text`` is the same notice with every shown stream untruncated (same
+    redaction), or ``None`` when nothing was cut. ``(None, None)`` means the
+    canonical redactor is unavailable and nothing may be written (#2324 (3)).
+    """
+    limit = OWNER_BODY_STREAM_LIMIT
     raw_stdout = (headless or {}).get('stdout', '')
     raw_stderr = (headless or {}).get('stderr', '')
     # A fleet watch can emit two channel rows per node. Classify all captured
     # rows before shortening the notification body, or late failures vanish.
     title_stdout = redact_for_owner(raw_stdout, len(str(raw_stdout)) + 1024)
     title_stderr = redact_for_owner(raw_stderr, len(str(raw_stderr)) + 1024)
-    stdout = redact_for_owner(raw_stdout, 900)
-    stderr = redact_for_owner(raw_stderr, 900)
+    stdout = redact_for_owner(raw_stdout, limit)
+    stderr = redact_for_owner(raw_stderr, limit)
     if None in (title_stdout, title_stderr, stdout, stderr):
-        return None
+        return None, None
     title = (safe_fleet_diagnostic_title(
         task_id, (headless or {}).get('fleetDiagnosticTitle')) if status != 'success' else None)
     title = title or fleet_diagnostic_title(task_id, status, title_stdout, title_stderr)
+    full_stdout = title_stdout
     if title and title.startswith('agent-cron fleet alert '):
         # Re-redact after reordering: the masks are line-local, and this keeps
         # the canonical defence-in-depth check on the exact text that ships.
-        stdout = redact_for_owner(fleet_rows_first(title_stdout), 900)
-        if stdout is None:
-            return None
+        full_stdout = redact_for_owner(fleet_rows_first(title_stdout), len(title_stdout) + 1024)
+        stdout = redact_for_owner(fleet_rows_first(title_stdout), limit)
+        if stdout is None or full_stdout is None:
+            return None, None
     stdout = stdout.strip()
     stderr = stderr.strip()
+    full_stdout = full_stdout.strip()
+    full_stderr = title_stderr.strip()
     lines = [
         title or f"agent-cron task {task_id} finished with execution status={status}",
         f"scheduledAt={scheduled_at or ''}",
         f"runId={run_id}",
         f"exitCode={(headless or {}).get('exitCode', '')}",
     ]
+    full_lines = list(lines)
+    cut = False
     if stdout:
-        lines.append('stdout:\n' + stdout[:900])
+        lines.append('stdout:\n' + stdout[:limit])
+        full_lines.append('stdout:\n' + full_stdout)
+        cut = cut or len(full_stdout) > limit
     # Successful CLI runs may emit their banner and full input prompt to stderr.
     # Keep diagnostics for failures (or a run with no report), not beside a
     # successful report where they obscure the application-level audit result.
     if stderr and (status != 'success' or not stdout):
-        lines.append('stderr:\n' + stderr[:900])
-    return '\n'.join(lines)
+        lines.append('stderr:\n' + stderr[:limit])
+        full_lines.append('stderr:\n' + full_stderr)
+        cut = cut or len(full_stderr) > limit
+    return '\n'.join(lines), ('\n'.join(full_lines) + '\n' if cut else None)
+
+
+# #2324 (3), owner decision 2026-10-23 (option B): a cut notice body keeps a
+# full copy in a local owner-only file and names it in the notice, instead of
+# losing the rest silently (the 2026-10 verdicts had to be rebuilt from the
+# journal). Local only: agent-cron never writes the result anywhere remote.
+# Retention is by count: the newest FULL_OUTPUT_KEEP files stay.
+FULL_OUTPUT_KEEP = 200
+
+
+def full_output_dir():
+    raw = os.environ.get('CCC_AGENT_CRON_FULL_OUTPUT_DIR')
+    if raw:
+        return Path(raw).expanduser()
+    base = store.parent if str(store.parent) != '.' else Path.cwd()
+    return base / 'full-output'
+
+
+def _open_private_dir(path):
+    """Open (creating 0700) a directory without following a symlink at it."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(path), flags)
+    try:
+        info = os.fstat(fd)
+        if not _stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError(f'full-output directory is not owner-private: {path}')
+        if _stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _prune_full_outputs(fd, keep):
+    entries = []
+    for entry in os.scandir(fd):
+        if entry.name.startswith('.') or not entry.name.endswith('.txt'):
+            continue
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        entries.append((entry.stat(follow_symlinks=False).st_mtime, entry.name))
+    entries.sort(reverse=True)
+    for _, name in entries[keep:]:
+        try:
+            os.unlink(name, dir_fd=fd)
+        except OSError:
+            pass
+
+
+def write_full_output(run_id, text):
+    """Atomically write the full redacted notice body as an owner-only file."""
+    path = full_output_dir()
+    fd = _open_private_dir(path)
+    try:
+        name = f"{safe_name(run_id)}.txt"
+        _secure_fs.atomic_write_bytes_at(fd, name, text.encode('utf-8'))
+        _prune_full_outputs(fd, FULL_OUTPUT_KEEP)
+    finally:
+        os.close(fd)
+    return path / name
 
 
 def notify_allowed_chats():
@@ -1596,7 +1688,7 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
             return {**base, 'delivery': 'blocked-not-allowlisted'}
         recipient = 'chat'
     spool = push_spool_dir()
-    text = build_owner_text(task_id, run_id, scheduled_at, status, headless)
+    text, full_text = _owner_text_parts(task_id, run_id, scheduled_at, status, headless)
     if text is None:
         return {
             **base,
@@ -1604,6 +1696,16 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
             'redacted': False,
             'reason': 'canonical-redaction-unavailable',
         }
+    full_output = {}
+    # Owner recipients only: a group chat gets no local filesystem path.
+    if full_text is not None and recipient == 'owner':
+        try:
+            full_path = write_full_output(run_id, full_text)
+            text += f"\n[body cut at {OWNER_BODY_STREAM_LIMIT} chars per stream; full redacted copy (local, owner-only): {full_path}]"
+            full_output = {'fullOutputPath': str(full_path)}
+        except Exception as e:
+            text += f"\n[body cut at {OWNER_BODY_STREAM_LIMIT} chars per stream; local full copy not saved: {type(e).__name__}]"
+            full_output = {'fullOutputError': short_text(str(e), 600)}
     ts = fmt_dt(at) or _secure_fs.utc_now_iso()
     payload = {
         'version': 1,
@@ -1621,6 +1723,7 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         'redacted': True,
         'send': False,
         'delivery': 'spooled',
+        **full_output,
     }
     if chat_id is not None:
         payload['chatId'] = chat_id
@@ -1635,9 +1738,9 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         finally:
             os.close(fd)
         payload['path'] = str(path)
-        return {**base, 'delivery': 'spooled', 'redacted': True, 'spoolPath': str(path)}
+        return {**base, 'delivery': 'spooled', 'redacted': True, 'spoolPath': str(path), **full_output}
     except Exception as e:
-        return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600)}
+        return {**base, 'delivery': 'spool-error', 'redacted': True, 'error': short_text(str(e), 600), **full_output}
 
 
 FAILURE_ALARM_STATE_VERSION = 2
