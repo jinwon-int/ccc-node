@@ -21,6 +21,8 @@
 #   install-nunchi.sh --apply --wiki-promote-apply # + queue APPLY — MUTATES the
 #                                            # wiki-candidates queue; implies
 #                                            # --wiki-promote, needs fresh approval
+#   install-nunchi.sh --apply --conflict-sweep # + daily implicit-conflict sweep
+#                                            # (#2479); flags review=1 only, never closes
 #   install-nunchi.sh --apply --verbatim-backend both
 #                                            # + hourly gotgan refresh beside the
 #                                            # MemPalace sweep (#2331 P3-2);
@@ -81,6 +83,14 @@ if [ -n "$JUDGE_MIN_CONFIDENCE" ]; then
   python3 -c "import sys; sys.exit(0 if 0 < float(sys.argv[1]) <= 1 else 1)" "$JUDGE_MIN_CONFIDENCE" 2>/dev/null \
     || { echo "CCC_NUNCHI_JUDGE_MIN_CONFIDENCE='$JUDGE_MIN_CONFIDENCE' invalid (0 < v <= 1)" >&2; exit 2; }
 fi
+# #2479 — opt-in daily conflict-sweep (#2464 제안 2). Flag-only by construction
+# (it sets review=1 and writes its pair ledger, never closes), so unlike
+# --judge-apply it has no separate APPLY gate: the cron always runs --apply.
+CONFLICT_SWEEP="${CCC_NUNCHI_CONFLICT_SWEEP:-0}"
+case "$CONFLICT_SWEEP" in
+  0|1) ;;
+  *) echo "CCC_NUNCHI_CONFLICT_SWEEP='$CONFLICT_SWEEP' invalid (0|1)" >&2; exit 2 ;;
+esac
 WIKI_PROMOTE="${CCC_NUNCHI_WIKI_PROMOTE:-0}"
 WIKI_PROMOTE_APPLY="${CCC_NUNCHI_WIKI_PROMOTE_APPLY:-0}"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
@@ -113,11 +123,12 @@ while [ $# -gt 0 ]; do
     # Same implication contract as --judge-apply: an apply-mode wiki-promote
     # cron without the batch cron is not a state the installer can express.
     --wiki-promote-apply) WIKI_PROMOTE=1; WIKI_PROMOTE_APPLY=1 ;;
+    --conflict-sweep) CONFLICT_SWEEP=1 ;;
     --verbatim-backend)
       [ $# -ge 2 ] || { echo "--verbatim-backend requires mempalace|gotgan|both" >&2; exit 2; }
       VERBATIM_BACKEND="$2"; shift ;;
     --help|-h)
-      sed -n '2,25p' "$0"; exit 0 ;;
+      sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -170,6 +181,9 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     CCC_NUNCHI_JUDGE="$JUDGE" CCC_NUNCHI_JUDGE_APPLY="$JUDGE_APPLY" \
     CCC_NUNCHI_JUDGE_PROVIDER="$JUDGE_PROVIDER" CCC_NUNCHI_JUDGE_MIN_CONFIDENCE="$JUDGE_MIN_CONFIDENCE" \
     CCC_NUNCHI_JUDGE_CODEX_FALLBACK="$JUDGE_CODEX_FALLBACK" \
+    CCC_NUNCHI_CONFLICT_SWEEP="$CONFLICT_SWEEP" \
+    NUNCHI_SYNTH_ORDER="${NUNCHI_SYNTH_ORDER:-}" NUNCHI_PIRI="${NUNCHI_PIRI:-}" \
+    NUNCHI_PIRI_ARGS="${NUNCHI_PIRI_ARGS:-}" \
     NUNCHI_SWEEP_DIR="${NUNCHI_SWEEP_DIR:-}" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
@@ -439,6 +453,7 @@ status() {
   echo "collection: $collection_line"
   # Managed lines only: a leftover hand-installed shadow line must not read as wired.
   echo "verbatim_backend: $(cat "$BACKEND_FILE" 2>/dev/null || echo mempalace) gotgan_cron=$(grep -F "$MARK" <<<"$cron" | grep -c 'gotgan-refresh.sh' || true) gotgan_db=$(ls -la "$GOTGAN_DB_PATH" 2>/dev/null | awk '{print $5" bytes"}' || echo none)"
+  echo "conflict_sweep_cron: $(grep -F "$MARK" <<<"$cron" | grep -c 'nunchi.py.* conflict-sweep ' || true) line(s)"
   echo "audience_scoped: $audience_line"
   echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo off)"
   echo "hooks: $([ -f "$HOOKS/nunchi.py" ] && echo present || echo MISSING) ($HOOKS)"
@@ -810,6 +825,14 @@ case "$ACTION" in
         exit 2
       fi
     fi
+    # #2479 readiness, checked BEFORE strip_cron like the gotgan lane: failing
+    # after it would leave the node with its managed lines half re-rendered.
+    # A hook tree older than #2474 has no conflict-sweep subcommand, so the
+    # daily line would exit 2 ("unknown command") every night unnoticed.
+    if [ "$CONFLICT_SWEEP" = 1 ] && ! grep -q '"conflict-sweep"' "$HOOKS/nunchi.py" 2>/dev/null; then
+      echo "installed nunchi.py has no conflict-sweep subcommand (need ccc-node >= #2474 hooks at $HOOKS) — run setup.sh/self-update first" >&2
+      exit 2
+    fi
     retire_legacy
     warn_ghost_markers apply  # ghosts in OUR crontab are removed by strip_cron below
     strip_cron
@@ -903,6 +926,32 @@ case "$ACTION" in
         echo "weekly wiki-promote cron added (Mon 06:40, dry-run)"
       fi
     fi
+    if [ "$CONFLICT_SWEEP" = 1 ]; then
+      # #2479 daily implicit-conflict sweep (#2464 제안 2). 04:53 — off every
+      # hourly nunchi minute (:00/:10…/:17/:27/:41) and before the 05:00
+      # fleet-skills sync. --since-days 2 overlaps one day so a fact that lands
+      # just after a run is still paired next night; the pair ledger keeps the
+      # overlap free (already-judged pairs are never asked again).
+      # --max-pairs 100: the 2026-10-23 real-DB measurement saw ~67 new
+      # pairs/day on one node, i.e. ~4 batched Haiku calls per night.
+      # Backend: conflict-sweep judges through llm_synthesize (claude → codex →
+      # pi, first that answers), NOT through judge-batch's provider switch, so
+      # there is no NUNCHI_JUDGE_PROVIDER equivalent to stamp. The only
+      # per-node knobs that chain reads are NUNCHI_SYNTH_ORDER / NUNCHI_PIRI /
+      # NUNCHI_PIRI_ARGS; cron starts without the operator's env, so they are
+      # stamped here when set at install time (and replayed by self-update
+      # from the same env). With no usable backend the sweep fails closed:
+      # exit 1, no flag, no ledger row, the pairs are asked again next run.
+      sweep_synth_env=""
+      if [ -n "${NUNCHI_SYNTH_ORDER:-}" ]; then sweep_synth_env+="NUNCHI_SYNTH_ORDER=$(cron_quote "$NUNCHI_SYNTH_ORDER") "; fi
+      if [ -n "${NUNCHI_PIRI:-}" ]; then sweep_synth_env+="NUNCHI_PIRI=$(cron_quote "$NUNCHI_PIRI") "; fi
+      if [ -n "${NUNCHI_PIRI_ARGS:-}" ]; then sweep_synth_env+="NUNCHI_PIRI_ARGS=$(cron_quote "$NUNCHI_PIRI_ARGS") "; fi
+      append_cron_line "53 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${sweep_synth_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/nunchi.py") conflict-sweep --apply --since-days 2 --max-pairs 100 >> $(cron_quote "$NUNCHI_DIR/conflict-sweep.cron.log") 2>&1 $MARK gen=$GEN"
+      echo "daily conflict-sweep cron added (04:53, flag review=1 only, never closes)"
+      if [ "$resolved_provider" = danso ]; then
+        echo "note: conflict-sweep judges via claude/codex/pi, not danso — without one of them on this node it fails closed (writes nothing)" >&2
+      fi
+    fi
     if [ "$resolved_provider" = "claude" ]; then
       set_sessionstart_hook add
     else
@@ -930,6 +979,9 @@ case "$ACTION" in
     # --wiki-promote-apply supersedes --wiki-promote in the record.
     if [ "$WIKI_PROMOTE_APPLY" = 1 ]; then record_argv+=(--wiki-promote-apply)
     elif [ "$WIKI_PROMOTE" = 1 ]; then record_argv+=(--wiki-promote); fi
+    # --conflict-sweep (#2479): opt-in like --judge, so a replay that omits it
+    # silently DELETES the daily line.
+    if [ "$CONFLICT_SWEEP" = 1 ]; then record_argv+=(--conflict-sweep); fi
     # --verbatim-backend is opt-in like --judge: a replay that omits it would
     # drop the gotgan lane and silently fall back to MemPalace.
     if [ "$VERBATIM_BACKEND" != mempalace ]; then record_argv+=(--verbatim-backend "$VERBATIM_BACKEND"); fi
