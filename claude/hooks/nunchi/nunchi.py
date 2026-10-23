@@ -70,6 +70,8 @@ Usage:
   nunchi.py supersede <fact_id> <new text>   # close old, insert new
   nunchi.py merge <dup_id> --into <fact_id>  # fold a duplicate into its survivor (#1336)
   nunchi.py annotate <fact_id> --because <reason>  # backfill a decision's reason
+  nunchi.py retag <fact_id> <kind>           # reclassify a fact
+  nunchi.py review [<fact_id> --clear]       # owner queue: G2/G3/conflict-sweep flags
   nunchi.py snapshot [--limit N]             # SessionStart-ready summary
   nunchi.py review-stale [--close]           # G1 retro pass over old facts
   nunchi.py conflict-sweep [--apply] [--since-days D] [--k K] [--max-pairs N]
@@ -81,6 +83,15 @@ Usage:
   nunchi.py metrics                          # body-free counters for bench
   nunchi.py backend-status                   # synthesis backend health (#1263)
   nunchi.py stats
+
+Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
+  No path deletes a fact row; "removing" means closing (valid_to), which is
+  reversible. Tier 1 unattended passes (ingest, judge-batch cron, snapshot)
+  only add facts, close under a deterministic gate (G1, B2, observation TTL)
+  and set/clear review flags. Tier 2 bulk closes (review-stale, constraints-
+  triage) are owner-invoked and dry-run by default; conflict-sweep only flags.
+  Tier 3 per-fact edits (supersede, merge, retag, annotate, review --clear)
+  are owner commands. curation-authority.test.sh enforces the boundary.
 """
 import fcntl
 import glob
@@ -2696,6 +2707,14 @@ def assemble(budget, hint, limit=25):
     print("\n".join(lines))
 
 
+# #2464 제안 4 — the queue is where unattended passes hand off, so the boundary
+# is stated where the owner acts. One trailing line; the pending summary above it
+# keeps its shape.
+REVIEW_AUTHORITY_LINE = ("authority: unattended passes only add, close by gate and flag;"
+                         " resolving these is an owner command, and nothing deletes a fact"
+                         " (docs/nunchi-curation-authority.md)")
+
+
 def review(fact_id=None, clear=False):
     """Owner queue for G2/G3 flags — list open review facts, or clear one.
 
@@ -2726,6 +2745,7 @@ def review(fact_id=None, clear=False):
     print(f"{len(rows)} pending — clear: nunchi.py review <id> --clear;"
           " replace: nunchi.py supersede <id> <new text>;"
           " fold a duplicate: nunchi.py merge <dup_id> --into <id>")
+    print(REVIEW_AUTHORITY_LINE)
 
 
 def review_stale(do_close):
