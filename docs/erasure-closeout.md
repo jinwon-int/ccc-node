@@ -82,8 +82,9 @@ Not group b, on purpose:
   `retain` for every request (rotate it via FW-03), so erasure never
   deletes it.
 - A bare `.env.bak`, `.env.backup`, `memory-facts.jsonl.bak`, or a
-  `crontab-backup-*.txt` that does not start with a digit matches no family
-  and stays a blocker.
+  `crontab-backup-*.txt` that does not start with a digit matches no group b
+  family. In the bot data dir it stays a blocker; in `~/.claude/state` it
+  falls back to operator scratch (see below).
 
 - Inventory: entries with a `retention_policy` object (`group`, optional
   `max_age_days`); defaults live in `retention_defaults` (`max_age_days: 30`,
@@ -188,14 +189,96 @@ their component's own env chain (`NUNCHI_HOME`, `CCC_STATE_DIR`,
   - Autosave prescreen, curator and per-provider seen ledgers.
   - Repo command and output-style manifests.
 
-Still blockers until the owner makes a policy call: operator one-offs, such
-as ad-hoc restart/rollout/apply scripts, handover notes, issue- or
-node-named files, one-time logs (`*.log.validate`, `*.log.telegram`),
-manual toggle archives (`distill.*.archive-*`/`.retired-*`), and
-`self-update.lock.stalefile-removed-*`. Also still blockers: files with no
-producer in this repo (`mcp-discover-verdicts.json`, `working-state*.lock`,
-`fleet-idle-finalize.no-services`) and the owner-decision backups of
-`wiki-candidates.md`, `working-state.md` and `skill-autosave.mode`.
+The operator one-offs that remained blockers after this batch now fall back
+to operator scratch in the state dir (next section). In `~/.nunchi` and the
+bot data dir they still block.
+
+## Operator scratch (#1468, owner decision 2026-10-23)
+
+Owner decision (2026-10-23, option 1, "권장대로 진행"): operator one-off files
+in the harness state dir form the `operator-scratch` retention class
+(`state.operator_scratch`). They are kept **90 days**, then become eligible
+for destruction at the same apply boundary as groups a/b. The class covers
+these files:
+
+- ad-hoc restart/rollout/apply scripts (`*.sh`, `*.py`)
+- handover notes, and issue- or node-named files
+- one-time logs: `manual-self-update-<ts>.log`, `*.log.validate`,
+  `*.log.telegram`
+- manual toggle archives (`distill.*.archive-*`)
+- `self-update.lock.stalefile-removed-*`
+- files with no producer in this repo (`mcp-discover-verdicts.json`,
+  `working-state*.lock`, `fleet-idle-finalize.no-services`)
+- the backups that used to be owner-decision blockers:
+  `wiki-candidates.md.bak*`, `working-state.md.bak*` and
+  `skill-autosave.mode.bak-auto-*`
+
+- **Fallback, not a pattern.** The entry has no resolve candidates. Its
+  `fallback_scope.roots` names the state dir through the harness chain
+  (`CCC_STATE_DIR`, then `~/.claude/state`; the first existing directory
+  wins). The planner gives the class every file directly under that root
+  that the unknown-artifact sweep would otherwise report as a blocker. A
+  file that any other class matches keeps that class, so the fallback never
+  causes a "conflicting actions" block. The rules follow the sweep:
+  - Subdirectories are never entered, so the agent-cron store and the skills
+    directories stay with their own classes.
+  - Only regular files and symlinks qualify. Symlinks are always kept.
+  - An orphan SQLite sidecar (its DB is gone) stays a blocker. A sidecar
+    whose DB is also scratch shares the DB's verdict.
+- **Scope.** The fallback covers only the state dir. `~/.nunchi` holds
+  private memory (facts DB, transcript index) and the bot data dir holds
+  credentials (`.env`, `memory-audience.key`), so an unknown file in either
+  stays a **blocker**. A stray file next to private memory or credentials
+  needs an explicit class, not a silent 90-day clock.
+- **Order of rules.**
+  1. Live claims come first (a path another class resolves as live is never
+     a target).
+  2. The key-file rule: `retain (key-file)` at any age.
+  3. Symlinks are kept.
+  4. The scheduler guard, below.
+  5. Age: `max(mtime, ctime)` against 90 days. `CCC_ERASURE_RETENTION_DAYS`
+     may only lengthen it.
+- **Scheduler guard** (`"scheduler_guard": true`). A scratch file that a
+  scheduler names is planned as `retain (scheduler-referenced)` at any age.
+  The guard reads three sources, read-only:
+  - the current user's crontab, via `$CCC_CRONTAB_CMD -l` (default
+    `crontab`, the repo's test seam). "no crontab for <user>" counts as
+    empty.
+  - the agent-cron task store: `CCC_AGENT_CRON_STORE`,
+    `$CCC_STATE_DIR/agent-cron/tasks.json` and
+    `~/.claude/state/agent-cron/tasks.json`. A missing store means no tasks.
+  - the non-comment lines of systemd unit and drop-in files under
+    `~/.config/systemd/user/` and `/etc/systemd/system/`.
+
+  A match is the absolute path, the realpath, or a `~/`, `$HOME/`,
+  `${HOME}/` or `%h/` form of it. The bare file name as a whole token also
+  matches, which covers `cd … && ./x.sh` and env-var indirection. A false
+  positive only keeps a file longer.
+- **Fail toward keeping.** If any of these sources cannot be read (crontab
+  missing or erroring, task store unreadable or not JSON, unit file
+  unreadable), no scratch file is eligible. Each one is planned as
+  `retain (scheduler references unreadable)`. The plan and the retention
+  report carry a body-free `scheduler_guard` block
+  (`status`/`sources`/`errors`). Scheduler text is never printed.
+- **Lifecycle requests.**
+
+  | request | scratch files |
+  |---|---|
+  | `prune-expired` | `delete` once expired and not referenced; otherwise a retain variant |
+  | `node-decommission` | `delete`, under the same age, guard and key-file gate as group b on decommission. Key files are never deleted |
+  | `audience-erasure`, `telegram-user-erasure`, `cache-rebuild` | not targeted, so kept. Scratch is not audience- or user-scoped data |
+- **New harness class found while scoping.**
+  `timed-test-deadline-scan.notify-<level>.json` is written by
+  `scripts/timed_test_deadline_scan.py`. It now has its own class
+  (`state.timed_test_notify_state`) instead of aging out as scratch.
+- **Apply caveat.** The apply boundary still refuses any target with
+  group/other permission bits, and that refusal blocks the whole run.
+  Operator scripts are often `0755`. A `chmod 600` refreshes ctime, which
+  restarts the 90-day clock (the rule errs toward keeping).
+
+Nothing is deleted by the planner. Destruction still needs a `prune-expired`
+plan run through `ccc-erasure-apply.py` with `ERASURE_APPLY=1`, and a fresh
+per-node owner approval.
 
 ## Wiki promotion records (#1447 batch)
 

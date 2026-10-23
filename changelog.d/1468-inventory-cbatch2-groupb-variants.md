@@ -30,6 +30,7 @@
   - **SQLite sidecars.** The new `sqlite_sidecars` flag makes `-wal`/`-shm`/
     `-journal` siblings follow their DB. A sidecar of a live file is claimed
     live, and in a retention class a sidecar takes its DB's verdict.
-  - **Still blockers.** Operator one-offs and files with no producer in this
-    repo still block until the owner makes a policy decision.
+  - **Operator one-offs.** Operator one-offs and files with no producer in
+    this repo are handled by the operator-scratch class
+    (`1468-operator-scratch.md`).
   - **Nothing is deleted by this change.**
