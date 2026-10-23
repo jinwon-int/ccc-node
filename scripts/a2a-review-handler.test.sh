@@ -492,6 +492,43 @@ P2_BIN="$TMP/danso-bin/danso-review-agent.sh" REVIEW_AGENT_ARGS="--model glm-tes
 ok "the danso wrapper (always --no-tools) is accepted with --model only (#1460 P2)" \
   '[ "$rc" = 0 ] && [ -e "$TMP/agent-marker-1460" ] && jq -e ".output.reviser_model == \"glm-test\"" >/dev/null "$TMP/out-p2-danso.json"'
 
+# #1460 P3: flag-value provenance — a flag after a bare --model is not a model.
+make_revise_task
+REVIEW_AGENT_BIN="$BIN/revise-stub-agent" REVIEW_AGENT_ARGS="-p --model --verbose --disallowed-tools *" \
+  REVIEW_TIMEOUT_SEC=30 WORKER_ID=testnode REVIEW_STUB_MODE=revised \
+  bash "$REVISE_HANDLER" < "$TMP/revise-task.json" > "$TMP/out-p3-model.json" 2>/dev/null; rc=$?
+ok "revise: '--model --verbose' records the self-reported model, not '--verbose' (#1460 P3)" \
+  '[ "$rc" = 0 ] && jq -e ".output.reviser_model == \"stub-model\"" >/dev/null "$TMP/out-p3-model.json"'
+make_task "$HEAD_OK"
+REVIEW_AGENT_BIN="$BIN/stub-agent" REVIEW_AGENT_ARGS="-p --no-tools --model --verbose" REVIEW_TIMEOUT_SEC=30 \
+  WORKER_ID=testnode REVIEW_STUB_HEAD="$HEAD_OK" REVIEW_STUB_OTHER_HEAD="$HEAD_OTHER" REVIEW_STUB_MODE=approve \
+  bash "$HANDLER" < "$TMP/task.json" > "$TMP/out-p3-review-model.json" 2>/dev/null; rc=$?
+ok "review: '--model --verbose' records the self-reported model, not '--verbose' (#1460 P3)" \
+  '[ "$rc" = 0 ] && jq -e ".output.review_model == \"stub-model\"" >/dev/null "$TMP/out-p3-review-model.json"'
+
+# #1460 P3: findings with null fields are coerced, not misreported as missing.
+make_revise_task
+jq '.payload.findings = [{severity:null, area:"procedure", note:"null severity"}, {area:7, note:"no severity"}]' \
+  "$TMP/revise-task.json" > "$TMP/revise-task-p3.json"
+PROMPT_CAPTURE="$TMP/prompt-p3-findings.txt" P2_TASK="$TMP/revise-task-p3.json" \
+  run_revise_p2 > "$TMP/out-p3-findings.json" 2>"$TMP/err-p3-findings.txt"; rc=$?
+ok "revise: null / non-string finding fields are coerced and reach the prompt (#1460 P3)" \
+  '[ "$rc" = 0 ] && grep -qF -- "- [?/procedure] null severity" "$TMP/prompt-p3-findings.txt" && grep -qF -- "- [?/7] no severity" "$TMP/prompt-p3-findings.txt"'
+for p3_shape in '"not-a-list"' '["a string finding"]'; do
+  make_revise_task
+  jq --argjson f "$p3_shape" '.payload.findings = $f' "$TMP/revise-task.json" > "$TMP/revise-task-p3.json"
+  rm -f "$TMP/agent-marker-1460"
+  AGENT_MARKER="$TMP/agent-marker-1460" P2_TASK="$TMP/revise-task-p3.json" \
+    run_revise_p2 >/dev/null 2>"$TMP/err-p3-findings.txt"; rc=$?
+  ok "revise: findings $p3_shape fail as malformed before the agent runs (#1460 P3)" \
+    '[ "$rc" = 1 ] && [ ! -e "$TMP/agent-marker-1460" ] && grep -q "packet findings malformed" "$TMP/err-p3-findings.txt"'
+done
+make_revise_task
+jq '.payload.findings = []' "$TMP/revise-task.json" > "$TMP/revise-task-p3.json"
+P2_TASK="$TMP/revise-task-p3.json" run_revise_p2 >/dev/null 2>"$TMP/err-p3-findings.txt"; rc=$?
+ok "revise: an empty findings list still fails as 'lacks findings' (#1460 P3)" \
+  '[ "$rc" = 1 ] && grep -q "packet lacks findings" "$TMP/err-p3-findings.txt"'
+
 # Single reviser node id: prompt binding, output and validation agree.
 make_revise_task
 PROMPT_CAPTURE="$TMP/prompt-p2-node.txt" env -u WORKER_ID A2A_WORKER_ID=a2a-node-1460 \
