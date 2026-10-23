@@ -681,6 +681,46 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(all(len(v) == 1 for v in owners.values()))
         apply.partition_targets(doc)                    # no conflicting actions
 
+    def test_non_owner_only_scratch_is_retained_not_planned(self):
+        # #1468 owner decision 2026-10-23 (option 2): apply refuses a run with
+        # any non-owner-only target, so such scratch is kept instead.
+        state = self.scratch_fixture()
+        readable = self.seed(state / "handover-notes.md", HORIZON_DAYS)
+        readable.chmod(0o644)
+        script = self.seed(state / "rollout-once.sh", HORIZON_DAYS)
+        script.chmod(0o755)
+        group_only = self.seed(state / "probe-once.py", HORIZON_DAYS)
+        group_only.chmod(0o640)
+        private = self.seed(state / "one-off.sh", HORIZON_DAYS)
+        report = self.report()
+        for path in (readable, script, group_only):
+            self.assertEqual(report[str(path)]["reason"], "not-owner-only", path.name)
+            self.assertFalse(report[str(path)]["eligible"], path.name)
+        for request in ("prune-expired", "node-decommission"):
+            actions = self.plan_actions(request)
+            for path in (readable, script, group_only):
+                self.assertEqual(actions[str(path)], "retain (not owner-only)", (request, path.name))
+            self.assertEqual(actions[str(private)], "delete", request)
+        # Only owner-only scratch reaches apply: its executable set passes the
+        # same owner-only verification the run enforces.
+        doc = planner.plan("prune-expired", self.inventory, None, None)
+        executable, _ = apply.partition_targets(doc)
+        deletes = [t["path"] for t in executable
+                   if t.get("artifact") == "state.operator_scratch" and t["action"] == "delete"]
+        self.assertEqual(deletes, [str(private)])
+        self.assertIsNone(apply.check_ancestors(str(private)))
+        for path in (readable, script, group_only):   # what apply would refuse
+            self.assertEqual(apply.check_ancestors(str(path)), "group-other-bits-on-target")
+
+    def test_owner_only_rule_does_not_touch_non_scratch_classes(self):
+        state = self.scratch_fixture()
+        self.seed(state / "crontab.bak-2", 35)          # absorbs last-copy
+        backup = self.seed(state / "crontab.bak-1", 40)
+        backup.chmod(0o644)
+        report = self.report()
+        self.assertEqual(report[str(backup)]["artifact"], "state.crontab_backups")
+        self.assertNotEqual(report[str(backup)]["reason"], "not-owner-only")
+
     def test_key_file_names_in_scratch_stay_retained(self):
         state = self.scratch_fixture()
         keys = [self.seed(state / n, HORIZON_DAYS) for n in (
