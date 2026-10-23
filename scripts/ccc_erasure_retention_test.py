@@ -366,6 +366,219 @@ class RetentionTests(unittest.TestCase):
                 self.assertEqual(kinds, {"pattern"}, entry["id"])
                 self.assertNotIn("extra_paths", entry, entry["id"])
 
+    # --- #1468 c-batch-2: observed group-b name variants --------------------
+    GROUP_B_VARIANTS = {
+        ".telegram_bot": (".env.bak.20261001120000", ".env.bak.20261001_120000",
+                          ".env.bak.pretimeout", ".env.bak-pre-delegated7200-20261001T1200+0900",
+                          ".env.pre-webmcp-20261001T120000+0900",
+                          "sessions.json.bak-effort-high-20261001T1200+0900",
+                          "sessions.json.bak-opus5-20261001T1200+0900"),
+        ".claude/state": ("crontab-backup-20261001-120000.txt",
+                          "crontab-backup-20261001-120000-lanes.txt",
+                          "crontab-backup-20261001-120000-before-both-mode.txt",
+                          "crontab.bak-nightly-0040-20261001T1200+0900",
+                          "crontab.bak.20261001-120000", "crontab.bak.20261001T120000Z",
+                          "memory-facts.jsonl.bak-names-20261001T1200"),
+        ".nunchi": ("crontab.bak-pre-piri-20261001T1200", "crontab.bak-pre-repair-20261001T1200"),
+    }
+
+    def seed_live_counterparts(self):
+        self.live_env()
+        self.seed(self.bot / "sessions.json", 0)
+        self.seed(self.home / ".claude/state/memory-facts.jsonl", 0)
+
+    def test_observed_group_b_variants_classified_and_eligible_after_30_days(self):
+        self.seed_live_counterparts()
+        seeded = {}
+        for sub, names in self.GROUP_B_VARIANTS.items():
+            for name in names:
+                seeded[name] = self.seed(self.home / sub / name, 40)
+            # crontab has no live file: the newest copy per directory is
+            # always kept, so a newer sentinel absorbs the last-copy rule.
+            self.seed(self.home / sub / "crontab.bak-sentinel", 31)
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        report = self.report()
+        actions = self.plan_actions()
+        for name, path in seeded.items():
+            with self.subTest(name=name):
+                self.assertNotIn(str(path), unknown)
+                self.assertTrue(report[str(path)]["eligible"])
+                self.assertEqual(report[str(path)]["group"], "b-sensitive-backup")
+                self.assertEqual(actions[str(path)], "delete")
+        for sub in self.GROUP_B_VARIANTS:
+            sentinel = str(self.home / sub / "crontab.bak-sentinel")
+            self.assertEqual(actions[sentinel], "retain (last copy; live missing)")
+
+    def test_observed_group_b_variants_retained_within_30_days(self):
+        self.seed_live_counterparts()
+        for sub, names in self.GROUP_B_VARIANTS.items():
+            for name in names:
+                path = self.seed(self.home / sub / name, 5)
+                with self.subTest(name=name):
+                    self.assertTrue(self.plan_actions()[str(path)].startswith("retain-until:"))
+
+    def test_memory_facts_backup_keeps_last_copy_while_lane_missing(self):
+        state = self.home / ".claude/state"
+        older = self.seed(state / "memory-facts.jsonl.bak-a", 60)
+        newest = self.seed(state / "memory-facts.jsonl.bak-b", 50)
+        actions = self.plan_actions()
+        self.assertEqual(actions[str(older)], "delete")
+        self.assertEqual(actions[str(newest)], "retain (last copy; live missing)")
+        self.seed(state / "memory-facts.jsonl", 0)
+        self.assertEqual(self.plan_actions()[str(newest)], "delete")
+
+    def test_live_files_and_lookalikes_never_match_group_b(self):
+        self.seed_live_counterparts()
+        state, nunchi = self.home / ".claude/state", self.home / ".nunchi"
+        # The bridge's previous-good recovery copies (session store, task
+        # ledger) are read back on primary corruption: live, never group b.
+        live_bak = [self.seed(self.bot / n, HORIZON_DAYS)
+                    for n in ("sessions.json.bak", "tasks.json.bak")]
+        lookalikes = [self.seed(self.bot / n, HORIZON_DAYS) for n in (
+            ".env.bak", ".env.backup", ".env.local", ".env.pre", "x.env.bak-1",
+            ".sessions.json.bak.tmp-abc", "sessions.json.bak.1",
+            "crontab")]
+        lookalikes += [self.seed(state / n, HORIZON_DAYS) for n in (
+            "crontab-backup.txt", "crontab-backup-x.txt", "crontab-backup-20261001.txt.gz",
+            "memory-facts.jsonl", "memory-facts.jsonl.bak", "memory-facts.jsonl.bak.1")]
+        lookalikes += [self.seed(nunchi / n, HORIZON_DAYS) for n in ("crontab.bak", "crontab.txt")]
+        report = self.report()
+        actions = self.plan_actions()
+        for path in live_bak + lookalikes:
+            with self.subTest(path=path.name):
+                self.assertNotIn(str(path), report)
+                self.assertNotEqual(actions.get(str(path)), "delete")
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        for path in live_bak:
+            self.assertNotIn(str(path), unknown)   # classified with the live store
+        decommission = self.plan_actions("node-decommission")
+        self.assertEqual(decommission[str(live_bak[0])], "delete-or-handoff")
+        self.assertEqual(decommission[str(live_bak[1])], "retain")
+        self.assertIn(str(state / "crontab-backup-x.txt"), unknown)
+
+    def test_key_files_in_widened_families_stay_retained(self):
+        self.seed_live_counterparts()
+        state = self.home / ".claude/state"
+        keys = [self.seed(state / "cert.pem.bak-tool-20261001T1200", HORIZON_DAYS),
+                self.seed(self.bot / ".env.bak.20261001.PEM", HORIZON_DAYS),
+                self.seed(self.bot / ".env.pre-x+0900.token", HORIZON_DAYS),
+                self.seed(state / "crontab.bak.id_ed25519", HORIZON_DAYS),
+                self.seed(state / "memory-facts.jsonl.bak-secrets-1", HORIZON_DAYS)]
+        report = self.report()
+        actions = self.plan_actions()
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        for path in keys:
+            with self.subTest(name=path.name):
+                self.assertNotIn(str(path), unknown)
+                self.assertEqual(report[str(path)]["reason"], "key-file")
+                self.assertTrue(actions[str(path)].startswith("retain"))
+        for path in keys[1:]:                      # delete classes: the guard wins
+            self.assertEqual(actions[str(path)], "retain (key-file)")
+        cert = str(keys[0])                        # PEM class: explicit retain too
+        self.assertEqual(report[cert]["artifact"], "state.cert_backups")
+        self.assertEqual(actions[cert], "retain")
+        self.assertEqual(self.plan_actions("node-decommission")[cert], "retain")
+
+    def test_skill_review_zai_env_is_retained_live_config(self):
+        live = self.seed(self.home / ".claude/state/skill-review.zai.env", HORIZON_DAYS)
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        self.assertNotIn(str(live), unknown)
+        self.assertNotIn(str(live), self.report())
+        for request in ("prune-expired", "node-decommission", "telegram-user-erasure"):
+            self.assertNotEqual(self.plan_actions(request).get(str(live)), "delete", request)
+        self.assertEqual(self.plan_actions("node-decommission")[str(live)], "retain")
+
+    # --- #1468 c-batch-2: SQLite sidecars follow their DB --------------------
+    def test_sidecars_of_the_live_default_db_are_never_retention_targets(self):
+        nunchi = self.home / ".nunchi"
+        self.seed(nunchi / "facts.db", HORIZON_DAYS)
+        self.seed(nunchi / ".legacy-retired", 0)
+        sidecars = [self.seed(nunchi / f"facts.db{s}", HORIZON_DAYS) for s in ("-wal", "-shm")]
+        # NUNCHI_DB unset: ~/.nunchi/facts.db IS live, so are its sidecars.
+        report = self.report()
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        for path in sidecars:
+            self.assertNotIn(str(path), report)
+            self.assertNotIn(str(path), unknown)
+            self.assertNotEqual(self.plan_actions().get(str(path)), "delete")
+            self.assertEqual(self.plan_actions("node-decommission")[str(path)], "handoff-or-drop")
+
+    def test_legacy_db_sidecars_share_the_db_verdict(self):
+        nunchi = self.home / ".nunchi"
+        scoped = self.seed(self.root / "scope/facts.db", 0)
+        db = self.seed(nunchi / "facts.db", 60)
+        wal = self.seed(nunchi / "facts.db-wal", 1)        # younger than its DB
+        shm = self.seed(nunchi / "facts.db-shm", 1)
+        with patch.dict(os.environ, {"NUNCHI_DB": str(scoped)}):
+            report = self.report()
+            for path in (db, wal, shm):                    # marker absent: live
+                self.assertNotIn(str(path), report)
+            self.seed(nunchi / ".legacy-retired", 0)
+            actions = self.plan_actions()
+            for path in (db, wal, shm):
+                self.assertEqual(actions[str(path)], "delete", path.name)
+            os.utime(db, (self.T - 5 * DAY,) * 2)          # DB young, WAL old
+            os.utime(wal, (self.T - 90 * DAY,) * 2)
+            report = self.report()
+            self.assertFalse(report[str(wal)]["eligible"])
+            self.assertEqual(report[str(wal)]["eligible_at"], report[str(db)]["eligible_at"])
+            self.assertEqual(self.plan_actions()[str(wal)],
+                             f"retain-until:{report[str(db)]['eligible_at']}")
+
+    def test_gotgan_store_and_sidecars_are_body_bearing_index(self):
+        nunchi = self.home / ".nunchi"
+        files = [self.seed(nunchi / n, 3) for n in ("gotgan.db", "gotgan.db-wal", "gotgan.db-shm")]
+        orphan = self.seed(nunchi / "gotgan.db.old", 3)
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        actions = self.plan_actions("node-decommission")
+        for path in files:
+            self.assertNotIn(str(path), unknown)
+            self.assertEqual(actions[str(path)], "delete", path.name)
+        self.assertIn(str(orphan), unknown)
+        entry = next(a for a in self.inventory["artifacts"] if a["id"] == "nunchi.gotgan_store")
+        self.assertIn("transcript-excerpts", entry["contains"])
+        self.assertEqual(entry["requests"]["cache-rebuild"], "re-index")
+
+    def test_harness_runtime_artifacts_are_classified_one_offs_stay_blockers(self):
+        state, nunchi = self.home / ".claude/state", self.home / ".nunchi"
+        harness = [self.seed(state / n, 1) for n in (
+            "repo-commands.manifest", "repo-output-styles.manifest",
+            "skill-autosave-cron.history.jsonl", ".skill-listing-policy.lock",
+            "skill-listing-policy.json", "prescreen-last.json",
+            "self-update.pending-activation.json", "skill-autosave-curator-state.json",
+            "nunchi-judge-human.flag", "nunchi-wiki-promote-report.md",
+            "nunchi.auto-distill-feed", "distill.scope", "distill.log.1.gz", "distill.log.2",
+            "skill-autosave.codex-seen", "skill-autosave.piri-seen",
+            "skill-autosave.danso-seen")]
+        harness += [self.seed(nunchi / n, 1) for n in (
+            ".jev-review.lock", ".journal-feed.lock", ".auto-distill-feed.lock",
+            ".danso-feed.lock", "gotgan-refresh.lock", "backend-health.json.lock",
+            "ingest.status.json", "judge.status.json", "journal-feed.status.json",
+            "matrix-journal-feed.status.json", "gotgan-refresh.status.json",
+            "matrix-ingest.status.json", "ingest.matrix.status.json",
+            "auto-distill-feed.state.json", "jev-review.db", "jev-review.db-journal",
+            "journal-receipts.jsonl", "journal-matrix-0123456789abcdef-receipts.jsonl",
+            "journal-configured-fedcba9876543210-receipts.jsonl",
+            "codex-receipts.jsonl", "piri-receipts.jsonl", "codex-seen", "danso-seen",
+            "gotgan-refresh.cron.log", "jev-review.py.log", "journal-feed.py.log",
+            "matrix-ingest.log", "verbatim-backend")]
+        harness.append(self.seed(self.bot / "jev-skill-advice.json", 1))
+        one_offs = [self.seed(state / n, 1) for n in (
+            "label-restart.sh", "handover-x-20261001.md", "mcp-discover-verdicts.json",
+            "self-update.lock.stalefile-removed-20261001", "distill.disabled.archive-20261001T0000Z",
+            "wiki-candidates.md.bak-20261001", "fleet-update-abc1234.log.validate",
+            "distill.log.1.gz.tmp")]
+        one_offs += [self.seed(nunchi / n, 1) for n in (
+            "gotgan-stage2-manual.time", "journal-matrix-XYZ-receipts.jsonl",
+            "jev-review.db-wal2")]
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        for path in harness:
+            self.assertNotIn(str(path), unknown, path.name)
+        for path in one_offs:
+            self.assertIn(str(path), unknown, path.name)
+        self.assertEqual(self.plan_actions("node-decommission")[str(nunchi / "jev-review.db")],
+                         "delete")
+
     def test_armed_apply_in_fixture_deletes_only_eligible(self):
         live = self.live_env()
         old = self.seed(self.bot / ".env.bak-old", 31)

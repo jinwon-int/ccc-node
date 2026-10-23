@@ -50,7 +50,10 @@ A path a non-retention class resolves as
 live — matched by path, realpath and inode, so symlinked and hard-linked
 live files count — is never a retention target, and the legacy ~/.nunchi
 store stays claimed live regardless of NUNCHI_* env until the operator
-creates ~/.nunchi/.legacy-retired. Eligibility is only a plan state:
+creates ~/.nunchi/.legacy-retired. A class flagged "sqlite_sidecars" also
+owns the -wal/-shm/-journal siblings of its files; sidecars of a live file
+are claimed live, and in a retention class a sidecar shares its DB's
+verdict. Eligibility is only a plan state:
 destruction still happens exclusively through ccc-erasure-apply.py (digest
 + blockers + owner-only + rollback-first, ERASURE_APPLY=1), which needs a
 separate per-node owner approval.
@@ -98,6 +101,9 @@ KEY_FILE_TOKENS = (
 BUILTIN_KEY_FILE_PATTERNS = (
     r"(?:^|[._-])(?:" + "|".join(KEY_FILE_TOKENS) + r")(?:[._-]|$)",
 )
+# SQLite keeps uncheckpointed/committed state beside a DB: a sidecar must
+# share its DB's fate (never deleted while the DB is live, never outlive it).
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 REQUESTS = {
     "audience-erasure": {"arg": "--audience"},
@@ -171,14 +177,30 @@ def _pattern_specs(entry: dict) -> list[tuple[str, re.Pattern[str]]]:
     return specs
 
 
+def sqlite_sidecar_names(path: str) -> list[str]:
+    """The -wal/-shm/-journal names SQLite may keep beside ``path``."""
+    return [path + suffix for suffix in SQLITE_SIDECAR_SUFFIXES]
+
+
+def sidecar_base(path: str) -> str | None:
+    """The DB path a sidecar name belongs to, or None for a plain file."""
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        if path.endswith(suffix) and len(path) > len(suffix):
+            return path[:-len(suffix)]
+    return None
+
+
 def secondary_paths(entry: dict) -> list[str]:
     """Every existing file that belongs to this class BEYOND the primary
-    resolution: extra_paths literals + pattern matches.
+    resolution: extra_paths literals + pattern matches (+ SQLite sidecars).
 
     extra_paths are additional literal candidates with the same shape as
     resolve.candidates — multi-file classes (the managed cron logs, the
-    runtime locks) register every file they write. Returns deduplicated
-    absolute paths; the primary resolve_entry path is NOT included.
+    runtime locks) register every file they write. A class flagged
+    ``sqlite_sidecars`` also owns the existing -wal/-shm/-journal siblings
+    of its primary and of every other file it owns, so they follow their
+    DB (#1468 c-batch-2). Returns deduplicated absolute paths; the primary
+    resolve_entry path is NOT included.
     """
     primary = resolve_entry(entry)
     primary_path = os.path.abspath(primary) if primary else None
@@ -206,7 +228,20 @@ def secondary_paths(entry: dict) -> list[str]:
                 continue
             if p not in out:
                 out.append(p)
+    if entry.get("sqlite_sidecars"):
+        _append_sidecars(out, primary_path)
     return out
+
+
+def _append_sidecars(out: list[str], primary_path: str | None) -> None:
+    """Add the existing SQLite sidecars of the primary and of every path
+    already in ``out`` (in place, deduplicated, primary excluded)."""
+    bases = ([primary_path] if primary_path and os.path.isfile(primary_path)
+             else []) + list(out)
+    for base in bases:
+        for p in sqlite_sidecar_names(base):
+            if os.path.isfile(p) and p != primary_path and p not in out:
+                out.append(p)
 
 
 def resolve_entry(entry: dict) -> str | None:
@@ -316,8 +351,11 @@ class _Claims:
         self.dirs: list[str] = []
 
     def add_file(self, path: str) -> None:
-        self.paths.add(os.path.abspath(path))
-        self.paths.add(os.path.realpath(path))
+        for p in (os.path.abspath(path), os.path.realpath(path)):
+            self.paths.add(p)
+            # A live DB's -wal/-shm/-journal are live too: deleting a WAL
+            # under an open DB loses committed rows.
+            self.paths.update(sqlite_sidecar_names(p))
         try:
             meta = os.stat(path)
         except OSError:
@@ -463,8 +501,11 @@ def retention_verdicts(inventory: dict, entry: dict, claims: _Claims,
     """
     out = [(p, retention_verdict(inventory, entry, p, now))
            for p in retention_paths(inventory, entry, claims)]
+    by_path = dict(out)
     newest: dict[str, tuple[float, float, str]] = {}
     for path, _verdict in out:
+        if sidecar_base(path) in by_path:
+            continue                    # a sidecar is never a "copy"
         if not _live_counterpart_missing(entry, path):
             continue
         try:
@@ -481,6 +522,16 @@ def retention_verdicts(inventory: dict, entry: dict, claims: _Claims,
     for path, verdict in out:
         if path in keep and verdict["eligible"]:
             verdict.update(eligible=False, reason="last-copy-live-missing")
+    # SQLite sidecars share their DB's verdict (#1468 c-batch-2): a -wal is
+    # destroyed together with its DB, never earlier and never left behind
+    # with committed frames once the DB is gone.
+    for path, verdict in out:
+        base = sidecar_base(path)
+        if base in by_path and verdict["reason"] in ("within-retention",
+                                                     "retention-expired"):
+            db = by_path[base]
+            verdict.update(eligible=db["eligible"], reason=db["reason"],
+                           eligible_at=db["eligible_at"])
     return out
 
 

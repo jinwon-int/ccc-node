@@ -210,6 +210,41 @@ after3="$(fix3_sum)"
 ok "READ-ONLY: fixture tree byte-identical after retention dry-runs" '[ "$before3" = "$after3" ]'
 ok "retention fixtures (python)" 'python3 "$ROOT/scripts/ccc_erasure_retention_test.py" >"$TMP/retention-test.out" 2>&1 || { cat "$TMP/retention-test.out"; false; }'
 
+# --- 8) c-batch-2: harness runtime artifacts + SQLite sidecars (#1468) -------
+# The 2026-10-23 fleet scan found the same harness-written files on most nodes
+# (nunchi feed status/locks/receipts, gotgan + jev-review stores, autosave and
+# self-update state). They classify through the same env chains as their
+# component; SQLite -wal/-shm siblings follow their DB; lookalikes and
+# operator one-offs keep blocking.
+for n in gotgan.db gotgan.db-wal gotgan.db-shm jev-review.db ingest.status.json \
+         journal-receipts.jsonl .journal-feed.lock gotgan-refresh.cron.log verbatim-backend \
+         facts.db-wal; do printf 'x' > "$NUNCHI_HOME/$n"; done
+for n in prescreen-last.json self-update.pending-activation.json repo-commands.manifest \
+         skill-listing-policy.json distill.log.1.gz; do printf 'x' > "$CCC_STATE_DIR/$n"; done
+printf 'x' > "$NUNCHI_HOME/gotgan.db.old"                 # lookalike
+printf 'x' > "$CCC_STATE_DIR/label-restart.sh"            # operator one-off
+# shellcheck disable=SC2034  # before8 is read via eval inside ok()
+before8="$(tree_sum)"
+out="$(run scan --json)"
+# shellcheck disable=SC2034  # scan_unknowns is read via eval inside ok()
+scan_unknowns="$(python3 -c 'import json,sys; print("\n".join(u["path"] for u in json.load(sys.stdin)["unknown"]))' <<<"$out")"
+ok "c-batch-2: nunchi stores, status, receipts, locks, logs classified" \
+  '! grep -qE "/(gotgan\.db(-wal|-shm)?|jev-review\.db|ingest\.status\.json|journal-receipts\.jsonl|\.journal-feed\.lock|gotgan-refresh\.cron\.log|verbatim-backend)$" <<<"$scan_unknowns"'
+ok "c-batch-2: live facts.db WAL follows its DB" '! grep -qF "facts.db-wal" <<<"$scan_unknowns"'
+ok "c-batch-2: state-dir harness files classified" \
+  '! grep -qE "/(prescreen-last\.json|self-update\.pending-activation\.json|repo-commands\.manifest|skill-listing-policy\.json|distill\.log\.1\.gz)$" <<<"$scan_unknowns"'
+ok "c-batch-2: lookalike and operator one-off still block" \
+  'grep -qF "gotgan.db.old" <<<"$scan_unknowns" && grep -qF "label-restart.sh" <<<"$scan_unknowns"'
+out="$(run node-decommission --json)"
+# shellcheck disable=SC2034  # actions8 is read via eval inside ok()
+actions8="$(python3 -c 'import json,sys,os; print("\n".join(os.path.basename(t["path"])+" "+t["action"] for t in json.load(sys.stdin)["targets"] if t["present"]))' <<<"$out")"
+ok "c-batch-2: gotgan store + sidecars decommission together" \
+  'grep -qx "gotgan.db delete" <<<"$actions8" && grep -qx "gotgan.db-wal delete" <<<"$actions8" && grep -qx "gotgan.db-shm delete" <<<"$actions8"'
+ok "c-batch-2: facts.db WAL keeps the DB handoff contract" 'grep -qx "facts.db-wal handoff-or-drop" <<<"$actions8"'
+# shellcheck disable=SC2034  # after8 is read via eval inside ok()
+after8="$(tree_sum)"
+ok "READ-ONLY: fixture tree byte-identical after c-batch-2 scans" '[ "$before8" = "$after8" ]'
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

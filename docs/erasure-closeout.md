@@ -54,10 +54,36 @@ before deletion.
 
 Owner decision (2026-09-29, option ②): group a (legacy unscoped stores,
 e.g. `~/.nunchi/{facts.db,backend-health.json,snapshot.md}` once the live
-resolver points elsewhere) and group b (sensitive backups: `.env.bak-*`,
-`.env.pre-*`, `sessions.json.bak-*`, `crontab.bak-*`) are kept **30 days**,
-then become **eligible** for destruction at the apply boundary. Key files are
-always kept.
+resolver points elsewhere) and group b (sensitive backups) are kept **30
+days**, then become **eligible** for destruction at the apply boundary. Key
+files are always kept.
+
+Group b name families (anchored regexes over file names; `+` is allowed so
+`…+0900` stamps match):
+
+| class | directory | names |
+|---|---|---|
+| `bot.env_backups` | bot data dir | `.env.bak-*`, `.env.bak.*`, `.env.pre-*` |
+| `bot.sessions_backups` | bot data dir | `sessions.json.bak-*` |
+| `state.crontab_backups` | bot data dir, `~/.claude/state`, `~/.nunchi` | `crontab.bak-*`, `crontab.bak.*`; state dir also `crontab-backup-<digit>….txt` |
+| `state.memory_facts_backups` | `~/.claude/state` | `memory-facts.jsonl.bak-*` (last-copy counterpart `memory-facts.jsonl`) |
+| `bot.credential_key_backups` | bot data dir | `memory-audience.key.{bak,pre}-*` — explicit `retain` |
+| `state.cert_backups` | `~/.claude/state` | `cert.pem.bak-*` — explicit `retain`; `pem` is a key token anyway |
+
+Not group b, on purpose:
+
+- `sessions.json.bak` and `tasks.json.bak` with **no suffix** are the
+  bridge's previous-good recovery copies (session store and task ledger).
+  They are rewritten on every save and read back when the primary is corrupt.
+  They belong to the live classes (`telegram.sessions_tasks_usage`,
+  `bot.runtime_state`), so they are claimed live and never age out.
+- `~/.claude/state/skill-review.zai.env` is the live credential file for the
+  skill-review zai fallback. It is registered as `skill.review_zai_env` with
+  `retain` for every request (rotate it via FW-03), so erasure never
+  deletes it.
+- A bare `.env.bak`, `.env.backup`, `memory-facts.jsonl.bak`, or a
+  `crontab-backup-*.txt` that does not start with a digit matches no family
+  and stays a blocker.
 
 - Inventory: entries with a `retention_policy` object (`group`, optional
   `max_age_days`); defaults live in `retention_defaults` (`max_age_days: 30`,
@@ -99,7 +125,8 @@ always kept.
   `manifest.json`). Removing the marker afterwards does not bring deleted
   files back.
 - Last copy: while a backup family's live counterpart is absent (`.env` for
-  `.env.bak-*`/`.env.pre-*`, `sessions.json` for its backups; crontab has no
+  `.env.bak-*`/`.env.pre-*`, `sessions.json` and `memory-facts.jsonl` for
+  their backups; crontab has no
   checkable file, so it always counts as absent), the newest copy per
   directory is planned as `retain (last copy; live missing)` even past
   retention. Only regular, non-symlink files can be that kept copy (a
@@ -112,12 +139,63 @@ always kept.
   `node-decommission` plans carry `delete` only for expired files; younger
   ones plan as `retain-until:<ISO date>`, which apply skips.
 
+- SQLite sidecars: a class flagged `sqlite_sidecars` (`nunchi.peer_facts`,
+  `legacy.nunchi_unscoped_db`, `nunchi.gotgan_store`,
+  `nunchi.jev_review_ledger`) also owns the existing `-wal`/`-shm`/`-journal`
+  siblings of its files. A sidecar of any live-claimed file is claimed live
+  as well. In a retention class a sidecar takes its DB's verdict, so a WAL is
+  never deleted before its DB and never left behind after it. An orphan
+  sidecar with no DB stays a blocker.
+
 **Out of scope here:** actually deleting anything on a node. Eligible files
 are destroyed only by a `prune-expired` plan run through
 `ccc-erasure-apply.py` with `ERASURE_APPLY=1` (digest, blockers, owner-only,
 rollback-first), and every such per-node run needs its **own fresh owner
 approval**. Measuring the two Termux nodes is also still
 open (#1468).
+
+## Inventory c-batch-2 (#1468)
+
+The read-only fleet scan on 2026-10-23 found the same harness-written files on
+most nodes, and they blocked every apply. They are now classified through
+their component's own env chain (`NUNCHI_HOME`, `CCC_STATE_DIR`,
+`CCC_BOT_DATA_DIR`, `GOTGAN_DB`), with the default-home literal added as well:
+
+- **New classes:**
+  - `nunchi.gotgan_store` holds verbatim transcript chunks, so it is a
+    body-bearing private index, handled like `mempalace.palace`
+    (`delete-entries-by-scope` / `delete` / `re-index`).
+  - `nunchi.jev_review_ledger` holds cursors and advisory verdicts, with no
+    fact bodies.
+  - `nunchi.feed_receipts` holds fingerprint receipts: sha256 path keys and
+    inode/size/mtime, with no bodies.
+  - `nunchi.feed_status` holds body-free run status for the feeds, judge,
+    journal channels and gotgan refresh.
+  - `state.skill_listing_policy`.
+  - `bot.jev_skill_advice_config`, the opt-in config with allowed user IDs.
+  - `skill.review_zai_env`, which is always retained.
+- **Extended classes:**
+  - Nunchi cron logs, including the documented repair and channel cron names.
+  - Nunchi runtime locks.
+  - Ingest dedup state.
+  - Nunchi runtime state (judge flag, wiki-promote report, auto-distill
+    marker, `verbatim-backend`).
+  - State locks.
+  - Rotated `*.log.N[.gz]` files.
+  - The autosave cron history, as an installer record.
+  - Distill scope and toggles.
+  - Self-update pending activation.
+  - Autosave prescreen, curator and per-provider seen ledgers.
+  - Repo command and output-style manifests.
+
+Still blockers until the owner makes a policy call: operator one-offs, such
+as ad-hoc restart/rollout/apply scripts, handover notes, issue- or
+node-named files, one-time logs (`*.log.validate`, `*.log.telegram`),
+manual toggle archives (`distill.*.archive-*`/`.retired-*`), and
+`self-update.lock.stalefile-removed-*`. Also still blockers: files with no
+producer in this repo (`mcp-discover-verdicts.json`, `working-state*.lock`,
+`fleet-idle-finalize.no-services`) and the owner-decision backups of
+`wiki-candidates.md`, `working-state.md` and `skill-autosave.mode`.
 
 ## Wiki promotion records (#1447 batch)
 
