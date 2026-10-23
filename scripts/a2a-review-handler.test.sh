@@ -891,4 +891,103 @@ rc=$?
 ok "reviewer stdout over 1 MiB is an oversized verdict (exit 1, #1460)" \
   '[ "$rc" = 1 ] && [ ! -s "$TMP/out-r2-bigout.json" ] && grep -q "HANDLER_FAIL: reviewer output exceeds 1048576 bytes" "$TMP/err-r2-bigout.txt"'
 
+# ─── #2491: claude session isolation (setting sources, MCP, private cwd) ────
+# A fake `claude` records its argv one element per line (so an empty element
+# is a visible blank line) and its cwd, then answers like the real reviewer /
+# reviser. The handlers run from a fake worker root; the agent must not.
+I_BIN="$TMP/isolation-bin"
+I_WORKER="$TMP/isolation-worker-root"
+I_TMPDIR="$TMP/isolation-tmpdir"
+mkdir -p "$I_BIN" "$I_WORKER/bin" "$I_TMPDIR"
+cat > "$I_BIN/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' "\$@" > "\$ISO_ARGV_OUT"
+pwd -P > "\$ISO_PWD_OUT"
+if [ "\${ISO_KIND:-review}" = review ]; then
+  printf '{"verdict":"approve","findings":[],"head_sha":"%s","rubric_version":"2026-10-22.1","model":"stub-model"}' "\$REVIEW_STUB_HEAD"
+else
+  printf '{"outcome":"revised","skillName":"stub-skill","sourceTreeSha256":"%s","changeSummary":"rewrote the procedure","skillFiles":[{"path":"SKILL.md","content":"# isolated revision"}]}' "${TREE_OK}"
+fi
+STUB
+chmod +x "$I_BIN/claude"
+cp "$I_BIN/claude" "$I_BIN/pi-agent"
+cp "$I_BIN/claude" "$I_WORKER/bin/claude"
+# shellcheck disable=SC2034  # read via eval inside ok()
+I_WORKER_REAL="$(cd "$I_WORKER" && pwd -P)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+I_TMPDIR_REAL="$(cd "$I_TMPDIR" && pwd -P)"
+
+# iso_run <review|revise> [VAR=value ...] — runs the handler from the fake
+# worker root with the given env assignments (REVIEW_AGENT_BIN unset unless
+# assigned, so the `claude` default resolves through PATH).
+iso_run() {
+  local kind="$1" handler task
+  shift
+  if [ "$kind" = review ]; then handler="$HANDLER"; make_task "$HEAD_OK"; task="$TMP/task.json"
+  else handler="$REVISE_HANDLER"; make_revise_task; task="$TMP/revise-task.json"; fi
+  rm -f "$TMP/iso-argv.txt" "$TMP/iso-pwd.txt"
+  (
+    cd "$I_WORKER" || exit 99
+    env -u REVIEW_AGENT_BIN -u REVIEW_AGENT_ARGS -u SKILLS_INTAKE_CLAUDE_SETTING_SOURCES \
+      PATH="$I_BIN:$PATH" TMPDIR="$I_TMPDIR" REVIEW_TIMEOUT_SEC=30 WORKER_ID=testnode \
+      REVIEW_STUB_HEAD="$HEAD_OK" ISO_KIND="$kind" \
+      ISO_ARGV_OUT="$TMP/iso-argv.txt" ISO_PWD_OUT="$TMP/iso-pwd.txt" "$@" \
+      bash "$handler" < "$task"
+  ) > "$TMP/iso-out.json" 2> "$TMP/iso-err.txt"
+}
+# iso_argv_is ELEM... — the recorded argv equals exactly these elements.
+iso_argv_is() { [ -f "$TMP/iso-argv.txt" ] && [ "$(cat "$TMP/iso-argv.txt")" = "$(printf '%s\n' "$@")" ]; }
+iso_count() { grep -cxF -- "$1" "$TMP/iso-argv.txt"; }
+# The agent ran in <handler temp dir>/agent-cwd, never the worker root, and
+# the handler removed that temp dir afterwards.
+iso_cwd_private() {
+  local cwd
+  cwd="$(cat "$TMP/iso-pwd.txt" 2>/dev/null)"
+  [ -n "$cwd" ] && [ "$cwd" != "$I_WORKER_REAL" ] \
+    && case "$cwd" in "$I_TMPDIR_REAL"/*/agent-cwd) true ;; *) false ;; esac \
+    && [ ! -e "$cwd" ] && [ -z "$(ls -A "$I_TMPDIR")" ]
+}
+
+for iso_kind in review revise; do
+  iso_run "$iso_kind"; rc=$?
+  ok "$iso_kind: default claude gets --setting-sources \"\" --strict-mcp-config after the operator args (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --disallowed-tools "*" --setting-sources "" --strict-mcp-config'
+  ok "$iso_kind: --setting-sources / --strict-mcp-config appear exactly once (#2491)" \
+    '[ "$(iso_count --setting-sources)" = 1 ] && [ "$(iso_count --strict-mcp-config)" = 1 ]'
+  ok "$iso_kind: claude runs in a private dir under the handler temp dir, not the worker root (#2491)" 'iso_cwd_private'
+
+  iso_run "$iso_kind" REVIEW_AGENT_BIN="$I_BIN/claude" REVIEW_AGENT_ARGS="-p --disallowed-tools * --setting-sources user"; rc=$?
+  ok "$iso_kind: an operator --setting-sources value wins and is not duplicated (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --disallowed-tools "*" --setting-sources user --strict-mcp-config && iso_cwd_private'
+
+  iso_run "$iso_kind" REVIEW_AGENT_BIN="$I_BIN/claude" \
+    REVIEW_AGENT_ARGS="-p --strict-mcp-config --setting-sources=project --disallowed-tools *"; rc=$?
+  ok "$iso_kind: operator --setting-sources= and --strict-mcp-config forms suppress both appends (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --strict-mcp-config --setting-sources=project --disallowed-tools "*"'
+
+  iso_run "$iso_kind" SKILLS_INTAKE_CLAUDE_SETTING_SOURCES="project, local,user"; rc=$?
+  ok "$iso_kind: SKILLS_INTAKE_CLAUDE_SETTING_SOURCES keeps only user (project/local dropped) (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --disallowed-tools "*" --setting-sources user --strict-mcp-config'
+  iso_run "$iso_kind" SKILLS_INTAKE_CLAUDE_SETTING_SOURCES="project"; rc=$?
+  ok "$iso_kind: SKILLS_INTAKE_CLAUDE_SETTING_SOURCES=project still loads no setting source (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --disallowed-tools "*" --setting-sources "" --strict-mcp-config'
+  iso_run "$iso_kind" SKILLS_INTAKE_CLAUDE_SETTING_SOURCES="user,bogus"; rc=$?
+  ok "$iso_kind: an unknown SKILLS_INTAKE_CLAUDE_SETTING_SOURCES name ignores the knob (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --disallowed-tools "*" --setting-sources "" --strict-mcp-config &&
+     grep -q "SKILLS_INTAKE_CLAUDE_SETTING_SOURCES ignored" "$TMP/iso-err.txt"'
+
+  iso_run "$iso_kind" REVIEW_AGENT_BIN="bin/claude"; rc=$?
+  ok "$iso_kind: a relative claude path still resolves after the cwd change (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --disallowed-tools "*" --setting-sources "" --strict-mcp-config && iso_cwd_private'
+
+  iso_run "$iso_kind" REVIEW_AGENT_BIN="$I_BIN/claude" REVIEW_AGENT_ARGS="-p --setting-sources user"; rc=$?
+  ok "$iso_kind: the tool lock is still judged on operator tokens only (no lock -> exit 1, agent not run) (#2491)" \
+    '[ "$rc" = 1 ] && [ ! -e "$TMP/iso-argv.txt" ] && grep -q "lacks a total tool lock" "$TMP/iso-err.txt"'
+
+  iso_run "$iso_kind" REVIEW_AGENT_BIN="$I_BIN/pi-agent" REVIEW_AGENT_ARGS="-p --no-tools --model xai/grok-test"; rc=$?
+  ok "$iso_kind: a non-claude agent keeps its exact argv and the inherited cwd (#2491)" \
+    '[ "$rc" = 0 ] && iso_argv_is -p --no-tools --model xai/grok-test && [ "$(cat "$TMP/iso-pwd.txt")" = "$I_WORKER_REAL" ]'
+done
+
 echo "PASS=$pass FAIL=$fail"
