@@ -157,6 +157,24 @@ canonical module cannot be loaded, task execution and history remain intact but
 notification delivery reports `blocked-redaction-unavailable` and writes no
 captured output to the spool.
 
+Full copy of a cut body (#2324): the spool text keeps at most 900 characters
+per shown stream. When an owner notice (`recipient: owner`) has to cut a stream,
+the same notice with every shown stream uncut, under the same redaction, is first
+written to `<store dir>/full-output/<runId>.txt` (default
+`~/.claude/state/agent-cron/full-output/`, override
+`CCC_AGENT_CRON_FULL_OUTPUT_DIR`). The file is 0600 and written atomically; the
+directory is 0700 and is never opened through a symlink. The notice then ends with a
+`[body cut at 900 chars per stream; full redacted copy (local, owner-only): PATH]`
+line, and the spool record and `notification` result carry `fullOutputPath`. If
+the copy cannot be written, the notice says `local full copy not saved: <error
+class>`, the result carries `fullOutputError`, and the notice is still spooled.
+The newest 200 `.txt` files are kept and older ones are deleted at each write.
+The copy is limited to what agent-cron captured (4000 characters per stream,
+or `outputMaxBytes` for command tasks). It stays local: agent-cron writes no
+results to GitHub or any other remote. Chat recipients get no path and no copy.
+The timed-test follow-up scan (`docs/timed-test-deadline-scan.md`) catches a
+scheduled check whose result never reached its issue.
+
 For a non-success run, the already-redacted, bounded stdout/stderr are also
 checked for the exact line-start fleet diagnostic tokens `DOWN`, `UNREACHABLE`,
 `DRIFT`, and `BOOTPATH`. If any are present, the first line identifies a fleet

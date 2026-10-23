@@ -1243,7 +1243,12 @@ def build_notify_text(
             lines.append(f"  {url}")
     if len(ordered) > NOTIFY_MAX_FINDINGS:
         lines.append(f"외 {len(ordered) - NOTIFY_MAX_FINDINGS}건")
-    lines.append(f"신뢰도 {level} 이상 · 전체 목록: timed-test-deadline-scan.cron.log")
+    # Followup mode runs from its own installer and cron log (#2324).
+    log_name = (
+        "timed-followup-scan.cron.log" if mode == "followup"
+        else "timed-test-deadline-scan.cron.log"
+    )
+    lines.append(f"신뢰도 {level} 이상 · 전체 목록: {log_name}")
     text = redaction.redact_credentials("\n".join(lines))
     if redaction.contains_credential(text):
         raise NotifyError("credential-shaped text survived redaction; notice suppressed")

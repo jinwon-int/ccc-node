@@ -1123,7 +1123,7 @@ cdrepo="$TMP/cron-drift-repo"
 mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
 cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
 cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
-for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-nunchi; do
+for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-timed-test-deadline-scan-cron install-timed-followup-scan-cron install-nunchi; do
   cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
 done
 # shellcheck source=/dev/null
@@ -1135,6 +1135,8 @@ gen_cl="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-cost-ledger-cron
 gen_fs="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-fleet-skills-sync-cron.sh")"
 gen_ta="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-tunnel-audit-cron.sh")"
 gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
+gen_td="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-test-deadline-scan-cron.sh")"
+gen_tf="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-followup-scan-cron.sh")"
 cat > "$TMP/cron-drift.py" <<'PY_EOF'
 import json, os, sys
 from pathlib import Path
@@ -1160,10 +1162,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: ten opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 10 ]'
-ok "empty crontab: rows are the ten known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
+ok "empty crontab: eleven opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 11 ]'
+ok "empty crontab: rows are the eleven known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen timed-followup-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
@@ -1239,6 +1241,27 @@ ok "2026-09-02 residual hand-installed lanes are documented 정상, not 경고" 
 cd_out="$(run_cd "*/5 * * * * bash /x/ghost.sh  # ccc-node:ghost-lane")"
 ok "unknown unmanaged marker is a 경고 with the label" \
   'jq -e ".rows[] | select(.item == \"cron unmanaged markers\" and .klass == \"경고\") | .status | contains(\"ccc-node:ghost-lane\")" <<<"$cd_out" >/dev/null'
+
+# #2324: the deadline and follow-up scans are separate lanes whose markers are
+# not prefixes of each other, so each row counts only its own entry and a
+# stale follow-up stamp never surfaces under the deadline row.
+cd_out="$(run_cd "# ccc-node:timed-test-deadline-scan:begin
+20 9,13,19 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:timed-test-deadline-scan gen=$gen_td
+# ccc-node:timed-test-deadline-scan:end
+# ccc-node:timed-followup-scan:begin
+35 9 * * * bash -lc 'y' >> /l 2>&1  # ccc-node:timed-followup-scan gen=h_000000000000
+# ccc-node:timed-followup-scan:end")"
+ok "timed deadline and follow-up rows each count only their own entry" \
+  'jq -e "[.rows[] | select(.item == \"cron gen timed-test-deadline-scan\" or .item == \"cron gen timed-followup-scan\") | .status | contains(\"lines=1\")] == [true, true]" <<<"$cd_out" >/dev/null'
+ok "stale follow-up stamp is 경고 on its own row only" \
+  'jq -e ".rows[] | select(.item == \"cron gen timed-followup-scan\" and .klass == \"경고\") | .action | contains(\"install-timed-followup-scan-cron.sh --apply\")" <<<"$cd_out" >/dev/null && jq -e ".rows[] | select(.item == \"cron gen timed-test-deadline-scan\" and .klass == \"정상\")" <<<"$cd_out" >/dev/null'
+ok "follow-up block markers are known, not unmanaged" \
+  '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\")" <<<"$cd_out" >/dev/null'
+cd_out="$(run_cd "# ccc-node:timed-followup-scan:begin
+35 9 * * * bash -lc 'y' >> /l 2>&1  # ccc-node:timed-followup-scan gen=$gen_tf
+# ccc-node:timed-followup-scan:end")"
+ok "current follow-up stamp is 정상 and the deadline row stays not-installed" \
+  'jq -e ".rows[] | select(.item == \"cron gen timed-followup-scan\" and .klass == \"정상\") | .status | contains(\"current\")" <<<"$cd_out" >/dev/null && jq -e ".rows[] | select(.item == \"cron gen timed-test-deadline-scan\") | .status | contains(\"not installed\")" <<<"$cd_out" >/dev/null'
 
 nolbrepo="$TMP/cron-drift-nolib"
 mkdir -p "$nolbrepo/scripts" "$nolbrepo/.claude"

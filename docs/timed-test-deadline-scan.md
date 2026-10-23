@@ -4,7 +4,8 @@
 window, trial) whose absolute KST end datetime has passed with no verdict
 comment. `scripts/install-timed-test-deadline-scan-cron.sh` runs it three times a day.
 The opt-in `--mode followup` also reports follow-ups promised by a verdict that
-are past due with nothing posted after them (see below).
+are past due with nothing posted after them; `scripts/install-timed-followup-scan-cron.sh`
+runs it once a day (see below).
 
 ## Install
 
@@ -61,9 +62,43 @@ later comment promised a follow-up at an absolute datetime that has passed with
 - In followup mode, `--json` adds `include_closed_days` to the payload and
   `issue_state` (`open`/`closed`, or null when unknown) to each finding. The
   text report marks closed issues `닫힌 이슈`.
-- Notices use their own dedup state, `notify-followup.json`. The installer
-  still wires only `expired`/`relative`, so for now run followup mode by hand,
-  e.g. `--repos-file … --mode followup --include-closed-days 45`.
+- Notices use their own dedup state, `notify-followup.json`, and point at
+  `timed-followup-scan.cron.log`.
+
+### Follow-up installer
+
+Followup mode has its own installer, separate from the deadline installer:
+
+```
+scripts/install-timed-followup-scan-cron.sh --dry-run   # preview
+scripts/install-timed-followup-scan-cron.sh --apply     # write the crontab entry
+scripts/install-timed-followup-scan-cron.sh --apply --remove
+```
+
+It renders one managed entry (`# ccc-node:timed-followup-scan`, BEGIN/END
+block, gen stamp) that runs
+`timed_test_deadline_scan.py --repos-file ~/.claude/timed-test-deadline-scan.repos
+--mode followup --include-closed-days N --notify LEVEL --exit-nonzero-on-findings`
+and appends to `~/.claude/state/timed-followup-scan.cron.log`.
+
+- Defaults: `35 9 * * *` (09:35 KST, once a day, after the deadline scan's
+  09:20 run), `--include-closed-days 45`, `--notify high`. Options:
+  `--schedule SPEC`, `--include-closed-days N` (non-negative integer, 0 = open
+  issues only), `--notify high|low|off`. Env overrides use the
+  `CCC_TIMED_FOLLOWUP_SCAN_*` prefix (`_CMD`, `_REPOS`, `_CLOSED_DAYS`,
+  `_NOTIFY`, `_CRON`, `_CRON_LOG`).
+- Same repos file as the deadline scan; the installer does not create it.
+- Every option is written to its own install record
+  (`~/.claude/state/install-timed-followup-scan-cron.json`), so a self-update
+  replay keeps the schedule, window and notice level.
+- Why a separate installer: followup mode reports only followup findings, so
+  re-applying the deadline installer with `--mode followup` would replace its
+  `expired` entry; install records are one per installer file, so two entries
+  from one installer would overwrite each other's record on replay; and the
+  marker is not a prefix of `# ccc-node:timed-test-deadline-scan` (or the
+  reverse), because the block parser and ccc-doctor match markers as
+  substrings. Installing or removing either lane leaves the other's block
+  alone. ccc-doctor reports it as `cron gen timed-followup-scan`.
 
 ## Owner notice
 

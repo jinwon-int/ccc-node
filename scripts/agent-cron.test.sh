@@ -13,6 +13,10 @@ trap 'rm -rf "$TMP"' EXIT
 # spool writes still pass their own CCC_PUSH_SPOOL.
 unset CCC_AGENT_CRON_PUSH_SPOOL
 export CCC_PUSH_SPOOL="$TMP/default-push-spool"
+# Same for the #2324 full-output copy of a cut owner notice: it defaults to a
+# directory next to the task store, which a test with no store override would
+# resolve to the developer node's real state dir.
+export CCC_AGENT_CRON_FULL_OUTPUT_DIR="$TMP/default-full-output"
 
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 

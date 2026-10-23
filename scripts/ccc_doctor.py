@@ -150,6 +150,14 @@ CRON_MARKER_INSTALLERS = (
      "scripts/install-timed-test-deadline-scan-cron.sh",
      "run scripts/install-timed-test-deadline-scan-cron.sh --apply "
      "(needs ~/.claude/timed-test-deadline-scan.repos; the scan exits 3 until it exists)"),
+    # timed-followup-scan (#2324): the same scanner in --mode followup, from
+    # its own installer so it never replaces the expired entry and keeps its
+    # own install record. The marker is not a prefix-extension of the
+    # deadline-scan marker: rows here match markers as substrings.
+    ("timed-followup-scan", "# ccc-node:timed-followup-scan",
+     "scripts/install-timed-followup-scan-cron.sh",
+     "run scripts/install-timed-followup-scan-cron.sh --apply "
+     "(reads ~/.claude/timed-test-deadline-scan.repos; the scan exits 3 until it exists)"),
     # skill-promotion-results (#2239): the publisher's 15-minute
     # `collect --results-only` lane, previously an ad-hoc crontab line nobody
     # rendered. Registered in the same commit as the installer.
@@ -176,6 +184,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:t2-starvation-observe:end",
     "# ccc-node:timed-test-deadline-scan:begin",
     "# ccc-node:timed-test-deadline-scan:end",
+    "# ccc-node:timed-followup-scan:begin",
+    "# ccc-node:timed-followup-scan:end",
     "# ccc-node:skill-promotion-results:begin",
     "# ccc-node:skill-promotion-results:end",
 )
