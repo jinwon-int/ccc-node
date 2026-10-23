@@ -150,8 +150,15 @@ class SinkTests(unittest.IsolatedAsyncioTestCase):
             for line in pidfile.read_text().splitlines():
                 stat_path = Path("/proc") / line / "stat"
                 # A killed orphan may briefly await reaping by container PID 1.
-                for _ in range(20):
-                    if not stat_path.exists() or stat_path.read_text().split()[2] == "Z":
+                # Read the state in one step: an `exists()` check followed by
+                # `read_text()` races the reaper, and the pid vanishing in
+                # between raised FileNotFoundError (#2470). Gone == stopped.
+                for _ in range(200):
+                    try:
+                        state = stat_path.read_text().split()[2]
+                    except (FileNotFoundError, ProcessLookupError):
+                        break
+                    if state == "Z":
                         break
                     await asyncio.sleep(0.01)
                 else:
