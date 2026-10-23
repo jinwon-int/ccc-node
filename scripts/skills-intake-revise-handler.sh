@@ -63,6 +63,27 @@
 #   raw reviser stdout (return)  <= 1 MiB (MAX_REVISER_OUTPUT_BYTES, the
 #                                publisher's command-output cap); more is an
 #                                oversized result (exit 3).
+#
+# Claude Code session isolation (#2491, a2a-nexus#2422 follow-up; same rule
+# as the review handler): `claude -p` loads the worker account's user context
+# by default — ~/.claude/CLAUDE.md, the SessionStart/Stop hooks (node memory +
+# Wiki prefetch injection, the evidence/notify Stop hooks) and the user MCP
+# servers — into a session whose main content is an untrusted candidate
+# skill. When the agent basename is `claude` (including the unset
+# REVIEW_AGENT_BIN default), the handler appends
+#   --setting-sources "" --strict-mcp-config
+# as separate argv elements after the operator args, and runs the agent from
+# an empty private directory inside the handler's temp dir instead of the
+# worker root it inherited. Precedence: an operator `--setting-sources` /
+# `--strict-mcp-config` token in REVIEW_AGENT_ARGS wins and is not duplicated
+# (the operator value is passed through verbatim).
+#   SKILLS_INTAKE_CLAUDE_SETTING_SOURCES  opt-in, mirrors a2a-nexus
+#       A2A_CLAUDE_SETTING_SOURCES for an untrusted cwd: only `user` can be
+#       kept (e.g. a node whose claude auth needs user settings); `project`
+#       and `local` are always dropped; an unknown name ignores the knob.
+#       Unset/empty = load no setting source.
+# Other agents (pi/piri, the danso wrapper, ...) keep their exact argv and
+# the inherited cwd. The tool-lock check evaluates operator tokens only.
 set -uo pipefail
 
 REVIEW_TIMEOUT_SEC="${REVIEW_TIMEOUT_SEC:-480}"
@@ -108,6 +129,46 @@ reviser_tool_locked() {
     prev="$tok"
   done
   [ "$locked" = 1 ]
+}
+# Claude Code session isolation (#2491, see the header). $@ = operator
+# REVIEW_AGENT_ARGS tokens; fills the global array claude_isolation_argv with
+# the args to append. Mirrors the copy in skills-intake-review-handler.sh —
+# keep them in step (the handlers are installed as standalone files).
+claude_isolation_args() {
+  local tok part raw has_sources=0 has_strict=0 want_user=0 invalid=0
+  local -a parts=()
+  claude_isolation_argv=()
+  for tok in "$@"; do
+    case "$tok" in
+      --setting-sources|--setting-sources=*) has_sources=1 ;;
+      --strict-mcp-config) has_strict=1 ;;
+    esac
+  done
+  if [ "$has_sources" = 1 ]; then
+    log "REVIEW_AGENT_ARGS sets --setting-sources; keeping the operator value (#2491)"
+  else
+    raw="${SKILLS_INTAKE_CLAUDE_SETTING_SOURCES:-}"
+    IFS=',' read -ra parts <<<"$raw"
+    for part in ${parts[@]+"${parts[@]}"}; do
+      part="${part//[[:space:]]/}"
+      case "$part" in
+        '') ;;
+        user) want_user=1 ;;
+        project|local) log "SKILLS_INTAKE_CLAUDE_SETTING_SOURCES: '$part' dropped (cwd-scoped sources never load for untrusted review material)" ;;
+        *) invalid=1 ;;
+      esac
+    done
+    if [ "$invalid" = 1 ]; then
+      log "SKILLS_INTAKE_CLAUDE_SETTING_SOURCES ignored (valid: user); loading no setting source"
+      want_user=0
+    fi
+    if [ "$want_user" = 1 ]; then
+      claude_isolation_argv+=(--setting-sources user)
+    else
+      claude_isolation_argv+=(--setting-sources "")
+    fi
+  fi
+  [ "$has_strict" = 1 ] || claude_isolation_argv+=(--strict-mcp-config)
 }
 read -ra reviser_args_tokens <<<"${REVIEW_AGENT_ARGS:-}"
 reviser_agent="$(basename "${REVIEW_AGENT_BIN:-unknown}")"
@@ -258,12 +319,26 @@ for _tok in "${reviser_args_tokens[@]}"; do
   _prev_arg="$_tok"
 done
 read -ra reviser_argv <<<"$REVIEW_AGENT_BIN $REVIEW_AGENT_ARGS"
+# #2491: claude gets the isolation args (separate elements, so the empty
+# --setting-sources value survives) and a private empty cwd. The binary is
+# made absolute first when it is a relative path, so the cd cannot break it.
+agent_cwd=""
+if [ "$reviser_agent" = "claude" ]; then
+  claude_isolation_args ${reviser_args_tokens[@]+"${reviser_args_tokens[@]}"}
+  reviser_argv+=(${claude_isolation_argv[@]+"${claude_isolation_argv[@]}"})
+  case "${reviser_argv[0]}" in /*) ;; */*) reviser_argv[0]="$PWD/${reviser_argv[0]}" ;; esac
+  agent_cwd="$tmp/agent-cwd"
+  mkdir -m 700 "$agent_cwd" || fail "cannot create the reviser working directory"
+fi
 # `-k`: SIGKILL after the grace when the reviser ignores the SIGTERM at the
 # budget (#1460 P2). The run is a background job + `wait` so the signal traps
 # above fire at once and can forward the kill; stdout goes to a file so its
-# size can be capped without holding it in a shell variable.
-timeout -k "$REVISE_KILL_GRACE_SEC" "$REVISION_TIMEOUT_SEC" "${reviser_argv[@]}" \
-  < "$tmp/prompt.txt" > "$tmp/model-out.txt" 2> "$tmp/agent.err" &
+# size can be capped without holding it in a shell variable. The subshell
+# execs timeout, so $! is still the timeout pid the traps forward to.
+(
+  if [ -n "$agent_cwd" ]; then cd "$agent_cwd" || exit 1; fi
+  exec timeout -k "$REVISE_KILL_GRACE_SEC" "$REVISION_TIMEOUT_SEC" "${reviser_argv[@]}"
+) < "$tmp/prompt.txt" > "$tmp/model-out.txt" 2> "$tmp/agent.err" &
 agent_pid=$!
 agent_rc=0
 wait "$agent_pid" || agent_rc=$?
