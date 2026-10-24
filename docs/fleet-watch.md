@@ -225,6 +225,38 @@ re-alert is due. Keep `fleet-doctor-sweep` daily for harness drift. Once the
 15-minute task has proven itself, the daily `adapter-fleet-watch` duplicates it
 and can be disabled (`agent-cron.sh disable adapter-fleet-watch`).
 
+## Remote heartbeat watch: a scheduler that stopped (#2428 follow-up)
+
+The bridge watch sees a node's channels, not whether its scheduled jobs still
+run. On 2026-07-13 a node's job scheduler stopped and the external GitHub
+PR/Issue watch it carried was silent for three months; nothing paged, because
+"no new external items" and "the watch is not running" print the same nothing.
+
+`scripts/remote-heartbeat-watch.sh` closes that gap from a **different** node.
+It reads the age of a file the watched job rewrites on every successful run
+(age is computed on the target, so clock skew cannot fake freshness) and pages
+`NEW` once when it goes stale, `STILL` at most every `--remind-hours` (default
+6), and `RECOVERED` when it is fresh again. An unreachable target exits 0: that
+is the bridge watch's alarm. Same exit-code contract as the change watch above
+(exit 1 = a person needs to look), so use `owner-on-failure` and
+`--failure-alert-after 0`.
+
+Example (run on the node that already does the reverse check of the watcher
+node; adding it is an operator decision):
+
+```sh
+agent-cron.sh add external-watch-heartbeat-30m \
+  --name "external GitHub watch heartbeat (30 min)" \
+  --prompt "Pages when the watcher node's external GitHub watch stops refreshing its state" \
+  --schedule 'every 30m' --timezone Asia/Seoul \
+  --notify owner-on-failure --catch-up-policy skip --failure-alert-after 0 --timeout-sec 60 \
+  --argv bash --argv <checkout>/scripts/remote-heartbeat-watch.sh \
+  --argv --target --argv <watcher-node> \
+  --argv --path --argv '~/.claude/state/external-github-watch/jinwon_int.json' \
+  --argv --max-age-min --argv 60 --argv --label --argv 'external GitHub watch' \
+  --argv --state-file --argv /root/.claude/state/fleet-watch/external-watch-heartbeat.json
+```
+
 ## Updating an existing schedule
 
 Verify the installed checkout contains the reviewed script and helper before
