@@ -1312,8 +1312,25 @@ _OWNER_SAFE_PATH = re.compile(
 )
 
 
+# GitHub web links (issue/PR/commit/run pages) in owner notifications are the
+# one URL shape worth keeping: the external-PR watch alert read
+# `url: https:[REDACTED_CREDENTIAL]` because `//github.com/<org>/<repo>/pull/<n>`
+# is a long token run (2026-10-24). Same three constraints as the path rule —
+# a fixed host (`//github.com` exactly, the `:` of the scheme already ends the
+# run), no `+`/`=` in segments, and every segment shorter than the run
+# threshold — so the invariant above holds: a 40-hex commit SHA or any token-
+# like segment still falls into a leftover stretch and is masked. Any other
+# host (`//api.example.com/v1/...`) matches nothing and stays masked.
+_OWNER_SAFE_GITHUB_URL = re.compile(
+    r'//github\.com(?:/[A-Za-z0-9_.-]{1,%d}(?=/|$))+' % (_OWNER_LONG_RUN_MIN - 1)
+)
+_OWNER_SAFE_SPANS = re.compile(
+    '%s|%s' % (_OWNER_SAFE_PATH.pattern, _OWNER_SAFE_GITHUB_URL.pattern)
+)
+
+
 def _mask_long_token_run(match, marker):
-    """Mask a long token run, preserving the filesystem paths it contains.
+    """Mask a long token run, preserving filesystem paths and GitHub page links.
 
     Every stretch that is not an allowlisted path is still masked whenever it
     reaches the same length threshold the whole run had to reach, so this is no
@@ -1326,7 +1343,7 @@ def _mask_long_token_run(match, marker):
         return run
     pieces = []
     cursor = 0
-    for path in _OWNER_SAFE_PATH.finditer(run):
+    for path in _OWNER_SAFE_SPANS.finditer(run):
         head = run[cursor:path.start()]
         pieces.append(marker if len(head) >= _OWNER_LONG_RUN_MIN else head)
         pieces.append(path.group(0))
