@@ -546,6 +546,34 @@ was never approved exits `66` with its state and submits nothing. Approving the
 deployment authorizes only that job to proceed — not a re-run, another
 environment, or a follow-up release.
 
+## External-author PRs (a2a-nexus#2428)
+
+A PR is **external** when its author is not one of the two fleet accounts
+(`jinon86`, `seoseo-ai`) or a fleet dependency bot (`app/dependabot`,
+`app/jinwon-deps-bot`, `app/github-actions`). Public repositories accept fork
+PRs from anyone; on 2026-10-22 an unaffiliated account's fork PR to worker
+artifact scripts was approved and merged during a bulk "close open issues"
+instruction, with no owner sign-off on the author.
+
+- Never review, approve, merge, or enqueue an external PR on a general or bulk
+  instruction ("정리", "clean up open PRs", "merge what is green"). It needs
+  the owner's explicit per-PR approval that names it as external, for example
+  `<n> 외부 승인`. Report it instead: author, `isCrossRepository`, changed
+  files, and a one-line risk note.
+- Check before any review or merge:
+  `gh pr view <n> --repo <owner/repo> --json author,isCrossRepository,files`.
+- Before asking for that approval, audit the exact head read-only: new
+  network/exec/eval, credential or key reads, dependency or lockfile changes,
+  CI workflow changes (`pull_request_target` above all), and changes to what
+  gets packed or deployed.
+- `merge-via-relay.sh` refuses an external author unless
+  `--external-author-approved` is also passed; set it only for the one PR the
+  owner approved. `approve-via-relay.sh` never reviews an external PR (it
+  accepts only the two fleet accounts as authors), so a direct `gh` review is
+  the only path and carries the same rule.
+- External activity is surfaced to the owner by a scheduled external-activity
+  watch; a missing alert is not evidence that no external PR exists.
+
 ## Security and merge rules
 
 - Never push directly to `main`; always use a branch and PR.
