@@ -277,7 +277,9 @@ def extract_gate():
     """Pull the signature gate block out of the script under test."""
     text = SCRIPT.read_text()
     start = text.index('if [ "$SIGNATURE_MODE" != "off" ]; then')
-    end = text.index('if ! git -C "$REPO" merge --ff-only', start)
+    # The provenance gate sits between this block and the merge; it has its
+    # own suite (ccc-self-update-provenance.test.sh).
+    end = text.index('# --- verify WHO authored the incoming commits', start)
     return text[start:end]
 
 

@@ -45,7 +45,9 @@
 #      pushed (origin has it at the exact local SHA) and the tree is clean —
 #      switching back then cannot lose anything (#1328). Every other
 #      wrong-branch shape stays fail-closed and notifies.
-#   3. git fetch + merge --ff-only (never rewrites local history)
+#   3. git fetch, tip signature check (#1591), commit-provenance gate (every
+#      incoming commit's GitHub author must be trusted or owner-approved), then
+#      merge --ff-only (never rewrites local history)
 #   4. if HEAD changed (or --force): snapshot Claude + Hermes managed artifacts
 #      and the Codex GitHub policy config, run ./setup.sh, validate bridge
 #      runtime config when its service is allowlisted, then verify repo SHA
@@ -113,7 +115,10 @@
 #      was never verified active — a pending-activation record exists (or its
 #      bookkeeping failed) and the tick refuses to report convergence from
 #      health alone, or (#2142) an external restart came back serving a
-#      generation other than the installed target; other non-zero = aborted
+#      generation other than the installed target, or the commit-provenance
+#      gate refused (untrusted incoming author under enforce, or an author
+#      lookup that could not complete under ON_ERROR=hold — nothing merged);
+#      other non-zero = aborted
 #      (reason logged).
 # Audit records keep `result` unchanged; an external restart failure adds
 #      `failure_kind` (timeout | start-error | stop-failed | rejected |
@@ -174,6 +179,39 @@ SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
 # it. Flipping the default to `enforce` is a separate, evidence-gated change.
 SIGNATURE_MODE="${CCC_SELF_UPDATE_SIGNATURE_MODE:-warn}"
 SIGNATURE_KEYRING="${CCC_SELF_UPDATE_SIGNATURE_KEYRING:-}"
+
+# Commit-provenance gate: WHO authored the incoming commits.
+#   enforce — refuse to merge while any incoming commit's GitHub author is not
+#             trusted (default; unknown values also mean enforce)
+#   warn    — report untrusted authors, but still apply
+#   off     — skip the lookup entirely (escape hatch)
+# The signature gate above cannot stop a merged external PR: GitHub signs its
+# own squash/merge-queue commits, so a PR from an unaffiliated account that gets
+# merged (a benign one did, jinwon-int/a2a-nexus#2428) is "verified" and would
+# run as root on every node via setup.sh within one daily tick. This gate asks
+# GitHub who authored each incoming commit instead.
+# Trust inputs come ONLY from this already-installed script and node-local files,
+# never from the incoming checkout (that would let the change vouch for itself):
+#   built-in list below, REPLACED (not merged) by the trusted-authors file when
+#   it exists (one login per line, `#` comments); owner-approved exceptions are
+#   full 40-hex SHAs, one per line, in the approved-commits file.
+# A lookup that cannot complete (no gh/jq, API failure, non-GitHub remote,
+# truncated compare, malformed JSON) is governed by ON_ERROR: `hold` (enforce
+# default: exit 14, alert after FAIL_ALERT_AFTER consecutive ticks) or
+# `proceed`. Under `warn` an unset ON_ERROR defaults to `proceed`, so warn never
+# blocks a node.
+PROVENANCE_MODE="${CCC_SELF_UPDATE_PROVENANCE_MODE:-enforce}"
+case "$PROVENANCE_MODE" in enforce|warn|off) ;; *) PROVENANCE_MODE=enforce ;; esac
+if [ "$PROVENANCE_MODE" = warn ]; then PROVENANCE_ON_ERROR_DEFAULT=proceed; else PROVENANCE_ON_ERROR_DEFAULT=hold; fi
+PROVENANCE_ON_ERROR="${CCC_SELF_UPDATE_PROVENANCE_ON_ERROR:-$PROVENANCE_ON_ERROR_DEFAULT}"
+case "$PROVENANCE_ON_ERROR" in hold|proceed) ;; *) PROVENANCE_ON_ERROR=hold ;; esac
+PROVENANCE_TRUSTED_DEFAULT="jinon86 seoseo-ai dependabot[bot] jinwon-deps-bot[bot] github-actions[bot]"
+PROVENANCE_TRUSTED_FILE="${CCC_SELF_UPDATE_TRUSTED_AUTHORS_FILE:-${HOME:-/root}/.ccc-node/self-update-trusted-authors}"
+PROVENANCE_APPROVED_FILE="${CCC_SELF_UPDATE_APPROVED_COMMITS_FILE:-$STATE_DIR/self-update-approved-external-commits}"
+PROVENANCE_FAIL_FILE="$STATE_DIR/self-update.provenance-failures"
+PROVENANCE_FAIL_ALERT_AFTER="${CCC_SELF_UPDATE_PROVENANCE_FAIL_ALERT_AFTER:-2}"
+case "$PROVENANCE_FAIL_ALERT_AFTER" in ''|*[!0-9]*) PROVENANCE_FAIL_ALERT_AFTER=2 ;; esac
+PROVENANCE_API_TIMEOUT_SECONDS=60
 
 SELF_UPDATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 HARNESS_PATHS_LIB="$SELF_UPDATE_DIR/lib/harness-paths.sh"
@@ -1102,6 +1140,113 @@ verify_commit_signature() { # <rev>
 # authored it; branch protection and CODEOWNERS remain the author control.
 TRUSTED_SIGNING_FPRS="${CCC_SELF_UPDATE_TRUSTED_FPRS:-968479A1AFF927E37D1A566BB5690EEEBB952194
 5DE3E0509C47EA3CF04A42D34AEE18F83AFDEB23}"
+
+# Read one-entry-per-line files: drop `#` comments and surrounding whitespace.
+provenance_list_entries() { # <file>
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$1"
+}
+
+# Ask GitHub who authored every commit in <old>..<incoming>.
+#
+# The set that is vetted is the LOCAL `git rev-list <old>..<incoming>` — exactly
+# what the ff-merge is about to bring in. GitHub's compare must account for
+# every one of those SHAs; a SHA it does not return is a lookup error, never a
+# pass. One API call: compare caps its commit list at 250, and a truncated list
+# (total_commits > returned) is also a lookup error.
+#
+# Sets PROV_RESULT (ok | untrusted | error), PROV_DETAIL (error reason),
+# PROV_COMMITS, PROV_APPROVED, PROV_UNTRUSTED_N and PROV_UNTRUSTED (newline-
+# separated "<login|unlinked> <sha12>"). Returns 0 ok, 2 untrusted, 1 error.
+verify_commit_provenance() { # <old> <incoming>
+  local old="$1" new="$2" url slug local_shas raw rc=0 parsed total returned
+  local sha login entry
+  local -a tprefix=()
+  local -A author=() trusted=() approved=()
+  PROV_RESULT=error PROV_DETAIL="" PROV_COMMITS=0 PROV_APPROVED=0
+  PROV_UNTRUSTED="" PROV_UNTRUSTED_N=0
+
+  local_shas="$(git -C "$REPO" rev-list "$old..$new" 2>/dev/null)" \
+    || { PROV_DETAIL="rev-list-failed"; return 1; }
+  if [ -z "$local_shas" ]; then
+    # The tip is already contained in HEAD: nothing new would be merged.
+    PROV_RESULT=ok; return 0
+  fi
+
+  url="$(git -C "$REPO" remote get-url origin 2>/dev/null)" || url=""
+  case "$url" in
+    https://github.com/*) slug="${url#https://github.com/}" ;;
+    git@github.com:*) slug="${url#git@github.com:}" ;;
+    *) PROV_DETAIL="non-github-remote"; return 1 ;;
+  esac
+  slug="${slug%.git}"
+  if ! [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    PROV_DETAIL="non-github-remote"; return 1
+  fi
+
+  command -v gh >/dev/null 2>&1 || { PROV_DETAIL="no-gh"; return 1; }
+  command -v jq >/dev/null 2>&1 || { PROV_DETAIL="no-jq"; return 1; }
+
+  # Trust lists are read before the network call so an unreadable file fails
+  # closed without spending an API request.
+  if [ -e "$PROVENANCE_TRUSTED_FILE" ]; then
+    [ -r "$PROVENANCE_TRUSTED_FILE" ] || { PROV_DETAIL="trusted-authors-unreadable"; return 1; }
+    while IFS= read -r entry; do trusted["${entry,,}"]=1; done \
+      < <(provenance_list_entries "$PROVENANCE_TRUSTED_FILE")
+  else
+    for entry in $PROVENANCE_TRUSTED_DEFAULT; do trusted["${entry,,}"]=1; done
+  fi
+  if [ -e "$PROVENANCE_APPROVED_FILE" ]; then
+    [ -r "$PROVENANCE_APPROVED_FILE" ] || { PROV_DETAIL="approved-commits-unreadable"; return 1; }
+    while IFS= read -r entry; do
+      entry="${entry,,}"
+      [[ "$entry" =~ ^[0-9a-f]{40}$ ]] && approved["$entry"]=1
+    done < <(provenance_list_entries "$PROVENANCE_APPROVED_FILE")
+  fi
+
+  command -v timeout >/dev/null 2>&1 \
+    && tprefix=(timeout --kill-after=5 "$PROVENANCE_API_TIMEOUT_SECONDS")
+  raw="$(GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 \
+    ${tprefix[@]+"${tprefix[@]}"} gh api "repos/$slug/compare/$old...$new" 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || { PROV_DETAIL="api-failed rc=$rc"; return 1; }
+
+  # Line 1: total_commits, line 2: returned count, then "<sha> <login|->".
+  parsed="$(printf '%s' "$raw" | jq -r '
+    if (.total_commits | type) == "number" and (.commits | type) == "array"
+    then (.total_commits | tostring), (.commits | length | tostring),
+         (.commits[] | "\(.sha // "") \(.author.login // "-")")
+    else error("malformed") end' 2>/dev/null)" || { PROV_DETAIL="malformed-json"; return 1; }
+  total="$(printf '%s\n' "$parsed" | sed -n 1p)"
+  returned="$(printf '%s\n' "$parsed" | sed -n 2p)"
+  case "$total$returned" in ''|*[!0-9]*) PROV_DETAIL="malformed-json"; return 1 ;; esac
+  if [ "$total" -gt "$returned" ]; then
+    PROV_DETAIL="incomplete total=$total returned=$returned"; return 1
+  fi
+  while read -r sha login; do
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { PROV_DETAIL="malformed-json"; return 1; }
+    author["$sha"]="$login"
+  done < <(printf '%s\n' "$parsed" | sed -n '3,$p')
+
+  while IFS= read -r sha; do
+    [ -n "${author[$sha]+set}" ] || { PROV_DETAIL="commit-missing-from-compare sha=${sha:0:12}"; return 1; }
+    PROV_COMMITS=$((PROV_COMMITS + 1))
+    login="${author[$sha]}"
+    # A null author.login (commit email not linked to any account) is untrusted.
+    if [ "$login" != "-" ] && [ -n "${trusted[${login,,}]+set}" ]; then
+      continue
+    fi
+    if [ -n "${approved[$sha]+set}" ]; then
+      PROV_APPROVED=$((PROV_APPROVED + 1)); continue
+    fi
+    [ "$login" = "-" ] && login=unlinked
+    PROV_UNTRUSTED_N=$((PROV_UNTRUSTED_N + 1))
+    PROV_UNTRUSTED="${PROV_UNTRUSTED:+$PROV_UNTRUSTED
+}$login ${sha:0:12}"
+  done <<<"$local_shas"
+
+  if [ "$PROV_UNTRUSTED_N" -gt 0 ]; then PROV_RESULT=untrusted; return 2; fi
+  PROV_RESULT=ok; return 0
+}
+
 if [ ! -d "$REPO/.git" ]; then
   notify_stalled no-repo "self-update 정지: $REPO 에 git 저장소가 없습니다. 이 노드는 복구 전까지 갱신되지 않습니다."
   say "self-update: no git repo at $REPO (set CCC_SELF_UPDATE_REPO or $REPO_FILE)" >&2
@@ -1318,6 +1463,67 @@ if [ "$SIGNATURE_MODE" != "off" ]; then
   else
     log "signature $SIG_RESULT rev=${INCOMING_SHA:-?} changed=$SIG_CHANGED mode=$SIGNATURE_MODE proceeding"
     say "self-update: WARNING unverified tip ${INCOMING_SHA:-?} ($SIG_RESULT, changed=$SIG_CHANGED); proceeding because mode=$SIGNATURE_MODE" >&2
+  fi
+fi
+
+# --- verify WHO authored the incoming commits BEFORE they become HEAD ---------
+# A valid GitHub signature only proves the commit went through GitHub's merge
+# path; a merged PR from an unaffiliated account is signed exactly like ours.
+# So every incoming commit's GitHub author must be on the node-local trust list
+# (or be an owner-approved SHA) before the ff-merge lets setup.sh run it as root.
+# Same ordering rule as the signature gate: after the merge it is too late.
+# Unlike the signature probe this runs only when the tip moved — an up-to-date
+# tick has nothing new to vet, and skipping it keeps gh off the daily path.
+if [ "$PROVENANCE_MODE" != "off" ]; then
+  PROV_INCOMING="$(git -C "$REPO" rev-parse "origin/$BRANCH" 2>/dev/null)"
+  if [ "$PROV_INCOMING" != "$OLD_SHA" ]; then
+    if [ -z "$PROV_INCOMING" ]; then
+      PROV_RESULT=error PROV_DETAIL="no-incoming-tip"
+    else
+      verify_commit_provenance "$OLD_SHA" "$PROV_INCOMING" || :
+    fi
+    case "$PROV_RESULT" in
+      ok)
+        rm -f "$PROVENANCE_FAIL_FILE" 2>/dev/null || :
+        log "provenance ok rev=$PROV_INCOMING commits=$PROV_COMMITS approved=$PROV_APPROVED mode=$PROVENANCE_MODE"
+        ;;
+      untrusted)
+        # The lookup itself worked, so the unverifiable-streak counter resets.
+        rm -f "$PROVENANCE_FAIL_FILE" 2>/dev/null || :
+        prov_list="$(printf '%s\n' "$PROV_UNTRUSTED" | awk 'NR <= 3 { printf "%s%s", (NR > 1 ? ", " : ""), $0 }')"
+        [ "$PROV_UNTRUSTED_N" -gt 3 ] && prov_list="$prov_list, … (총 ${PROV_UNTRUSTED_N}개)"
+        prov_inline="$(printf '%s\n' "$PROV_UNTRUSTED" | tr ' ' ':' | paste -sd ',' -)"
+        if [ "$PROVENANCE_MODE" = enforce ]; then
+          notify_stalled external-author \
+            "self-update 정지: origin/$BRANCH 새 커밋에 외부 작성자 코드가 있습니다 ($prov_list). 오너 확인 전까지 이 노드는 갱신되지 않습니다. 승인 시 SHA를 $PROVENANCE_APPROVED_FILE 에 추가." \
+            "rev=$PROV_INCOMING untrusted=$PROV_UNTRUSTED_N commits=$PROV_COMMITS authors=$prov_inline"
+          say "self-update: refusing origin/$BRANCH ${PROV_INCOMING:0:12}: $PROV_UNTRUSTED_N incoming commit(s) by untrusted authors ($prov_list); add approved SHAs to $PROVENANCE_APPROVED_FILE; aborting (fail-closed)" >&2
+          exit 14
+        fi
+        log "provenance untrusted rev=$PROV_INCOMING untrusted=$PROV_UNTRUSTED_N commits=$PROV_COMMITS authors=$prov_inline mode=$PROVENANCE_MODE proceeding"
+        say "self-update: WARNING $PROV_UNTRUSTED_N incoming commit(s) by untrusted authors ($prov_list); proceeding because mode=$PROVENANCE_MODE" >&2
+        ;;
+      *)
+        # Cannot tell who wrote the incoming code. Like a fetch failure this can
+        # be transient (API outage, expired gh auth), so hold the node but alert
+        # only once it has burned consecutive scheduled ticks.
+        if [ "$PROVENANCE_ON_ERROR" = proceed ]; then
+          log "provenance unverifiable rev=$PROV_INCOMING detail=$PROV_DETAIL mode=$PROVENANCE_MODE on_error=proceed proceeding"
+          say "self-update: WARNING cannot verify incoming commit authors ($PROV_DETAIL); proceeding because CCC_SELF_UPDATE_PROVENANCE_ON_ERROR=proceed" >&2
+        else
+          prov_fails="$(cat "$PROVENANCE_FAIL_FILE" 2>/dev/null)"
+          case "$prov_fails" in ''|*[!0-9]*) prov_fails=0 ;; esac
+          prov_fails=$(( prov_fails + 1 ))
+          printf '%s' "$prov_fails" > "$PROVENANCE_FAIL_FILE" 2>/dev/null || :
+          log "abort reason=provenance-unverifiable repo=$REPO rev=$PROV_INCOMING detail=$PROV_DETAIL consecutive=$prov_fails mode=$PROVENANCE_MODE"
+          if [ "$prov_fails" -ge "$PROVENANCE_FAIL_ALERT_AFTER" ]; then
+            notify "self-update 정지: origin/$BRANCH 새 커밋의 작성자를 ${prov_fails}회 연속 확인하지 못했습니다 ($PROV_DETAIL). 확인 전까지 이 노드는 갱신되지 않습니다. ~/.claude/state/self-update.log" "stalled-provenance-unverifiable"
+          fi
+          say "self-update: cannot verify incoming commit authors ($PROV_DETAIL); holding (CCC_SELF_UPDATE_PROVENANCE_ON_ERROR=hold)" >&2
+          exit 14
+        fi
+        ;;
+    esac
   fi
 fi
 

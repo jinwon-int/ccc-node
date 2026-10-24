@@ -380,6 +380,11 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_SIGNATURE_MODE` | `warn` | tip signature policy: `warn` (verify + report, still apply), `enforce` (refuse an unverified tip, exit 13), `off` (skip) |
 | `CCC_SELF_UPDATE_SIGNATURE_KEYRING` | `scripts/trusted-keys/github-web-flow.gpg` | keyring holding the permitted signing keys |
 | `CCC_SELF_UPDATE_TRUSTED_FPRS` | GitHub web-flow fingerprints | newline-separated full fingerprints allowed to sign the tip |
+| `CCC_SELF_UPDATE_PROVENANCE_MODE` | `enforce` | commit-author policy for incoming commits: `enforce` (refuse when any incoming commit's GitHub author is untrusted, exit 14), `warn` (report, still apply), `off` (skip). Unknown values mean `enforce`. See "Commit provenance gate" |
+| `CCC_SELF_UPDATE_PROVENANCE_ON_ERROR` | `hold` (`proceed` under `warn`) | when the author lookup cannot complete (no `gh`/`jq`, API failure, non-GitHub remote, truncated compare, malformed JSON): `hold` (exit 14, nothing merged) or `proceed` |
+| `CCC_SELF_UPDATE_PROVENANCE_FAIL_ALERT_AFTER` | `2` | consecutive held (unverifiable) ticks before the owner is notified; counter in `~/.claude/state/self-update.provenance-failures` |
+| `CCC_SELF_UPDATE_TRUSTED_AUTHORS_FILE` | `~/.ccc-node/self-update-trusted-authors` | node-local trusted GitHub logins, one per line, `#` comments; when the file exists it **replaces** the built-in list (`jinon86 seoseo-ai dependabot[bot] jinwon-deps-bot[bot] github-actions[bot]`) |
+| `CCC_SELF_UPDATE_APPROVED_COMMITS_FILE` | `~/.claude/state/self-update-approved-external-commits` | owner-approved exceptions: full 40-hex commit SHAs, one per line, accepted even when their author is untrusted |
 
 Exit codes: 0 ok/up-to-date · 3 lock held · 4 precondition failed · 5 fetch/ff
 failed · 6 setup/snapshot failed (repo and managed artifacts were verified
@@ -401,7 +406,12 @@ serving; also (#2142) an external restart succeeded but the bridge came back
 serving a different `runtime_generation.source_git.head` (e.g. a Termux launcher
 pinned to an older prepared generation). Switch the bridge to a preparation of
 the target commit; the next tick reconciles from the live bridge's startup
-head, or a new upstream commit retries.
+head, or a new upstream commit retries. Also returned by the commit
+provenance gate — an incoming commit by an untrusted author under `enforce`
+(log `abort reason=external-author`), or an author lookup that could not
+complete under `CCC_SELF_UPDATE_PROVENANCE_ON_ERROR=hold` (log
+`abort reason=provenance-unverifiable`). Nothing was merged in either case;
+see "Commit provenance gate" below.
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
 `0600` Claude and Hermes archives) for local operator
@@ -478,6 +488,65 @@ that would fix it.
 Flip criteria: every node in the fleet logging non-`ok` **zero** times for seven
 consecutive days, plus at least one `changed=yes` success somewhere in the fleet
 so the real update path — not just the probe — is known to pass.
+
+### Commit provenance gate
+
+The signature gate cannot stop a merged pull request from an unaffiliated
+GitHub account: GitHub signs its own squash and merge-queue commits, so such a
+merge is "verified" (a benign one was merged in jinwon-int/a2a-nexus#2428).
+Merged to `main`, it would run as root on every node through `setup.sh` within
+one daily tick. So after the signature gate and before the ff-merge, the
+script asks GitHub **who authored** every incoming commit:
+
+1. Runs only when `origin/$BRANCH` differs from HEAD. An up-to-date tick never
+   calls `gh`. The vetted set is the local `git rev-list HEAD..origin/$BRANCH`,
+   so the check covers exactly what the merge would bring in.
+2. `owner/repo` comes from `git remote get-url origin`
+   (`https://github.com/O/R(.git)` or `git@github.com:O/R(.git)`; any other
+   remote is a lookup error).
+3. It makes one call, `gh api repos/O/R/compare/<HEAD>...<tip>`. Every local SHA
+   must appear in the response. `total_commits` greater than the commits
+   returned (compare caps at 250) counts as an incomplete lookup.
+4. A commit passes when its `author.login` is trusted (case-insensitive) or its
+   full SHA is in the approved-commits file. A `null` login (author email
+   linked to no account) is untrusted.
+
+Trust inputs come only from the **already-installed script** and **node-local
+files**, never from the incoming checkout. Otherwise the change could vouch for
+itself. The built-in list is `jinon86 seoseo-ai dependabot[bot]
+jinwon-deps-bot[bot] github-actions[bot]`. If `~/.ccc-node/self-update-trusted-authors`
+exists, it replaces that list. If it exists and is empty, nobody is trusted.
+
+When untrusted commits are found under `enforce`, the owner is notified (dedup
+`stalled-external-author`, up to three `login sha12` pairs), nothing is merged,
+and the run exits 14. To let a reviewed commit through, add its full SHA to
+`~/.claude/state/self-update-approved-external-commits`. The next tick then
+proceeds. `warn` logs `provenance untrusted ... proceeding` and applies anyway.
+
+A lookup that cannot complete is held by default (`ON_ERROR=hold`). The run
+logs `abort reason=provenance-unverifiable detail=<reason> consecutive=N` and
+exits 14. The owner is notified only after
+`CCC_SELF_UPDATE_PROVENANCE_FAIL_ALERT_AFTER` (2) consecutive holds, which
+mirrors the fetch-failure rule. A lookup that succeeds clears the counter.
+Under `warn`, an unset `ON_ERROR` means `proceed`, so `warn` never blocks a
+node.
+
+```
+provenance ok rev=<sha> commits=3 approved=0 mode=enforce
+abort reason=external-author repo=... rev=<sha> untrusted=1 commits=1 authors=someone:0123456789ab
+abort reason=provenance-unverifiable repo=... rev=<sha> detail=no-gh consecutive=1 mode=enforce
+```
+
+**Prerequisite.** The account that runs the cron must have an authenticated
+`gh` (`gh auth status`). On a node without one, `enforce` holds every changed
+tick. Escape hatches for that node: `CCC_SELF_UPDATE_PROVENANCE_ON_ERROR=proceed`
+or `CCC_SELF_UPDATE_PROVENANCE_MODE=warn|off`.
+
+**Limit.** `author.login` is GitHub's mapping of the commit's author email.
+For a squash merge, GitHub sets the author to the PR author's account, which
+cannot be spoofed. A merge-commit or rebase merge keeps the PR's own commits,
+and their author email can be forged. Squash-only merging keeps this gate
+meaningful.
 
 ### Forced reapply and bounded operator commands (#1523)
 
