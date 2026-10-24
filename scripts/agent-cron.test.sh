@@ -622,6 +622,10 @@ kept = (
     "DRIFT yukson doctor_exit=1 runtime=/root/ccc-node",
     "drifted: /root/.claude/hooks/lifecycle-feed.sh",
     "OK seoseo (/opt/ccc-node)",
+    # GitHub page links (2026-10-24: the external-PR watch alert lost its URL).
+    "  - url: https://github.com/jinwon-int/a2a-nexus/pull/2428",
+    "see https://github.com/jinwon-int/esp32-iphone-agent/issues/77#issuecomment-6291232321",
+    "run https://github.com/jinwon-int/ccc-node/actions/runs/40057236011",
 )
 for raw in kept:
     assert module.redact_for_owner(raw) == raw, raw
@@ -641,6 +645,12 @@ masked = (
     "/root/" + "E" * 30,                        # over-long leaf segment
     "/root/" + "F" * 30 + "/x",                 # over-long segment mid-path
     "backup=/root/.claude/backups/ccc-doctor-files-20260730-145600.tar.gz",
+    "https://github.com/jinwon-int/ccc-node/commit/" + "a" * 40,  # SHA leaf masked
+    "https://github.com/" + "T" * 30 + "/x",           # over-long segment
+    "https://github.com/o/r?token=" + "U" * 30,         # query string is not kept
+    "https://github.com.evil.example/" + "V" * 30,      # look-alike host
+    "https://gist.github.com/" + "W" * 30,              # other GitHub host
+    "https://github.com/o/" + "X" * 12 + "+" + "Y" * 12,  # base64 char breaks the segment
 )
 for raw in masked:
     out = module.redact_for_owner(raw)
