@@ -23,7 +23,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, Optional, Protocol, Tuple
 
 from telegram_bot.core.external_wait import (
     SOURCE_GITHUB_MERGE_QUEUE,
@@ -59,6 +59,12 @@ DEFAULT_RESUME_DAILY_CAP = 10
 NOT_ENQUEUED_GRACE_SECONDS = 180.0
 #: Merge-queue polls back off to this ceiling (group runs take minutes).
 MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS = 120.0
+#: When the base branch's required check set cannot be read, a green rollup
+#: must repeat on this many consecutive polls before it counts (#2507): the
+#: first poll after a push often sees only the fast CodeQL checks.
+UNKNOWN_REQUIRED_SETTLE_POLLS = 2
+#: Required-context sets change rarely; re-read them at most this often.
+REQUIRED_CONTEXTS_TTL_SECONDS = 600.0
 
 _MERGE_QUEUE_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
@@ -80,6 +86,9 @@ class PrState:
 
     head_sha: str
     rollup: str  # pending | success | failure | cancelled
+    #: False when the base branch's required check set could not be read; a
+    #: success is then only provisional and must settle (#2507).
+    required_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +133,50 @@ async def _run_gh(*args: str, timeout: float = 60) -> bytes:
 class GhCliTransport:
     """Production transport: authenticated ``gh`` CLI, body-free parsing."""
 
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._required_cache: Dict[Tuple[str, str], Tuple[float, Optional[FrozenSet[str]]]] = {}
+
+    async def required_contexts(self, repo: str, base: str) -> Optional[FrozenSet[str]]:
+        """Required status contexts of ``base``: classic protection + rulesets.
+
+        Mirrors ``skills/gh-pr-flow/ci-watch.sh`` (#2200). ``None`` means the
+        set could not be read at all (both sources failed or were empty), so
+        the caller must not treat "nothing pending" as complete (#2507).
+        """
+        key = (repo, base)
+        now = self._clock()
+        cached = self._required_cache.get(key)
+        if cached is not None and now - cached[0] < REQUIRED_CONTEXTS_TTL_SECONDS:
+            return cached[1]
+        names: set = set()
+        readable = False
+        try:
+            classic = json.loads((await _run_gh("api", f"repos/{repo}/branches/{base}")).decode("utf-8", "replace"))
+            protection = classic.get("protection") if isinstance(classic, dict) else None
+            checks = (protection or {}).get("required_status_checks") or {}
+            for name in checks.get("contexts") or []:
+                if isinstance(name, str) and name:
+                    names.add(name)
+            readable = True
+        except (TransportError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+        try:
+            rules = json.loads((await _run_gh("api", f"repos/{repo}/rules/branches/{base}")).decode("utf-8", "replace"))
+            for rule in rules if isinstance(rules, list) else []:
+                if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+                    continue
+                for item in (rule.get("parameters") or {}).get("required_status_checks") or []:
+                    name = item.get("context") if isinstance(item, dict) else None
+                    if isinstance(name, str) and name:
+                        names.add(name)
+            readable = True
+        except (TransportError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+        result: Optional[FrozenSet[str]] = frozenset(names) if readable and names else None
+        self._required_cache[key] = (now, result)
+        return result
+
     async def fetch_pr_state(self, repo: str, pr_number: int) -> PrState:
         try:
             process = await asyncio.create_subprocess_exec(
@@ -134,7 +187,7 @@ class GhCliTransport:
                 "--repo",
                 repo,
                 "--json",
-                "headRefOid,statusCheckRollup",
+                "headRefOid,statusCheckRollup,baseRefName",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -154,7 +207,13 @@ class GhCliTransport:
         head_sha = str(payload.get("headRefOid") or "").strip().lower()
         if not head_sha:
             raise TransportError("malformed-response")
-        return PrState(head_sha=head_sha, rollup=_normalize_rollup(payload))
+        base = str(payload.get("baseRefName") or "").strip()
+        required = await self.required_contexts(repo, base) if base else None
+        return PrState(
+            head_sha=head_sha,
+            rollup=_normalize_rollup(payload, required),
+            required_known=required is not None,
+        )
 
     async def fetch_merge_queue_state(self, repo: str, pr_number: int) -> MergeQueueState:
         owner, name = repo.split("/", 1)
@@ -242,26 +301,41 @@ def _classify_gh_error(stderr: bytes) -> str:
     return "gh-error"
 
 
-def _normalize_rollup(payload: Dict[str, Any]) -> str:
+def _normalize_rollup(payload: Dict[str, Any], required: Optional[FrozenSet[str]] = None) -> str:
     checks = payload.get("statusCheckRollup")
     if not isinstance(checks, list) or not checks:
         # No registered checks yet: still in-flight for our purposes.
         return ROLLUP_PENDING
     states = []
+    names = set()
     for entry in checks:
         if not isinstance(entry, dict):
             continue
+        name = entry.get("name") or entry.get("context")
+        if isinstance(name, str) and name:
+            names.add(name)
         conclusion = str(entry.get("conclusion") or "").upper()
         status = str(entry.get("status") or "").upper()
+        # Legacy commit statuses (StatusContext) report only ``state``; a
+        # pending one used to be dropped and read as green (#2507).
+        legacy = str(entry.get("state") or "").upper()
         if conclusion:
             states.append(conclusion)
         elif status:
             states.append(status)
-    if any(state in {"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"} for state in states):
+        elif legacy:
+            states.append(legacy)
+        else:
+            states.append("")
+    if any(state in {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"} for state in states):
         return ROLLUP_FAILURE
     if any(state == "CANCELLED" for state in states):
         return ROLLUP_CANCELLED
-    if any(state in {"", "PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"} for state in states):
+    if any(state in {"", "PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED"} for state in states):
+        return ROLLUP_PENDING
+    # A required context that has not registered yet means its workflow has
+    # not started: the visible checks are only the fast ones (#2507, #2200).
+    if required and not required.issubset(names):
         return ROLLUP_PENDING
     # SUCCESS / NEUTRAL / SKIPPED only.
     return ROLLUP_SUCCESS
@@ -386,6 +460,7 @@ class ExternalWaitMonitor:
         self._tick_seconds = max(1.0, float(tick_seconds))
         self._clock = clock
         self._transport_errors: Dict[str, int] = {}
+        self._provisional_greens: Dict[str, int] = {}
         self._resume_count = 0
         self._resume_day = ""
         self._idle_identity: Optional[tuple] = None
@@ -471,6 +546,15 @@ class ExternalWaitMonitor:
                 # The PR moved on: never report the stale run as the watched one.
                 self._registry.finish(wait_id, TERMINAL_SUPERSEDED, now=now)
                 return
+        if state.rollup == ROLLUP_SUCCESS and not state.required_known:
+            # Required set unknown: one green poll may be the registration gap
+            # (#2507). Count consecutive greens; anything else resets.
+            greens = self._provisional_greens.get(wait_id, 0) + 1
+            if greens < UNKNOWN_REQUIRED_SETTLE_POLLS:
+                self._provisional_greens[wait_id] = greens
+                self._reschedule(record)
+                return
+        self._provisional_greens.pop(wait_id, None)
         terminal = _TERMINAL_BY_ROLLUP.get(state.rollup)
         if terminal is not None:
             self._registry.finish(wait_id, terminal, now=now)
