@@ -42,6 +42,11 @@ unset CODEX_HOME
 # FAILs (#2236). Drop both keys the preflight reads.
 unset CLAUDE_PROCESS_TIMEOUT CCC_DELEGATED_TASK_STALL_SECONDS
 export CCC_SELF_UPDATE_HEALTH_FILE="$TMP/no-such-health.json"
+# The commit-provenance gate asks GitHub who authored each incoming commit; these
+# fixtures fetch from a local bare repo (not a GitHub remote), so the default
+# `enforce` would hold every changed tick. Its behaviour is covered end-to-end
+# by scripts/ccc-self-update-provenance.test.sh.
+export CCC_SELF_UPDATE_PROVENANCE_MODE=off
 # Same for the Matrix frontend's health file (never the node's real ~/.ccc-matrix).
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
 export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
