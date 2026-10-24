@@ -6,7 +6,12 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: merge-via-relay.sh --repo OWNER/REPO --pr NUMBER \
-  --expected-head 40_HEX_SHA --operator-approved [--ssh-target HOST] [--dry-run]
+  --expected-head 40_HEX_SHA --operator-approved [--external-author-approved] \
+  [--ssh-target HOST] [--dry-run]
+
+A PR authored by anyone other than the two fleet accounts or the fleet's
+dependency bots is refused unless --external-author-approved records the
+owner's explicit approval of that external PR (a2a-nexus#2428).
 EOF
 }
 
@@ -16,6 +21,7 @@ expected_head=""
 ssh_target="${CCC_RELAY_SSH_TARGET:-relay}"
 expected_actor="${CCC_RELAY_MERGE_ACTOR:-jinon86}"
 approved=0
+external_ok=0
 dry_run=0
 
 while [ "$#" -gt 0 ]; do
@@ -25,6 +31,7 @@ while [ "$#" -gt 0 ]; do
     --expected-head) expected_head="${2:-}"; shift 2 ;;
     --ssh-target) ssh_target="${2:-}"; shift 2 ;;
     --operator-approved) approved=1; shift ;;
+    --external-author-approved) external_ok=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -59,7 +66,7 @@ command -v ssh >/dev/null 2>&1 || { echo "ssh is required" >&2; exit 2; }
 
 ssh -o BatchMode=yes -o ConnectTimeout="${CCC_RELAY_SSH_TIMEOUT:-8}" \
   "$ssh_target" bash -s -- \
-  "$repo" "$pr" "${expected_head,,}" "$expected_actor" "$dry_run" <<'REMOTE'
+  "$repo" "$pr" "${expected_head,,}" "$expected_actor" "$dry_run" "$external_ok" <<'REMOTE'
 set -euo pipefail
 
 repo="$1"
@@ -67,6 +74,7 @@ pr="$2"
 expected_head="$3"
 expected_actor="$4"
 dry_run="$5"
+external_ok="$6"
 
 command -v gh >/dev/null 2>&1 || { echo "remote gh is unavailable" >&2; exit 3; }
 command -v jq >/dev/null 2>&1 || { echo "remote jq is unavailable" >&2; exit 3; }
@@ -85,12 +93,24 @@ default_branch="$(gh api "repos/$repo" --jq .default_branch)"
 }
 
 pr_json="$(gh pr view "$pr" --repo "$repo" \
-  --json state,isDraft,baseRefName,headRefOid,mergeable,mergeStateStatus,statusCheckRollup)"
+  --json author,isCrossRepository,state,isDraft,baseRefName,headRefOid,mergeable,mergeStateStatus,statusCheckRollup)"
 
 [ "$(jq -r '.state' <<<"$pr_json")" = "OPEN" ] || {
   echo "refusing merge: PR is not open" >&2
   exit 4
 }
+# External authors (not a fleet account or fleet dependency bot) need the
+# owner's separate explicit approval of that PR (a2a-nexus#2428).
+author="$(jq -r '.author.login // ""' <<<"$pr_json")"
+case "$author" in
+  jinon86|seoseo-ai|app/dependabot|app/jinwon-deps-bot|app/github-actions) ;;
+  *)
+    [ "$external_ok" = 1 ] || {
+      echo "refusing merge: PR author '$author' is external; needs --external-author-approved after explicit owner approval" >&2
+      exit 4
+    }
+    ;;
+esac
 [ "$(jq -r '.isDraft' <<<"$pr_json")" = "false" ] || {
   echo "refusing merge: PR is still draft" >&2
   exit 4

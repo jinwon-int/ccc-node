@@ -38,6 +38,7 @@ elif [ "${1:-}" = api ] && [[ "${2:-}" == repos/* ]]; then
   printf '%s\n' "${FAKE_DEFAULT_BRANCH:-main}"
 elif [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
   jq -n \
+    --arg author "${FAKE_AUTHOR:-jinon86}" \
     --arg head "${FAKE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
     --arg state "${FAKE_STATE:-OPEN}" \
     --arg base "${FAKE_BASE:-main}" \
@@ -45,7 +46,7 @@ elif [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
     --arg merge_state "${FAKE_MERGE_STATE:-CLEAN}" \
     --argjson draft "${FAKE_DRAFT:-false}" \
     --argjson checks "${FAKE_CHECKS:-[]}" \
-    '{state:$state,isDraft:$draft,baseRefName:$base,headRefOid:$head,mergeable:$mergeable,mergeStateStatus:$merge_state,statusCheckRollup:$checks}'
+    '{author:{login:$author},isCrossRepository:false,state:$state,isDraft:$draft,baseRefName:$base,headRefOid:$head,mergeable:$mergeable,mergeStateStatus:$merge_state,statusCheckRollup:$checks}'
 elif [ "${1:-}" = api ] && [ "${2:-}" = --method ]; then
   : > "${FAKE_MERGE_MARKER:?}"
   printf '%s\n' '{"merged":true,"message":"ok","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
@@ -135,6 +136,30 @@ if [ "$rc" -ne 0 ] && grep -q 'base branch is not the repository default branch'
 else
   fail "non-default base branch was not rejected"
 fi
+
+# External author gate (a2a-nexus#2428).
+FAKE_AUTHOR=dbdefault \
+  bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+  --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err" && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && grep -q "author 'dbdefault' is external" "$TMP/err"; then
+  pass
+else
+  fail "external author was not refused"
+fi
+if FAKE_AUTHOR=dbdefault bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+  --operator-approved --external-author-approved --dry-run >"$TMP/out" 2>"$TMP/err"; then
+  pass
+else
+  fail "external author with explicit approval flag was refused"
+fi
+for a in seoseo-ai app/dependabot app/jinwon-deps-bot; do
+  if FAKE_AUTHOR="$a" bash "$SCRIPT" --repo jinwon-int/ccc-node --pr 1 --expected-head "$HEAD_SHA" \
+    --operator-approved --dry-run >"$TMP/out" 2>"$TMP/err"; then
+    pass
+  else
+    fail "internal author $a was refused"
+  fi
+done
 
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
