@@ -236,6 +236,12 @@
       "pattern": "skills/registry.json",
       "compatibility": "unsupported",
       "reason": "generated skill-registry artifact (#1338); consumed by validate-harness CI, not an installable asset for any harness"
+    },
+    {
+      "pattern": "skills/external-github-content/**",
+      "compatibility": "adapted",
+      "audience": "shared",
+      "codex_skill": "external-github-content"
     }
   ],
   "managed_skills": [
@@ -286,6 +292,10 @@
     {
       "name": "web-routing",
       "source": "skills/web-routing"
+    },
+    {
+      "name": "external-github-content",
+      "source": "skills/external-github-content"
     }
   ]
 }

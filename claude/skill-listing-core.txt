@@ -18,6 +18,7 @@
 
 # --- repo-shipped fleet workflows (skills/ in this repository) ---
 gh-pr-flow
+external-github-content
 gh-ci-wait
 wiki-record
 self-update
