@@ -4,6 +4,22 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **`install-termux-mempalace.sh`: a node still on an older managed freeze is
+  managed state, not drift (#2509).** The in-place guard accepted only a lock
+  that differed from the *current* freeze in its `mempalace==` line, so once
+  Dependabot bumped the freeze (#2169, #2483) every Termux node installed
+  earlier failed closed for good — neither the 3.10.0 → 3.11.0 upgrade (#2328)
+  nor the security bumps could reach it (gongyung 2026-10-25: `installed
+  MemPalace version drift`, exit 2; daegyo same lock). A lock byte-identical
+  to a freeze the checkout's git history shipped (`git hash-object` against
+  the blobs of `scripts/termux-mempalace-requirements.txt`) whose
+  `mempalace==` line names the installed dist-info now counts as managed:
+  a previous-pin venv upgrades in place and a same-pin venv reinstalls the
+  current freeze. Without git history (shallow/tarball) the path is off, and
+  any other lock or version drift still fails closed.
+  `install-termux-mempalace.test.sh` 25→30 PASS (hermetic two-freeze git
+  checkout); the two positive cases fail on the previous script.
+
 - **`bridge-safe-detached-run`: long waits inside a bridge turn are a trigger,
   and the skill now says what to do with them (Step 2c).** A 2026-10-21 session
   polled fleet self-updates in-turn for 15+ minutes, ran into the bridge's turn
