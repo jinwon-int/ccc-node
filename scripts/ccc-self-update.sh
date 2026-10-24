@@ -1498,7 +1498,7 @@ if [ "$PROVENANCE_MODE" != "off" ]; then
             "self-update 정지: origin/$BRANCH 새 커밋에 외부 작성자 코드가 있습니다 ($prov_list). 오너 확인 전까지 이 노드는 갱신되지 않습니다. 승인 시 SHA를 $PROVENANCE_APPROVED_FILE 에 추가." \
             "rev=$PROV_INCOMING untrusted=$PROV_UNTRUSTED_N commits=$PROV_COMMITS authors=$prov_inline"
           say "self-update: refusing origin/$BRANCH ${PROV_INCOMING:0:12}: $PROV_UNTRUSTED_N incoming commit(s) by untrusted authors ($prov_list); add approved SHAs to $PROVENANCE_APPROVED_FILE; aborting (fail-closed)" >&2
-          exit 14
+          exit 16
         fi
         log "provenance untrusted rev=$PROV_INCOMING untrusted=$PROV_UNTRUSTED_N commits=$PROV_COMMITS authors=$prov_inline mode=$PROVENANCE_MODE proceeding"
         say "self-update: WARNING $PROV_UNTRUSTED_N incoming commit(s) by untrusted authors ($prov_list); proceeding because mode=$PROVENANCE_MODE" >&2
@@ -1520,7 +1520,7 @@ if [ "$PROVENANCE_MODE" != "off" ]; then
             notify "self-update 정지: origin/$BRANCH 새 커밋의 작성자를 ${prov_fails}회 연속 확인하지 못했습니다 ($PROV_DETAIL). 확인 전까지 이 노드는 갱신되지 않습니다. ~/.claude/state/self-update.log" "stalled-provenance-unverifiable"
           fi
           say "self-update: cannot verify incoming commit authors ($PROV_DETAIL); holding (CCC_SELF_UPDATE_PROVENANCE_ON_ERROR=hold)" >&2
-          exit 14
+          exit 16
         fi
         ;;
     esac

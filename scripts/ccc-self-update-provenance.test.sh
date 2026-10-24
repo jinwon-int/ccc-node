@@ -162,7 +162,7 @@ before="$(head_sha)"; setups="$(setup_runs)"
 write_compare - evil-contrib
 out="$(run_selfup 2>&1)"; rc=$?
 ext_sha="$(seed_sha)"
-ok "external author: enforce exits 14" '[ "$rc" = 14 ]'
+ok "external author: enforce exits 16" '[ "$rc" = 16 ]'
 ok "external author: HEAD not moved" '[ "$(head_sha)" = "$before" ]'
 ok "external author: working tree clean, setup.sh not run" '[ -z "$(git -C "$REPO" status --porcelain)" ] && [ "$(setup_runs)" = "$setups" ]'
 ok "external author: owner notified with login + sha12 + approved file" \
@@ -174,14 +174,14 @@ ok "external author: clear stderr line" 'grep -q "refusing origin/main ${ext_sha
 reset_tick
 write_compare - null
 out="$(run_selfup 2>&1)"; rc=$?
-ok "unlinked author: exits 14" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ]'
+ok "unlinked author: exits 16" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ]'
 ok "unlinked author: notification says unlinked" 'spool_text | grep -q "unlinked ${ext_sha:0:12}"'
 
 # --- unknown mode value is treated as enforce ------------------------------
 reset_tick
 write_compare - evil-contrib
 out="$(CCC_SELF_UPDATE_PROVENANCE_MODE=bogus run_selfup 2>&1)"; rc=$?
-ok "unknown mode: treated as enforce" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ]'
+ok "unknown mode: treated as enforce" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ]'
 
 # --- owner-approved SHA lets it through ------------------------------------
 reset_tick
@@ -198,7 +198,7 @@ reset_tick
 before="$(head_sha)"
 write_compare - outsider jinon86
 out="$(run_selfup 2>&1)"; rc=$?
-ok "mixed: one untrusted of two blocks the tick" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ]'
+ok "mixed: one untrusted of two blocks the tick" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ]'
 ok "mixed: only the untrusted commit is listed" \
   'grep -q "untrusted=1 commits=2 authors=outsider:$(seed_sha | cut -c1-12)$" "$LOGF" && ! spool_text | grep -q jinon86'
 
@@ -210,20 +210,20 @@ ok "warn: untrusted logged and warned" \
   'grep -q "provenance untrusted .*untrusted=1 .*mode=warn proceeding" "$LOGF" && grep -q "WARNING 1 incoming commit(s) by untrusted authors" <<<"$out"'
 ok "warn: no stall notification" '! spool_text | grep -q stalled-external-author'
 
-# --- gh missing -> hold (exit 14); alert only on the 2nd consecutive tick ----
+# --- gh missing -> hold (exit 16); alert only on the 2nd consecutive tick ----
 land nogh
 reset_tick
 before="$(head_sha)"
 write_compare - jinon86
 rm -f "$FAILS"
 out="$(GH_PATH="$NOGH" run_selfup 2>&1)"; rc=$?
-ok "gh missing: holds with exit 14" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ]'
+ok "gh missing: holds with exit 16" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ]'
 ok "gh missing: unverifiable abort logged" 'grep -q "abort reason=provenance-unverifiable .*detail=no-gh consecutive=1" "$LOGF"'
 ok "gh missing: first failure does not notify" '! spool_text | grep -q stalled-provenance-unverifiable'
 ok "gh missing: failure counter = 1" '[ "$(cat "$FAILS")" = 1 ]'
 reset_tick
 out="$(GH_PATH="$NOGH" run_selfup 2>&1)"; rc=$?
-ok "gh missing: second consecutive failure still holds" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ]'
+ok "gh missing: second consecutive failure still holds" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ]'
 ok "gh missing: second consecutive failure notifies" 'spool_text | grep -q "2회 연속.*no-gh.*stalled-provenance-unverifiable"'
 
 # --- warn mode never blocks on a lookup error (ON_ERROR defaults to proceed) --
@@ -253,33 +253,33 @@ reset_tick
 before="$(head_sha)"
 write_compare 300 jinon86
 out="$(run_selfup 2>&1)"; rc=$?
-ok "incomplete compare: holds" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ]'
+ok "incomplete compare: holds" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ]'
 ok "incomplete compare: logged as incomplete" 'grep -q "detail=incomplete total=300 returned=1" "$LOGF"'
 
 # --- malformed JSON / API failure / commit missing from compare -> error ------
 reset_tick
 printf 'not json' > "$FAKE_GH_JSON"
 out="$(run_selfup 2>&1)"; rc=$?
-ok "malformed JSON: holds" '[ "$rc" = 14 ] && grep -q "detail=malformed-json" "$LOGF"'
+ok "malformed JSON: holds" '[ "$rc" = 16 ] && grep -q "detail=malformed-json" "$LOGF"'
 reset_tick
 printf '{"message":"Not Found"}' > "$FAKE_GH_JSON"
 out="$(run_selfup 2>&1)"; rc=$?
-ok "error-shaped JSON: holds" '[ "$rc" = 14 ] && grep -q "detail=malformed-json" "$LOGF"'
+ok "error-shaped JSON: holds" '[ "$rc" = 16 ] && grep -q "detail=malformed-json" "$LOGF"'
 reset_tick
 write_compare - jinon86
 out="$(FAKE_GH_RC=1 run_selfup 2>&1)"; rc=$?
-ok "API failure: holds" '[ "$rc" = 14 ] && grep -q "detail=api-failed rc=1" "$LOGF" && [ "$(head_sha)" = "$before" ]'
+ok "API failure: holds" '[ "$rc" = 16 ] && grep -q "detail=api-failed rc=1" "$LOGF" && [ "$(head_sha)" = "$before" ]'
 land second-uncovered
 reset_tick
 write_compare 1 jinon86   # two incoming commits, compare accounts for one
 out="$(run_selfup 2>&1)"; rc=$?
-ok "commit missing from compare: holds" '[ "$rc" = 14 ] && grep -q "detail=commit-missing-from-compare" "$LOGF" && [ "$(head_sha)" = "$before" ]'
+ok "commit missing from compare: holds" '[ "$rc" = 16 ] && grep -q "detail=commit-missing-from-compare" "$LOGF" && [ "$(head_sha)" = "$before" ]'
 
 # --- non-GitHub remote -> lookup error; SSH remote form accepted -------------
 reset_tick
 write_compare - jinon86 jinon86
 out="$(FAKE_ORIGIN_URL='https://gitlab.example/jinwon-int/ccc-node.git' run_selfup 2>&1)"; rc=$?
-ok "non-GitHub remote: holds without calling gh" '[ "$rc" = 14 ] && grep -q "detail=non-github-remote" "$LOGF" && [ ! -s "$GH_CALLS" ]'
+ok "non-GitHub remote: holds without calling gh" '[ "$rc" = 16 ] && grep -q "detail=non-github-remote" "$LOGF" && [ ! -s "$GH_CALLS" ]'
 reset_tick
 out="$(FAKE_ORIGIN_URL='git@github.com:jinwon-int/ccc-node.git' run_selfup 2>&1)"; rc=$?
 ok "SSH remote: accepted and resolved to owner/repo" \
@@ -293,7 +293,7 @@ reset_tick
 before="$(head_sha)"
 write_compare - jinon86
 out="$(run_selfup 2>&1)"; rc=$?
-ok "trusted file: built-in login no longer trusted" '[ "$rc" = 14 ] && [ "$(head_sha)" = "$before" ] && spool_text | grep -q "jinon86 "'
+ok "trusted file: built-in login no longer trusted" '[ "$rc" = 16 ] && [ "$(head_sha)" = "$before" ] && spool_text | grep -q "jinon86 "'
 reset_tick
 write_compare - Alice
 out="$(run_selfup 2>&1)"; rc=$?
