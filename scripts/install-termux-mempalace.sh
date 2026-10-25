@@ -301,13 +301,45 @@ for line in sys.stdin:
 print(json.dumps({"schema":"ccc.termux-mempalace.status.v1",**d},separators=(",",":"),sort_keys=True))' <<<"$values"
 }
 
+# Classify the initial refresh from its own status record (#2511). The refresh
+# also exits 0 without running when another refresh holds its single-writer
+# lock, nunchi mode is not on, or it degrades, so exit 0 alone is not
+# "completed". Prints ok | skipped-busy | skipped-mode-off | degraded | unverified.
+initial_refresh_outcome() {
+  local t0="$1" mode
+  mode="$(cat "${CCC_STATE_DIR:-$HOME/.claude/state}/nunchi.mode" 2>/dev/null || true)"
+  if [ "$mode" != on ]; then echo skipped-mode-off; return 0; fi
+  python3 - "${CCC_NUNCHI_MEMPALACE_STATUS:-$nunchi_home/mempalace-refresh.status.json}" "$provider" "$t0" <<'PY'
+import json, sys
+path, provider, t0 = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+except (OSError, ValueError):
+    doc = None
+if not isinstance(doc, dict) or doc.get("schema") != "ccc.nunchi.mempalace-refresh.v1":
+    print("unverified"); raise SystemExit(0)
+started, state = doc.get("started_at"), doc.get("state")
+mine = type(started) is int and started >= t0 and doc.get("provider") == provider
+if mine and state == "ok":
+    print("ok")
+elif mine and state == "degraded":
+    print("degraded")
+elif state == "running" and type(started) is int and 0 < started < t0:
+    print("skipped-busy")
+else:
+    print("unverified")
+PY
+}
+
 write_metadata() {
-  local enabled="$1" provider="$2" source="$3" state="$4"
+  local enabled="$1" provider="$2" source="$3" state="$4" initial_refresh="${5:-}"
   prepare_managed_dir
-  python3 - "$metadata" "$enabled" "$provider" "$source" "$state" "$container" "$version" <<'PY'
+  python3 - "$metadata" "$enabled" "$provider" "$source" "$state" "$container" "$version" "$initial_refresh" <<'PY'
 import json, os, sys, tempfile, time
 path=sys.argv[1]
 payload={"schema":"ccc.termux-mempalace.install.v1","enabled":sys.argv[2]=="1","provider":sys.argv[3],"source":sys.argv[4],"state":sys.argv[5],"container":sys.argv[6],"version":sys.argv[7],"updated_at":int(time.time())}
+if sys.argv[8]: payload["initial_refresh"]=sys.argv[8]
 fd,tmp=tempfile.mkstemp(prefix=".status.",dir=os.path.dirname(path))
 try:
  with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(payload,f,separators=(",",":")); f.write("\n")
@@ -549,6 +581,7 @@ case "$ACTION" in
       exit 1
     fi
     refresh="$HOME/.claude/hooks/nunchi/mempalace-refresh.sh"
+    refresh_t0="$(date +%s)"
     if [ ! -x "$refresh" ] || ! CCC_NUNCHI_MEMPALACE_CLI="$wrapper" NUNCHI_SWEEP_DIR="$source" \
       bash "$refresh" "$provider" "$source"; then
       disable_refresh_cron
@@ -558,8 +591,17 @@ case "$ACTION" in
       echo "initial MemPalace refresh failed; peer_facts-only wiring restored" >&2
       exit 1
     fi
-    write_metadata 1 "$provider" "$source" ready
-    echo "Termux MemPalace installed and initial refresh completed"
+    # Wiring is ready either way (the hourly cron refreshes); state stays
+    # "ready" for ccc_memory_probe, and initial_refresh says what really ran.
+    initial_refresh="$(initial_refresh_outcome "$refresh_t0")"
+    write_metadata 1 "$provider" "$source" ready "$initial_refresh"
+    case "$initial_refresh" in
+      ok) echo "Termux MemPalace installed and initial refresh completed" ;;
+      skipped-busy) echo "Termux MemPalace installed; initial refresh skipped: another MemPalace refresh started before this install still holds the lock (the hourly refresh cron runs it next; check --status)" ;;
+      skipped-mode-off) echo "Termux MemPalace installed; initial refresh skipped: nunchi mode is not on" ;;
+      degraded) echo "Termux MemPalace installed; initial refresh reported degraded (MemPalace CLI unavailable to the refresh; check --status)" ;;
+      *) echo "Termux MemPalace installed; initial refresh not confirmed: no refresh status from this install (check --status)" ;;
+    esac
     emit_status
     ;;
 esac

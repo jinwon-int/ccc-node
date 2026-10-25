@@ -4,6 +4,20 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **`install-termux-mempalace.sh`: "initial refresh completed" only when the
+  refresh actually ran for this install (#2511).** `mempalace-refresh.sh`
+  exits 0 without running when another refresh holds its single-writer lock,
+  when nunchi mode is off, and when it degrades, and the installer checked only
+  the exit code (gongyung 2026-10-25 09:43 KST: a 3.10.0 sweep from 09:17 held
+  the lock, the 3.11.0 install still printed "completed"). The installer now
+  reads the refresh's status record: `ok` needs a record from this provider
+  that started at or after the call; a `running` record from before it is
+  `skipped-busy`; otherwise `skipped-mode-off`, `degraded` or `unverified`.
+  Each non-`ok` outcome prints its cause instead of "completed" and lands in a
+  new metadata `initial_refresh` field; `state` stays `ready` (the wiring is,
+  and `ccc_memory_probe` requires it) and the exit code stays 0.
+  `install-termux-mempalace.test.sh` 36→42 PASS, reverse-validated (original
+  installer, an always-`ok` classifier, and no start-time check each fail).
 - **`ccc_memory_probe.py`: the Termux palace probe accepts every MemPalace
   pin the installer manages (#2514).** `_termux_metadata_state()` accepted only
   `version == "3.10.0"` (#1869). The installer records its own pin in its
