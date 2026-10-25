@@ -24,9 +24,16 @@
 #      bridge/.env copied (0600) from the SERVING generation (the effective
 #      .env lives in the generation, not the checkout), then
 #      bridge/termux_prepare.py builds job/ — reusing the serving generation's
-#      native wheels when bridge/requirements.lock.txt is unchanged between the
-#      two SHAs (minutes instead of ~1 h; the tool itself re-verifies the
-#      toolchain and refuses a stale reuse).
+#      native wheels when the native + build-tool LOCK SUBSETS (exact pins and
+#      hashes of the packages that are compiled or build them, not the whole
+#      lock files) are identical between the two SHAs (#2524), as decided by
+#      the TARGET's bridge/termux_lock_subset.py; a pure-Python bump such as
+#      certifi keeps the reuse (minutes instead of ~1 h). Anything the
+#      prefilter cannot decide means no reuse. The tool itself re-verifies the
+#      subsets, toolchain, API and linker profile and refuses a stale reuse; if
+#      it refuses with reuse_*_mismatch / reuse_lock_subset_unavailable, the
+#      refused attempt is kept for diagnosis and ONE full build (no reuse) runs
+#      in a fresh generation dir with the remaining timeout budget.
 #   5. Receipt must say `ready`, AND — when this node runs the Matrix
 #      frontend (~/.ccc-matrix or the runit service exists) — the runtime must
 #      import the Matrix extra (`aiohttp`, `nio`): `termux_prepare.py` only
@@ -68,10 +75,11 @@
 #        sourced) > 3300 s. ccc-self-update.sh reads the same file and raises
 #        its prepare-cmd budget to cover it (+300 s). A bad file (owner, mode,
 #        value) is ignored with a warning, never fatal. A slow node needs this
-#        when bridge/requirements.lock.txt changes: no wheel reuse, a full
-#        native build of ~50+ min (a slow node 2026-10-22..26: native-wheels
-#        timeout at 3300 s four ticks in a row). The value and its source
-#        (env/file/default) appear in the dry-run, --status and build lines.
+#        when a native/build-tool pin changes (or the prefilter is undecided):
+#        no wheel reuse, a full native build of ~50+ min (a slow node
+#        2026-10-22..26: native-wheels timeout at 3300 s four ticks in a row).
+#        The value and its source (env/file/default) appear in the dry-run,
+#        --status and build lines.
 # Exit:  0 ok (serving or repointed) · 2 usage/precondition · 3 build failed ·
 #        4 receipt not ready or Matrix extra missing · 5 pointer switch failed.
 set -euo pipefail
@@ -89,7 +97,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --status) STATUS=1 ;;
     --target) TARGET="${2:-}"; shift ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
     *) echo "termux-prepare-generation: unknown argument $1" >&2; exit 2 ;;
   esac
   shift
@@ -130,15 +138,33 @@ resolve_repo() {
   printf '%s' "$H/ccc-node"
 }
 
-receipt_status() { # <job-dir> — "ready" / other / "" when unreadable
+receipt_field() { # <job-dir> <key> — the receipt's top-level string value, "" when unreadable
   [ -f "$1/receipt.json" ] || { printf ''; return; }
-  "$PY" - "$1/receipt.json" <<'PYEOF' 2>/dev/null || printf ''
+  "$PY" - "$1/receipt.json" "$2" <<'PYEOF' 2>/dev/null || printf ''
 import json, sys
 try:
-    print(str(json.load(open(sys.argv[1])).get("status", "")))
+    print(str(json.load(open(sys.argv[1])).get(sys.argv[2], "")))
 except Exception:
     print("")
 PYEOF
+}
+receipt_status() { receipt_field "$1" status; } # <job-dir> — "ready" / other / ""
+
+# Wheel-reuse prefilter (#2524): "equal" only when the TARGET's lock-subset
+# helper, fed both SHAs' lock files straight from git (no worktree, no temp
+# files, no network), says the native + build-tool subsets are identical.
+# Prints equal / different / undecided:<why>; never fails the run.
+lock_subset_check() { # <serving-sha> <target-sha>
+  local helper="bridge/termux_lock_subset.py" out rc
+  git -C "$REPO" cat-file -e "$2:$helper" 2>/dev/null || { printf 'undecided:no-helper-at-target'; return; }
+  out="$(git -C "$REPO" show "$2:$helper" 2>/dev/null \
+         | env -u PYTHONPATH -u PYTHONHOME "$PY" -I -B - --compare-git "$REPO" "$1" "$2" 2>/dev/null)" && rc=0 || rc=$?
+  case "$rc:$out" in
+    0:equal) printf 'equal' ;;
+    1:different) printf 'different' ;;
+    2:undecided:*) printf '%s' "$out" | tr -c 'a-z0-9_:-' '_' | cut -c1-80 ;;
+    *) printf 'undecided:helper-failed' ;;
+  esac
 }
 
 gen_head() { git -C "$1/source" rev-parse HEAD 2>/dev/null || printf ''; }
@@ -292,12 +318,23 @@ fi
 [ -f "$SERVING/source/bridge/.env" ] || die 2 "serving generation has no bridge/.env to inherit: $SERVING/source/bridge/.env"
 [ -x "$PY" ] || die 2 "python not executable: $PY (set CCC_TERMUX_PYTHON to the base interpreter)"
 
-GEN="$PREP/main-$SHORT-$(date +%Y%m%d)"
-[ -e "$GEN" ] && GEN="$GEN-$(date +%H%M%S)"   # a failed earlier attempt is kept for diagnosis
-REUSE=()
-if [ -n "$SERVING_HEAD" ] && [ "$(receipt_status "$SERVING/job")" = "ready" ] \
-   && git -C "$REPO" diff --quiet "$SERVING_HEAD" "$TARGET" -- bridge/requirements.lock.txt 2>/dev/null; then
-  REUSE=(--reuse-wheels-from "$SERVING/job")
+new_gen_path() { # a fresh main-<sha7>-<YYYYMMDD>[-<hhmmss>[-<n>]]; failed earlier attempts are kept for diagnosis
+  local g base n=2
+  g="$PREP/main-$SHORT-$(date +%Y%m%d)"
+  [ -e "$g" ] || { printf '%s' "$g"; return; }
+  g="$g-$(date +%H%M%S)"; base="$g"
+  while [ -e "$g" ]; do g="$base-$n"; n=$((n + 1)); done
+  printf '%s' "$g"
+}
+GEN="$(new_gen_path)"
+REUSE=(); REUSE_CHECK="no-serving-head"
+if [ -n "$SERVING_HEAD" ]; then
+  if [ "$(receipt_status "$SERVING/job")" != "ready" ]; then
+    REUSE_CHECK="serving-receipt-not-ready"
+  else
+    REUSE_CHECK="$(lock_subset_check "$SERVING_HEAD" "$TARGET")"
+    [ "$REUSE_CHECK" = equal ] && REUSE=(--reuse-wheels-from "$SERVING/job")
+  fi
 fi
 EXTRA=()
 if matrix_frontend_configured; then
@@ -311,26 +348,54 @@ if matrix_frontend_configured; then
   fi
 fi
 if [ "$DRY" = 1 ]; then
-  say "dry-run: would build $(basename "$GEN") from $SERVING_HEAD -> $SHORT reuse=${REUSE[*]:-none} extra=${EXTRA[*]:-none} timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC"
+  say "dry-run: would build $(basename "$GEN") from $SERVING_HEAD -> $SHORT reuse=${REUSE[*]:-none} lock_subsets=$REUSE_CHECK extra=${EXTRA[*]:-none} timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC"
   exit 0
 fi
 
 umask 077
-mkdir -p "$PREP" "$GEN"
-chmod 700 "$PREP" "$GEN"
-say "building $(basename "$GEN") (serving $(basename "$SERVING") @${SERVING_HEAD:0:7}; reuse=${REUSE[*]:-none}; extra=${EXTRA[*]:-none}; timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC)"
-git -C "$REPO" worktree add --detach "$GEN/source" "$TARGET" >>"$GEN/prepare.log" 2>&1 \
-  || die 3 "git worktree add failed (see $GEN/prepare.log)"
-install -m 600 "$SERVING/source/bridge/.env" "$GEN/source/bridge/.env" || die 3 "could not inherit bridge/.env"
+mkdir -p "$PREP"
+chmod 700 "$PREP"
+
+build_attempt() { # <gen-dir> <timeout-s> [reuse args...] — 0 when termux_prepare.py exits 0
+  local gen="$1" tmo="$2"; shift 2
+  mkdir -p "$gen"; chmod 700 "$gen"
+  git -C "$REPO" worktree add --detach "$gen/source" "$TARGET" >>"$gen/prepare.log" 2>&1 \
+    || die 3 "git worktree add failed (see $gen/prepare.log)"
+  install -m 600 "$SERVING/source/bridge/.env" "$gen/source/bridge/.env" || die 3 "could not inherit bridge/.env"
+  # The tool must see the BASE interpreter's environment: a shell spawned by a
+  # running bridge carries VIRTUAL_ENV / a generation runtime first in PATH, and
+  # with those the backend probe failed (2026-10-08). Drop the venv variables and
+  # any venv/generation bin entries from PATH (CCC_TERMUX_PREPARE_PATH overrides).
+  env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME -u ANDROID_API_LEVEL PATH="$(prepare_path)" \
+    "$PY" -B "$gen/source/bridge/termux_prepare.py" --work-dir "$gen/job" --verify-reinstall \
+    --timeout-seconds "$tmo" --jobs "$JOBS" "$@" "${EXTRA[@]}" >>"$gen/prepare.log" 2>&1
+}
+
+say "building $(basename "$GEN") (serving $(basename "$SERVING") @${SERVING_HEAD:0:7}; reuse=${REUSE[*]:-none}; lock_subsets=$REUSE_CHECK; extra=${EXTRA[*]:-none}; timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC)"
 started=$SECONDS
-# The tool must see the BASE interpreter's environment: a shell spawned by a
-# running bridge carries VIRTUAL_ENV / a generation runtime first in PATH, and
-# with those the backend probe failed (2026-10-08). Drop the venv variables and
-# any venv/generation bin entries from PATH (CCC_TERMUX_PREPARE_PATH overrides).
-if ! env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME -u ANDROID_API_LEVEL PATH="$(prepare_path)" \
-     "$PY" -B "$GEN/source/bridge/termux_prepare.py" --work-dir "$GEN/job" --verify-reinstall \
-     --timeout-seconds "$TIMEOUT_S" --jobs "$JOBS" "${REUSE[@]}" "${EXTRA[@]}" >>"$GEN/prepare.log" 2>&1; then
-  die 3 "termux_prepare.py failed after $((SECONDS - started))s (log: $GEN/prepare.log); pointer unchanged"
+if ! build_attempt "$GEN" "$TIMEOUT_S" "${REUSE[@]}"; then
+  elapsed=$((SECONDS - started))
+  reason="$(receipt_field "$GEN/job" reason)"
+  # One full-build retry (#2524) when the tool refused only the REUSE: the
+  # prefilter said equal but the receipt-level check disagreed (or a pre-#2524
+  # prior job lacks usable subset files). Never for any other failure, never
+  # twice, and never past the original budget (self-update sized its own
+  # prepare-cmd budget from TIMEOUT_S).
+  remaining=""
+  case "$TIMEOUT_S" in
+    ''|*[!0-9]*) remaining="$TIMEOUT_S" ;;
+    *) if [ $((TIMEOUT_S - elapsed)) -ge 60 ]; then remaining=$((TIMEOUT_S - elapsed)); fi ;;
+  esac
+  case "$reason" in reuse_*_mismatch|reuse_lock_subset_unavailable) retry=1 ;; *) retry=0 ;; esac
+  if [ "${#REUSE[@]}" -gt 0 ] && [ "$retry" = 1 ] && [ -n "$remaining" ]; then
+    FAILED="$GEN"; GEN="$(new_gen_path)"
+    say "reuse refused (reason=$reason) after ${elapsed}s; kept $(basename "$FAILED") for diagnosis; retrying once as a full build: $(basename "$GEN") (reuse=none; timeout=${remaining}s)"
+    started=$SECONDS
+    build_attempt "$GEN" "$remaining" \
+      || die 3 "termux_prepare.py full-build retry failed after $((SECONDS - started))s (reason=$(receipt_field "$GEN/job" reason); log: $GEN/prepare.log); pointer unchanged"
+  else
+    die 3 "termux_prepare.py failed after ${elapsed}s (reason=${reason:-unknown}; log: $GEN/prepare.log); pointer unchanged"
+  fi
 fi
 status="$(receipt_status "$GEN/job")"
 [ "$status" = "ready" ] || die 4 "receipt status is '${status:-missing}', not ready (log: $GEN/prepare.log); pointer unchanged"

@@ -135,8 +135,8 @@ ccc_restore_codex_policy_state() { # <codex-dir> <snapshot-dir>
 }
 
 # Operator-owned per-node Termux preparation budget (#2487). A slow Termux node
-# needs ~50+ min for a full native wheel build whenever
-# bridge/requirements.lock.txt changes (no wheel reuse), which overruns the
+# needs ~50+ min for a full native wheel build whenever wheel reuse is off (a
+# native/build-tool pin or hash changed, #2524), which overruns the
 # shipped defaults. One file per node,
 #   ${CCC_TERMUX_PREPARE_ENV_FILE:-${XDG_CONFIG_HOME:-~/.config}/ccc-node/termux-prepare.env}
 # owned by the running user, mode 0600 (no group/world bits), holding

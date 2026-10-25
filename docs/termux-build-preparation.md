@@ -119,16 +119,58 @@ are replaced by a `native-wheels-reuse` stage, which:
   `ready` with `fresh_install: pass`, names another `work_dir`, or does not
   list exactly the five native wheels;
 - after measuring this run's own toolchain, refuses unless `android_api`,
-  `linker_threads`, both `lock_sha256` values and the complete `toolchain`
-  record (versions and binary hashes) are identical — any change means a full
-  build (rerun without the flag). Toolchain hashes keep the reuse on one node:
-  another node's builds differ (a second Termux node's pydantic-core wheel
-  hash differs from the first's);
+  `linker_threads`, both `lock_subset_sha256` values (below) and the complete
+  `toolchain` record (versions and binary hashes) are identical — any change
+  means a full build (rerun without the flag; reason `reuse_<field>_mismatch`).
+  Toolchain hashes keep the reuse on one node: another node's builds differ (a
+  second Termux node's pydantic-core wheel hash differs from the first's);
 - copies the prior job's pip wheel cache (`pip-cache/wheels`, regular files
   only, bounded) into this job's private cache and the wheelhouse evidence
   copy, then requires every native wheel to match the prior receipt's digest;
 - after fresh install and reinstall, requires the cache to still hold exactly
   those wheels (`reused_wheels_not_used` if pip built a native package again).
+
+### Which lock change refuses reuse (#2524)
+
+The lock input is matched on the **subsets the native build actually reads**,
+not on the whole lock files. `lock_subset()` (`bridge/termux_lock_subset.py`)
+copies, for each package in `NATIVE` (`bridge/requirements.lock.txt`) and
+`BUILD_TOOLS` (`.github/requirements/bridge-ci.txt`), its exact
+`name==version` pin plus every `--hash=sha256:` entry into
+`job/native.lock.txt` and `job/build-tools.lock.txt`; those two files are the
+only lock input of the `build-tools` and `native-wheels` stages. The receipt
+records `lock_subset_sha256: {"build-tools": ..., "native": ...}` (SHA-256 of
+those files) and reuse matches on it. Every other locked package is pure and
+is installed fresh by the fresh-install bootstrap and the forced reinstall —
+both `pip install --require-hashes -r requirements.lock.txt` against the
+**full** lock — so a pure-Python bump (#2433 certifi) keeps the subsets
+byte-identical and the wheels reusable, while any native or build-tool pin or
+hash change is refused. `lock_sha256` (whole-file digests) stays in the
+receipt as evidence only. Matching on it refused reuse for every unrelated bump; a
+slow node then hit the full-build timeout every day, and because a failed
+build never becomes serving, each tick repeated the same refusal (5 days).
+
+A ready receipt written before #2524 has no `lock_subset_sha256`; the prior
+digests are then computed from that job's own `native.lock.txt` /
+`build-tools.lock.txt`, which must be regular, non-symlink, owner-private,
+bounded (4 MiB) files inside the already-validated prior job. Anything else
+fails closed with `reuse_lock_subset_unavailable` (as does a malformed
+recorded value).
+
+`termux-prepare-generation.sh` applies the same rule as a prefilter before any
+worktree exists: it pipes the **target** commit's `bridge/termux_lock_subset.py`
+(stdlib only) into `python3 -I -B - --compare-git <repo> <serving> <target>`,
+which reads both commits' lock files with `git show` (no temp files, no
+network). Only `equal` passes `--reuse-wheels-from`; `different`, a target
+without the helper, an unparseable lock or any other `undecided:<why>` means
+no reuse. The decision is logged as `lock_subsets=<result>` next to `reuse=`
+in the dry-run and `building` lines. The prefilter never replaces the tool's
+own check. If the tool refuses the reuse anyway with `reuse_*_mismatch` or
+`reuse_lock_subset_unavailable` (e.g. an old serving job without usable
+subset files), the refused generation dir is kept for diagnosis and the script
+retries **once** as a full build (no reuse) in a fresh generation dir, with the
+remaining timeout budget (no retry when under 60 s remain). Any other failure,
+or a failed retry, ends the tick as before (exit 3, pointer unchanged).
 
 pip's cached wheels keep their original sdist hash in `origin.json`, so the
 ordinary bootstrap still enforces `--require-hashes` against the lock. The
@@ -183,14 +225,16 @@ wheels built in the job's private pip cache are carried forward by
 
 ## Per-node preparation timeout (operator file)
 
-A dependency-lock change (`bridge/requirements.lock.txt`) means no wheel reuse
-(`reuse=none`) and a full native build. A slow Termux node needs ~50+ minutes
+A change to a native or build-tool pin/hash (since #2524 — before it, *any*
+`bridge/requirements.lock.txt` change) means no wheel reuse (`reuse=none`) and
+a full native build. A slow Termux node needs ~50+ minutes
 for `native-wheels` alone, more than the `termux-prepare-generation.sh` default
 of 3300 seconds: one slow node stayed on `main-fb17fc4-20261021` from 2026-10-22 to
 2026-10-26 because #2433 (certifi) changed the lock and every daily tick ended
-`native-wheels_timeout` at 3300 s. The reuse rule (only a `ready` receipt with
-an unchanged lock is reused) stays as it is; instead the node's operator
-records a longer budget in one per-node file (#2487):
+`native-wheels_timeout` at 3300 s. #2524 since keeps reuse for such
+pure-package bumps (see above); a real native change still needs the full
+build, so the node's operator records a longer budget in one per-node file
+(#2487):
 
 ```bash
 mkdir -p ~/.config/ccc-node
