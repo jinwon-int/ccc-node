@@ -21,19 +21,41 @@ if __package__:
     from .dependency_bootstrap import android_build_api
     from .runtime_readiness import PROBES
     from .prepared_runtime import source_seal
+    from . import termux_lock_subset as locks
 else:
     from dependency_bootstrap import android_build_api
     from runtime_readiness import PROBES
     from prepared_runtime import source_seal
+    import termux_lock_subset as locks
 
-NATIVE = ("cryptography", "jiter", "pydantic-core", "rpds-py", "pyromark")
-BUILD_TOOLS = ("setuptools", "packaging", "cffi", "pycparser")
+NATIVE = locks.NATIVE
+BUILD_TOOLS = locks.BUILD_TOOLS
 MATURIN_VERSION = "1.14.1"
 MIN_FREE_BYTES = 2 * 1024**3
 # Same-node wheel reuse (#2175): the prior receipt must match on every input
 # that determines the native build output. Toolchain hashes pin the node's
 # compiler/backend binaries, so another node's (different) wheels never match.
-REUSE_MATCH_FIELDS = ("android_api", "linker_threads", "lock_sha256", "toolchain")
+#
+# The lock input is matched on ``lock_subset_sha256`` (#2524): the SHA-256 of
+# the exact text lock_subset() writes to <job>/native.lock.txt and
+# <job>/build-tools.lock.txt -- the name==version pin plus every
+# --hash=sha256: entry of each NATIVE and BUILD_TOOLS package, and nothing
+# else. Those two files are the only lock input of the native build: the
+# builder venv installs build-tools.lock.txt (--require-hashes) over the base
+# interpreter's site-packages, whose maturin/rustc/clang/ld.lld/patchelf are
+# pinned by ``toolchain``; native-wheels builds native.lock.txt with
+# --no-build-isolation --no-deps --require-hashes. Every other locked package
+# is pure and is installed fresh by the fresh-install bootstrap and the forced
+# reinstall, both ``pip install --require-hashes -r requirements.lock.txt``
+# against the FULL lock, which also re-checks each reused native wheel's
+# origin sdist hash. So a pure-package bump (e.g. certifi) keeps the subsets
+# byte-identical and the wheels reusable; any native/build-tool pin or hash
+# change still refuses. The whole-file ``lock_sha256`` stays in the receipt
+# as evidence only: matching on it refused reuse for every unrelated bump, a
+# slow node then timed out on the full build, and since a failed build never
+# becomes serving, every later tick hit the same refusal (5 days, #2524).
+REUSE_MATCH_FIELDS = ("android_api", "linker_threads", "lock_subset_sha256", "toolchain")
+LOCK_SUBSET_KEYS = tuple(key for key, _, _ in locks.LOCK_SOURCES)
 MAX_RECEIPT_BYTES = 1024**2
 # Optional frontend extras (#2175 B). They stay outside the hash lock by design
 # (see each requirements file), so they are installed *constrained to the core
@@ -214,6 +236,39 @@ def native_cache_wheels(cache: Path) -> dict[str, list[str]]:
     return found
 
 
+def _is_subset_digests(value) -> bool:
+    return (isinstance(value, dict) and sorted(value) == sorted(LOCK_SUBSET_KEYS)
+            and all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in value.values()))
+
+
+def prior_lock_subset_sha256(receipt: dict) -> dict[str, str]:
+    """The prior job's lock-subset digests, fail closed (#2524).
+
+    A receipt written before #2524 has no ``lock_subset_sha256``; its job dir
+    still holds the subsets it built from (``<key>.lock.txt``, private_write
+    0600). Those must be regular, non-symlink, owner-private, bounded files
+    inside the already-validated prior job, else ``reuse_lock_subset_unavailable``.
+    """
+    recorded = receipt.get("lock_subset_sha256")
+    if recorded is not None:
+        if not _is_subset_digests(recorded):
+            raise PreparationError("reuse_lock_subset_unavailable")
+        return recorded
+    prior = Path(receipt["_path"])
+    found = {}
+    for key in LOCK_SUBSET_KEYS:
+        path = prior / f"{key}.lock.txt"
+        try:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or not _owner_private(info)
+                    or info.st_size > locks.MAX_LOCK_BYTES):
+                raise PreparationError("reuse_lock_subset_unavailable")
+            found[key] = _sha256(path)
+        except OSError:
+            raise PreparationError("reuse_lock_subset_unavailable") from None
+    return found
+
+
 def reuse_native_wheels(work: Path, receipt: dict, report: dict) -> None:
     """Seed this job's private caches from a matching prior job (#2175).
 
@@ -223,7 +278,9 @@ def reuse_native_wheels(work: Path, receipt: dict, report: dict) -> None:
     evidence only. Every native wheel must match the prior receipt's digest.
     """
     for field in REUSE_MATCH_FIELDS:
-        if report.get(field) != receipt.get(field):
+        prior_value = (prior_lock_subset_sha256(receipt) if field == "lock_subset_sha256"
+                       else receipt.get(field))
+        if report.get(field) is None or report.get(field) != prior_value:
             raise PreparationError(f"reuse_{field}_mismatch")
     prior = Path(receipt["_path"])
     source_cache, target_cache = prior / "pip-cache" / "wheels", work / "pip-cache" / "wheels"
@@ -260,32 +317,15 @@ def verify_reused_wheels_used(work: Path, report: dict) -> None:
 
 
 def lock_subset(path: Path, names: tuple[str, ...]) -> str:
-    """Copy exact pins/hashes from canonical pip-compile locks, fail closed."""
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4 * 1024**2:
-        raise PreparationError("invalid_lock_file")
-    logical = " ".join(line.strip() for line in path.read_text().splitlines()
-                       if line.strip() and not line.lstrip().startswith("#"))
-    # Backslash-newline continuations are now spaces. Match complete records,
-    # rejecting directives, URLs, unpinned requirements and unhashed entries.
-    logical = logical.replace("\\", " ")
-    record = re.compile(r"([A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?==([^\s]+)"
-                        r"((?:\s+--hash=sha256:[0-9a-f]{64})+)(?=\s|$)")
-    found = {}
-    position = 0
-    while position < len(logical):
-        match = record.match(logical, position)
-        if match is None:
-            raise PreparationError("unsupported_lock_syntax")
-        name = re.sub(r"[-_.]+", "-", match[1]).lower()
-        if name in found:
-            raise PreparationError("duplicate_lock_requirement")
-        found[name] = match[0]
-        position = match.end()
-        while position < len(logical) and logical[position].isspace():
-            position += 1
-    if not set(names) <= found.keys():
-        raise PreparationError("missing_locked_build_requirement")
-    return "\n".join(found[name] for name in names) + "\n"
+    """Copy exact pins/hashes from canonical pip-compile locks, fail closed.
+
+    The parser lives in termux_lock_subset.py (stdlib only) so the generation
+    script can run the target commit's copy as its reuse prefilter (#2524).
+    """
+    try:
+        return locks.lock_subset(path, names)
+    except locks.LockSubsetError as exc:
+        raise PreparationError(str(exc)) from None
 
 
 def build_environment(work: Path, api: int, jobs: int) -> dict[str, str]:
@@ -376,15 +416,17 @@ def prepare(runner: Runner, source: Path, report: dict, reinstall: bool,
     work = runner.work
     report["source_seal"] = source_seal(source)
     report["toolchain"] = provenance(runner)
-    report["lock_sha256"] = {}
-    for name, path, subset in (
-        ("build-tools", source.parent / ".github/requirements/bridge-ci.txt", BUILD_TOOLS),
-        ("native", source / "requirements.lock.txt", NATIVE),
-    ):
-        private_write(work / f"{name}.lock.txt", lock_subset(path, subset))
+    report["lock_sha256"] = {}  # whole source lock files: evidence, not a reuse key
+    report["lock_subset_sha256"] = {}  # exactly the build-input text below (#2524)
+    for name, relative, subset in locks.LOCK_SOURCES:
+        path = source.parent / relative
+        text = lock_subset(path, subset)
+        private_write(work / f"{name}.lock.txt", text)
+        report["lock_subset_sha256"][name] = locks.subset_sha256(text)
         report["lock_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
     report["source_sha256"] = {name: hashlib.sha256((source / name).read_bytes()).hexdigest()
-                               for name in ("termux_prepare.py", "dependency_bootstrap.py",
+                               for name in ("termux_prepare.py", "termux_lock_subset.py",
+                                            "dependency_bootstrap.py",
                                             "runtime_readiness.py", "requirements.txt", "pyproject.toml")}
     base = [sys.executable, "-I", "-B", "-m", "venv"]
     if reuse is None:
@@ -566,8 +608,9 @@ def main(argv=None) -> int:
                         help="also install an optional frontend extra, constrained to the core "
                              "runtime freeze (repeatable)")
     parser.add_argument("--reuse-wheels-from", type=Path, metavar="PRIOR_JOB",
-                        help="reuse native wheels from a ready job on this node whose locks, "
-                             "toolchain, API and linker profile match exactly (else refuse)")
+                        help="reuse native wheels from a ready job on this node whose "
+                             "native/build-tool lock subsets, toolchain, API and linker "
+                             "profile match exactly (else refuse)")
     args = parser.parse_args(argv)
     report = {"schema": "ccc.termux-preparation.v1", "status": "error", "stages": [],
               "scenarios": {name: "not_run" for name in

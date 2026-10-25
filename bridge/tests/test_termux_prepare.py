@@ -333,7 +333,11 @@ WHEELS = {
     "pyromark-0.9.13-cp314-cp314-android_24_arm64_v8a.whl": b"pyromark",
     "rpds_py-2026.6.3-cp314-cp314-android_24_arm64_v8a.whl": b"rpds",
 }
+NATIVE_SUBSET = "".join(pin(name).replace(" \\\n   ", "") for name in prep.NATIVE)
+TOOLS_SUBSET = "".join(pin(name).replace(" \\\n   ", "") for name in prep.BUILD_TOOLS)
 INPUTS = {"android_api": 24, "linker_threads": 1, "lock_sha256": {"native": "n", "build-tools": "b"},
+          "lock_subset_sha256": {"native": prep.locks.subset_sha256(NATIVE_SUBSET),
+                                 "build-tools": prep.locks.subset_sha256(TOOLS_SUBSET)},
           "toolchain": {"rustc": {"binary_sha256": "r"}, "python": "3.14.6"}}
 
 
@@ -362,8 +366,14 @@ def prior_job(root, **overrides):
                "scenarios": {"fresh_install": "pass"}, **INPUTS,
                "wheels": {name: sha(data) for name, data in WHEELS.items()}}
     receipt.update(overrides)
+    receipt = {key: value for key, value in receipt.items() if value is not DROP}
     prep.private_write(job / "receipt.json", json.dumps(receipt))
+    prep.private_write(job / "native.lock.txt", NATIVE_SUBSET)
+    prep.private_write(job / "build-tools.lock.txt", TOOLS_SUBSET)
     return job
+
+
+DROP = object()  # prior_job(..., field=DROP) omits a receipt field (pre-#2524 receipt)
 
 
 def new_work(root):
@@ -407,7 +417,8 @@ def test_reuse_copies_private_cache_and_records_source(tmp_path):
 
 @pytest.mark.parametrize("field,value", [
     ("android_api", 33), ("linker_threads", 2),
-    ("lock_sha256", {"native": "changed", "build-tools": "b"}),
+    ("lock_subset_sha256", {"native": "c" * 64, "build-tools": INPUTS["lock_subset_sha256"]["build-tools"]}),
+    ("lock_subset_sha256", {"native": INPUTS["lock_subset_sha256"]["native"], "build-tools": "c" * 64}),
     ("toolchain", {"rustc": {"binary_sha256": "other-node"}, "python": "3.14.6"}),
 ])
 def test_reuse_refuses_any_build_input_mismatch(tmp_path, field, value):
@@ -472,9 +483,11 @@ def test_prepare_with_reuse_skips_build_and_detects_rebuild(tmp_path, monkeypatc
     receipt = prep.load_reuse_source(prior_job(tmp_path))
     work = new_work(tmp_path)
     monkeypatch.setattr(prep, "provenance", lambda runner: INPUTS["toolchain"])
-    real_lock = prep.hashlib.sha256((source / "requirements.lock.txt").read_bytes()).hexdigest()
-    real_tools = prep.hashlib.sha256((source.parent / ".github/requirements/bridge-ci.txt").read_bytes()).hexdigest()
-    receipt["lock_sha256"] = {"build-tools": real_tools, "native": real_lock}
+    real_native = prep.lock_subset(source / "requirements.lock.txt", prep.NATIVE)
+    real_tools = prep.lock_subset(source.parent / ".github/requirements/bridge-ci.txt", prep.BUILD_TOOLS)
+    receipt["lock_subset_sha256"] = {"build-tools": sha(real_tools.encode()), "native": sha(real_native.encode())}
+    # Whole-file digests from an older lock (a pure-package bump): evidence only (#2524).
+    receipt["lock_sha256"] = {"build-tools": "0" * 64, "native": "1" * 64}
     runner = prep.Runner(work, {}, 30)
     calls = []
     monkeypatch.setattr(runner, "run", lambda name, argv: calls.append(name))
@@ -486,6 +499,10 @@ def test_prepare_with_reuse_skips_build_and_detects_rebuild(tmp_path, monkeypatc
     assert runner.stages[-1]["id"] == "native-wheels-reuse" and runner.stages[-1]["status"] == "pass"
     assert report["wheels"] == receipt["wheels"]
     assert report["scenarios"] == {"fresh_install": "pass", "reinstall": "pass"}
+    assert report["lock_subset_sha256"] == receipt["lock_subset_sha256"]
+    assert report["lock_sha256"] != receipt["lock_sha256"]
+    assert sha((work / "native.lock.txt").read_bytes()) == report["lock_subset_sha256"]["native"]
+    assert sha((work / "build-tools.lock.txt").read_bytes()) == report["lock_subset_sha256"]["build-tools"]
 
     # A bootstrap that ignored the seeded cache would add a freshly built wheel.
     work2 = tmp_path / "new2"
@@ -513,6 +530,186 @@ def test_invalid_reuse_source_claims_no_workspace(tmp_path, monkeypatch, capsys)
     assert prep.main(["--work-dir", str(target), "--reuse-wheels-from", str(tmp_path / "missing")]) == 1
     assert not target.exists()
     assert json.loads(capsys.readouterr().out)["reason"] == "preflight_or_io_error"
+
+
+# --- #2524: reuse keys off the native/build-tool lock subsets ---------------
+
+def full_lock(native_hash="a", pure_version="1"):
+    """A canonical-style lock: every native package plus one pure package."""
+    text = "".join(pin(name) for name in prep.NATIVE)
+    text = text.replace("pydantic-core==1 \\\n    --hash=sha256:" + "a" * 64,
+                        "pydantic-core==1 \\\n    --hash=sha256:" + native_hash * 64)
+    return "# pip-compile header\n" + text + pin("certifi", pure_version)
+
+
+def subset_digests(native_lock: Path, tools_lock: Path) -> dict:
+    return {"native": sha(prep.lock_subset(native_lock, prep.NATIVE).encode()),
+            "build-tools": sha(prep.lock_subset(tools_lock, prep.BUILD_TOOLS).encode())}
+
+
+def test_pure_package_bump_keeps_subsets_and_reuse(tmp_path):
+    tools = tmp_path / "bridge-ci.txt"
+    tools.write_text("".join(pin(n) for n in prep.BUILD_TOOLS) + pin("pytest"))
+    old, new = tmp_path / "old.lock", tmp_path / "new.lock"
+    old.write_text(full_lock(pure_version="1"))
+    new.write_text(full_lock(pure_version="2"))  # e.g. a certifi bump
+    assert sha(old.read_bytes()) != sha(new.read_bytes())
+    assert subset_digests(old, tools) == subset_digests(new, tools)
+    job = prior_job(tmp_path, lock_subset_sha256=subset_digests(old, tools),
+                    lock_sha256={"native": sha(old.read_bytes()), "build-tools": sha(tools.read_bytes())})
+    receipt = prep.load_reuse_source(job)
+    report = {**INPUTS, "lock_subset_sha256": subset_digests(new, tools),
+              "lock_sha256": {"native": sha(new.read_bytes()), "build-tools": sha(tools.read_bytes())}}
+    prep.reuse_native_wheels(new_work(tmp_path), receipt, report)
+    assert report["native_wheels"]["mode"] == "reused"
+
+
+@pytest.mark.parametrize("change", ["native_hash", "native_pin", "build_tool"])
+def test_native_or_build_tool_change_refuses_reuse(tmp_path, change):
+    tools = tmp_path / "bridge-ci.txt"
+    tools.write_text("".join(pin(n) for n in prep.BUILD_TOOLS))
+    old = tmp_path / "old.lock"
+    old.write_text(full_lock())
+    new_lock, new_tools = tmp_path / "new.lock", tmp_path / "new-ci.txt"
+    new_lock.write_text({"native_hash": full_lock(native_hash="b"),
+                         "native_pin": full_lock().replace("jiter==1 ", "jiter==2 ")}.get(change, full_lock()))
+    new_tools.write_text(tools.read_text().replace("cffi==1 ", "cffi==2 ") if change == "build_tool"
+                         else tools.read_text())
+    job = prior_job(tmp_path, lock_subset_sha256=subset_digests(old, tools))
+    receipt = prep.load_reuse_source(job)
+    work = new_work(tmp_path)
+    report = {**INPUTS, "lock_subset_sha256": subset_digests(new_lock, new_tools)}
+    with pytest.raises(prep.PreparationError, match="reuse_lock_subset_sha256_mismatch"):
+        prep.reuse_native_wheels(work, receipt, report)
+    assert not (work / "pip-cache/wheels").exists()
+
+
+def test_pre_2524_receipt_uses_prior_job_subset_files(tmp_path):
+    job = prior_job(tmp_path, lock_subset_sha256=DROP)
+    receipt = prep.load_reuse_source(job)
+    assert "lock_subset_sha256" not in receipt
+    assert prep.prior_lock_subset_sha256(receipt) == INPUTS["lock_subset_sha256"]
+    report = dict(INPUTS)
+    prep.reuse_native_wheels(new_work(tmp_path), receipt, report)
+    assert report["native_wheels"]["mode"] == "reused"
+
+
+def test_pre_2524_receipt_with_different_subset_file_is_a_mismatch(tmp_path):
+    job = prior_job(tmp_path, lock_subset_sha256=DROP)
+    (job / "native.lock.txt").unlink()
+    prep.private_write(job / "native.lock.txt", NATIVE_SUBSET.replace("jiter==1", "jiter==0"))
+    receipt = prep.load_reuse_source(job)
+    with pytest.raises(prep.PreparationError, match="reuse_lock_subset_sha256_mismatch"):
+        prep.reuse_native_wheels(new_work(tmp_path), receipt, dict(INPUTS))
+
+
+@pytest.mark.parametrize("damage", ["missing", "symlink", "directory", "group_readable", "oversize"])
+@pytest.mark.parametrize("key", ["native", "build-tools"])
+def test_pre_2524_receipt_without_usable_subset_file_fails_closed(tmp_path, damage, key):
+    job = prior_job(tmp_path, lock_subset_sha256=DROP)
+    path = job / f"{key}.lock.txt"
+    original = path.read_text()
+    path.unlink()
+    if damage == "symlink":
+        target = tmp_path / "elsewhere.txt"
+        prep.private_write(target, original)
+        path.symlink_to(target)
+    elif damage == "directory":
+        path.mkdir(mode=0o700)
+    elif damage == "group_readable":
+        path.write_text(original)
+        path.chmod(0o640)
+    elif damage == "oversize":
+        prep.private_write(path, original + "#" * prep.locks.MAX_LOCK_BYTES)
+    receipt = prep.load_reuse_source(job)
+    work = new_work(tmp_path)
+    with pytest.raises(prep.PreparationError, match="reuse_lock_subset_unavailable"):
+        prep.reuse_native_wheels(work, receipt, dict(INPUTS))
+    assert not (work / "pip-cache/wheels").exists()
+
+
+@pytest.mark.parametrize("value", [
+    {"native": "a" * 64}, {"native": "a" * 64, "build-tools": "short"}, "a" * 64, [],
+    {"native": "a" * 64, "build-tools": "b" * 64, "extra": "c" * 64},
+])
+def test_malformed_recorded_subset_digests_fail_closed(tmp_path, value):
+    receipt = prep.load_reuse_source(prior_job(tmp_path, lock_subset_sha256=value))
+    with pytest.raises(prep.PreparationError, match="reuse_lock_subset_unavailable"):
+        prep.reuse_native_wheels(new_work(tmp_path), receipt, dict(INPUTS))
+
+
+def test_lock_sha256_is_evidence_not_a_reuse_key():
+    assert "lock_sha256" not in prep.REUSE_MATCH_FIELDS
+    assert "lock_subset_sha256" in prep.REUSE_MATCH_FIELDS
+    assert prep.LOCK_SUBSET_KEYS == ("build-tools", "native")
+
+
+def _git(repo, *args):
+    import subprocess
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def lock_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "bridge").mkdir(parents=True)
+    (repo / ".github/requirements").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+
+    def commit(lock, tools="".join(pin(n) for n in prep.BUILD_TOOLS)):
+        (repo / "bridge/requirements.lock.txt").write_text(lock)
+        (repo / ".github/requirements/bridge-ci.txt").write_text(tools)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "c", "--allow-empty")
+        return _git(repo, "rev-parse", "HEAD")
+    return repo, commit
+
+
+def test_compare_git_equal_different_and_undecided(lock_repo, capsys):
+    from telegram_bot import termux_lock_subset as locks
+    repo, commit = lock_repo
+    base = commit(full_lock())
+    pure = commit(full_lock(pure_version="2"))
+    native = commit(full_lock(native_hash="b"))
+    tools = commit(full_lock(), "".join(pin(n) for n in prep.BUILD_TOOLS).replace("cffi==1", "cffi==3"))
+    assert locks.main(["--compare-git", str(repo), base, pure]) == 0
+    assert capsys.readouterr().out == "equal\n"
+    assert locks.main(["--compare-git", str(repo), base, native]) == 1
+    assert capsys.readouterr().out == "different\n"
+    assert locks.main(["--compare-git", str(repo), base, tools]) == 1
+    assert capsys.readouterr().out == "different\n"
+    broken = commit("not-a-lock\n")
+    assert locks.main(["--compare-git", str(repo), base, broken]) == 2
+    assert capsys.readouterr().out == "undecided:unsupported_lock_syntax\n"
+    assert locks.main(["--compare-git", str(repo), base, "HEAD"]) == 2
+    assert capsys.readouterr().out == "undecided:invalid_rev\n"
+    assert locks.main(["--compare-git", str(repo), base, "f" * 40]) == 2
+    assert capsys.readouterr().out == "undecided:lock_unreadable_at_rev\n"
+    assert locks.main(["--compare-git", str(repo), base]) == 2
+    assert capsys.readouterr().out == "undecided:usage\n"
+
+
+def test_compare_git_matches_the_job_subset_digests(lock_repo, tmp_path):
+    """The prefilter hashes exactly what prepare() writes and records."""
+    from telegram_bot import termux_lock_subset as locks
+    repo, commit = lock_repo
+    rev = commit(full_lock())
+    assert locks.git_subset_sha256(str(repo), rev) == subset_digests(
+        repo / "bridge/requirements.lock.txt", repo / ".github/requirements/bridge-ci.txt")
+
+
+def test_lock_subset_helper_runs_standalone_from_stdin(lock_repo):
+    """The generation script pipes the target's helper into `python -I -B -`."""
+    import subprocess
+    repo, commit = lock_repo
+    a, b = commit(full_lock()), commit(full_lock(pure_version="9"))
+    helper = Path(prep.__file__).resolve().parent / "termux_lock_subset.py"
+    result = subprocess.run([sys.executable, "-I", "-B", "-", "--compare-git", str(repo), a, b],
+                            input=helper.read_text(), capture_output=True, text=True, cwd=repo)
+    assert (result.returncode, result.stdout) == (0, "equal\n")
 
 
 # --- #2175 B: optional frontend extras constrained to the core freeze -------
