@@ -55,11 +55,23 @@
 #        ~/.claude/self-update.repo, else ~/ccc-node), CCC_TERMUX_CCC_NODE_DIR
 #        (~/.ccc-node), CCC_TERMUX_PYTHON ($PREFIX/bin/python3 — the BASE
 #        interpreter; termux_prepare.py refuses a venv python),
-#        CCC_TERMUX_PREPARE_TIMEOUT (3300 s, passed to the tool),
+#        CCC_TERMUX_PREPARE_TIMEOUT (passed to the tool as --timeout-seconds;
+#        see "Prepare timeout" below), CCC_TERMUX_PREPARE_ENV_FILE,
 #        CCC_TERMUX_PREPARE_JOBS (1), CCC_TERMUX_PREPARE_LOG
 #        (~/.claude/state/termux-prepare.log), CCC_TERMUX_MATRIX_FRONTEND
 #        (1/0 — override the Matrix-frontend detection),
 #        CCC_TERMUX_GENERATIONS_KEEP (2), CCC_TERMUX_PREPARE_PRUNE (1; 0 = off).
+# Prepare timeout (#2487): explicit CCC_TERMUX_PREPARE_TIMEOUT env > the
+#        operator-owned per-node file
+#        ${CCC_TERMUX_PREPARE_ENV_FILE:-${XDG_CONFIG_HOME:-~/.config}/ccc-node/termux-prepare.env}
+#        (0600, `CCC_TERMUX_PREPARE_TIMEOUT=<seconds>`, 1..6900; parsed, never
+#        sourced) > 3300 s. ccc-self-update.sh reads the same file and raises
+#        its prepare-cmd budget to cover it (+300 s). A bad file (owner, mode,
+#        value) is ignored with a warning, never fatal. A slow node needs this
+#        when bridge/requirements.lock.txt changes: no wheel reuse, a full
+#        native build of ~50+ min (a slow node 2026-10-22..26: native-wheels
+#        timeout at 3300 s four ticks in a row). The value and its source
+#        (env/file/default) appear in the dry-run, --status and build lines.
 # Exit:  0 ok (serving or repointed) · 2 usage/precondition · 3 build failed ·
 #        4 receipt not ready or Matrix extra missing · 5 pointer switch failed.
 set -euo pipefail
@@ -70,7 +82,6 @@ PREP="$CN/preparations"
 POINTER="$CN/bridge-current"
 LOGF="${CCC_TERMUX_PREPARE_LOG:-$H/.claude/state/termux-prepare.log}"
 PY="${CCC_TERMUX_PYTHON:-${PREFIX:-/usr}/bin/python3}"
-TIMEOUT_S="${CCC_TERMUX_PREPARE_TIMEOUT:-3300}"
 JOBS="${CCC_TERMUX_PREPARE_JOBS:-1}"
 DRY=0; STATUS=0; TARGET="${CCC_SELF_UPDATE_TARGET_SHA:-}"
 while [ $# -gt 0 ]; do
@@ -88,6 +99,24 @@ ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { mkdir -p "$(dirname "$LOGF")" 2>/dev/null || :; printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOGF" || :; }
 say() { printf 'termux-prepare-generation: %s\n' "$*"; log "$*"; }
 die() { say "$2" >&2; exit "$1"; }
+
+# --- prepare timeout: env > operator file > default (#2487) ------------------
+TIMEOUT_DEFAULT=3300
+if [ -n "${CCC_TERMUX_PREPARE_TIMEOUT:-}" ]; then
+  TIMEOUT_S="$CCC_TERMUX_PREPARE_TIMEOUT"; TIMEOUT_SRC="env"
+else
+  TIMEOUT_S="$TIMEOUT_DEFAULT"; TIMEOUT_SRC=default
+  _paths_lib="$(dirname "${BASH_SOURCE[0]:-$0}")/lib/harness-paths.sh"
+  # shellcheck source=lib/harness-paths.sh
+  if [ -r "$_paths_lib" ] && . "$_paths_lib" && declare -F ccc_termux_prepare_read_env_file >/dev/null; then
+    ccc_termux_prepare_read_env_file
+    for _w in "${CCC_TERMUX_PREPARE_FILE_WARNINGS[@]}"; do say "warning: $_w (timeout falls back to ${TIMEOUT_DEFAULT}s)"; done
+    if [ -n "$CCC_TERMUX_PREPARE_FILE_TIMEOUT" ]; then TIMEOUT_S="$CCC_TERMUX_PREPARE_FILE_TIMEOUT"; TIMEOUT_SRC="file"; fi
+  else
+    say "warning: $_paths_lib unavailable; operator timeout file not read (timeout ${TIMEOUT_DEFAULT}s)"
+  fi
+  unset _paths_lib _w
+fi
 
 resolve_repo() {
   if [ -n "${CCC_SELF_UPDATE_REPO_DIR:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_REPO_DIR"; return; fi
@@ -218,7 +247,7 @@ if [ -L "$POINTER" ] || [ -e "$POINTER" ]; then
 fi
 
 if [ "$STATUS" = 1 ]; then
-  say "repo=$REPO head=$(git -C "$REPO" rev-parse --short HEAD) target=$SHORT serving=${SERVING:-none} serving_head=${SERVING_HEAD:0:7}"
+  say "repo=$REPO head=$(git -C "$REPO" rev-parse --short HEAD) target=$SHORT serving=${SERVING:-none} serving_head=${SERVING_HEAD:0:7} timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC"
   exit 0
 fi
 
@@ -282,14 +311,14 @@ if matrix_frontend_configured; then
   fi
 fi
 if [ "$DRY" = 1 ]; then
-  say "dry-run: would build $(basename "$GEN") from $SERVING_HEAD -> $SHORT reuse=${REUSE[*]:-none} extra=${EXTRA[*]:-none} timeout=${TIMEOUT_S}s"
+  say "dry-run: would build $(basename "$GEN") from $SERVING_HEAD -> $SHORT reuse=${REUSE[*]:-none} extra=${EXTRA[*]:-none} timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC"
   exit 0
 fi
 
 umask 077
 mkdir -p "$PREP" "$GEN"
 chmod 700 "$PREP" "$GEN"
-say "building $(basename "$GEN") (serving $(basename "$SERVING") @${SERVING_HEAD:0:7}; reuse=${REUSE[*]:-none}; extra=${EXTRA[*]:-none})"
+say "building $(basename "$GEN") (serving $(basename "$SERVING") @${SERVING_HEAD:0:7}; reuse=${REUSE[*]:-none}; extra=${EXTRA[*]:-none}; timeout=${TIMEOUT_S}s source=$TIMEOUT_SRC)"
 git -C "$REPO" worktree add --detach "$GEN/source" "$TARGET" >>"$GEN/prepare.log" 2>&1 \
   || die 3 "git worktree add failed (see $GEN/prepare.log)"
 install -m 600 "$SERVING/source/bridge/.env" "$GEN/source/bridge/.env" || die 3 "could not inherit bridge/.env"

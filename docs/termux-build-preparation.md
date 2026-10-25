@@ -181,6 +181,56 @@ wheels built in the job's private pip cache are carried forward by
 `--reuse-wheels-from` like any other cached wheel. The serving gate
 (`prepared_runtime.py`) is unchanged: it never inspected extras.
 
+## Per-node preparation timeout (operator file)
+
+A dependency-lock change (`bridge/requirements.lock.txt`) means no wheel reuse
+(`reuse=none`) and a full native build. A slow Termux node needs ~50+ minutes
+for `native-wheels` alone, more than the `termux-prepare-generation.sh` default
+of 3300 seconds: one slow node stayed on `main-fb17fc4-20261021` from 2026-10-22 to
+2026-10-26 because #2433 (certifi) changed the lock and every daily tick ended
+`native-wheels_timeout` at 3300 s. The reuse rule (only a `ready` receipt with
+an unchanged lock is reused) stays as it is; instead the node's operator
+records a longer budget in one per-node file (#2487):
+
+```bash
+mkdir -p ~/.config/ccc-node
+printf 'CCC_TERMUX_PREPARE_TIMEOUT=6000\n' > ~/.config/ccc-node/termux-prepare.env
+chmod 600 ~/.config/ccc-node/termux-prepare.env
+```
+
+- **Path:** `${XDG_CONFIG_HOME:-~/.config}/ccc-node/termux-prepare.env` (a
+  relative `XDG_CONFIG_HOME` is ignored); `CCC_TERMUX_PREPARE_ENV_FILE`
+  overrides the path.
+- **Format:** `KEY=VALUE` lines, parsed and **never sourced**; blank lines and
+  `#` comments are skipped. Only `CCC_TERMUX_PREPARE_TIMEOUT` is read; other
+  keys are ignored with a warning.
+- **Value:** an integer 1..**6900** seconds. 6900 is self-update's 7200 s
+  prepare-budget maximum minus the 300 s margin that covers the script around
+  the build (worktree, receipt gate, repoint); `termux_prepare.py`'s own limit
+  is two hours.
+- **Fail-safe:** a symlink, a file not owned by the running user, any group or
+  world permission bit, or any invalid `CCC_TERMUX_PREPARE_TIMEOUT` assignment
+  makes the whole file be ignored with a warning; both scripts then use their
+  defaults. An update is never aborted because of this file.
+- **Who reads it:** `scripts/termux-prepare-generation.sh` passes the value as
+  `--timeout-seconds`, and `ccc-self-update.sh` raises its prepare-cmd budget to
+  `value + 300` when that exceeds its 3600 s default (it never lowers it), so the
+  self-update watchdog does not kill a build that is still inside its own
+  timeout. The shared parser is `ccc_termux_prepare_read_env_file` in
+  `scripts/lib/harness-paths.sh`.
+- **Precedence:** explicit environment > file > default, per script: an
+  exported `CCC_TERMUX_PREPARE_TIMEOUT` (e.g. a manual rerun) wins in
+  `termux-prepare-generation.sh`, and an exported
+  `CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS` wins in self-update (it is
+  then not raised from the file). Under self-update prefer the file, which both
+  read.
+- **Where it shows:** the effective value and its source (`env`, `file` or
+  `default`) appear in `termux-prepare-generation.sh --dry-run`, `--status` and
+  its `building …` line, in `ccc-self-update.sh status` (`prepare command:
+  configured (timeout 5700s, source=file, termux_prepare_timeout=5400s)`), in
+  the `prepare begin timeout=… source=…` log line and, on failure, in the
+  audit record's `prepare_budget_source`.
+
 ## Time, disk and receipts
 
 One shared command deadline (maximum two hours) covers tool checks, builds,

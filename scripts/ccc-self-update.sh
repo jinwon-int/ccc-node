@@ -109,7 +109,9 @@
 #      restored); 15 = prepare-cmd failed (#2207): the
 #      runtime-preparation command (self-update.prepare-cmd, e.g. a Termux
 #      prepared-generation build) exited non-zero or hit
-#      CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS (3600, max 7200) —
+#      CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS (3600, max 7200;
+#      without it the budget is raised to the operator file's
+#      CCC_TERMUX_PREPARE_TIMEOUT + 300 s, #2487) —
 #      nothing was restarted, the previous generation keeps serving;
 #      14 = activation incomplete (#1527): the installed generation
 #      was never verified active — a pending-activation record exists (or its
@@ -158,8 +160,17 @@ HEALTH_CMD_FILE="${CCC_SELF_UPDATE_HEALTH_CMD_FILE:-$CLAUDE_DIR/self-update.heal
 # skips every restart so the old generation keeps serving, records a
 # `prepare-failed` pending activation and exits 15. Ships with
 # scripts/termux-prepare-generation.sh as the Termux implementation.
+# Budget precedence (#2487): explicit CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS
+# > the operator-owned per-node termux-prepare.env (its CCC_TERMUX_PREPARE_TIMEOUT
+# + 300 s, when that exceeds the default; the same file termux-prepare-generation.sh
+# reads, see ccc_termux_prepare_read_env_file in lib/harness-paths.sh) > 3600 s.
 PREPARE_CMD_FILE="${CCC_SELF_UPDATE_PREPARE_CMD_FILE:-$CLAUDE_DIR/self-update.prepare-cmd}"
-PREPARE_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS:-3600}"
+PREPARE_COMMAND_TIMEOUT_DEFAULT=3600
+PREPARE_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS:-$PREPARE_COMMAND_TIMEOUT_DEFAULT}"
+PREPARE_BUDGET_SOURCE=default
+[ -n "${CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS:-}" ] && PREPARE_BUDGET_SOURCE="env"
+PREPARE_BUDGET_NOTE=""
+PREPARE_BUDGET_WARNINGS=()
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
 RESTART_COMMAND_TIMEOUT_DEFAULT=180
 if [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; then
@@ -233,6 +244,22 @@ KEEP_INSTALL_SNAPSHOT=0
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOG" || :; }
 say() { printf '%s\n' "$*"; }
+
+# Operator file → prepare budget (#2487). Never fatal: a missing helper or a
+# bad file leaves the default; the warnings are reported by `status` and at
+# `prepare begin`.
+if [ "$PREPARE_BUDGET_SOURCE" = default ] && declare -F ccc_termux_prepare_read_env_file >/dev/null; then
+  ccc_termux_prepare_read_env_file
+  PREPARE_BUDGET_WARNINGS=("${CCC_TERMUX_PREPARE_FILE_WARNINGS[@]}")
+  if [ -n "$CCC_TERMUX_PREPARE_FILE_TIMEOUT" ]; then
+    PREPARE_BUDGET_NOTE="termux_prepare_timeout=${CCC_TERMUX_PREPARE_FILE_TIMEOUT}s"
+    _need=$((CCC_TERMUX_PREPARE_FILE_TIMEOUT + CCC_TERMUX_PREPARE_BUDGET_MARGIN))
+    if [ "$_need" -gt "$PREPARE_COMMAND_TIMEOUT_SECONDS" ]; then
+      PREPARE_COMMAND_TIMEOUT_SECONDS="$_need"; PREPARE_BUDGET_SOURCE="file"
+    fi
+    unset _need
+  fi
+fi
 
 # --- lock inspection (#1945) --------------------------------------------------
 # The lock contract is a DIRECTORY created with mkdir. An external serializer
@@ -835,7 +862,8 @@ if [ "$MODE" = "status" ]; then
   say "lock: $(lock_status)"
   say "services file: $SERVICES_FILE $([ -f "$SERVICES_FILE" ] && echo "($(grep -cv '^[[:space:]]*\(#\|$\)' "$SERVICES_FILE" 2>/dev/null || true) services)" || echo '(missing)')"
   say "external restart command timeout: ${RESTART_COMMAND_TIMEOUT_SECONDS}s"
-  say "prepare command: $(resolve_prepare_cmd >/dev/null 2>&1 && echo "configured (timeout ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)" || echo none)"
+  say "prepare command: $(resolve_prepare_cmd >/dev/null 2>&1 && echo "configured (timeout ${PREPARE_COMMAND_TIMEOUT_SECONDS}s, source=${PREPARE_BUDGET_SOURCE}${PREPARE_BUDGET_NOTE:+, $PREPARE_BUDGET_NOTE})" || echo none)"
+  for _w in "${PREPARE_BUDGET_WARNINGS[@]}"; do say "prepare budget warning: $_w (budget stays ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)"; done
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
   say "installed A2A handler refresh: $([ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ] && echo "disabled (CCC_SELF_UPDATE_A2A_HANDLERS=0)" || echo "enabled (existing copies only)")"
   pending_rc=0
@@ -870,7 +898,8 @@ if [[ ! "$RESTART_COMMAND_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$RESTAR
   exit 2
 fi
 # The prepare budget is separate: a native wheel build on Termux can take up
-# to ~1 h. It is still shorter than the 2 h cap so one tick cannot run away.
+# to ~1 h (a slow node more: the operator file raises it, #2487). It is still
+# capped at 2 h so one tick cannot run away; the file's 6900 s cap + 300 s fits.
 if [[ ! "$PREPARE_COMMAND_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$PREPARE_COMMAND_TIMEOUT_SECONDS" -gt 7200 ]; then
   say "self-update: CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS must be an integer in 1..7200" >&2
   exit 2
@@ -1925,7 +1954,8 @@ a2a_handlers_tick changed
 PREPARE_JSON='[]'
 if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && pcmd="$(resolve_prepare_cmd)"; then
   prepare_started=$SECONDS
-  log "prepare begin timeout=${PREPARE_COMMAND_TIMEOUT_SECONDS}s target=$NEW_SHA"
+  for _w in "${PREPARE_BUDGET_WARNINGS[@]}"; do log "prepare budget warning: $_w (budget stays ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)"; done
+  log "prepare begin timeout=${PREPARE_COMMAND_TIMEOUT_SECONDS}s source=${PREPARE_BUDGET_SOURCE}${PREPARE_BUDGET_NOTE:+ $PREPARE_BUDGET_NOTE} target=$NEW_SHA"
   prepare_rc=0
   CCC_SELF_UPDATE_TARGET_SHA="$NEW_SHA" CCC_SELF_UPDATE_PREVIOUS_SHA="$OLD_SHA" CCC_SELF_UPDATE_REPO_DIR="$REPO" \
     run_bounded_operator_cmd "$PREPARE_COMMAND_TIMEOUT_SECONDS" "$pcmd" || prepare_rc=$?
@@ -1936,7 +1966,7 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && pcmd="$(resolve_prepare
     KEEP_INSTALL_SNAPSHOT=1
     write_pending_activation "prepare-failed" "$PREPARE_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
     audit "prepare-failed" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$PREPARE_JSON" \
-      "$(jq -nc --argjson rc "$prepare_rc" --argjson budget "$PREPARE_COMMAND_TIMEOUT_SECONDS" '{prepare_exit:$rc, prepare_budget_seconds:$budget}')"
+      "$(jq -nc --argjson rc "$prepare_rc" --argjson budget "$PREPARE_COMMAND_TIMEOUT_SECONDS" --arg src "$PREPARE_BUDGET_SOURCE" '{prepare_exit:$rc, prepare_budget_seconds:$budget, prepare_budget_source:$src}')"
     log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=prepare-failure"
     notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 런타임 준비 명령(prepare-cmd)이 실패해(rc=${prepare_rc}) 재시작을 건너뜁니다. 이전 세대가 계속 서빙되며 롤백 자료는 ${INSTALL_SNAPSHOT_DIR}에 있습니다. ~/.claude/state/self-update.log 확인 필요." "prepare-fail-$NEW_SHA"
     say "self-update: prepare command failed (rc=$prepare_rc); restarts skipped, previous generation keeps serving; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2

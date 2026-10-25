@@ -17,6 +17,7 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 export HOME="$TMP/home"; mkdir -p "$HOME/.claude/state"
 unset CCC_SELF_UPDATE_TARGET_SHA CCC_SELF_UPDATE_REPO_DIR CCC_TERMUX_CCC_NODE_DIR CCC_TERMUX_PYTHON
 unset CCC_TERMUX_PREPARE_TIMEOUT CCC_TERMUX_PREPARE_JOBS CCC_TERMUX_PREPARE_LOG PREFIX
+unset CCC_TERMUX_PREPARE_ENV_FILE XDG_CONFIG_HOME   # the operator file resolves under the fixture HOME
 
 # --- fixture checkout: A (serving) -> B (same lock) -> C (lock changed) -> D ---
 REPO="$HOME/ccc-node"
@@ -86,6 +87,7 @@ ok "new generation built and pointer moved" '[ "$rc" = 0 ] && [ -n "$NEWGEN" ] &
 ok "source worktree is at the target" '[ "$(git -C "$NEWGEN/source" rev-parse HEAD)" = "$B" ]'
 ok "build reused the serving generation native wheels (lock unchanged)" 'grep -q -- "--reuse-wheels-from $SERV/job" "$FAKE_CALLS"'
 ok "build passed --verify-reinstall and the job dir" 'grep -q -- "--work-dir $NEWGEN/job --verify-reinstall" "$FAKE_CALLS"'
+ok "no operator file: the tool gets the 3300s default" 'grep -q -- "--timeout-seconds 3300 " "$FAKE_CALLS" && grep -q "timeout=3300s source=default" <<<"$out"'
 ok ".env inherited from the serving generation, owner-only" '[ "$(stat -c %a "$NEWGEN/source/bridge/.env")" = 600 ] && grep -q secret-token-marker "$NEWGEN/source/bridge/.env"'
 ok "previous pointer recorded" 'compgen -G "$CN/bridge-current.prev-*" >/dev/null && grep -q "$(basename "$SERV")" "$CN"/bridge-current.prev-*'
 ok "generation dir is owner-private" '[ "$(stat -c %a "$NEWGEN")" = 700 ]'
@@ -124,6 +126,57 @@ out="$(run --dry-run)"; rc=$?
 ok "dry-run reports the plan only" '[ "$rc" = 0 ] && grep -q "dry-run: would build" <<<"$out" && [ "$(wc -l < "$FAKE_CALLS")" = "$calls_before" ] && [ "$(readlink "$CN/bridge-current")" = "$ptr_before" ]'
 out="$(run --status)"; rc=$?
 ok "status prints serving and target heads" '[ "$rc" = 0 ] && grep -q "serving_head=${D:0:7}" <<<"$out"'
+
+# 7b) operator-owned per-node prepare timeout file (#2487): env > file > default.
+#     A bad file is ignored with a warning (never fatal, never sourced).
+OPF="$HOME/.config/ccc-node/termux-prepare.env"; mkdir -p "$(dirname "$OPF")"
+opfile() { rm -f "$OPF"; printf '%s\n' "$@" > "$OPF"; chmod 600 "$OPF"; }
+dry() { run --dry-run; }
+out="$(dry)"
+ok "no operator file: default 3300s, source=default, no warning" 'grep -q "timeout=3300s source=default" <<<"$out" && ! grep -q warning <<<"$out"'
+opfile '# slow node: full native build ~50 min' '' '  CCC_TERMUX_PREPARE_TIMEOUT=5400  '
+out="$(dry)"
+ok "valid 0600 file: its value is used, source=file" 'grep -q "timeout=5400s source=file" <<<"$out" && ! grep -q warning <<<"$out"'
+out="$(run --status)"
+ok "--status reports the effective timeout and source" 'grep -q "timeout=5400s source=file" <<<"$out"'
+out="$(CCC_TERMUX_PREPARE_TIMEOUT=4000 dry)"
+ok "explicit env overrides the file" 'grep -q "timeout=4000s source=env" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=6900'
+ok "the 6900s cap itself is accepted" 'out="$(dry)"; grep -q "timeout=6900s source=file" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=6901'
+out="$(dry)"; rc=$?
+ok "too large (6901): default + warning, not fatal" '[ "$rc" = 0 ] && grep -q "timeout=3300s source=default" <<<"$out" && grep -q "warning: .*not an integer in 1..6900; file ignored" <<<"$out"'
+for bad in 0 -5 1h 3600s "" 99999999; do
+  opfile "CCC_TERMUX_PREPARE_TIMEOUT=$bad"
+  ok "invalid value '$bad': default + warning" 'out="$(dry)"; grep -q "timeout=3300s source=default" <<<"$out" && grep -q "warning: .*CCC_TERMUX_PREPARE_TIMEOUT" <<<"$out"'
+done
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=5400' 'CCC_TERMUX_PREPARE_TIMEOUT=abc'
+ok "any invalid assignment voids the file (no partial trust)" 'out="$(dry)"; grep -q "timeout=3300s source=default" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=$(touch '"$TMP"'/pwned)' "touch $TMP/pwned2" 'CCC_TERMUX_PREPARE_JOBS=2'
+out="$(dry)"
+ok "the file is parsed, never sourced or executed" '[ ! -e "$TMP/pwned" ] && [ ! -e "$TMP/pwned2" ] && grep -q "timeout=3300s source=default" <<<"$out" && grep -q "is not KEY=VALUE" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=5400' 'OTHER_KEY=1'
+out="$(dry)"
+ok "an unsupported key is ignored with a warning; the timeout still applies" 'grep -q "timeout=5400s source=file" <<<"$out" && grep -q "unsupported key OTHER_KEY" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=5400'
+for m in 644 640 604 660 606; do
+  chmod "$m" "$OPF"
+  ok "mode $m (group/world bits): default + warning" 'out="$(dry)"; grep -q "timeout=3300s source=default" <<<"$out" && grep -q "has mode $m (group/world access)" <<<"$out"'
+done
+chmod 400 "$OPF"
+ok "owner read-only 0400 is accepted" 'out="$(dry)"; grep -q "timeout=5400s source=file" <<<"$out"'
+chmod 600 "$OPF"
+STATBIN="$TMP/statbin"; mkdir -p "$STATBIN"
+printf '#!/usr/bin/env bash\necho "%s 600"\n' "$(( $(id -u) + 4242 ))" > "$STATBIN/stat"; chmod +x "$STATBIN/stat"
+ok "a file owned by another uid: default + warning" 'out="$(PATH="$STATBIN:$PATH" dry)"; grep -q "timeout=3300s source=default" <<<"$out" && grep -q "is owned by uid" <<<"$out"'
+mv "$OPF" "$TMP/real-termux-prepare.env"; ln -s "$TMP/real-termux-prepare.env" "$OPF"
+ok "a symlinked file is refused: default + warning" 'out="$(dry)"; grep -q "timeout=3300s source=default" <<<"$out" && grep -q "not a regular file" <<<"$out"'
+rm -f "$OPF"
+mkdir -p "$TMP/xdg/ccc-node"; printf 'CCC_TERMUX_PREPARE_TIMEOUT=4500\n' > "$TMP/xdg/ccc-node/termux-prepare.env"; chmod 600 "$TMP/xdg/ccc-node/termux-prepare.env"
+ok "XDG_CONFIG_HOME is respected" 'out="$(XDG_CONFIG_HOME="$TMP/xdg" dry)"; grep -q "timeout=4500s source=file" <<<"$out"'
+ok "a relative XDG_CONFIG_HOME is ignored (falls back to ~/.config)" 'out="$(XDG_CONFIG_HOME=rel dry)"; grep -q "timeout=3300s source=default" <<<"$out"'
+ok "CCC_TERMUX_PREPARE_ENV_FILE overrides the path" 'out="$(CCC_TERMUX_PREPARE_ENV_FILE="$TMP/xdg/ccc-node/termux-prepare.env" dry)"; grep -q "timeout=4500s source=file" <<<"$out"'
+ok "the operator file never moved the pointer or built anything" '[ "$(wc -l < "$FAKE_CALLS")" = "$calls_before" ] && [ "$(readlink "$CN/bridge-current")" = "$ptr_before" ]'
 
 # 8) explicit target env (as self-update passes it) and precondition failures
 out="$(CCC_SELF_UPDATE_TARGET_SHA=deadbeef run)"; rc=$?
@@ -174,8 +227,11 @@ out="$(VIRTUAL_ENV="$TMP/venv" PYTHONPATH=/x/site PATH="$TMP/venv/bin:$PREP/main
 ok "termux_prepare.py runs with VIRTUAL_ENV/PYTHONPATH unset" '[ "$rc" = 0 ] && grep -q "^VIRTUAL_ENV=unset PYTHONPATH=unset " "$FAKE_CALLS.env"'
 ok "venv and generation runtime bin entries are dropped from PATH, the rest is kept" '! grep -q "$TMP/venv/bin" "$FAKE_CALLS.env" && ! grep -q "/preparations/" "$FAKE_CALLS.env" && grep -q "PATH=.*/bin" "$FAKE_CALLS.env"'
 echo k > "$REPO/k.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm K
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=5400'
 out="$(CCC_TERMUX_PREPARE_PATH="/only/this:$FAKEBIN:/usr/bin:/bin" run)"; rc=$?
+rm -f "$OPF"
 ok "CCC_TERMUX_PREPARE_PATH replaces the build PATH verbatim" '[ "$rc" = 0 ] && grep -q "PATH=/only/this:$FAKEBIN:/usr/bin:/bin$" "$FAKE_CALLS.env"'
+ok "a real build passes the operator file value as --timeout-seconds" 'tail -1 "$FAKE_CALLS" | grep -q -- "--timeout-seconds 5400 " && grep -q "timeout=5400s source=file" <<<"$out"'
 
 # 12) prune (#2362): serving, newest N rollback targets, live, <24h and
 #     hand-made generations survive; only old script-built ones go.
