@@ -48,6 +48,7 @@ A2A 태스크를 claim하면 업무량에 맞춰 소환(예산 0–3, 하드캡 
 - `~/.claude/hooks/phone-adb.sh <ssh-host> <adb 인자…>` — 폰 자체 adb 서버로 ssh 터널(폰에 노드별 키 허용 불필요). 예: `phone-adb.sh <host> shell getprop ro.product.model`
 - 로컬 adb 없으면 ssh 모드(shell류만, push/pull/install 거부). `--status` · `--close` · `--serial S`
 - 직접 `adb connect <폰>:5555` 금지 — 미허용 키가 폰 화면에 허용 요청을 남김
+- 안드로이드 Chrome MCP: `claude mcp add -s user android-browser -- ~/.claude/hooks/phone-browser-mcp.sh <ssh-host>` (폰 USB 디버깅 ON 필요, 화면 꺼지면 스크린샷 멈춤). 로그인 불필요 작업은 `new_page` `isolatedContext` 사용
 
 ## GitHub (PR-first)
 - 생성: `gh pr create --repo <owner/repo> --base main --head <branch> --title .. --body ..`
