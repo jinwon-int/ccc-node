@@ -178,6 +178,13 @@ out="$(env "${stage_env[@]}" python3 "$PROMOTER" export --limit 1)"; rc=$?
 transport_id="$(jq -r '.envelopes[0].transport_id' <<<"$out")"
 ok "read-only export returns a hash-verified envelope" \
   '[ "$rc" = 0 ] && jq -e ".mode == \"export-read-only\" and .envelopes[0].node == \"testnode\" and (.envelopes[0].files[0].content_b64 | length > 20)" >/dev/null <<<"$out"'
+# The collect dials remotes with `export --limit min(share, max_prs)`; max_prs
+# accepts 1-8, so export must too (a {1,2,3} range made every remote exit 2 → command_failed).
+out="$(env "${stage_env[@]}" python3 "$PROMOTER" export --limit 8)"; rc=$?
+ok "export accepts --limit up to the max_prs ceiling (8)" \
+  '[ "$rc" = 0 ] && jq -e ".mode == \"export-read-only\"" >/dev/null <<<"$out"'
+env "${stage_env[@]}" python3 "$PROMOTER" export --limit 9 >/dev/null 2>&1; rc=$?
+ok "export rejects --limit above the max_prs ceiling" '[ "$rc" = 2 ]'
 
 # Existing private repository scaffold; raw intake will be written only on a branch.
 SEED="$TMP/seed"
@@ -428,6 +435,20 @@ out="$(env "${usage_env[@]}" python3 "$PROMOTER" run --dry-run)"; rc=$?
 ok "#2239 L1: a Read-only row is not use → still blocked" \
   '[ "$rc" = 0 ] && jq -e ".staged == [] and .blocked[0].code == \"usage_unproven\" and .blocked[0].uses == 0" >/dev/null <<<"$out"'
 printf '%s\n' '{"ts":"2026-10-20T00:00:00Z","skill":"unproven-skill","tool":"Skill","runtime":"claude"}' > "$USAGE_LEDGER"
+# Installed layout (setup.sh: scripts/ccc-skill-promotion.py -> $CLAUDE_DIR/hooks/,
+# claude/hooks/skill-review/ -> $CLAUDE_DIR/hooks/skill-review/). The repo-path-only
+# curator lookup failed every installed node with curator_module_unavailable.
+INSTALLED_HOOKS="$TMP/installed-claude/hooks"
+mkdir -p "$INSTALLED_HOOKS"
+cp "$PROMOTER" "$INSTALLED_HOOKS/ccc-skill-promotion.py"
+cp -R "$HERE/../claude/hooks/skill-review" "$INSTALLED_HOOKS/skill-review"
+out="$(env "${usage_env[@]}" python3 "$INSTALLED_HOOKS/ccc-skill-promotion.py" run --dry-run)"; rc=$?
+ok "#2239 L1: installed layout finds hooks/skill-review/curator.py → staged" \
+  '[ "$rc" = 0 ] && jq -e ".staged[0].name == \"unproven-skill\"" >/dev/null <<<"$out"'
+rm -f "$INSTALLED_HOOKS/skill-review/curator.py"
+out="$(env "${usage_env[@]}" python3 "$INSTALLED_HOOKS/ccc-skill-promotion.py" run --dry-run 2>/dev/null)"; rc=$?
+ok "#2239 L1: no curator in either layout still fails closed" \
+  '[ "$rc" != 0 ] && jq -e ".code == \"curator_module_unavailable\"" >/dev/null <<<"$out"'
 out="$(env "${usage_env[@]}" CCC_SKILL_PROMOTION_MIN_SKILL_USES=2 python3 "$PROMOTER" run --dry-run)"; rc=$?
 ok "#2239 L1: MIN_SKILL_USES=2 with one use → blocked with uses == 1" \
   '[ "$rc" = 0 ] && jq -e ".staged == [] and .blocked[0].code == \"usage_unproven\" and .blocked[0].uses == 1" >/dev/null <<<"$out"'
