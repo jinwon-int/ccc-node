@@ -91,10 +91,15 @@ chmod 700 "$TMP/install-nunchi"
 cat > "$home/.claude/hooks/nunchi/mempalace-refresh.sh" <<'SH'
 #!/usr/bin/env bash
 mkdir -p "$HOME/.nunchi"
+# Mirrors the real exit-0-without-running paths (#2511): nunchi mode off, and
+# another refresh holding the single-writer lock (CCC_TEST_REFRESH_SKIP=1).
+[ "$(cat "$HOME/.claude/state/nunchi.mode" 2>/dev/null || true)" = on ] || exit 0
+[ "${CCC_TEST_REFRESH_SKIP:-0}" = 1 ] && exit 0
 rc="${CCC_TEST_REFRESH_RC:-0}"
-state=ok
+state="${CCC_TEST_REFRESH_STATE:-ok}"
 [ "$rc" = 0 ] || state=error
-printf '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"%s","state":"%s","exit_code":%s,"started_at":1,"finished_at":2}\n' "$1" "$state" "$rc" > "$HOME/.nunchi/mempalace-refresh.status.json"
+now="$(date +%s)"
+printf '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"%s","state":"%s","exit_code":%s,"started_at":%s,"finished_at":%s}\n' "$1" "$state" "$rc" "$now" "$now" > "$HOME/.nunchi/mempalace-refresh.status.json"
 exit "$rc"
 SH
 chmod 700 "$home/.claude/hooks/nunchi/mempalace-refresh.sh"
@@ -185,7 +190,35 @@ ok "repeat apply is idempotent and does not create another container" \
 
 out="$(run_install --status --json --codex 2>&1)"; rc=$?
 ok "JSON status is body-free and reports the managed topology" \
-  '[ "$rc" = 0 ] && jq -e '\'' .schema == "ccc.termux-mempalace.status.v1" and .container == "ccc-mempalace" and .backend == "sqlite_exact" and .source_files == 1 and .drawer_count == 1 and .palace_integrity == "ok" and .refresh_finished_at == 2 and .source_latest_mtime > 0 '\'' <<<"$out" >/dev/null && ! grep -q "literal;\|rollout one\|TEST_BODY_MUST_NOT_LEAK" <<<"$out"'
+  '[ "$rc" = 0 ] && jq -e '\'' .schema == "ccc.termux-mempalace.status.v1" and .container == "ccc-mempalace" and .backend == "sqlite_exact" and .source_files == 1 and .drawer_count == 1 and .palace_integrity == "ok" and .refresh_finished_at > 2 and .source_latest_mtime > 0 '\'' <<<"$out" >/dev/null && ! grep -q "literal;\|rollout one\|TEST_BODY_MUST_NOT_LEAK" <<<"$out"'
+
+# #2511: exit 0 from the refresh is not "completed". The installer reads the
+# refresh's own status record and reports what actually ran; metadata state
+# stays "ready" (ccc_memory_probe requires it) with an initial_refresh field.
+meta_json="$home/.nunchi/termux-mempalace/status.json"
+refresh_status="$home/.nunchi/mempalace-refresh.status.json"
+ok "a refresh that ran for this install is reported as completed" \
+  'jq -e '\'' .state == "ready" and .initial_refresh == "ok" '\'' "$meta_json" >/dev/null'
+busy_started=$(( $(date +%s) - 600 ))
+printf '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"running","exit_code":-1,"started_at":%s,"finished_at":0}\n' "$busy_started" > "$refresh_status"
+out="$(CCC_TEST_REFRESH_SKIP=1 run_install --apply --codex 2>&1)"; rc=$?
+ok "a refresh skipped behind another refresh's lock is not reported as completed" \
+  '[ "$rc" = 0 ] && grep -q "initial refresh skipped: another MemPalace refresh started before this install still holds the lock" <<<"$out" && ! grep -q "initial refresh completed" <<<"$out" && jq -e '\'' .enabled == true and .state == "ready" and .initial_refresh == "skipped-busy" '\'' "$meta_json" >/dev/null && jq -e --argjson s "$busy_started" '\'' .state == "running" and .started_at == $s '\'' "$refresh_status" >/dev/null'
+printf '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":%s,"finished_at":%s}\n' "$busy_started" "$busy_started" > "$refresh_status"
+out="$(CCC_TEST_REFRESH_SKIP=1 run_install --apply --codex 2>&1)"; rc=$?
+ok "an older ok status does not stand in for a refresh this install never ran" \
+  '[ "$rc" = 0 ] && grep -q "initial refresh not confirmed" <<<"$out" && ! grep -q "initial refresh completed" <<<"$out" && jq -e '\'' .initial_refresh == "unverified" '\'' "$meta_json" >/dev/null'
+out="$(CCC_TEST_REFRESH_STATE=degraded run_install --apply --codex 2>&1)"; rc=$?
+ok "a degraded initial refresh is reported as degraded" \
+  '[ "$rc" = 0 ] && grep -q "initial refresh reported degraded" <<<"$out" && ! grep -q "initial refresh completed" <<<"$out" && jq -e '\'' .initial_refresh == "degraded" '\'' "$meta_json" >/dev/null'
+printf off > "$home/.claude/state/nunchi.mode"
+out="$(run_install --apply --codex 2>&1)"; rc=$?
+printf on > "$home/.claude/state/nunchi.mode"
+ok "a refresh skipped because nunchi mode is off is reported as skipped" \
+  '[ "$rc" = 0 ] && grep -q "initial refresh skipped: nunchi mode is not on" <<<"$out" && ! grep -q "initial refresh completed" <<<"$out" && jq -e '\'' .initial_refresh == "skipped-mode-off" '\'' "$meta_json" >/dev/null'
+out="$(run_install --apply --codex 2>&1)"; rc=$?
+ok "a later apply whose refresh runs reports completed again" \
+  '[ "$rc" = 0 ] && grep -q "initial refresh completed" <<<"$out" && jq -e '\'' .initial_refresh == "ok" '\'' "$meta_json" >/dev/null'
 
 printf '%s\n' \
   '*/10 * * * * feed # nunchi:#816' \
