@@ -296,6 +296,41 @@ out="$(HOME="$probe_home" PREFIX="$termux_prefix" \
   bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check recognizes the managed Termux sqlite_exact palace" \
   '[ "$rc" = 0 ] && jq -e '\'' .nunchi.status == "ok" and .mempalace.status == "ok" and .mempalace.backend == "sqlite_exact" and .mempalace.integrity == "ok" and .mempalace.embeddings == 2 and .mempalace.index == {status:"ok",sqlite_count:2,hnsw_count:2,divergence:0} '\'' >/dev/null <<<"$out" && ! grep -q "PROBE_TERMUX_SECRET" <<<"$out"'
+# #2514: the installer records its own pin in the metadata, so a node upgraded
+# to the current pin must still read ok, and an unmanaged version fails closed.
+termux_meta_version() { # <version>
+  printf '{"schema":"ccc.termux-mempalace.install.v1","enabled":true,"provider":"codex","source":"/redacted","state":"ready","container":"ccc-mempalace","version":"%s","updated_at":190}\n' "$1" > "$termux_meta"
+  chmod 600 "$termux_meta"
+}
+termux_check() {
+  HOME="$probe_home" PREFIX="$termux_prefix" \
+    CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+    CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" \
+    bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
+}
+termux_meta_version 3.11.0
+out="$(termux_check)"; rc=$?
+ok "memory check accepts Termux metadata on the installer's current 3.11.0 pin" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "ok" and .mempalace.integrity == "ok" and .mempalace.embeddings == 2 '\'' >/dev/null <<<"$out"'
+termux_meta_version 9.9.9
+out="$(termux_check)"; rc=$?
+ok "memory check fails a Termux metadata version the installer never managed closed" \
+  'jq -e '\'' .mempalace.integrity == "error" and .mempalace.palace_exists == false '\'' >/dev/null <<<"$out"'
+termux_meta_version 3.10.0
+pins="$(sed -n -e 's/^version="\${CCC_TERMUX_MEMPALACE_VERSION:-\([^}]*\)}"$/\1/p' \
+  -e 's/^upgradable_from="\([^"]*\)"$/\1/p' "$ROOT/scripts/install-termux-mempalace.sh" | tr '\n' ' ')"
+# shellcheck disable=SC2034,SC2086 # read via ok/eval; $pins is a space-separated version list
+probe_missing="$(PROBE_PY="$ROOT/scripts/ccc_memory_probe.py" python3 - $pins <<'PY' 2>&1
+import importlib.util, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["PROBE_PY"]))
+spec = importlib.util.spec_from_file_location("ccc_memory_probe", os.environ["PROBE_PY"])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+print("ok:" + " ".join(v for v in sys.argv[1:] if v not in mod.TERMUX_MEMPALACE_VERSIONS))
+PY
+)"
+ok "the probe accepts every MemPalace pin the Termux installer manages (current + upgradable_from)" \
+  '[ "$(wc -w <<<"$pins")" -ge 2 ] && [ "$probe_missing" = "ok:" ]'
 printf '%s\n' 'not the managed marker' > "$termux_base/.ccc-node-managed"
 out="$(HOME="$probe_home" PREFIX="$termux_prefix" \
   CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
