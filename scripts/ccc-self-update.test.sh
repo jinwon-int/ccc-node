@@ -58,6 +58,9 @@ export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$TMP/no-such-serving-health.json"
 # And for the installed A2A handler refresh (#2357): never inspect or rewrite
 # the node's real /usr/local/sbin copies. The #2357 section also overrides HOME.
 export CCC_A2A_HANDLER_SYSTEM_DEST="$TMP/no-such-sbin"
+# And for the operator-owned Termux prepare budget file (#2487): never read the
+# node's real ~/.config/ccc-node/termux-prepare.env.
+export CCC_TERMUX_PREPARE_ENV_FILE="$TMP/no-such-termux-prepare.env"
 
 # Fixture: origin repo with a stub setup.sh, plus a node-side clone.
 ORIGIN="$TMP/origin.git"
@@ -1737,7 +1740,7 @@ SEQ="$TMP/prepare-seq.log"; : > "$SEQ"
 printf 'echo "prepare target=$CCC_SELF_UPDATE_TARGET_SHA prev=$CCC_SELF_UPDATE_PREVIOUS_SHA repo=$CCC_SELF_UPDATE_REPO_DIR" >> %s\n' "$SEQ" > "$CLAUDE/self-update.prepare-cmd"
 printf 'echo restart >> %s\n' "$SEQ" > "$CLAUDE/self-update.restart-cmd"
 out="$(run_selfup status 2>&1)"
-ok "status names the configured prepare command and its budget" 'grep -q "prepare command: configured (timeout 3600s)" <<<"$out"'
+ok "status names the configured prepare command and its budget" 'grep -q "prepare command: configured (timeout 3600s, source=default)" <<<"$out"'
 bump2142 prepare-ok
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "prepare-cmd runs before the external restart and the tick exits 0" \
@@ -1754,7 +1757,7 @@ bump2142 prepare-fail
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "failing prepare-cmd exits 15 and restarts nothing" '[ "$rc" = 15 ] && ! grep -q restart "$SEQ" && grep -q "prepare command failed (rc=3)" <<<"$out"'
 ok "prepare failure is audited with its exit code and budget" \
-  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"prepare-failed\" and .prepare_exit == 3 and .prepare_budget_seconds == 3600 and .services[0].name == \"prepare\" and .services[0].ok == false" >/dev/null'
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"prepare-failed\" and .prepare_exit == 3 and .prepare_budget_seconds == 3600 and .prepare_budget_source == \"default\" and .services[0].name == \"prepare\" and .services[0].ok == false" >/dev/null'
 ok "prepare failure leaves a pending activation and the recovery snapshot" \
   '[ "$(jq -r .outcome "$STATE/self-update.pending-activation.json")" = prepare-failed ] && compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 ok "prepare failure notifies the owner naming prepare-cmd" 'grep -rh "prepare-cmd" "$TMP/spool" >/dev/null 2>&1'
@@ -1769,6 +1772,52 @@ out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=9999 run_selfup run 2>&1)
 ok "prepare budget above 7200s is refused by run" '[ "$rc" = 2 ] && grep -q "1..7200" <<<"$out" && [ "$(git -C "$REPO" rev-parse HEAD)" = "$budget_head" ]'
 rm -f "$CLAUDE/self-update.prepare-cmd" "$CLAUDE/self-update.restart-cmd" "$STATE/self-update.pending-activation.json"
 rm -rf "$STATE"/self-update-install-rollback.*
+
+# --- #2487: one operator-owned per-node prepare timeout file for both scripts --
+# The prepare-cmd is the real termux-prepare-generation.sh (--status, read-only,
+# fixture state dirs), so the test proves both scripts read the same value:
+# the tool timeout T from the file, the self-update budget max(3600, T+300).
+OPF="$TMP/termux-prepare-2487.env"
+export CCC_TERMUX_PREPARE_ENV_FILE="$OPF"
+opfile() { rm -f "$OPF"; printf '%s\n' "$@" > "$OPF"; chmod 600 "$OPF"; }
+: > "$SEQ"
+printf 'CCC_TERMUX_PREPARE_LOG=%s CCC_TERMUX_CCC_NODE_DIR=%s bash %s --status >> %s 2>&1\n' \
+  "$TMP/tp2487.log" "$TMP/tp2487-cn" "$ROOT/scripts/termux-prepare-generation.sh" "$SEQ" > "$CLAUDE/self-update.prepare-cmd"
+printf 'echo restart >> %s\n' "$SEQ" > "$CLAUDE/self-update.restart-cmd"
+out="$(run_selfup status 2>&1)"
+ok "no operator file: default budget, no warning" 'grep -q "prepare command: configured (timeout 3600s, source=default)" <<<"$out" && ! grep -q "prepare budget warning" <<<"$out"'
+opfile '# slow node: full native build ~50 min' 'CCC_TERMUX_PREPARE_TIMEOUT=5400'
+out="$(run_selfup status 2>&1)"
+ok "valid file raises the budget to value+300, source=file" 'grep -q "prepare command: configured (timeout 5700s, source=file, termux_prepare_timeout=5400s)" <<<"$out"'
+bump2142 prepare-file-5400
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "tick logs the file-derived budget at prepare begin" '[ "$rc" = 0 ] && grep -q "prepare begin timeout=5700s source=file termux_prepare_timeout=5400s target=$(git -C "$TMP/seed" rev-parse HEAD)" "$STATE/self-update.log"'
+ok "the prepare-cmd (termux-prepare-generation.sh) read the same file value" 'grep -q "timeout=5400s source=file" "$SEQ" && grep -qx restart "$SEQ"'
+out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=1800 run_selfup status 2>&1)"
+ok "explicit env budget overrides the file" 'grep -q "prepare command: configured (timeout 1800s, source=env)" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=1200'
+out="$(run_selfup status 2>&1)"
+ok "a file value below default-300 keeps the 3600s default (never lowered)" 'grep -q "prepare command: configured (timeout 3600s, source=default, termux_prepare_timeout=1200s)" <<<"$out"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=6900'
+bump2142 prepare-file-6900
+: > "$STATE/self-update.log"; : > "$SEQ"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "the 6900s file cap yields exactly the 7200s budget cap and the run proceeds" '[ "$rc" = 0 ] && grep -q "prepare begin timeout=7200s source=file termux_prepare_timeout=6900s" "$STATE/self-update.log" && grep -q "timeout=6900s source=file" "$SEQ"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=7000'
+out="$(run_selfup status 2>&1)"
+ok "too-large file value: default budget + warning in status" 'grep -q "prepare command: configured (timeout 3600s, source=default)" <<<"$out" && grep -q "prepare budget warning: .*not an integer in 1..6900; file ignored" <<<"$out"'
+bump2142 prepare-file-bad
+: > "$STATE/self-update.log"; : > "$SEQ"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "invalid file never aborts the tick: warned, default budget, both scripts on defaults" \
+  '[ "$rc" = 0 ] && grep -q "prepare budget warning: .*file ignored" "$STATE/self-update.log" && grep -q "prepare begin timeout=3600s source=default target=" "$STATE/self-update.log" && grep -q "timeout=3300s source=default" "$SEQ"'
+opfile 'CCC_TERMUX_PREPARE_TIMEOUT=5400'; chmod 644 "$OPF"
+out="$(run_selfup status 2>&1)"
+ok "group/world-readable file: default budget + warning" 'grep -q "prepare command: configured (timeout 3600s, source=default)" <<<"$out" && grep -q "has mode 644 (group/world access)" <<<"$out"'
+rm -f "$OPF" "$CLAUDE/self-update.prepare-cmd" "$CLAUDE/self-update.restart-cmd" "$STATE/self-update.pending-activation.json"
+rm -rf "$STATE"/self-update-install-rollback.*
+export CCC_TERMUX_PREPARE_ENV_FILE="$TMP/no-such-termux-prepare.env"
 
 # --- #2357: refresh drifted installed A2A handler copies ----------------------
 # The installer copies the handlers; self-update must refresh copies that

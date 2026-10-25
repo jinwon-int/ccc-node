@@ -133,3 +133,81 @@ ccc_restore_codex_policy_state() { # <codex-dir> <snapshot-dir>
   fi
   [ "$failed" = 0 ]
 }
+
+# Operator-owned per-node Termux preparation budget (#2487). A slow Termux node
+# needs ~50+ min for a full native wheel build whenever
+# bridge/requirements.lock.txt changes (no wheel reuse), which overruns the
+# shipped defaults. One file per node,
+#   ${CCC_TERMUX_PREPARE_ENV_FILE:-${XDG_CONFIG_HOME:-~/.config}/ccc-node/termux-prepare.env}
+# owned by the running user, mode 0600 (no group/world bits), holding
+#   CCC_TERMUX_PREPARE_TIMEOUT=<seconds>      # integer 1..6900
+# is read by scripts/termux-prepare-generation.sh (the --timeout-seconds it
+# passes to termux_prepare.py) and by ccc-self-update.sh (the prepare-cmd
+# budget, never below that value + CCC_TERMUX_PREPARE_BUDGET_MARGIN), so the two
+# agree. The cap is self-update's 7200 s prepare maximum minus the margin.
+# The file is parsed as KEY=VALUE text and NEVER sourced: blank lines and `#`
+# comments are skipped, other keys are ignored with a warning, and a wrong
+# owner, group/world permission bits, a symlink or any invalid
+# CCC_TERMUX_PREPARE_TIMEOUT assignment makes the whole file be ignored with a
+# warning (callers fall back to their defaults; an update is never aborted).
+CCC_TERMUX_PREPARE_TIMEOUT_MAX=6900
+# shellcheck disable=SC2034  # read by ccc-self-update.sh
+CCC_TERMUX_PREPARE_BUDGET_MARGIN=300
+
+ccc_termux_prepare_env_file() { # print the operator file path
+  if [ -n "${CCC_TERMUX_PREPARE_ENV_FILE:-}" ]; then printf '%s' "$CCC_TERMUX_PREPARE_ENV_FILE"; return 0; fi
+  local base="${XDG_CONFIG_HOME:-}"
+  case "$base" in /*) ;; *) base="${HOME:-/root}/.config" ;; esac   # XDG: relative values are invalid
+  printf '%s/ccc-node/termux-prepare.env' "$base"
+}
+
+# Sets CCC_TERMUX_PREPARE_FILE_TIMEOUT (validated seconds, or empty) and the
+# array CCC_TERMUX_PREPARE_FILE_WARNINGS (why the file or a line was ignored;
+# empty when absent or clean). Always returns 0, safe under `set -e`.
+# shellcheck disable=SC2034  # results are read by the sourcing scripts
+ccc_termux_prepare_read_env_file() {
+  local f meta uid mode me line key val n=0 found="" bad=0
+  CCC_TERMUX_PREPARE_FILE_TIMEOUT=""
+  CCC_TERMUX_PREPARE_FILE_WARNINGS=()
+  f="$(ccc_termux_prepare_env_file)"
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f is not a regular file (symlinks are refused); file ignored")
+    return 0
+  fi
+  me="$(id -u 2>/dev/null)" || me=""
+  if ! meta="$(stat -c '%u %a' -- "$f" 2>/dev/null)" || [ -z "$me" ]; then
+    CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f: owner/mode unreadable; file ignored")
+    return 0
+  fi
+  uid="${meta%% *}"; mode="${meta##* }"
+  if [ "$uid" != "$me" ]; then
+    CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f is owned by uid $uid, not $me; file ignored")
+    return 0
+  fi
+  if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 8#077) != 0 )); then
+    CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f has mode $mode (group/world access); chmod 600 it; file ignored")
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f line $n is not KEY=VALUE; line ignored"); continue
+    fi
+    key="${line%%=*}"; val="${line#*=}"
+    if [ "$key" != CCC_TERMUX_PREPARE_TIMEOUT ]; then
+      CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f line $n: unsupported key ${key:0:64}; line ignored"); continue
+    fi
+    if [[ "$val" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$val" -le "$CCC_TERMUX_PREPARE_TIMEOUT_MAX" ]; then
+      found="$val"
+    else
+      bad=1
+      CCC_TERMUX_PREPARE_FILE_WARNINGS+=("$f line $n: CCC_TERMUX_PREPARE_TIMEOUT='${val:0:32}' is not an integer in 1..$CCC_TERMUX_PREPARE_TIMEOUT_MAX; file ignored")
+    fi
+  done < "$f"
+  [ "$bad" = 0 ] && CCC_TERMUX_PREPARE_FILE_TIMEOUT="$found"
+  return 0
+}
