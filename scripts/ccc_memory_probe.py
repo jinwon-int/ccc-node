@@ -179,6 +179,14 @@ def _safe_owned_directory(path: Path, mode: int) -> bool:
     )
 
 
+# MemPalace pins the Termux installer (scripts/install-termux-mempalace.sh)
+# manages: its current `version` default plus every `upgradable_from` pin, since
+# a node keeps the metadata version it was installed with until it upgrades.
+# ccc-memory.test.sh fails when an installer pin bump leaves this set behind
+# (#2514: the 3.11.0 bump in #2328 did, and both Termux nodes read "error").
+TERMUX_MEMPALACE_VERSIONS = frozenset({"3.10.0", "3.11.0"})
+
+
 def _termux_metadata_state(metadata: Path) -> tuple[str, str | None]:
     if not metadata.exists() and not metadata.is_symlink():
         return "absent", None
@@ -199,7 +207,7 @@ def _termux_metadata_state(metadata: Path) -> tuple[str, str | None]:
     container = doc.get("container")
     if (
         doc.get("enabled") is not True
-        or doc.get("version") != "3.10.0"
+        or doc.get("version") not in TERMUX_MEMPALACE_VERSIONS
         or doc.get("state") != "ready"
         or doc.get("provider") not in {"codex", "claude", "piri"}
         or type(doc.get("updated_at")) is not int

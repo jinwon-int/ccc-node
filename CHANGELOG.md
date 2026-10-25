@@ -4,6 +4,19 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **`ccc_memory_probe.py`: the Termux palace probe accepts every MemPalace
+  pin the installer manages (#2514).** `_termux_metadata_state()` accepted only
+  `version == "3.10.0"` (#1869). The installer records its own pin in its
+  metadata, and #2328 moved that pin to 3.11.0 without the probe, so after the
+  2026-10-25 upgrade (#2510) `ccc-memory-check.sh` reported both Termux nodes'
+  healthy palaces as `degraded` (`palace-error`, `index-error`,
+  `integrity=error`). The probe now accepts `TERMUX_MEMPALACE_VERSIONS`
+  (3.10.0, 3.11.0); other versions still fail closed. `ccc-memory.test.sh`
+  203→206 PASS: a 3.11.0 metadata reads ok, an unmanaged version fails closed,
+  and a cross-check reads the installer's `version` default and
+  `upgradable_from` so the next pin bump that skips the probe turns CI red
+  (reverse-validated against a 3.12.0 bump, an added previous pin and an
+  unparseable pin line).
 - **`install-termux-mempalace.sh`: the guest setup syncs the venv to the
   managed freeze, and an interrupted upgrade is reported and resumable
   (#2512).** `pip install -r` never removes a package the new freeze dropped,
