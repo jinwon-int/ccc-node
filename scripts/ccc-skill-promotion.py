@@ -82,6 +82,8 @@ _MAX_LEDGER_BYTES = 8 * 1024 * 1024
 # silently lost the remainder to a broker record that does not outlive it.
 _MAX_VERDICT_FINDINGS = 16
 _MAX_CANDIDATES_PER_RUN = 64
+# Upper bound of CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN and of `export --limit`.
+_MAX_PRS_PER_RUN_CEILING = 8
 # #1647: cross-run collect rotation cursor. Owner-only JSON in the promotion
 # state dir; written only by a locked, non-dry collect (dry-run never writes
 # it, never acks). Missing state means "begin at the first source"; a present
@@ -871,7 +873,9 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         node=_safe_node(env.get("CCC_NODE") or env.get("HOSTNAME") or ""),
         providers=providers,
         provider_roots=provider_roots,
-        max_prs=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN", 1, 1, 8),
+        max_prs=_secure_fs.bounded_int_env(
+            env, "CCC_SKILL_PROMOTION_MAX_PRS_PER_RUN", 1, 1, _MAX_PRS_PER_RUN_CEILING
+        ),
         enabled=enabled,
         publisher_enabled=publisher_enabled,
         collect_nodes=collect_nodes,
@@ -1440,7 +1444,18 @@ def _load_curator_module() -> Any:
     Reusing curator.py means this gate, the curator and the usage report can
     never disagree about what a recorded Skill-tool use is.
     """
-    path = Path(__file__).resolve().parents[1] / "claude" / "hooks" / "skill-review" / "curator.py"
+    here = Path(__file__).resolve()
+    # Installed layout first (setup.sh deploys claude/hooks/ to $CLAUDE_DIR/hooks/,
+    # so curator.py sits beside this file under skill-review/), then the repo
+    # layout (scripts/ -> claude/hooks/skill-review/). Checking only the repo
+    # path made every installed node fail this gate with curator_module_unavailable.
+    candidates = (
+        here.parent / "skill-review" / "curator.py",
+        here.parents[1] / "claude" / "hooks" / "skill-review" / "curator.py",
+    )
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise PromotionError("curator_module_unavailable")
     spec = importlib.util.spec_from_file_location("ccc_skill_promotion_curator", path)
     if spec is None or spec.loader is None:
         raise PromotionError("curator_module_unavailable")
@@ -9399,7 +9414,12 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--lock-wait", type=_lock_wait_seconds, default=0,
                             metavar="SEC", help=_LOCK_WAIT_HELP)
     export_parser = subparsers.add_parser("export")
-    export_parser.add_argument("--limit", type=int, default=3, choices=range(1, 4))
+    # The collect asks each remote for min(share, max_prs) envelopes, so the
+    # accepted range must track the max_prs ceiling: a narrower range made every
+    # remote export exit 2 (collect error command_failed) once max_prs > 3.
+    export_parser.add_argument(
+        "--limit", type=int, default=3, choices=range(1, _MAX_PRS_PER_RUN_CEILING + 1)
+    )
     ack_parser = subparsers.add_parser("ack")
     ack_parser.add_argument("transport_id")
     collect_parser = subparsers.add_parser("collect")
