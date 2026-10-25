@@ -773,6 +773,9 @@ run atomic_install "$SRC/scripts/trusted-keys/github-web-flow.gpg" \
 # separately via scripts/install-pr-status-poll-cron.sh, tracks only the
 # repos an operator lists in ~/.claude/pr-status-poll.repos.
 run atomic_install "$SRC/scripts/ccc-pr-status-poll.sh" "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
+# Fleet ADB to Android/Termux nodes through an SSH tunnel to the phone's own
+# adb server (#2517) — no per-node ADB key authorization on the phone.
+run atomic_install "$SRC/scripts/phone-adb.sh" "$CLAUDE_DIR/hooks/phone-adb.sh"
 # #958: record the install-source repo path so ccc-self-update's resolve_repo()
 # (env > this file > script-location inference > ~/ccc-node) never falls back
 # to a nonexistent ~/ccc-node on /opt installs — 8 nodes aborted no-repo until
@@ -836,6 +839,7 @@ installed_hook_scripts=(
   "$CLAUDE_DIR/hooks/ccc-skill-listing-policy.py"
   "$CLAUDE_DIR/hooks/ccc-self-update.sh"
   "$CLAUDE_DIR/hooks/ccc-pr-status-poll.sh"
+  "$CLAUDE_DIR/hooks/phone-adb.sh"
 )
 run chmod +x "${installed_hook_scripts[@]}" "${hook_tree_targets[@]}"
 # #909: register a self-update agent-cron task so the harness auto-updates on
