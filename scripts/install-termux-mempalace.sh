@@ -451,6 +451,18 @@ case "$ACTION" in
           # Same pin, older managed freeze (#2509): keep the lock; the guest
           # pip below installs the current freeze and rewrites it on success.
           echo "refreshing MemPalace $version dependencies from an older managed freeze" >&2
+        elif resume_from="$(sed -n 's/^mempalace==//p' "$root/opt/ccc-mempalace/requirements.lock" | head -n 1)" \
+          && case " $upgradable_from " in *" $resume_from "*) true ;; *) false ;; esac \
+          && lock_is_managed_for "$root/opt/ccc-mempalace/requirements.lock" "$resume_from" \
+          && find "$root/opt/ccc-mempalace/venv/lib" -type d \
+            -name "mempalace-$version.dist-info" -print -quit 2>/dev/null | grep -q . \
+          && safe_private_file "$root/opt/ccc-mempalace/requirements.input.lock" \
+          && cmp -s "$requirements_source" "$root/opt/ccc-mempalace/requirements.input.lock"; then
+          # Interrupted upgrade (#2512): pip already moved the venv to the new
+          # pin, but the guest failed before rewriting the lock. The lock is a
+          # managed freeze of a listed previous pin and the input lock left by
+          # that attempt is this checkout's freeze, so rerun the guest setup.
+          echo "resuming interrupted MemPalace $resume_from -> $version upgrade (venv on $version, lock still a managed $resume_from freeze)" >&2
         else
           echo "installed dependency lock drift; refusing in-place mutation" >&2
           exit 2
@@ -470,7 +482,7 @@ case "$ACTION" in
       need_guest_setup=0
     fi
     if [ "$need_guest_setup" = 1 ]; then
-      "$proot_cli" login --isolated "$container" -- /bin/sh -eu -c '
+      if ! "$proot_cli" login --isolated "$container" -- /bin/sh -eu -c '
       version="$1"
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
@@ -479,6 +491,19 @@ case "$ACTION" in
       if [ ! -x /opt/ccc-mempalace/venv/bin/python ]; then python3 -m venv /opt/ccc-mempalace/venv; fi
       /opt/ccc-mempalace/venv/bin/python -m pip install --disable-pip-version-check --no-input "pip==24.0"
       /opt/ccc-mempalace/venv/bin/python -m pip install --disable-pip-version-check --no-input --only-binary=:all: -r /opt/ccc-mempalace/requirements.input.lock
+      # pip install -r never removes a package the managed freeze dropped, so the
+      # byte-exact freeze check below would fail on a half-updated venv (#2512).
+      # Sync first: uninstall what the freeze reports but the input lock omits.
+      pipnames() { sed -n "s/^\([A-Za-z0-9][A-Za-z0-9._-]*\)==.*/\1/p" "$1" | tr "A-Z" "a-z" | sed "s/[-_.][-_.]*/-/g" | sort -u; }
+      /opt/ccc-mempalace/venv/bin/python -m pip freeze > /opt/ccc-mempalace/.requirements.have.tmp
+      pipnames /opt/ccc-mempalace/.requirements.have.tmp > /opt/ccc-mempalace/.requirements.have.names
+      pipnames /opt/ccc-mempalace/requirements.input.lock > /opt/ccc-mempalace/.requirements.want.names
+      extra="$(comm -23 /opt/ccc-mempalace/.requirements.have.names /opt/ccc-mempalace/.requirements.want.names | grep -vx pip || true)"
+      rm -f /opt/ccc-mempalace/.requirements.have.tmp /opt/ccc-mempalace/.requirements.have.names /opt/ccc-mempalace/.requirements.want.names
+      if [ -n "$extra" ]; then
+        echo "removing packages the managed freeze no longer lists:" $extra >&2
+        /opt/ccc-mempalace/venv/bin/python -m pip uninstall --disable-pip-version-check --no-input -y $extra
+      fi
       /opt/ccc-mempalace/venv/bin/python -m pip check
       /opt/ccc-mempalace/venv/bin/python -m pip freeze > /opt/ccc-mempalace/requirements.lock.tmp
       cmp /opt/ccc-mempalace/requirements.input.lock /opt/ccc-mempalace/requirements.lock.tmp
@@ -486,7 +511,16 @@ case "$ACTION" in
       mv -f /opt/ccc-mempalace/requirements.lock.tmp /opt/ccc-mempalace/requirements.lock
       printf "%s\n" "ccc-node #867 managed container" > /opt/ccc-mempalace/.ccc-node-managed
       chmod 600 /opt/ccc-mempalace/.ccc-node-managed
-    ' sh "$version"
+    ' sh "$version"; then
+        # The venv may already be partly on the new freeze while the lock still
+        # names the old one. Say so instead of a silent set -e exit (#2512); a
+        # rerun on the same freeze resumes via the interrupted-upgrade branch.
+        guest_enabled=0
+        safe_managed_wrapper && guest_enabled=1
+        write_metadata "$guest_enabled" "$provider" "$source" guest-setup-failed
+        echo "MemPalace guest dependency setup failed; the venv may be partly updated. Fix the cause and rerun --apply (an interrupted upgrade on the same freeze resumes)" >&2
+        exit 2
+      fi
     fi
     [ -x "$root/opt/ccc-mempalace/venv/bin/mempalace" ] \
       || { echo "MemPalace executable missing after install" >&2; exit 2; }

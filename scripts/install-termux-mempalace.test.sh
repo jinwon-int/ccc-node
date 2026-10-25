@@ -40,6 +40,20 @@ EOF
   chmod 600 "$root/opt/ccc-mempalace/.ccc-node-managed"
   exit 0
 fi
+if [ "${1:-}" = login ] && [ "${CCC_TEST_PROOT_GUEST_EXEC:-0}" = 1 ]; then
+  # Opt-in (#2512): run the real guest setup script against the container root
+  # with a fake apt-get and the fake venv pip from mk_fake_pip.
+  args=("$@")
+  for i in "${!args[@]}"; do
+    if [ "${args[$i]}" = -c ]; then
+      root="${CCC_TEST_CONTAINER_ROOT:?}"
+      script="${args[$((i+1))]}"
+      script="${script//\/opt\/ccc-mempalace/$root/opt/ccc-mempalace}"
+      PATH="${CCC_TEST_GUEST_BIN:?}:$PATH" sh -eu -c "$script" "${args[@]:$((i+2))}"
+      exit $?
+    fi
+  done
+fi
 if [ "${1:-}" = login ] && [ -f "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.input.lock" ]; then
   # Mimic the guest pip: the venv ends up on exactly the pin the input lock names.
   pin="$(sed -n 's/^mempalace==//p' "${CCC_TEST_CONTAINER_ROOT:?}/opt/ccc-mempalace/requirements.input.lock" | head -1)"
@@ -371,6 +385,91 @@ out="$(env "${common_env[@]}" HOME="$nh_home" CCC_TERMUX_MEMPALACE_CONTAINER_ROO
   GIT_CEILING_DIRECTORIES="$TMP" bash "$nh_repo/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
 ok "without git history an older shipped freeze is not trusted" \
   '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && cmp -s "$old_freeze" "$nh_root/opt/ccc-mempalace/requirements.lock"'
+
+# #2512: the real guest script runs against a fake pip with real `pip install -r`
+# semantics — requested pins replace same-name packages, anything else stays.
+# old_freeze carries zz-retired-security-pin, which the current freeze dropped.
+guest_bin="$TMP/guest-bin"
+mkdir -p "$guest_bin"
+printf '#!/bin/sh\nexit 0\n' > "$guest_bin/apt-get"; chmod 700 "$guest_bin/apt-get"
+mk_fake_pip() { # <root> <installed-freeze>
+  cat > "$1/opt/ccc-mempalace/venv/bin/python" <<'SH'
+#!/usr/bin/env bash
+venv="$(cd "$(dirname "$0")/.." && pwd)"
+state="$venv/.fake-site"; site="$venv/lib/python3.11/site-packages"
+[ "$1 $2" = "-m pip" ] || exit 2
+shift 2
+printf '%s\n' "$*" >> "${CCC_TEST_PIP_LOG:?}"
+case "$1" in
+  install)
+    req=""; prev=""
+    for a in "$@"; do [ "$prev" = -r ] && req="$a"; prev="$a"; done
+    [ -n "$req" ] || exit 0
+    pin="$(sed -n 's/^mempalace==//p' "$req" | head -n 1)"
+    find "$site" -maxdepth 1 -type d -name 'mempalace-*.dist-info' -exec rm -rf {} +
+    mkdir -p "$site/mempalace-$pin.dist-info"
+    [ "${CCC_TEST_PIP_FAIL_AFTER_PIN:-0}" = 1 ] && { echo "simulated pip failure after the pin moved" >&2; exit 1; }
+    awk -F'==' 'NR==FNR { want[$1]=1; print; next } !($1 in want)' "$req" "$state" > "$state.new"
+    mv -f "$state.new" "$state" ;;
+  uninstall)
+    shift
+    names=""; for a in "$@"; do case "$a" in -*) ;; *) names="$names $a" ;; esac; done
+    awk -F'==' -v drop="$names" 'BEGIN { n=split(drop, d, " "); for (i=1; i<=n; i++) gone[d[i]]=1 } !($1 in gone)' "$state" > "$state.new"
+    mv -f "$state.new" "$state" ;;
+  check) ;;
+  freeze) cat "$state" ;;
+  *) exit 2 ;;
+esac
+SH
+  chmod 700 "$1/opt/ccc-mempalace/venv/bin/python"
+  cp "$2" "$1/opt/ccc-mempalace/venv/.fake-site"
+}
+run_guest() { # <home> <root> [VAR=value...]
+  local h="$1" r="$2"; shift 2
+  env "${common_env[@]}" HOME="$h" CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$r" CCC_TEST_CONTAINER_ROOT="$r" \
+    CCC_TEST_PROOT_GUEST_EXEC=1 CCC_TEST_GUEST_BIN="$guest_bin" CCC_TEST_PIP_LOG="$r/pip.log" "$@" \
+    bash "$hist_repo/scripts/install-termux-mempalace.sh" --apply --codex 2>&1
+}
+cur_freeze="$ROOT/scripts/termux-mempalace-requirements.txt"
+site_pkgs() { echo "$1/opt/ccc-mempalace/venv/lib/python3.11/site-packages"; }
+
+gs_home="$TMP/guest-sync-home"; gs_root="$TMP/guest-sync-root"
+mk_prev_root "$gs_home" "$gs_root" 3.10.0 delta
+cp "$old_freeze" "$gs_root/opt/ccc-mempalace/requirements.lock"
+mk_fake_pip "$gs_root" "$old_freeze"
+out="$(run_guest "$gs_home" "$gs_root")"; rc=$?
+ok "an upgrade removes a package the current freeze dropped and lands on the exact freeze" \
+  '[ "$rc" = 0 ] && grep -q "removing packages the managed freeze no longer lists: zz-retired-security-pin" <<<"$out" && grep -qx "uninstall --disable-pip-version-check --no-input -y zz-retired-security-pin" "$gs_root/pip.log" && ! grep -q "^zz-retired-security-pin==" "$gs_root/opt/ccc-mempalace/venv/.fake-site" && cmp -s "$cur_freeze" "$gs_root/opt/ccc-mempalace/requirements.lock"'
+ok "the synced upgrade keeps exactly the new dist-info" \
+  '[ -d "$(site_pkgs "$gs_root")/mempalace-3.11.0.dist-info" ] && [ ! -d "$(site_pkgs "$gs_root")/mempalace-3.10.0.dist-info" ]'
+
+gn_home="$TMP/guest-noop-home"; gn_root="$TMP/guest-noop-root"
+mk_prev_root "$gn_home" "$gn_root" 3.10.0 delta
+mk_fake_pip "$gn_root" "$gn_root/opt/ccc-mempalace/requirements.lock"
+out="$(run_guest "$gn_home" "$gn_root")"; rc=$?
+ok "a freeze that drops nothing uninstalls nothing" \
+  '[ "$rc" = 0 ] && ! grep -q "^uninstall" "$gn_root/pip.log" && ! grep -q "removing packages" <<<"$out" && cmp -s "$cur_freeze" "$gn_root/opt/ccc-mempalace/requirements.lock"'
+
+gf_home="$TMP/guest-fail-home"; gf_root="$TMP/guest-fail-root"
+mk_prev_root "$gf_home" "$gf_root" 3.10.0 delta
+cp "$old_freeze" "$gf_root/opt/ccc-mempalace/requirements.lock"
+mk_fake_pip "$gf_root" "$old_freeze"
+out="$(run_guest "$gf_home" "$gf_root" CCC_TEST_PIP_FAIL_AFTER_PIN=1)"; rc=$?
+ok "a guest failure after pip moved the pin is reported, not a silent set -e exit" \
+  '[ "$rc" = 2 ] && grep -q "guest dependency setup failed" <<<"$out" && jq -e '\'' .state == "guest-setup-failed" and .enabled == false '\'' "$gf_home/.nunchi/termux-mempalace/status.json" >/dev/null && cmp -s "$old_freeze" "$gf_root/opt/ccc-mempalace/requirements.lock" && [ -d "$(site_pkgs "$gf_root")/mempalace-3.11.0.dist-info" ]'
+out="$(run_guest "$gf_home" "$gf_root")"; rc=$?
+ok "a rerun on the same freeze resumes the interrupted upgrade" \
+  '[ "$rc" = 0 ] && grep -q "resuming interrupted MemPalace 3.10.0 -> 3.11.0 upgrade" <<<"$out" && cmp -s "$cur_freeze" "$gf_root/opt/ccc-mempalace/requirements.lock" && ! grep -q "^zz-retired-security-pin==" "$gf_root/opt/ccc-mempalace/venv/.fake-site" && [ ! -d "$(site_pkgs "$gf_root")/mempalace-3.10.0.dist-info" ]'
+
+gr_home="$TMP/guest-resume-guard-home"; gr_root="$TMP/guest-resume-guard-root"
+mk_prev_root "$gr_home" "$gr_root" 3.11.0 delta
+cp "$old_freeze" "$gr_root/opt/ccc-mempalace/requirements.lock"
+cp "$old_freeze" "$gr_root/opt/ccc-mempalace/requirements.input.lock"
+chmod 600 "$gr_root/opt/ccc-mempalace/requirements.input.lock"
+mk_fake_pip "$gr_root" "$old_freeze"
+out="$(run_guest "$gr_home" "$gr_root")"; rc=$?
+ok "a venv on the pin with an old lock but no attempt on this freeze still fails closed" \
+  '[ "$rc" = 2 ] && grep -q "dependency lock drift" <<<"$out" && ! grep -q resuming <<<"$out" && cmp -s "$old_freeze" "$gr_root/opt/ccc-mempalace/requirements.lock" && [ ! -e "$gr_root/pip.log" ]'
 
 unmanaged="$TMP/unmanaged-home"
 mkdir -p "$unmanaged/.codex/sessions" "$unmanaged/.local/bin"
