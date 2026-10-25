@@ -4,6 +4,23 @@ All notable changes to the Claude Code node harness. Dates are KST.
 
 ## [Unreleased]
 
+- **`install-termux-mempalace.sh`: the guest setup syncs the venv to the
+  managed freeze, and an interrupted upgrade is reported and resumable
+  (#2512).** `pip install -r` never removes a package the new freeze dropped,
+  so the byte-exact `pip freeze` check failed after pip had already moved the
+  venv to the new pin; the guest `sh -eu` died without a message and every
+  later `--apply` refused the venv-new/lock-old state as drift for good. The
+  guest now uninstalls what the freeze reports but the input lock omits
+  (PEP 503 names, never `pip`) before `pip check` and the freeze comparison. A
+  guest failure prints a cause, writes `guest-setup-failed` metadata and exits
+  2. A rerun resumes only when the venv is on the new pin, the lock is a
+  managed freeze of a listed previous pin and the input lock left by the
+  attempt equals this checkout's freeze; other drift still fails closed. No
+  freeze change so far dropped a package (6 commits #883–#2483), so this was
+  latent; MemPalace 3.12.0 is the likely first trigger.
+  `install-termux-mempalace.test.sh` 30→36 PASS (an opt-in fake proot runs
+  the real guest script against a fake pip with `install -r` semantics),
+  reverse-validated per component.
 - **`install-termux-mempalace.sh`: a node still on an older managed freeze is
   managed state, not drift (#2509).** The in-place guard accepted only a lock
   that differed from the *current* freeze in its `mempalace==` line, so once
