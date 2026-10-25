@@ -151,6 +151,29 @@ lock_is_mempalace_only_delta() {
   rm -f "$norm"; return 1
 }
 
+# True when the installed lock is byte-identical to a managed freeze this
+# checkout shipped earlier (#2509). Dependabot bumps the freeze after a node
+# installed it, so a node that is still exactly on an older managed freeze is
+# managed state, not drift. Needs the checkout's git history; without it (no
+# git, shallow or tarball install) this is false and the guard stays closed.
+lock_is_historical_freeze() {
+  local lock="$1" blob
+  safe_private_file "$lock" || return 1
+  command -v git >/dev/null 2>&1 || return 1
+  blob="$(git hash-object --no-filters -- "$lock" 2>/dev/null)" || return 1
+  [ -n "$blob" ] || return 1
+  git -C "$ROOT" log --format= --raw --no-abbrev --no-renames \
+      -- scripts/termux-mempalace-requirements.txt 2>/dev/null \
+    | awk -v b="$blob" '$4 == b { found = 1 } END { exit !found }'
+}
+
+# A managed lock whose mempalace== line names the installed dist-info.
+lock_is_managed_for() {
+  local lock="$1" installed="$2"
+  grep -qx "mempalace==$installed" "$lock" 2>/dev/null || return 1
+  lock_is_mempalace_only_delta "$lock" || lock_is_historical_freeze "$lock"
+}
+
 prepare_managed_dir() {
   if [ -L "$managed_dir" ]; then
     echo "refusing symlinked managed directory: $managed_dir" >&2
@@ -396,7 +419,7 @@ case "$ACTION" in
       installed_version="${installed_version%.dist-info}"
       case " $upgradable_from " in
         *" $installed_version "*)
-          if lock_is_mempalace_only_delta "$root/opt/ccc-mempalace/requirements.lock"; then
+          if lock_is_managed_for "$root/opt/ccc-mempalace/requirements.lock" "$installed_version"; then
             upgrade_from="$installed_version"
           fi ;;
       esac
@@ -404,7 +427,7 @@ case "$ACTION" in
         echo "installed MemPalace version drift; refusing in-place mutation" >&2
         exit 2
       fi
-      echo "upgrading MemPalace $upgrade_from -> $version in place (lock delta is mempalace== only)" >&2
+      echo "upgrading MemPalace $upgrade_from -> $version in place (installed lock is a managed freeze)" >&2
     fi
     if [ -e "$root/opt/ccc-mempalace/requirements.lock" ] \
       || [ -L "$root/opt/ccc-mempalace/requirements.lock" ]; then
@@ -424,6 +447,10 @@ case "$ACTION" in
           cp "$requirements_source" "$catchup_tmp"
           chmod 600 "$catchup_tmp"
           mv -f "$catchup_tmp" "$root/opt/ccc-mempalace/requirements.lock"
+        elif lock_is_managed_for "$root/opt/ccc-mempalace/requirements.lock" "$version"; then
+          # Same pin, older managed freeze (#2509): keep the lock; the guest
+          # pip below installs the current freeze and rewrites it on success.
+          echo "refreshing MemPalace $version dependencies from an older managed freeze" >&2
         else
           echo "installed dependency lock drift; refusing in-place mutation" >&2
           exit 2

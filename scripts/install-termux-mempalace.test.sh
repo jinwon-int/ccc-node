@@ -308,6 +308,70 @@ out="$(env "${common_env[@]}" HOME="$dr_home" \
 ok "a previous-pin venv with an unrelated lock drift is not upgraded" \
   '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && [ -d "$dr_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info" ] && grep -q "^extra-dep==1.0$" "$dr_root/opt/ccc-mempalace/requirements.lock"'
 
+# #2509: Dependabot bumped the freeze after the node installed it. A lock that is
+# byte-identical to a freeze the checkout shipped earlier is managed state. The
+# check reads git history, so build a hermetic checkout (CI may be shallow).
+hist_repo="$TMP/hist-repo"
+mkdir -p "$hist_repo/scripts"
+cp "$ROOT/scripts/install-termux-mempalace.sh" "$ROOT/scripts/termux-mempalace-wrapper.sh" "$hist_repo/scripts/"
+old_freeze="$TMP/old-freeze.txt"
+sed -e 's/^mempalace==3.11.0$/mempalace==3.10.0/' -e '1a\
+zz-retired-security-pin==0.1' "$ROOT/scripts/termux-mempalace-requirements.txt" > "$old_freeze"
+same_pin_freeze="$TMP/same-pin-freeze.txt"
+sed '1a\
+zz-same-pin-older-dep==0.1' "$ROOT/scripts/termux-mempalace-requirements.txt" > "$same_pin_freeze"
+hgit() { git -C "$hist_repo" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false "$@"; }
+hgit init -q
+for f in "$old_freeze" "$same_pin_freeze" "$ROOT/scripts/termux-mempalace-requirements.txt"; do
+  cp "$f" "$hist_repo/scripts/termux-mempalace-requirements.txt"
+  hgit add -A && hgit commit -q -m freeze
+done
+chmod 700 "$hist_repo/scripts/install-termux-mempalace.sh" "$hist_repo/scripts/termux-mempalace-wrapper.sh"
+run_hist() { # <home> <root>
+  env "${common_env[@]}" HOME="$1" CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$2" CCC_TEST_CONTAINER_ROOT="$2" \
+    bash "$hist_repo/scripts/install-termux-mempalace.sh" --apply --codex 2>&1
+}
+
+hu_home="$TMP/hist-up-home"; hu_root="$TMP/hist-up-root"
+mk_prev_root "$hu_home" "$hu_root" 3.10.0 delta
+cp "$old_freeze" "$hu_root/opt/ccc-mempalace/requirements.lock"
+out="$(run_hist "$hu_home" "$hu_root")"; rc=$?
+ok "a previous-pin venv on an older shipped freeze upgrades in place to the current freeze" \
+  '[ "$rc" = 0 ] && grep -q "upgrading MemPalace 3.10.0 -> 3.11.0" <<<"$out" && cmp -s "$ROOT/scripts/termux-mempalace-requirements.txt" "$hu_root/opt/ccc-mempalace/requirements.lock" && [ -d "$hu_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.11.0.dist-info" ] && [ ! -d "$hu_root/opt/ccc-mempalace/venv/lib/python3.11/site-packages/mempalace-3.10.0.dist-info" ]'
+
+hs_home="$TMP/hist-same-home"; hs_root="$TMP/hist-same-root"
+mk_prev_root "$hs_home" "$hs_root" 3.11.0 delta
+cp "$same_pin_freeze" "$hs_root/opt/ccc-mempalace/requirements.lock"
+: > "$proot_log"
+out="$(run_hist "$hs_home" "$hs_root")"; rc=$?
+ok "a venv already on the pin refreshes its dependencies from an older shipped freeze" \
+  '[ "$rc" = 0 ] && grep -q "refreshing MemPalace 3.11.0 dependencies" <<<"$out" && grep -aq "pip install" "$proot_log" && cmp -s "$ROOT/scripts/termux-mempalace-requirements.txt" "$hs_root/opt/ccc-mempalace/requirements.lock"'
+
+hm_home="$TMP/hist-mismatch-home"; hm_root="$TMP/hist-mismatch-root"
+mk_prev_root "$hm_home" "$hm_root" 3.10.0 delta
+cp "$same_pin_freeze" "$hm_root/opt/ccc-mempalace/requirements.lock"
+out="$(run_hist "$hm_home" "$hm_root")"; rc=$?
+ok "a shipped freeze whose mempalace pin disagrees with the installed dist-info still fails closed" \
+  '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && cmp -s "$same_pin_freeze" "$hm_root/opt/ccc-mempalace/requirements.lock"'
+
+hd_home="$TMP/hist-drift-home"; hd_root="$TMP/hist-drift-root"
+mk_prev_root "$hd_home" "$hd_root" 3.10.0 delta
+{ cat "$old_freeze"; echo 'extra-dep==1.0'; } > "$hd_root/opt/ccc-mempalace/requirements.lock"
+out="$(run_hist "$hd_home" "$hd_root")"; rc=$?
+ok "a lock that matches no shipped freeze still fails closed with history available" \
+  '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && grep -q "^extra-dep==1.0$" "$hd_root/opt/ccc-mempalace/requirements.lock"'
+
+nh_home="$TMP/no-history-home"; nh_root="$TMP/no-history-root"
+mk_prev_root "$nh_home" "$nh_root" 3.10.0 delta
+cp "$old_freeze" "$nh_root/opt/ccc-mempalace/requirements.lock"
+nh_repo="$TMP/no-history-repo"
+mkdir -p "$nh_repo/scripts"
+cp "$hist_repo/scripts/"* "$nh_repo/scripts/"
+out="$(env "${common_env[@]}" HOME="$nh_home" CCC_TERMUX_MEMPALACE_CONTAINER_ROOT="$nh_root" CCC_TEST_CONTAINER_ROOT="$nh_root" \
+  GIT_CEILING_DIRECTORIES="$TMP" bash "$nh_repo/scripts/install-termux-mempalace.sh" --apply --codex 2>&1)"; rc=$?
+ok "without git history an older shipped freeze is not trusted" \
+  '[ "$rc" = 2 ] && grep -q "version drift" <<<"$out" && cmp -s "$old_freeze" "$nh_root/opt/ccc-mempalace/requirements.lock"'
+
 unmanaged="$TMP/unmanaged-home"
 mkdir -p "$unmanaged/.codex/sessions" "$unmanaged/.local/bin"
 printf '{}\n' > "$unmanaged/.codex/sessions/a.jsonl"
