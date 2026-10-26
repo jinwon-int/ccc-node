@@ -1109,29 +1109,61 @@ GRACEFUL_STOP_SECONDS = 10.0
 
 
 def run_with_graceful_timeout(args, *, timeout, input=None, capture_output=False, **popen_kwargs):
-    """subprocess.run(..., timeout=) that sends SIGTERM, then SIGKILL after a grace."""
+    """subprocess.run(..., timeout=) that sends SIGTERM, then SIGKILL after a grace.
+
+    ccc-node#2533: the child leads its own session and both signals go to that
+    whole process group, so the claude CLI's own children (MCP servers) stop with
+    it instead of being orphaned. Every wait after the timeout is bounded by the
+    grace: a descendant that left the group can hold the pipes open, and the old
+    unbounded communicate() after SIGKILL pinned the caller (daegyo bench q23,
+    2026-10-26).
+    """
+    import os
+    import signal
+
     if capture_output:
         popen_kwargs["stdout"] = subprocess.PIPE
         popen_kwargs["stderr"] = subprocess.PIPE
     if input is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
+    popen_kwargs.setdefault("start_new_session", True)
+    own_group = bool(popen_kwargs["start_new_session"])
+
+    def stop(proc, sig):
+        try:
+            if own_group:
+                os.killpg(proc.pid, sig)
+            else:
+                proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def drain(proc):
+        try:
+            return proc.communicate(timeout=GRACEFUL_STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+            return None, None
+
     with subprocess.Popen(args, **popen_kwargs) as proc:
         try:
             out, err = proc.communicate(input, timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.terminate()
+            stop(proc, signal.SIGTERM)
             try:
                 out, err = proc.communicate(timeout=GRACEFUL_STOP_SECONDS)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
+                stop(proc, signal.SIGKILL)
+                out, err = drain(proc)
             raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err) from None
         except BaseException:
-            proc.terminate()
+            stop(proc, signal.SIGTERM)
             try:
                 proc.wait(timeout=GRACEFUL_STOP_SECONDS)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                stop(proc, signal.SIGKILL)
             raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
