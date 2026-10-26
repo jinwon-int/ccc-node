@@ -69,9 +69,9 @@ even when accepted), `NEW` (fails), `GONE`, `UNBASELINED`, `UNREACHABLE`,
 `ERROR`.
 
 ```bash
-bash scripts/agent-trust-audit-fleet.sh                       # review
-bash scripts/agent-trust-audit-fleet.sh --accept-baseline     # freeze after review
-bash scripts/install-agent-trust-audit-cron.sh --apply         # Mon 06:40, hub only
+CCC_FLEET_NODES="<ssh aliases>" bash scripts/agent-trust-audit-fleet.sh   # review
+CCC_FLEET_NODES="<ssh aliases>" bash scripts/agent-trust-audit-fleet.sh --accept-baseline
+bash scripts/install-agent-trust-audit-cron.sh --apply --nodes "<ssh aliases>"   # Mon 06:40, hub only
 ```
 
 If a finding is real: do not run agents in that directory, delete the planted

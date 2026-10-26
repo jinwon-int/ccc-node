@@ -31,7 +31,9 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COLLECTOR="${CCC_AGENT_TRUST_COLLECTOR:-$SELF_DIR/../claude/hooks/lib/agent_trust.py}"
-NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
+# No built-in roster (#1451: node names must not spread). The hub's cron line
+# carries the list (install-agent-trust-audit-cron.sh --nodes).
+NODES="${CCC_FLEET_NODES:-}"
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
 SELF="${CCC_FLEET_SELF:-$(hostname -s 2>/dev/null || echo _none_)}"
 STATE_DIR="${CCC_STATE_DIR:-${HOME:-/root}/.claude/state}"
@@ -56,7 +58,7 @@ with each node's accepted baseline. Verdicts: OK | DANGER | NEW | GONE |
 UNBASELINED | UNREACHABLE | ERROR. Exit 1 on DANGER/NEW/UNREACHABLE/ERROR.
 --accept-baseline freezes the current collection (all nodes or the list);
 DANGER findings keep failing even after acceptance.
-Env: CCC_FLEET_NODES, CCC_FLEET_SSH, CCC_FLEET_SELF, CCC_STATE_DIR /
+Env: CCC_FLEET_NODES (required), CCC_FLEET_SSH, CCC_FLEET_SELF, CCC_STATE_DIR /
 CCC_AGENT_TRUST_AUDIT_DIR, CCC_FLEET_SSH_TIMEOUT, CCC_AGENT_TRUST_COLLECTOR.
 EOF
       exit 0
@@ -65,6 +67,7 @@ EOF
   esac
 done
 
+[ -n "$NODES" ] || { echo "agent-trust-audit-fleet: set CCC_FLEET_NODES (space-separated ssh aliases)" >&2; exit 2; }
 [ -r "$COLLECTOR" ] || { echo "agent-trust-audit-fleet: collector not found: $COLLECTOR" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "agent-trust-audit-fleet: jq is required" >&2; exit 2; }
 mkdir -p "$AUDIT_DIR/current" "$AUDIT_DIR/baseline" "$AUDIT_DIR/runs" 2>/dev/null || {

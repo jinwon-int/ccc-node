@@ -29,6 +29,7 @@ export CCC_CRONTAB_CMD="$STUB"
 export CCC_CLAUDE_DIR="$TMP/claude"
 export CCC_STATE_DIR="$CCC_CLAUDE_DIR/state"
 mkdir -p "$CCC_CLAUDE_DIR/hooks" "$CCC_CLAUDE_DIR/state"
+export CCC_AGENT_TRUST_AUDIT_NODES="alpha beta"
 
 pass=0; fail=0
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
@@ -112,6 +113,21 @@ out="$(bash "$INSTALLER" --apply 2>&1)"
 rc=$?
 ok "corrupt managed block exits 4" '[ "$rc" = 4 ]'
 ok "corrupt managed block is reported" 'printf "%s" "$out" | grep -q "corrupt managed schedule block"'
+
+# --nodes contract (#1451: no roster in the repo; the list lives in the crontab)
+: > "$FAKE_CRON"
+bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "installed line carries the node list for the wrapper" 'grep -qF "CCC_FLEET_NODES=\"alpha beta\"" "$FAKE_CRON"'
+out="$(CCC_AGENT_TRUST_AUDIT_NODES="" bash "$INSTALLER" --dry-run 2>&1)"; rc=$?
+ok "missing --nodes is refused (exit 2)" '[ "$rc" = 2 ] && grep -q "nodes is required" <<<"$out"'
+out="$(bash "$INSTALLER" --dry-run --nodes 'a;rm -rf /' 2>&1)"; rc=$?
+ok "shell metacharacters in --nodes are refused" '[ "$rc" = 2 ] && grep -q "lowercase ssh aliases only" <<<"$out"'
+: > "$FAKE_CRON"
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+out="$(bash "$INSTALLER" --dry-run --nodes "gamma,delta" 2>&1)"
+# shellcheck disable=SC2034
+rc=$?
+ok "--nodes accepts commas and normalises to spaces" '[ "$rc" = 0 ] && grep -qF "CCC_FLEET_NODES=\"gamma delta\"" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

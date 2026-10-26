@@ -80,6 +80,7 @@ out="$(CCC_FLEET_NODES=me CCC_FLEET_SELF=me CCC_AGENT_TRUST_HOMES="$TMP/home" CC
 rc=$?
 ok "real collector flags a planted ancestor AGENTS.md as DANGER" '[ "$rc" = 1 ] && grep -q "^DANGER me: ancestor-agent-file $TMP/roots/AGENTS.md" <<<"$out"'
 
+ok "missing CCC_FLEET_NODES exits 2 (no built-in roster)" 'CCC_FLEET_NODES="" bash "$FLEET" >/dev/null 2>&1; [ "$?" = 2 ]'
 ok "bad arg exits 2" 'bash "$FLEET" --nope >/dev/null 2>&1; [ "$?" = 2 ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

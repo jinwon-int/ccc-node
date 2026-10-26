@@ -2,7 +2,9 @@
 # Install the weekly fleet agent-trust audit cron (ccc-node#2538 — planted
 # AGENTS.md/CLAUDE.md, endpoint overrides, MCP drift, known-bad npm). Opt-in,
 # hub-node only: the payload ssh-es to every fleet node, so it belongs on a
-# node with fleet ssh reach (seoseo, like tunnel-audit), not on all twelve.
+# node with fleet ssh reach (the hub, like tunnel-audit), not on every node.
+# The node list is passed with --nodes and lives only in the hub crontab
+# (#1451: no roster in the repo).
 #
 # The cron line runs scripts/agent-trust-audit-fleet.sh from THIS checkout and
 # appends its verdicts to the log. Exit 1 (DANGER / NEW / UNREACHABLE / ERROR)
@@ -25,6 +27,7 @@ CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 MARKER="# ccc-node:agent-trust-audit"
 BLOCK_BEGIN="# ccc-node:agent-trust-audit:begin"
 BLOCK_END="# ccc-node:agent-trust-audit:end"
+NODES="${CCC_AGENT_TRUST_AUDIT_NODES:-}"
 APPLY=0
 REMOVE=0
 
@@ -44,7 +47,7 @@ GEN="$(ccc_installer_gen_stamp_auto "$SELF")"
 
 usage() {
   cat <<EOF
-Usage: install-agent-trust-audit-cron.sh [--dry-run|--apply] [--remove] [--schedule SPEC]
+Usage: install-agent-trust-audit-cron.sh [--dry-run|--apply] [--remove] [--schedule SPEC] --nodes "a b c"
 
 Installs (or removes) a weekly crontab entry that runs
 scripts/agent-trust-audit-fleet.sh --quiet from this checkout (hub node only) and
@@ -58,8 +61,10 @@ Options:
   --apply          Write the crontab change.
   --remove         Remove the managed entry (with --apply) instead of adding it.
   --schedule SPEC  Cron schedule (5 fields). Default: "$SCHEDULE".
+  --nodes LIST     Space-separated ssh aliases to sweep (required unless --remove;
+                   env CCC_AGENT_TRUST_AUDIT_NODES). Stored only in the crontab.
 
-Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_AGENT_TRUST_AUDIT_FLEET_CMD,
+Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_AGENT_TRUST_AUDIT_FLEET_CMD, CCC_AGENT_TRUST_AUDIT_NODES,
 CCC_AGENT_TRUST_AUDIT_CRON, CCC_AGENT_TRUST_AUDIT_CRON_LOG, CCC_CRONTAB_CMD.
 EOF
 }
@@ -70,13 +75,24 @@ while [ $# -gt 0 ]; do
     --apply) APPLY=1 ;;
     --remove) REMOVE=1 ;;
     --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
+    --nodes) ccc_cron_need_val "$1" "${2:-}"; NODES="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
 
-CRON_LINE="$SCHEDULE bash -lc 'CCC_STATE_DIR=\"$STATE_DIR\" bash \"$FLEET\" --quiet; echo \"agent-trust-audit-fleet rc=\$?\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+if [ "$REMOVE" != 1 ]; then
+  NODES="$(printf '%s' "$NODES" | tr -s ' ,' '  ' | sed 's/^ //; s/ $//')"
+  if [ -z "$NODES" ]; then
+    echo "--nodes is required (space-separated ssh aliases of the nodes to sweep)" >&2; exit 2
+  fi
+  case "$NODES" in *[!a-z0-9\ -]*)
+    echo "--nodes accepts lowercase ssh aliases only ([a-z0-9-], space-separated)" >&2; exit 2 ;;
+  esac
+fi
+
+CRON_LINE="$SCHEDULE bash -lc 'CCC_FLEET_NODES=\"$NODES\" CCC_STATE_DIR=\"$STATE_DIR\" bash \"$FLEET\" --quiet; echo \"agent-trust-audit-fleet rc=\$?\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 
 if [ "$APPLY" = 1 ] && [ "$REMOVE" != 1 ]; then
   # Same redirect-first failure mode as the sibling installers: the cron line
