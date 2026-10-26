@@ -55,8 +55,9 @@ ccc_installer_gen_inputs() {
     # install-timed-test-deadline-scan-cron.sh carries no such cost — it is
     # listed from its first commit because no node has installed it yet.
     # install-skill-promotion-results-cron.sh (#2239) and
-    # install-timed-followup-scan-cron.sh (#2324) likewise.)
-    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh|install-timed-test-deadline-scan-cron.sh|install-skill-promotion-results-cron.sh|install-timed-followup-scan-cron.sh)
+    # install-timed-followup-scan-cron.sh (#2324) and
+    # install-agent-trust-audit-cron.sh (#2538) likewise.)
+    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh|install-agent-trust-audit-cron.sh|install-timed-test-deadline-scan-cron.sh|install-skill-promotion-results-cron.sh|install-timed-followup-scan-cron.sh)
       extras="installer-cron-common.sh" ;;
   esac
   printf '%s\n' "$self"

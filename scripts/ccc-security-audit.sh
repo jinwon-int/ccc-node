@@ -251,6 +251,49 @@ else:
                 f"{row.get('artifact')}: {row.get('pending')} pending [{state}]",
                 'drain before any erasure apply — docs/erasure-closeout.md')
 
+# Agent trust surface (#2538): planted AGENTS.md/CLAUDE.md in download dirs or
+# shared ancestor roots (/tmp is the A2A analysis cwd parent), endpoint
+# overrides, unpinned npx MCP servers, known-bad npm packages. Detection only —
+# TM-1306 keeps blocking guards out. Hosts/paths/hashes only, never contents.
+trust_lib = repo / 'claude' / 'hooks' / 'lib' / 'agent_trust.py'
+if not trust_lib.exists():
+    add('수동필요', 'agent trust surface', 'collector missing from repo', 'restore claude/hooks/lib/agent_trust.py')
+else:
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ccc_agent_trust', trust_lib)
+        trust = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trust)
+        homes = os.environ.get('CCC_AGENT_TRUST_HOMES')
+        rep = trust.collect(homes=homes.split(':') if homes else [str(claude_dir.parent)], fast=True)
+    except Exception as exc:
+        rep = None
+        add('수동필요', 'agent trust surface', f'collector failed ({type(exc).__name__})',
+            'run python3 claude/hooks/lib/agent_trust.py manually')
+    if rep is not None:
+        label = {'danger': '위험', 'warn': '경고'}
+        action = {
+            'download-agent-file': 'do not run agents there; inspect and delete the file; if an agent already ran there, review agent config and rotate tokens',
+            'ancestor-agent-file': 'every agent session below this root loads it — inspect, delete, then review agent config',
+            'ancestor-agent-config': 'inspect and delete unless intentional',
+            'known-bad-npm': 'remove the package, review ~/.codex/config.toml and Claude settings, rotate agent OAuth/API tokens',
+            'endpoint-override': 'confirm the host is intended; otherwise remove it and rotate tokens (allowlist: CCC_AGENT_TRUST_ENDPOINT_ALLOW)',
+            'unpinned-npx-mcp': 'pin the MCP package to an exact version',
+            'home-agent-file': 'loaded by every bridge session — confirm intent or remove',
+            'session-in-downloads': 'review that session for config writes',
+        }
+        shown = [f for f in rep['findings'] if f['severity'] in label]
+        for f in shown[:12]:
+            add(label[f['severity']], f"agent trust: {f['kind']}", f"{f['id']} — {f['detail']}".rstrip(' —'),
+                action.get(f['kind'], 'review'))
+        if len(shown) > 12:
+            add('경고', 'agent trust surface', f'{len(shown) - 12} more finding(s) not listed',
+                'run python3 claude/hooks/lib/agent_trust.py')
+        if not shown:
+            inv = rep['inventory']
+            add('정상', 'agent trust surface',
+                f"no planted agent files / endpoint overrides / known-bad npm (mcp: claude={len(inv['claude_mcp'])} codex={len(inv['codex_mcp'])})",
+                'none')
 
 # Metadata-only content scans.
 scan_tree('push spool redaction', spool_dir)
