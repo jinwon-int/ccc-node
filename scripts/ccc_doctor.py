@@ -133,6 +133,11 @@ CRON_MARKER_INSTALLERS = (
      "run scripts/install-fleet-skills-sync-cron.sh --apply"),
     ("tunnel-audit", "# ccc-node:tunnel-audit", "scripts/install-tunnel-audit-cron.sh",
      "run scripts/install-tunnel-audit-cron.sh --apply (hub node only)"),
+    # agent-trust-audit (#2538): weekly hub-only fleet sweep for planted
+    # AGENTS.md/CLAUDE.md, endpoint overrides and MCP drift. Registered with
+    # the installer (the #1398/#1421 lesson).
+    ("agent-trust-audit", "# ccc-node:agent-trust-audit", "scripts/install-agent-trust-audit-cron.sh",
+     "run scripts/install-agent-trust-audit-cron.sh --apply (hub node only)"),
     # t2-starvation-observe (#1421) is a seoseo-hub-only observation cron; like
     # cost-ledger before #1398 it landed without a registry entry and surfaced
     # as an unknown unmanaged marker on the 2026-09-02 evening sweep.
@@ -180,6 +185,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:fleet-skills-sync:end",
     "# ccc-node:tunnel-audit:begin",
     "# ccc-node:tunnel-audit:end",
+    "# ccc-node:agent-trust-audit:begin",
+    "# ccc-node:agent-trust-audit:end",
     "# ccc-node:t2-starvation-observe:begin",
     "# ccc-node:t2-starvation-observe:end",
     "# ccc-node:timed-test-deadline-scan:begin",

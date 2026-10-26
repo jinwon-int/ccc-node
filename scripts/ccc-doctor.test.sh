@@ -1123,7 +1123,7 @@ cdrepo="$TMP/cron-drift-repo"
 mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
 cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
 cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
-for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-timed-test-deadline-scan-cron install-timed-followup-scan-cron install-nunchi; do
+for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-agent-trust-audit-cron install-timed-test-deadline-scan-cron install-timed-followup-scan-cron install-nunchi; do
   cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
 done
 # shellcheck source=/dev/null
@@ -1134,6 +1134,7 @@ gen_sa="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-skill-autosave-c
 gen_cl="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-cost-ledger-cron.sh")"
 gen_fs="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-fleet-skills-sync-cron.sh")"
 gen_ta="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-tunnel-audit-cron.sh")"
+gen_at="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-agent-trust-audit-cron.sh")"
 gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
 gen_td="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-test-deadline-scan-cron.sh")"
 gen_tf="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-followup-scan-cron.sh")"
@@ -1162,10 +1163,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: eleven opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 11 ]'
-ok "empty crontab: rows are the eleven known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen timed-followup-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
+ok "empty crontab: twelve opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 12 ]'
+ok "empty crontab: rows are the twelve known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen agent-trust-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen timed-followup-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
@@ -1187,6 +1188,9 @@ CRON_TZ=Etc/UTC
 # ccc-node:tunnel-audit:begin
 20 6 * * 1 bash -lc 'x' >> /l 2>&1  # ccc-node:tunnel-audit gen=$gen_ta
 # ccc-node:tunnel-audit:end
+# ccc-node:agent-trust-audit:begin
+40 6 * * 1 bash -lc 'x' >> /l 2>&1  # ccc-node:agent-trust-audit gen=$gen_at
+# ccc-node:agent-trust-audit:end
 */10 * * * * bash /h/ingest-cron.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu
 17 * * * * bash /h/mempalace-refresh.sh codex /s >> /l 2>&1 # nunchi:#816 gen=$gen_nu
 7 8 * * 1 bash /h/bench.sh >> /l 2>&1 # nunchi:#816 gen=$gen_nu"
