@@ -936,6 +936,44 @@ sh_re="$(sed -n 's/^INVALID_RE="\${NUNCHI_BENCH_INVALID_RE:-\(.*\)}"$/\1/p' "$HE
 ok "bench.sh and nunchi.py share one unavailable-backend pattern" \
   '[ -n "$sh_re" ] && [ "$py_re" = "$sh_re" ]'
 
+# ---- #2531: the claude synthesis call runs isolated from the node harness ----
+# Without isolation `claude -p` inherited CLAUDE.md, SessionStart injection, the
+# output style, hooks and tools; the 2026-10-26 bench answers became full
+# reports and every node's gate failed. The stub records its argv so the test
+# pins the flags and that the prompt stays argv[2] (other stubs read "$2").
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "${ARGV_LOG:?}"
+echo "ISOLATED-ANSWER"
+EOF
+chmod +x "$synth_bin/claude"
+argv_log="$TMP/claude-argv.log"
+out="$(ARGV_LOG="$argv_log" PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "isolated claude synthesis still answers" 'grep -q "ISOLATED-ANSWER" <<<"$out"'
+for flag in --safe-mode --strict-mcp-config --no-session-persistence; do
+  ok "claude synthesis passes $flag (#2531)" 'grep -qxF -- "$flag" "$argv_log"'
+done
+ok "claude synthesis disables tools and MCP tools (#2531)" \
+  'grep -A1 -xF -- "--tools" "$argv_log" | sed -n 2p | grep -qx "" && grep -A1 -xF -- "--disallowedTools" "$argv_log" | sed -n 2p | grep -qxF "mcp__*"'
+ok "claude synthesis keeps the prompt directly after -p (#2531)" \
+  '[ "$(sed -n 1p "$argv_log")" = "-p" ] && sed -n 2p "$argv_log" | grep -q "peer 메모리"'
+
+# #2531 — the partial-gap wording must never read as a refusal to bench.sh, and
+# the prompts must not tell the model to write '기록 없음' for an uncited clause.
+# shellcheck disable=SC2034  # gap is read via eval inside ok()
+gap="$(python3 -c "
+import sys; sys.path.insert(0, '$HERE')
+from nunchi import PARTIAL_GAP_PHRASE, NO_RECORD_RE
+print('MATCH' if NO_RECORD_RE.search(PARTIAL_GAP_PHRASE) else PARTIAL_GAP_PHRASE)")"
+ok "partial-gap phrase stays clear of NO_RECORD_RE (#2531)" '[ "$gap" = "근거에 포함되지 않음" ]'
+# bench.sh reads the same phrase as a refusal when it is the conclusion line.
+# shellcheck disable=SC2034  # gap_re is read via eval inside ok()
+gap_re="$(sed -n 's/^PARTIAL_GAP_RE="\${NUNCHI_BENCH_PARTIAL_GAP_RE:-\(.*\)}"$/\1/p' "$HERE/bench.sh")"
+ok "bench.sh PARTIAL_GAP_RE matches nunchi.py PARTIAL_GAP_PHRASE (#2531)" \
+  '[ -n "$gap_re" ] && grep -qE "$gap_re" <<<"$gap"'
+ok "dialectic prompt no longer maps an uncited clause to '기록 없음' (#2531)" \
+  '! grep -qF "인용할 근거가 없으면 '"'"'기록 없음'"'"'" "$HERE/nunchi.py"'
+
 # ---- #827 / TM-2339: synthesize reads evidence from stdin -------------------
 # The bench Wiki layer needs a synthesis entry point that is NOT dialectic, so
 # live recall behaviour stays put while the gate gains the layer TM-2029 made

@@ -760,5 +760,52 @@ ok "NUNCHI_BENCH_START_UTC moves the window start (#1399)" \
   'grep -q "^- backend attempts during run: 6 (failed: 6)$" "$bh_pin" \
    && grep -q "^- gate verdict: INDETERMINATE — synthesis backend degraded during run (6/6 attempts failed)$" "$bh_pin"'
 
+# ---- #2531: refusal is judged on the conclusion line, not the whole body ----
+# 2026-10-26: correct answers that also said "peer 메모리: 기록 없음" about one
+# sub-point graded UNANSWERED on every node (58-93%), and a whole-answer refusal
+# worded with the partial-gap phrase graded FABRICATED on a negative control.
+lb_home="$TMP/home-leadblock"
+lb_hooks="$lb_home/.claude/hooks/nunchi"
+lb_state="$lb_home/.claude/state"
+lb_nh="$lb_home/.nunchi"
+mkdir -p "$lb_hooks" "$lb_state" "$lb_nh"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$lb_hooks/bench.sh"
+chmod 700 "$lb_hooks/bench.sh"
+printf 'on' > "$lb_state/nunchi.mode"
+{
+  printf 'id\tcategory\tquery\texpect_hint\tsource\tevidence\n'
+  printf 'p1\t노드사실\tpartial-gap answer\th\tnunchi\te\n'
+  printf 'p2\t노드사실\theading refusal\th\tnunchi\te\n'
+  printf 'n1\t부정형\tgap refusal\th\tnone\te\n'
+  printf 'n2\t부정형\tbody-only gap\th\tnone\te\n'
+} > "$lb_hooks/bench-qset.tsv"
+cat > "$lb_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+q = sys.argv[2] if len(sys.argv) > 2 else ""
+answers = {
+    "partial-gap answer": "quiz2-api는 127.0.0.1:8801에서 돈다.\n- peer 메모리: 기록 없음\n- 진행 DB 경로는 근거에 포함되지 않음",
+    "heading refusal": "## 답변\n\n**기록 없음**: 근거에 해당 결정이 없다.",
+    "gap refusal": "주유(juyu)의 Tailscale IP는 근거에 포함되지 않음.\n- 노드 목록에 주유가 없다.",
+    "body-only gap": "주유(juyu)의 Tailscale IP는 100.64.0.9이다.\n- 등록일은 근거에 포함되지 않음",
+}
+print("stub metrics" if cmd == "metrics" else answers.get(q, "?"))
+PY
+HOME="$lb_home" CCC_STATE_DIR="$lb_state" NUNCHI_HOME="$lb_nh" \
+  NUNCHI_BENCH_QSET="$lb_hooks/bench-qset.tsv" CCC_NODE=test-node \
+  NUNCHI_BENCH_WIKI_CLI=/nonexistent \
+  bash "$lb_hooks/bench.sh" > "$TMP/lb-stdout" 2>&1
+lb_out="$(find "$lb_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+ok "a correct answer with a partial '기록 없음' sub-point is ANSWERED (#2531)" \
+  '[ -n "$lb_out" ] && grep -q "^## p1 .*source=nunchi$" "$lb_out"'
+ok "a heading followed by a refusal line is still a refusal (#2531)" \
+  'grep -q "^## p2 .*source=none$" "$lb_out"'
+ok "a negative control refused with the partial-gap wording is CORRECT-REJECT (#2531)" \
+  'grep -q "^## n1 .*grade=CORRECT-REJECT$" "$lb_out"'
+ok "a fabricated conclusion stays FABRICATED despite a gap phrase in the body (#2531)" \
+  'grep -q "^## n2 .*grade=FABRICATED$" "$lb_out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
