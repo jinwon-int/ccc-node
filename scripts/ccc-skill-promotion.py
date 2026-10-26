@@ -1115,7 +1115,7 @@ def run_with_graceful_timeout(args, *, timeout, input=None, capture_output=False
     whole process group, so the claude CLI's own children (MCP servers) stop with
     it instead of being orphaned. Every wait after the timeout is bounded by the
     grace: a descendant that left the group can hold the pipes open, and the old
-    unbounded communicate() after SIGKILL pinned the caller (daegyo bench q23,
+    unbounded communicate() after SIGKILL pinned the caller (a weekly bench run at q23,
     2026-10-26).
     """
     import os
