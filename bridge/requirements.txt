@@ -7,14 +7,14 @@
 # tests/test_runtime_deps_lock.py fails CI when they diverge. For manual dev
 # setups prefer `pip install -e .` (or `pip install -e .[dev]` for tests).
 python-telegram-bot==22.8
-telegramify-markdown==1.4.0
+telegramify-markdown==1.4.1
 python-dotenv==1.2.4
 pydantic==2.13.5
-pydantic-settings==2.15.0
-claude-agent-sdk==0.2.165
+pydantic-settings==2.16.1
+claude-agent-sdk==0.2.174
 opentelemetry-api==1.45.1
 opentelemetry-sdk==1.45.1
-openai==3.29.0
+openai==3.37.0
 # Optional: the Volcengine TOS voice-upload provider needs the `tos` package,
 # which builds a native `crcmod` wheel and can fail on minimal toolchains. It is
 # intentionally NOT a core dependency so a missing/unbuildable `tos` cannot abort
