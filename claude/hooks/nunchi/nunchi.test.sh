@@ -966,6 +966,11 @@ import sys; sys.path.insert(0, '$HERE')
 from nunchi import PARTIAL_GAP_PHRASE, NO_RECORD_RE
 print('MATCH' if NO_RECORD_RE.search(PARTIAL_GAP_PHRASE) else PARTIAL_GAP_PHRASE)")"
 ok "partial-gap phrase stays clear of NO_RECORD_RE (#2531)" '[ "$gap" = "근거에 포함되지 않음" ]'
+# bench.sh reads the same phrase as a refusal when it is the conclusion line.
+# shellcheck disable=SC2034  # gap_re is read via eval inside ok()
+gap_re="$(sed -n 's/^PARTIAL_GAP_RE="\${NUNCHI_BENCH_PARTIAL_GAP_RE:-\(.*\)}"$/\1/p' "$HERE/bench.sh")"
+ok "bench.sh PARTIAL_GAP_RE matches nunchi.py PARTIAL_GAP_PHRASE (#2531)" \
+  '[ -n "$gap_re" ] && grep -qE "$gap_re" <<<"$gap"'
 ok "dialectic prompt no longer maps an uncited clause to '기록 없음' (#2531)" \
   '! grep -qF "인용할 근거가 없으면 '"'"'기록 없음'"'"'" "$HERE/nunchi.py"'
 

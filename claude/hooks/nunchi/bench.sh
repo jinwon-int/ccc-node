@@ -120,6 +120,24 @@ INVALID_RE="${NUNCHI_BENCH_INVALID_RE:-Not logged in|Please run /login|Invalid A
 # match scored those paraphrases as successes. Kept byte-identical to
 # nunchi.py's NO_RECORD_RE; nunchi.test.sh asserts the two stay in sync.
 NO_RECORD_RE="${NUNCHI_BENCH_NO_RECORD_RE:-기록 없음|기록이 없|근거가 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없}"
+# #2531 — the partial-gap wording nunchi.py's NO_RECORD_RULE gives a missing
+# detail (nunchi.py PARTIAL_GAP_PHRASE; nunchi.test.sh asserts it matches).
+PARTIAL_GAP_RE="${NUNCHI_BENCH_PARTIAL_GAP_RE:-근거에 포함되지 않}"
+# #2531 — a refusal is judged on the answer's conclusion, not anywhere in its
+# body. Matching the whole body turned every correct answer that also said
+# "peer 메모리: 기록 없음" about one sub-point into UNANSWERED (2026-10-26:
+# unanswered 58-93% on every node). The prompt now puts the conclusion on the
+# first line, so the lead block is: leading markdown heading lines plus the
+# first non-heading content line ("## 답변" + "**기록 없음**: …" still reads
+# as a refusal). On the lead block the partial-gap wording is a refusal too —
+# "X는 근거에 포함되지 않음." as a conclusion means the core ask is missing; a
+# negative control answered that way is a correct rejection, not a fabrication.
+lead_block() {
+  printf '%s\n' "$1" | awk 'NF == 0 { next } { print } !/^[[:space:]]*#/ { exit }'
+}
+is_refusal() {
+  lead_block "$1" | grep -qE "$NO_RECORD_RE|$PARTIAL_GAP_RE"
+}
 # #827 — TM-2029 assigns durable cross-node knowledge to the Family Wiki, so the
 # parity gate must ask "nunchi + Wiki", not "nunchi alone". A per-node store can
 # never answer a cross-node question, which made the old gate unpassable by
@@ -211,7 +229,7 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
   # exactly like "the Wiki has nothing" — 0/48 with no trace of why.
   wiki_state=-
   if [ "$status" = OK ]; then
-    if printf '%s' "$ans" | grep -qE "$NO_RECORD_RE"; then
+    if is_refusal "$ans"; then
       # nunchi found nothing — consult the layer TM-2029 made responsible for
       # durable cross-node knowledge before counting this against the gate.
       if [ -n "$WIKI_CLI" ] && [ -x "$WIKI_CLI" ]; then
@@ -229,7 +247,7 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
           if [ "$synth_rc" = 124 ]; then
             wiki_state=timeout
           elif [ -n "${wiki_ans//[[:space:]]/}" ] \
-             && ! printf '%s' "$wiki_ans" | grep -qE "$NO_RECORD_RE" \
+             && ! is_refusal "$wiki_ans" \
              && ! printf '%s' "$wiki_ans" | grep -qiE "$INVALID_RE"; then
             source=wiki
             wiki_state=ok
@@ -263,7 +281,7 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
   # layer that fabricates on top of a nunchi refusal now passes the gate — the
   # sheet keeps source=wiki on the row so a reviewer can still see the supplement.
   nunchi_rejected=no
-  if printf '%s' "$ans" | grep -qE "$NO_RECORD_RE"; then
+  if is_refusal "$ans"; then
     nunchi_rejected=yes
   fi
   # Spelled out rather than `test && x || y`: this is the grading decision, and

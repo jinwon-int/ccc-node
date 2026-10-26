@@ -2015,10 +2015,13 @@ NO_RECORD_RE = re.compile(
 # "peer 메모리: 기록 없음" clauses and graded UNANSWERED. Partial gaps get their
 # own wording, which nunchi.test.sh asserts stays clear of NO_RECORD_RE.
 PARTIAL_GAP_PHRASE = "근거에 포함되지 않음"
+# bench.sh judges refusal on the conclusion line only (is_refusal), so the rule
+# also pins the conclusion to the first line.
 NO_RECORD_RULE = (
-    "근거에 없는 내용은 지어내지 마라. 질문에 답할 근거가 전혀 없을 때만 답 첫머리에 '기록 없음'이라 하라. "
-    f"근거가 일부만 있으면 근거 있는 부분만 답하고, 빠진 세부는 '{PARTIAL_GAP_PHRASE}'이라고 짧게 적어라"
-    "('기록 없음'은 답 전체가 없을 때 전용이다). 답변 형식은 평문으로 간결하게, 보고서 절이나 다음 액션 제안은 붙이지 마라.\n"
+    "근거에 없는 내용은 지어내지 마라. 답의 첫 줄은 결론 한 문장으로 써라. "
+    "질문이 묻는 핵심(값·이유·절차 등)이 근거에 없으면 첫 줄을 '기록 없음'으로 시작하라. "
+    f"핵심은 답했지만 일부 세부만 빠졌으면 그 세부를 본문에서 '{PARTIAL_GAP_PHRASE}'이라고 짧게 적어라"
+    "('기록 없음'은 핵심이 없을 때 전용이다). 답변은 평문으로 간결하게, 보고서 절이나 다음 액션 제안은 붙이지 마라.\n"
 )
 
 
