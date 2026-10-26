@@ -60,6 +60,12 @@
           },
           {
             "type": "command",
+            "command": "bash /root/.claude/hooks/agent-trust-watch.sh SessionStart",
+            "timeout": 15,
+            "statusMessage": "Checking agent instruction files / config drift (#2538)..."
+          },
+          {
+            "type": "command",
             "command": "bash /root/.claude/hooks/distill/pending-drain.sh >/dev/null 2>&1 &",
             "timeout": 5,
             "statusMessage": "Recovering pending memory distills (background)..."
