@@ -297,6 +297,7 @@ class HandeTransport:
         self.account = str(self.c["account"])
         self.approval_timeout_s = int(self.c.get("approval_timeout_s") or 120)
         self.tool_timeout_s = int(self.c.get("tool_timeout_s") or 90)
+        self._close_task: asyncio.Future[None] | None = None
         self.interim_frames = bool(self.c.get("interim_frames"))
         self.notice_frames = bool(self.c.get("notice_frames"))
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
@@ -352,10 +353,31 @@ class HandeTransport:
         if self._server is None:
             await self.open()
         assert self._server is not None
-        async with self._server:
+        # Not ``async with self._server``: from Python 3.12 ``Server.wait_closed()``
+        # (what its ``__aexit__`` awaits, unbounded) waits for every open connection,
+        # and the native bot never hangs up on its own. A SIGTERM-cancelled
+        # ``run()`` then never returned, so the ``close()`` in ``MatrixBot.serve``'s
+        # ``finally`` that would hang up was never reached: systemd SIGKILLed the
+        # unit at its stop timeout and runit left it in ``got TERM`` (#2535).
+        # ``close()`` hangs up on the client first and bounds the wait.
+        try:
             await self._stopping.wait()
+        finally:
+            await self.close()
 
     async def close(self) -> None:
+        """Hang up, stop listening and remove the socket; idempotent and cancel-safe.
+
+        ``run()``'s ``finally`` and ``MatrixBot.serve``'s ``finally`` both call it;
+        every caller awaits the same single close, which a cancelled caller does
+        not interrupt halfway.
+        """
+
+        if self._close_task is None:
+            self._close_task = asyncio.ensure_future(self._close_once())
+        await asyncio.shield(self._close_task)
+
+    async def _close_once(self) -> None:
         self._stopping.set()
         if self._active is not None and self._active.task is not None:
             self._active.task.cancel()

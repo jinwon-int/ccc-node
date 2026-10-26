@@ -473,3 +473,43 @@ async def test_screen_delegation_turn_reaches_the_runner_fenced(tmp_path: Path) 
         await bot.close()
     finally:
         await _stop(served)
+
+
+async def test_cancelled_run_returns_while_the_bot_stays_connected(tmp_path: Path) -> None:
+    """SIGTERM cancels the serving task while the native bot is still connected (#2535).
+
+    The bot never hangs up on its own, and from Python 3.12 ``Server.wait_closed()``
+    (what ``async with server`` awaits on exit) waits for every open connection, so
+    ``run()`` must close the client itself instead of waiting on it. Before the fix
+    the bridge hung here until systemd's stop timeout SIGKILLed it (runit: forever).
+    """
+
+    served = await _serve(tmp_path)
+    bot = await FakeBot.connect(served.path)
+    try:
+        await _connected(served)
+        assert served.task is not None
+        served.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(served.task), 10)
+        assert await bot.closed(), "run() returned without hanging up on the bot"
+        assert not served.path.exists()
+    finally:
+        await bot.close()
+        await _stop(served)
+
+
+async def test_close_while_the_bot_stays_connected_ends_run(tmp_path: Path) -> None:
+    """An orderly ``close()`` with the bot still attached ends ``run()`` promptly (#2535)."""
+
+    served = await _serve(tmp_path)
+    bot = await FakeBot.connect(served.path)
+    try:
+        await _connected(served)
+        await asyncio.wait_for(served.transport.close(), 10)
+        assert served.task is not None
+        await asyncio.wait_for(served.task, 10)
+        assert await bot.closed()
+    finally:
+        await bot.close()
+        await _stop(served)
