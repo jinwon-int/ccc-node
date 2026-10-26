@@ -1293,6 +1293,39 @@ refresh_skill_manifest_hashes() { # refresh_skill_manifest_hashes <dest-root> <m
   mv "$manifest.tmp" "$manifest"
 }
 run mkdir -p "$CLAUDE_DIR/output-styles" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state"
+
+# #2541 — state/node.txt is the fleet identity that cron-run hooks read when
+# CCC_NODE is absent (nunchi ingest, load-memory, statusline). Nothing wrote
+# it, so nodes without a hand-made copy attributed every subject=node fact to
+# "unknown". Seed it ONCE from an identity that is already decided — --node,
+# then CCC_NODE, then the single CCC_NODE="..." value fleet installers wrote
+# into this user's crontab — and never rewrite an existing file (a node.txt
+# is an operator decision). Ambiguous or non-slug values are skipped, not
+# guessed; nunchi's canonical-hostname fallback still covers those nodes.
+seed_node_txt() {
+  local f="$CLAUDE_DIR/state/node.txt" v="" src=""
+  [ -e "$f" ] && return 0
+  if [ -n "$OPT_NODE" ]; then v="$OPT_NODE"; src="--node"
+  elif [ -n "${CCC_NODE:-}" ]; then v="$CCC_NODE"; src="CCC_NODE"
+  elif command -v crontab >/dev/null 2>&1; then
+    v="$(crontab -l 2>/dev/null | grep -vE '^[[:space:]]*#' \
+         | grep -oE 'CCC_NODE="?[A-Za-z0-9_-]+' | sed -E 's/^CCC_NODE="?//' \
+         | LC_ALL=C sort -u || true)"
+    src="crontab CCC_NODE"
+    if [ "$(printf '%s\n' "$v" | grep -c .)" -gt 1 ]; then
+      note "node.txt not seeded — crontab carries several CCC_NODE values ($(printf '%s' "$v" | tr '\n' ' '))"
+      return 0
+    fi
+  fi
+  [ -n "$v" ] || return 0
+  case "$v" in
+    *[!a-z0-9-]*) note "node.txt not seeded — '$v' ($src) is not a node slug"; return 0 ;;
+  esac
+  if [ "$DRY" = 1 ]; then echo "[dry-run] seed $f = $v ($src)"; return 0; fi
+  ( umask 077; printf '%s\n' "$v" > "$f" ) && note "seeded $f = $v (from $src)"
+}
+seed_node_txt
+
 install_repo_files_into "$CLAUDE_DIR/output-styles" "$CLAUDE_DIR/state/repo-output-styles.manifest" "$SRC/claude/output-styles"
 install_repo_files_into "$CLAUDE_DIR/commands" "$CLAUDE_DIR/state/repo-commands.manifest" "$SRC/claude/commands"
 install_repo_skills_into "$CLAUDE_DIR/skills" "$CLAUDE_DIR/state/repo-skills.manifest" "$SRC/skills"

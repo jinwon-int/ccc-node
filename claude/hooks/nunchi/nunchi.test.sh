@@ -74,6 +74,45 @@ CCC_NODE="카렐렌" payload sk1 fact node "카렐렌 노드는 외부 친구 �
 row="$(python3 -c "import sqlite3;print(sqlite3.connect('$NUNCHI_DB').execute(\"SELECT observed FROM peer_facts WHERE fact LIKE '%외부 친구 노드%'\").fetchone()[0])")"
 ok "stale 카렐렌 alias removed — observed stays literal, never yukson (#1472)" '[ "$row" = "카렐렌" ]'
 
+# ---- 3a. #2541: node identity without CCC_NODE (cron ingest) --------------
+# Resolution order CCC_NODE > $CCC_STATE_DIR/node.txt > ~/.claude/state/node.txt
+# > canonical short hostname > "unknown". os.uname and NODE_ALIASES are
+# patched with placeholders so the result never depends on the machine
+# running the suite (and no fleet identifier enters this file).
+idres() {  # idres <hostname> [state-dir] [home]
+  env -u CCC_NODE CCC_STATE_DIR="${2:-$TMP/id-empty}" HOME="${3:-$TMP/id-home}" \
+    python3 - "$HERE" "$1" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+host = sys.argv[2]
+class U:  # minimal uname_result stand-in
+    nodename = host
+os.uname = lambda: U
+import nunchi
+nunchi.NODE_ALIASES = {"node-alpha": "node-alpha", "알파": "node-alpha"}
+print(nunchi._node_name(), nunchi.map_observed("node", "sid"))
+PY
+}
+mkdir -p "$TMP/id-empty" "$TMP/id-state" "$TMP/id-home/.claude/state" "$TMP/id-blank"
+printf 'node-beta\n' > "$TMP/id-state/node.txt"
+printf 'node-gamma\n' > "$TMP/id-home/.claude/state/node.txt"
+: > "$TMP/id-blank/node.txt"
+# shellcheck disable=SC2034  # r1..r5 are read via eval inside ok()
+r1="$(idres node-alpha "$TMP/id-state")"
+ok "CCC_STATE_DIR/node.txt wins over ~/.claude/state and hostname (#2541)" '[ "$r1" = "node-beta node-beta" ]'
+# shellcheck disable=SC2034
+r2="$(idres node-alpha "$TMP/id-empty" "$TMP/id-home")"
+ok "HOME/.claude/state/node.txt used when CCC_STATE_DIR has none (#2541)" '[ "$r2" = "node-gamma node-gamma" ]'
+# shellcheck disable=SC2034
+r3="$(idres node-alpha.tailnet.example "$TMP/id-blank" "$TMP/id-empty")"
+ok "blank node.txt falls through to canonical FQDN short hostname (#2541)" '[ "$r3" = "node-alpha node-alpha" ]'
+# shellcheck disable=SC2034
+r4="$(idres host-unmapped "$TMP/id-empty" "$TMP/id-empty")"
+ok "unmapped hostname stays unknown, never a new peer slug (#2541)" '[ "$r4" = "unknown unknown" ]'
+# shellcheck disable=SC2034
+r5="$(CCC_NODE=node-delta CCC_STATE_DIR="$TMP/id-state" python3 -c "import sys;sys.path.insert(0,sys.argv[1]);import nunchi;print(nunchi._node_name())" "$HERE")"
+ok "CCC_NODE still overrides node.txt (#2541)" '[ "$r5" = "node-delta" ]'
+
 # ---- 3b. ingest: mutable-ops facts filtered (#1010) ------------------------
 out="$(payload s6 fact node "카렐렌 ccc-node 커밋 efe088b, Bridge active/enabled, NRestarts=0" | python3 "$NP" ingest - 2>&1)"
 ok "mutable-ops state fact skipped at ingest" 'grep -q "ingested 0/1" <<<"$out" && grep -q "skipped_mutable_ops=1" <<<"$out"'

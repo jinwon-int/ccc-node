@@ -335,12 +335,36 @@ def _atomic_write_text(path, text):
 
 
 def _node_name():
+    """Fleet identity for subject=node facts: CCC_NODE > state/node.txt >
+    canonical short hostname > "unknown".
+
+    #2541 — cron ingest carries no CCC_NODE and setup.sh never wrote
+    node.txt, so five nodes stored every subject=node fact as
+    observed=unknown (wiki-promote's roster gate then failed 100%). The
+    hostname step only accepts a name NODE_ALIASES already knows; an
+    unmapped host (a provider-assigned VPS name, a CI runner) still yields
+    "unknown" rather than a
+    new, non-canonical observed peer.
+    """
     if os.environ.get("CCC_NODE"):
         return os.environ["CCC_NODE"]
+    paths = []
+    if os.environ.get("CCC_STATE_DIR"):
+        paths.append(os.path.join(os.environ["CCC_STATE_DIR"], "node.txt"))
+    paths.append(os.path.expanduser("~/.claude/state/node.txt"))
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                name = fh.readline().strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if name:
+            return name
     try:
-        return open(os.path.expanduser("~/.claude/state/node.txt")).read().strip()
-    except OSError:
-        return "unknown"
+        host = os.uname().nodename.split(".")[0]
+    except (AttributeError, OSError):
+        host = ""
+    return canon_node(host) or "unknown"
 
 
 def canon_node(name):
