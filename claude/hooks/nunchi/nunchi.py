@@ -1520,10 +1520,29 @@ SYNTH_UNAVAILABLE_RE = re.compile(
 )
 
 
+# #2531 — the claude synthesis call must not inherit the node harness. Without
+# isolation `claude -p` loads CLAUDE.md, SessionStart memory injection, the
+# ccc-report output style, hooks, tools and MCP servers: the 2026-10-26 bench
+# answers came back as full "확정 사실/리스크/다음 액션" reports that quoted
+# SessionStart constraints and ran live `git` lookups, and every node's gate
+# failed (unanswered 58-93%). Same flag set judge-batch.py adopted in #2245;
+# --safe-mode keeps OAuth login (unlike --bare). "{prompt}" stays argv[2]
+# (directly after -p): it must precede the variadic --tools/--disallowedTools
+# options, and the test stubs read the prompt from "$2".
+CLAUDE_SYNTH_ISOLATION = (
+    "--safe-mode",
+    "--tools", "",
+    "--disallowedTools", "mcp__*",
+    "--strict-mcp-config",
+    "--permission-mode", "dontAsk",
+    "--no-session-persistence",
+)
+
+
 def _synth_candidates():
     """Backends to try, in order. claude stays first for backward compatibility."""
     return (
-        ("claude", ["claude", "-p", "{prompt}", "--model", "haiku"]),
+        ("claude", ["claude", "-p", "{prompt}", *CLAUDE_SYNTH_ISOLATION, "--model", "haiku"]),
         ("codex", ["codex", "exec", "--skip-git-repo-check", "{prompt}"]),
     )
 
@@ -1989,6 +2008,19 @@ NO_RECORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# #2531 — "기록 없음" is the whole-answer refusal token: bench.sh reads any
+# NO_RECORD_RE match anywhere in an answer as "this layer did not answer".
+# #2473 told the model to write '기록 없음' whenever it had nothing to cite, and
+# Wiki/MemPalace evidence carries no [#id], so correct answers grew partial
+# "peer 메모리: 기록 없음" clauses and graded UNANSWERED. Partial gaps get their
+# own wording, which nunchi.test.sh asserts stays clear of NO_RECORD_RE.
+PARTIAL_GAP_PHRASE = "근거에 포함되지 않음"
+NO_RECORD_RULE = (
+    "근거에 없는 내용은 지어내지 마라. 질문에 답할 근거가 전혀 없을 때만 답 첫머리에 '기록 없음'이라 하라. "
+    f"근거가 일부만 있으면 근거 있는 부분만 답하고, 빠진 세부는 '{PARTIAL_GAP_PHRASE}'이라고 짧게 적어라"
+    "('기록 없음'은 답 전체가 없을 때 전용이다). 답변 형식은 평문으로 간결하게, 보고서 절이나 다음 액션 제안은 붙이지 마라.\n"
+)
+
 
 def synthesize_stdin(query):
     """Answer `query` from evidence supplied on stdin (#827 gate — Wiki layer).
@@ -2008,7 +2040,7 @@ def synthesize_stdin(query):
         return
     prompt = (
         "아래는 Family Wiki에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
-        "근거에 없는 내용은 지어내지 말고 '기록 없음'이라 하라.\n"
+        + NO_RECORD_RULE +
         # #832 — same conversational-echo guard as dialectic: wiki chunks can
         # quote past exchanges, and quoted speech is evidence of what was said,
         # not a question to answer now.
@@ -2035,8 +2067,9 @@ def dialectic(query, target, as_of=None):
     prompt = (
         as_of_line +
         "아래는 peer 메모리(요약 사실)와 MemPalace(원문 발췌)에서 검색한 근거다. 질문에 한국어로 간결·정확히 답하라.\n"
-        "근거에 없는 내용은 지어내지 말고 '기록 없음'이라 하라. 시일이 닫힌(valid_to 있는) 사실은 과거 이력이다.\n"
-        "근거로 쓴 사실은 문장 끝에 `[#id]`로 인용하라. 인용할 근거가 없으면 '기록 없음'이라 하라.\n"
+        + NO_RECORD_RULE +
+        "시일이 닫힌(valid_to 있는) 사실은 과거 이력이다.\n"
+        "peer 사실을 근거로 썼으면 문장 끝에 `[#id]`로 인용하라. MemPalace 발췌처럼 id가 없는 근거는 인용 표시 없이 써도 된다.\n"
         "현재 유효 사실 앞의 날짜는 기록 시점이다. 같은 주제의 사실이 여럿이면 가장 최근 것을 현재 상태로 보고, "
         "더 오래된 사실은 갱신됐을 수 있다고 분명히 말하라(옛 사실을 현재로 단정하지 마라).\n"
         # #832 — MemPalace serves raw transcript chunks, so a chunk can carry a
