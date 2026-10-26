@@ -15,6 +15,8 @@ child processes (no claude, no network).
 from __future__ import annotations
 
 import ast
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -72,6 +74,65 @@ CHILD = textwrap.dedent(
     """
 )
 
+# #2533 — a descendant that keeps the parent's stdout/stderr open. In "escape"
+# mode it leaves the process group (setsid), so only the bounded drain can free
+# the caller; otherwise it ignores SIGTERM ("ignore") or saves on it ("save").
+GRANDCHILD = textwrap.dedent(
+    """
+    import os, signal, sys, time
+    pidfile, marker, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+    if mode == "escape":
+        os.setsid()
+    if mode == "save":
+        def on_term(*_):
+            open(marker, "w").write("TERM")
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, on_term)
+    else:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(pidfile, "w").write(str(os.getpid()))
+    time.sleep(60)
+    """
+)
+
+# Stands in for the claude CLI: spawns the descendant with inherited pipes.
+PARENT = textwrap.dedent(
+    """
+    import signal, subprocess, sys, time
+    grand, pidfile, gmarker, gmode, pmode = sys.argv[1:6]
+    if pmode == "ignore":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    subprocess.Popen([sys.executable, grand, pidfile, gmarker, gmode])
+    for _ in range(200):
+        try:
+            if open(pidfile).read():
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+    sys.stdout.write("started\\n"); sys.stdout.flush()
+    time.sleep(60)
+    """
+)
+
+
+def _gone(pid: int, wait: float = 3.0) -> bool:
+    """True once pid no longer runs (absent, or a zombie awaiting its reaper)."""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            if state == "Z":
+                return True
+        except (OSError, IndexError):
+            return True
+        time.sleep(0.05)
+    return False
+
 
 class GracefulTimeout(unittest.TestCase):
     def setUp(self) -> None:
@@ -80,13 +141,30 @@ class GracefulTimeout(unittest.TestCase):
         self.child = self.tmp / "child.py"
         self.child.write_text(CHILD, encoding="utf-8")
         self.marker = self.tmp / "marker"
+        self.grand = self.tmp / "grand.py"
+        self.grand.write_text(GRANDCHILD, encoding="utf-8")
+        self.parent = self.tmp / "parent.py"
+        self.parent.write_text(PARENT, encoding="utf-8")
+        self.gpid = self.tmp / "grand.pid"
+        self.gmarker = self.tmp / "grand.marker"
 
     def tearDown(self) -> None:
+        # An escaped descendant outlives the helper by design; never leak it.
+        try:
+            os.kill(int(self.gpid.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
         self._tmp.cleanup()
+
+    def _family(self, gmode: str, pmode: str) -> list[str]:
+        return [sys.executable, str(self.parent), str(self.grand), str(self.gpid),
+                str(self.gmarker), gmode, pmode]
 
     def test_all_copies_are_identical_and_present(self) -> None:
         reference = helper_source(COPIES[0])
-        self.assertIn("proc.terminate()", reference)
+        # #2533: signals go to the child's own process group, not just the child.
+        self.assertIn("os.killpg(", reference)
+        self.assertIn("start_new_session", reference)
         for rel in COPIES:
             with self.subTest(copy=rel):
                 self.assertEqual(helper_source(rel), reference)
@@ -132,6 +210,44 @@ class GracefulTimeout(unittest.TestCase):
         elapsed = time.time() - started
         self.assertGreaterEqual(elapsed, 1.9, "SIGKILL came before the grace ran out")
         self.assertLess(elapsed, 10.0)
+
+    def test_descendant_holding_the_pipes_is_killed_with_the_group(self) -> None:
+        # #2533: proc.kill() reached only the direct child, so an in-group
+        # descendant kept stdout open and the unbounded communicate() hung.
+        run = load_helper(1.0)["run_with_graceful_timeout"]
+        started = time.time()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(self._family("ignore", "ignore"), capture_output=True, text=True, timeout=1)
+        self.assertLess(time.time() - started, 8.0, "caller was pinned by the descendant")
+        self.assertTrue(_gone(int(self.gpid.read_text())), "descendant survived SIGKILL")
+
+    def test_descendant_outside_the_group_cannot_pin_the_caller(self) -> None:
+        # A descendant that called setsid() escapes killpg; the drain after
+        # SIGKILL is bounded, so the caller still returns.
+        run = load_helper(1.0)["run_with_graceful_timeout"]
+        started = time.time()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(self._family("escape", "ignore"), capture_output=True, text=True, timeout=1)
+        self.assertLess(time.time() - started, 10.0, "unbounded wait after SIGKILL")
+
+    def test_descendants_get_sigterm_first_too(self) -> None:
+        # The #2397 order holds for the whole group: SIGTERM, not SIGKILL.
+        run = load_helper(5.0)["run_with_graceful_timeout"]
+        started = time.time()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            run(self._family("save", "save"), capture_output=True, text=True, timeout=1)
+        self.assertEqual(self.gmarker.read_text(), "TERM")
+        self.assertIn("started", caught.exception.output or "")
+        self.assertLess(time.time() - started, 5.0)
+
+    def test_caller_may_opt_out_of_a_new_session(self) -> None:
+        run = load_helper(5.0)["run_with_graceful_timeout"]
+        done = run([sys.executable, "-c", "import os; print(os.getpgrp() == os.getpgid(os.getppid()))"],
+                   capture_output=True, text=True, timeout=20, start_new_session=False)
+        self.assertEqual(done.stdout.strip(), "True")
+        done = run([sys.executable, "-c", "import os; print(os.getpgrp() == os.getpid())"],
+                   capture_output=True, text=True, timeout=20)
+        self.assertEqual(done.stdout.strip(), "True")
 
     def test_spawn_errors_propagate_like_subprocess_run(self) -> None:
         run = load_helper(1.0)["run_with_graceful_timeout"]
