@@ -112,7 +112,13 @@ Prerequisites live in family-messenger#460 and are installed separately
 `fleet-alerts`, the 「한데」 fleet alert room (bot-to-bot allowed room, #425),
 and the bot unit (`native-mls-bot <relay-url> steward <device> --identity-file
 … --rooms-dir … --access-jwt-file … --responder-unix /run/fleet-alerts/responder.sock`)
-running as the user named in `--socket-owner`. Then:
+running as the user named in `--socket-owner` **with
+`NATIVE_MLS_BOT_ROOM_FRAMES=1`** — an alert-mode room accepts `notice` frames
+only on the `--room-frames` wire; on the single-room wire the bot drops them
+(`agent_outbound_dropped`). Device naming: the bot posts its actor as the
+device id up to the first hyphen and the relay checks it against the policy
+actor (`commit_actor_mismatch` otherwise), so use a hyphen-free actor such as
+`fleet` / device `fleet-bot`. Then:
 
 1. `python3 fleet_alerts_sender_hande.py --queue /var/lib/fleet-alerts/queue --install-only`
    — adds `hande_alerts` + trigger `hande_mirror` under the queue lock. The
@@ -120,6 +126,8 @@ running as the user named in `--socket-owner`. Then:
    step are not mirrored.
 2. Copy `fleet-alerts-sender-hande.service.example` to `/etc/systemd/system/`,
    set `--room` to the relay room id, `systemctl enable --now fleet-alerts-sender-hande`.
+   Keep `RuntimeDirectoryMode=0755`: the bot user must traverse
+   `/run/fleet-alerts` (the socket itself stays 0600).
 3. Canary: one alert must appear in **both** rooms; `--status` shows the mirror
    backlog (0 when drained).
 
