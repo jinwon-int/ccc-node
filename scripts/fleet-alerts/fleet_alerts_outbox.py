@@ -29,6 +29,9 @@ DEFAULT_DEDUP_WINDOW_S = 900.0
 # in the room; "socket-write" (the hande lane's hand-off to the relay bot) is
 # weak — the bot has no notice ack. ``notified`` means at least one strong one.
 TIERS = ("info", "action", "critical")
+# Derived rows the policy module creates (never accepted from a node payload —
+# the receiver normalises payload tiers with the closed TIERS set).
+INTERNAL_TIERS = ("digest", "renotify")
 DEFAULT_TIER = "info"
 ALERT_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 ALERT_ID_LEN = 6
@@ -204,7 +207,8 @@ def enqueue(
             raise ValueError("invalid alert text")
         conn.execute(
             "INSERT INTO alerts(txn,body,created,fingerprint,node,event,alert_id,tier) VALUES (?,?,?,?,?,?,?,?)",
-            (txn, final, now, fingerprint, node[:64], event[:64], alert_id, normalize_tier(tier)),
+            (txn, final, now, fingerprint, node[:64], event[:64], alert_id,
+             tier if tier in INTERNAL_TIERS else normalize_tier(tier)),
         )
     return txn, False
 

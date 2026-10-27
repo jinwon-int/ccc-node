@@ -36,6 +36,7 @@ retired. See "「한데」 lane" below.
 | `fleet_alerts_receiver.py` | HTTP receiver: verifies `X-Fleet-Node` / `X-Fleet-Timestamp` / `X-Fleet-Signature`, enforces the per-node secret allowlist, replay skew and body cap, queues the formatted text. stdlib only. |
 | `fleet_alerts_sender.py` | Send-only Matrix transport (ccc-node `MatrixTransport` with inbound admission disabled) draining the queue into the one configured room with a stable txn id. Needs the bridge venv's matrix extra. |
 | `fleet_alerts_sender_hande.py` | 「한데」 lane: mirror table + trigger on the queue (`--install-only` / `--uninstall` / `--status`), Unix-socket FLEET-WORKER port for the relay bot (answers `turn` with an empty result, pushes paced `notice` frames). stdlib only. |
+| `fleet_alerts_policy.py` | Tier policy (stage 2): info digest at 09:00 KST, action/critical re-notify once after 15 min; derived `digest`/`renotify` rows, `meta` table for the digest day. Pure queue operations, no network. |
 | `fleet_alerts_receipt.py` | Operator read of one alert's receipts by alert id or txn (local, metadata only, exit 3 when unknown). |
 | `fleet_alerts_outbox.py` | Shared owner-only queue (0700 dir, 0600 files, flock, dedup fingerprint window, bodies wiped on delivery; v2: `alert_id`, `tier`, `receipts` — migrated in place on first open). |
 | `*.service.example` | systemd units for both processes. |
@@ -65,8 +66,24 @@ python3 fleet_alerts_receipt.py --queue /var/lib/fleet-alerts/queue <alertId|txn
 
 Producers set the tier in the spool record (`tier` key): agent-cron marks a
 non-success run and the failure alarm `action`, a success notice `info`;
-records without the key are `info`. Digest/re-notify policies per tier are
-the next stage.
+records without the key are `info`.
+
+**Delivery policy per tier (stage 2, `fleet_alerts_policy.py`, run by the
+Matrix sender before every round):**
+
+| tier | leaves the queue | re-notify |
+|---|---|---|
+| `info` | held; one **digest** row per day at **09:00 KST** (`📋 플릿 알림 다이제스트 <date> — info N건`, one `• HH:MM [node] #id first-line` per alert, max 60 lines); held rows get a `digested` receipt pointing at the digest id | — |
+| `action` | at once | once, 15 min after the Matrix receipt, unless a `reply` receipt (`ok/hold <id>`, responder stage) exists — a derived `⏰ 재통지 #id …` row |
+| `critical` | at once | like `action`, `🚨` |
+
+Derived rows carry internal tiers `digest` / `renotify` that a node payload
+can never set (`normalize_tier` maps unknown values to `info`). The 「한데」
+mirror copies every non-`info` insert, so both rooms show the same thing: the
+digest and the re-notify rows, never a held info alert. The daily digest is
+made from the relay host's clock (`Asia/Seoul`); a day with nothing held is
+recorded so the check stays cheap. Policy errors are logged and never block
+`action`/`critical` delivery.
 
 | Response | Meaning | Node side |
 |---|---|---|

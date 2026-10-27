@@ -23,6 +23,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
+import fleet_alerts_policy as policy  # noqa: E402
 
 DEFAULT_MSGTYPE = "m.text"
 IDLE_SLEEP_S = 1.0
@@ -33,9 +34,14 @@ async def deliver_one(queue: Path, transport: Any, room: str, *, msgtype: str = 
 
     ``transport`` only needs ``matrix_lock``, ``pin_devices``, ``room_gate``
     and ``encrypted_send`` (duck-typed so the loop is unit-testable without
-    matrix-nio).
+    matrix-nio). Returns False when nothing may leave right now (an empty
+    queue, or only held ``info`` rows).
     """
-    item = await asyncio.to_thread(outbox.pending, queue)
+    # Stage 2 (#2413): run the tier policy first (info digest at 09:00 KST,
+    # action/critical re-notify once after 15 min), then take the oldest row
+    # that may leave now — held ``info`` rows wait for their digest.
+    await asyncio.to_thread(policy.tick, queue)
+    item = await asyncio.to_thread(policy.pending_deliverable, queue)
     if item is None:
         return False
     txn, body = item
