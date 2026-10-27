@@ -8,6 +8,10 @@ HELPER="$ROOT/codex/skills/gh-pr-flow/scripts/approve-via-seoseo-ai.sh"
 # Fixtures supply every CCC_* input this suite needs; ambient harness variables
 # from a live node must not reach them (#1023).
 ccc_test_reset_hook_env
+# The Phase 1 shadow recorder (#2137) would call the local gh after an approval;
+# this suite tests the relay contract only, so keep it off (its own suite is
+# scripts/delegated-approval-shadow.test.sh).
+export CCC_DELEGATED_SHADOW=0
 TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 PASS=0

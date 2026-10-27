@@ -212,6 +212,16 @@ instruction, with no owner sign-off on the author.
 - Review approval and merge are separate writes unless the current user
   instruction explicitly authorizes both for that exact PR.
 
+## Delegated-approval shadow recorder (a2a-nexus#2317 Phase 1, #2137)
+
+After a real approval, `approve-via-relay.sh` records which 하부위임전결 tier
+(L1/L2/L3) the structured evidence maps to — ledger
+`$CCC_STATE_DIR/delegated-approval/shadow.jsonl`, one stderr line, stdout
+unchanged, failures never affect the approval. It decides nothing; Phase 1
+only measures agreement with the human decision for the 14-day Q5 review
+(`delegated_approval_shadow.py summary --days 14`). `CCC_DELEGATED_SHADOW=0`
+turns it off. Details: `docs/delegated-approval-shadow.md`.
+
 ## Standing approval for mechanical fleet-skills promote PRs (#2239 L3)
 
 The single exception to per-invocation fresh approval. It exists only while
