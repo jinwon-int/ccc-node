@@ -7,7 +7,9 @@
 # `native-mls-bot <relay-url> steward <device> --responder-unix /run/fleet-alerts/responder.sock
 # --identity-file … --rooms-dir … --access-jwt-file …`, same shape as the card
 # bot that has run on the relay host since 2026-10-26); it must run as the user
-# named in --socket-owner. Install: copy to
+# named in --socket-owner AND with NATIVE_MLS_BOT_ROOM_FRAMES=1: an alert-mode
+# room accepts notice frames only on the --room-frames wire (STEWARD.md #423;
+# the single-room wire posts notices to the agent room only). Install: copy to
 # /etc/systemd/system/fleet-alerts-sender-hande.service, then
 #   python3 /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_sender_hande.py --queue /var/lib/fleet-alerts/queue --install-only
 #   systemctl daemon-reload && systemctl enable --now fleet-alerts-sender-hande
@@ -26,7 +28,9 @@ WorkingDirectory=/opt/ccc-node/scripts/fleet-alerts
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 RuntimeDirectory=fleet-alerts
-RuntimeDirectoryMode=0750
+# 0755, not 0750: the bot runs as the --socket-owner user and must traverse
+# /run/fleet-alerts to reach the socket (the socket itself is 0600 owner-only).
+RuntimeDirectoryMode=0755
 ExecStart=/usr/bin/python3 /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_sender_hande.py \
   --queue /var/lib/fleet-alerts/queue \
   --socket /run/fleet-alerts/responder.sock \

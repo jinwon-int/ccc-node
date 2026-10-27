@@ -1,0 +1,1 @@
+- **fleet-alerts:** 「한데」 lane unit example `RuntimeDirectoryMode` 0750 → 0755 (the bot user must traverse `/run/fleet-alerts`) and README/unit notes for `NATIVE_MLS_BOT_ROOM_FRAMES=1` (alert-mode rooms take notices only on the room-frames wire) and hyphen-free bot actors (`commit_actor_mismatch`) — both found on the first relay-host install (#2413).
