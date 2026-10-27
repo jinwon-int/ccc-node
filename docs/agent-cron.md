@@ -125,6 +125,12 @@ never labelled `retry-exhausted` — its failures stay plain `failed`.
 
 ## Notify modes
 
+Every owner/chat spool record also carries a fleet-alert **tier** (#2413):
+`action` for a non-success run and for the consecutive-failure alarm, `info`
+for a success notice. The relay prefixes the alert id and records per-channel
+receipts; see `scripts/fleet-alerts/README.md` "Contract".
+
+
 - `none` (default) — no spool writes.
 - `owner` — every run writes a short redacted owner-only spool entry.
 - `owner-on-failure` — spool only non-success runs (failed/timeout);

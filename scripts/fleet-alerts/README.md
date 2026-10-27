@@ -36,18 +36,41 @@ retired. See "「한데」 lane" below.
 | `fleet_alerts_receiver.py` | HTTP receiver: verifies `X-Fleet-Node` / `X-Fleet-Timestamp` / `X-Fleet-Signature`, enforces the per-node secret allowlist, replay skew and body cap, queues the formatted text. stdlib only. |
 | `fleet_alerts_sender.py` | Send-only Matrix transport (ccc-node `MatrixTransport` with inbound admission disabled) draining the queue into the one configured room with a stable txn id. Needs the bridge venv's matrix extra. |
 | `fleet_alerts_sender_hande.py` | 「한데」 lane: mirror table + trigger on the queue (`--install-only` / `--uninstall` / `--status`), Unix-socket FLEET-WORKER port for the relay bot (answers `turn` with an empty result, pushes paced `notice` frames). stdlib only. |
-| `fleet_alerts_outbox.py` | Shared owner-only queue (0700 dir, 0600 files, flock, dedup fingerprint window, bodies wiped on delivery). |
+| `fleet_alerts_receipt.py` | Operator read of one alert's receipts by alert id or txn (local, metadata only, exit 3 when unknown). |
+| `fleet_alerts_outbox.py` | Shared owner-only queue (0700 dir, 0600 files, flock, dedup fingerprint window, bodies wiped on delivery; v2: `alert_id`, `tier`, `receipts` — migrated in place on first open). |
 | `*.service.example` | systemd units for both processes. |
 | `fleet_alerts_test.py` / `fleet-alerts.test.sh` | Hermetic tests (bridge client ↔ receiver round trip included). |
 
-## Contract (`ccc.fleet-alert.v1`)
+## Contract (`ccc.fleet-alert.v2`, v1 accepted)
 
 `POST /v1/alerts`, JSON body built by `bridge/core/fleet_alert_relay.build_payload`;
 signature `sha256=HMAC-SHA256(secret, "<unix-ts>." + body)`.
 
+**v2 (#2413, field-additive).** The body carries `tier` — `info` (default) /
+`action` (a person should look) / `critical` — and the receiver accepts both
+`ccc.fleet-alert.v1` and `.v2` (an old node simply sends no tier → `info`).
+Every queued alert gets a 6-char **alert id** (base36, derived from the txn,
+unique in the queue) that the owner can quote back (`ok <id>` / `hold <id>`,
+later stage); the queued text starts with `[<name>] #<id> …`. Each channel
+records a **delivery receipt** in the queue: the Matrix sender's event id
+(`matrix-event`, strong) and the 「한데」 lane's hand-off (`socket-write`, weak —
+the relay bot has no notice ack). `notified` = at least one strong receipt;
+an `action` alert without one must be treated as *not* notified (fail-closed
+for L2 pre-notification, a2a-nexus#2317). Read receipts on the relay host:
+
+```bash
+python3 fleet_alerts_receipt.py --queue /var/lib/fleet-alerts/queue <alertId|txn>
+# → {"alert_id":…,"tier":…,"node":…,"event":…,"receipts":[{"channel","kind","ref","at"}…],"notified":bool}
+```
+
+Producers set the tier in the spool record (`tier` key): agent-cron marks a
+non-success run and the failure alarm `action`, a success notice `info`;
+records without the key are `info`. Digest/re-notify policies per tier are
+the next stage.
+
 | Response | Meaning | Node side |
 |---|---|---|
-| `202 {"accepted":true,"txn":…,"duplicate":bool}` | queued (or already queued inside the dedup window) | archive record |
+| `202 {"accepted":true,"txn":…,"duplicate":bool,"alertId":…,"tier":…}` | queued (or already queued inside the dedup window — same alertId) | archive record |
 | `401` missing headers / bad timestamp / stale (> `--skew`, default 300 s) / bad signature | final | archive record |
 | `403` node not in `--secrets-dir` (or its secret file unsafe) | final | archive record |
 | `400` bad JSON / schema / `node` ≠ header / empty or oversize `text` | final | archive record |

@@ -1731,6 +1731,8 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         'node': socket.gethostname(),
         'text': text,
         'dedup': f'agent-cron:{task_id}:{run_id}:{status}',
+        # Fleet alert contract v2 (#2413): a non-success run needs a person; a success notice is informational.
+        'tier': 'info' if status == 'success' else 'action',
         'recipient': recipient,
         'taskId': task_id,
         'runId': run_id,
@@ -1879,6 +1881,7 @@ def write_failure_alarm_spool(task_id, run_id, text, reasons, at):
         'node': socket.gethostname(),
         'text': text,
         'dedup': f"agent-cron-alarm:{task_id}:{run_id}:{','.join(reasons)}",
+        'tier': 'action',
         'recipient': 'owner',
         'taskId': task_id,
         'runId': run_id,

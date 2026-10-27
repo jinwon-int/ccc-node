@@ -39,13 +39,19 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-SCHEMA = "ccc.fleet-alert.v1"
+SCHEMA_V1 = "ccc.fleet-alert.v1"
+# v2 (#2413): v1 plus ``tier`` (info|action|critical, default info). Field-additive —
+# a v1 receiver ignores ``tier``; the v2 receiver accepts both schema names.
+SCHEMA = "ccc.fleet-alert.v2"
+ACCEPTED_SCHEMAS = (SCHEMA_V1, SCHEMA)
+TIERS = ("info", "action", "critical")
+DEFAULT_TIER = "info"
 NODE_HEADER = "X-Fleet-Node"
 TIMESTAMP_HEADER = "X-Fleet-Timestamp"
 SIGNATURE_HEADER = "X-Fleet-Signature"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 # Record keys forwarded verbatim (everything else in a spool record is dropped).
-RAW_KEYS = ("ts", "event", "node", "text", "dedup", "chatId", "recipient")
+RAW_KEYS = ("ts", "event", "node", "text", "dedup", "chatId", "recipient", "tier")
 
 
 class RelayError(Exception):
@@ -96,6 +102,12 @@ def verify(secret: str, timestamp: int, body: bytes, signature: str) -> bool:
         return False
 
 
+def normalize_tier(value: object) -> str:
+    """``info`` / ``action`` / ``critical``; anything else (or missing) is ``info``."""
+    v = str(value or "").strip().lower()
+    return v if v in TIERS else DEFAULT_TIER
+
+
 def build_payload(node: str, record_name: str, data: dict, formatted_text: str) -> dict:
     """The JSON body for one spool record.
 
@@ -113,6 +125,7 @@ def build_payload(node: str, record_name: str, data: dict, formatted_text: str) 
         "ts": data.get("ts"),
         "text": formatted_text,
         "dedup": f"{node}:{dedup}" if dedup else "",
+        "tier": normalize_tier(data.get("tier")),
         "raw": raw,
     }
 

@@ -40,10 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
 
 from telegram_bot.core.fleet_alert_relay import (  # noqa: E402
+    ACCEPTED_SCHEMAS,
     NODE_HEADER,
-    SCHEMA,
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
+    normalize_tier,
     read_secret,
     verify,
 )
@@ -108,7 +109,7 @@ def check_request(
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return Decision(400, "bad-json", node)
-    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
+    if not isinstance(payload, dict) or payload.get("schema") not in ACCEPTED_SCHEMAS:
         return Decision(400, "bad-schema", node)
     if payload.get("node") != node:
         return Decision(400, "node-mismatch", node)
@@ -158,8 +159,8 @@ def queue_payload(queue_dir: Path, payload: dict, labels: Optional[NodeLabels] =
     node = str(payload.get("node") or "")
     text = payload["text"]
     label = labels.label(node) if labels is not None else node
-    if label:
-        text = f"[{label}] {text}"  # the owner reads the sender in the first line
+    # First line: "[sender] #<id> …" — the owner quotes the id back (ok/hold <id>, #2413).
+    prefix = f"[{label}] " if label else ""
     key = str(payload.get("record") or payload.get("dedup") or "")
     fp = outbox.fingerprint(node, key) if key else None
     return outbox.enqueue(
@@ -168,6 +169,8 @@ def queue_payload(queue_dir: Path, payload: dict, labels: Optional[NodeLabels] =
         node=node,
         event=str(payload.get("event") or ""),
         fingerprint=fp,
+        tier=normalize_tier(payload.get("tier")),
+        body_with_id=lambda alert_id: f"{prefix}#{alert_id} {text}",
     )
 
 
@@ -208,8 +211,11 @@ class Receiver:
         except Exception as exc:  # queue unsafe/unwritable → node keeps the record
             log.error("queue failure node=%s reason=%s", d.node, exc.__class__.__name__)
             return 503, {"error": "queue-unavailable"}
-        log.info("accepted node=%s event=%s txn=%s duplicate=%s", d.node, d.payload.get("event", ""), txn, dup)
-        return 202, {"accepted": True, "txn": txn, "duplicate": dup}
+        alert_id = outbox.alert_id_of(self.queue_dir, txn)
+        tier = normalize_tier(d.payload.get("tier"))
+        log.info("accepted node=%s event=%s txn=%s alert=%s tier=%s duplicate=%s",
+                 d.node, d.payload.get("event", ""), txn, alert_id, tier, dup)
+        return 202, {"accepted": True, "txn": txn, "duplicate": dup, "alertId": alert_id, "tier": tier}
 
 
 def make_handler(receiver: Receiver) -> type[BaseHTTPRequestHandler]:

@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
 import fleet_alerts_receiver as rx  # noqa: E402
+import fleet_alerts_receipt as rcpt  # noqa: E402
 import fleet_alerts_sender as tx  # noqa: E402
 from telegram_bot.core import fleet_alert_relay as R  # noqa: E402
 
@@ -165,7 +166,8 @@ class NodeLabelTest(_Base):
         self.assertEqual(labels.label("node-b"), "node-b")  # unknown → id
         self.assertEqual(labels.label("node-c"), "node-c")  # empty name → id
         txn, _ = rx.queue_payload(self.queue, _payload(), labels)
-        self.assertEqual(outbox.pending(self.queue), (txn, "[에이전트A] 🔔 formatted"))
+        self.assertEqual(outbox.pending(self.queue)[0], txn)
+        self.assertRegex(outbox.pending(self.queue)[1], r"^\[에이전트A\] #[0-9a-z]{6} 🔔 formatted$")
         f.write_text(json.dumps({"node-a": "새이름"}), encoding="utf-8")
         os.utime(f, (time.time() + 5, time.time() + 5))  # force a different mtime
         self.assertEqual(labels.label("node-a"), "새이름")
@@ -177,7 +179,8 @@ class NodeLabelTest(_Base):
         bad.write_text("not json", encoding="utf-8")
         self.assertEqual(rx.NodeLabels(bad).label("node-a"), "node-a")
         txn, _ = rx.queue_payload(self.queue, _payload(), None)
-        self.assertEqual(outbox.pending(self.queue), (txn, "[node-a] 🔔 formatted"))
+        self.assertEqual(outbox.pending(self.queue)[0], txn)
+        self.assertRegex(outbox.pending(self.queue)[1], r"^\[node-a\] #[0-9a-z]{6} 🔔 formatted$")
 
 
 class HttpRoundTripTest(_Base):
@@ -201,7 +204,7 @@ class HttpRoundTripTest(_Base):
         relay.post(payload)
         relay.post(payload)  # lost-2xx retry
         self.assertEqual(outbox.pending_count(self.queue), 1)
-        self.assertEqual(outbox.pending(self.queue)[1], "[node-a] 🔔 formatted")
+        self.assertRegex(outbox.pending(self.queue)[1], r"^\[node-a\] #[0-9a-z]{6} 🔔 formatted$")
         relay.post(R.build_payload("node-a", "r2.json", {"event": "x", "text": "t"}, "second"))
         self.assertEqual(outbox.pending_count(self.queue), 2)
 
@@ -277,6 +280,135 @@ class SenderLoopTest(_Base):
             tx.validate_config({"rooms": ["!a:hs", "!b:hs"]})
         with self.assertRaises(ValueError):
             tx.validate_config({"rooms": ["!a:hs"], "family": {"rooms": ["!f:hs"]}})
+
+
+class ContractV2Test(_Base):
+    """#2413 stage 1: alert id + tier on every row, per-channel receipts, v1 still accepted."""
+
+    def test_enqueue_assigns_unique_6char_alert_id_and_tier(self) -> None:
+        t1, _ = outbox.enqueue(self.queue, "a", tier="action")
+        t2, _ = outbox.enqueue(self.queue, "b", tier="bogus")
+        a1, a2 = outbox.alert_id_of(self.queue, t1), outbox.alert_id_of(self.queue, t2)
+        self.assertRegex(a1, r"^[0-9a-z]{6}$")
+        self.assertNotEqual(a1, a2)
+        self.assertEqual(outbox.lookup(self.queue, a1)["tier"], "action")
+        self.assertEqual(outbox.lookup(self.queue, a2)["tier"], "info")  # unknown tier → info
+        self.assertIsNone(outbox.alert_id_of(self.queue, "fleet-missing"))
+
+    def test_body_with_id_puts_the_id_into_the_stored_text(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "x", body_with_id=lambda i: f"[n] #{i} x")
+        aid = outbox.alert_id_of(self.queue, txn)
+        self.assertEqual(outbox.pending(self.queue), (txn, f"[n] #{aid} x"))
+        with self.assertRaises(ValueError):
+            outbox.enqueue(self.queue, "x", body_with_id=lambda i: "   ")
+
+    def test_matrix_delivery_writes_a_strong_receipt_and_lookup_reports_notified(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "x", node="node-a", event="AgentCronRun", tier="action")
+        aid = outbox.alert_id_of(self.queue, txn)
+        self.assertFalse(outbox.lookup(self.queue, aid)["notified"])
+        outbox.delivered(self.queue, txn, "$evt")
+        info = outbox.lookup(self.queue, aid)
+        self.assertEqual([(r["channel"], r["kind"], r["ref"]) for r in info["receipts"]], [("matrix", "matrix-event", "$evt")])
+        self.assertTrue(info["notified"])
+        self.assertEqual((info["node"], info["event"], info["tier"], info["txn"]), ("node-a", "AgentCronRun", "action", txn))
+        self.assertNotIn("body", info)
+        self.assertEqual(outbox.lookup(self.queue, txn)["alert_id"], aid)  # txn also resolves
+        self.assertIsNone(outbox.lookup(self.queue, "zzzzzz"))
+
+    def test_weak_receipt_alone_is_not_notified_and_one_receipt_per_channel(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "x")
+        outbox.receipt(self.queue, txn, "hande", "socket-write")
+        info = outbox.lookup(self.queue, txn)
+        self.assertEqual(len(info["receipts"]), 1)
+        self.assertFalse(info["notified"])
+        outbox.receipt(self.queue, txn, "hande", "hande-ack", "ev-1")  # later ack replaces the weak one
+        info = outbox.lookup(self.queue, txn)
+        self.assertEqual([(r["kind"], r["ref"]) for r in info["receipts"]], [("hande-ack", "ev-1")])
+        self.assertTrue(info["notified"])
+        with self.assertRaises(ValueError):
+            outbox.receipt(self.queue, txn, "", "x")
+
+    def test_prune_drops_receipts_with_their_alert(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "x")
+        outbox.delivered(self.queue, txn, "$e")
+        self.assertEqual(outbox.prune(self.queue, keep_seconds=-1), 1)
+        with outbox.database(self.queue) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0], 0)
+
+    def test_pre_v2_queue_is_migrated_in_place(self) -> None:
+        q = self.root / "old"
+        q.mkdir(mode=0o700)
+        import sqlite3
+        conn = sqlite3.connect(q / "queue.sqlite3")
+        conn.execute("""CREATE TABLE alerts (txn TEXT PRIMARY KEY, body TEXT NOT NULL, created REAL NOT NULL,
+            fingerprint TEXT, node TEXT NOT NULL DEFAULT '', event TEXT NOT NULL DEFAULT '', delivered REAL,
+            event_id TEXT, attempts INTEGER NOT NULL DEFAULT 0)""")
+        conn.execute("INSERT INTO alerts(txn,body,created) VALUES ('fleet-old','legacy',1.0)")
+        conn.commit()
+        conn.close()
+        os.chmod(q / "queue.sqlite3", 0o600)
+        self.assertEqual(outbox.pending(q), ("fleet-old", "legacy"))  # opening migrates
+        info = outbox.lookup(q, "fleet-old")
+        self.assertEqual((info["alert_id"], info["tier"], info["receipts"]), (None, "info", []))
+        txn, _ = outbox.enqueue(q, "new")
+        self.assertRegex(outbox.alert_id_of(q, txn), r"^[0-9a-z]{6}$")
+
+    def test_receiver_accepts_v1_and_v2_prefixes_id_and_returns_tier(self) -> None:
+        receiver = rx.Receiver(secrets_dir=self.secrets, queue_dir=self.queue)
+        for schema, tier, want in ((R.SCHEMA_V1, None, "info"), (R.SCHEMA, "critical", "critical"), (R.SCHEMA, "weird", "info")):
+            payload = _payload(record=f"r-{schema}-{tier}.json")
+            payload["schema"] = schema
+            if tier is None:
+                payload.pop("tier", None)
+            else:
+                payload["tier"] = tier
+            headers, body = _signed("ka", "node-a", payload, int(time.time()))
+            status, obj = receiver.handle("POST", rx.ALERTS_PATH, headers, body)
+            self.assertEqual(status, 202, obj)
+            self.assertEqual(obj["tier"], want)
+            self.assertRegex(obj["alertId"], r"^[0-9a-z]{6}$")
+            self.assertEqual(outbox.lookup(self.queue, obj["alertId"])["tier"], want)
+        texts = []
+        while (item := outbox.pending(self.queue)) is not None:
+            texts.append(item[1])
+            outbox.delivered(self.queue, item[0], "$x")
+        self.assertEqual(len(texts), 3)
+        for t in texts:
+            self.assertRegex(t, r"^\[node-a\] #[0-9a-z]{6} 🔔 formatted$")
+        payload = _payload(record="r-bad.json")
+        payload["schema"] = "ccc.fleet-alert.v9"
+        headers, body = _signed("ka", "node-a", payload, int(time.time()))
+        self.assertEqual(receiver.handle("POST", rx.ALERTS_PATH, headers, body)[0], 400)
+
+    def test_duplicate_retry_keeps_the_first_alert_id(self) -> None:
+        receiver = rx.Receiver(secrets_dir=self.secrets, queue_dir=self.queue)
+        payload = _payload(record="same.json")
+        headers, body = _signed("ka", "node-a", payload, int(time.time()))
+        s1, o1 = receiver.handle("POST", rx.ALERTS_PATH, headers, body)
+        s2, o2 = receiver.handle("POST", rx.ALERTS_PATH, headers, body)
+        self.assertEqual((s1, s2, o1["duplicate"], o2["duplicate"]), (202, 202, False, True))
+        self.assertEqual(o1["alertId"], o2["alertId"])
+
+    def test_client_payload_carries_tier_from_the_spool_record(self) -> None:
+        self.assertEqual(R.build_payload("n", "r", {"text": "t"}, "t")["tier"], "info")
+        self.assertEqual(R.build_payload("n", "r", {"text": "t", "tier": "ACTION"}, "t")["tier"], "action")
+        p = R.build_payload("n", "r", {"text": "t", "tier": "critical"}, "t")
+        self.assertEqual((p["schema"], p["raw"]["tier"]), (R.SCHEMA, "critical"))
+
+    def test_receipt_cli_prints_metadata_and_exits_3_when_unknown(self) -> None:
+        import contextlib
+        import io
+        txn, _ = outbox.enqueue(self.queue, "secret body text", tier="action")
+        aid = outbox.alert_id_of(self.queue, txn)
+        outbox.delivered(self.queue, txn, "$ev")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(rcpt.main(["--queue", str(self.queue), f"#{aid}"]), 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual((out["alert_id"], out["notified"], out["tier"]), (aid, True, "action"))
+        self.assertNotIn("secret body", buf.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rcpt.main(["--queue", str(self.queue), "nope00"]), 3)
 
 
 if __name__ == "__main__":
