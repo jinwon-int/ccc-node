@@ -56,6 +56,14 @@ python3 <skill-root>/scripts/web_search.py "검색어" [--limit 5]
   SearXNG returns titles that may not match the URL (SEO spam); check the URL
   before citing. Its upstream engines throttle or CAPTCHA under load, so
   `unresponsive_engines` can shrink a result set without an error.
+- SearXNG language: the helper sends `language=ko` for queries containing
+  Hangul and `language=en` otherwise (`--lang auto`, the default). Override
+  with `--lang all|ko|en|en-US|…` or a node default `SEARXNG_LANGUAGE`
+  (environment, else `~/.hermes/.env`). Without it the instance default
+  locale applies to every engine: a Korean default makes Bing return nothing,
+  while an English locale on a Korean query pulls in off-language results
+  (Japanese/Chinese Q&A sites) — measured 2026-10-27. Firecrawl ignores
+  `--lang`.
 - This fleet-canon copy embeds no default SearXNG endpoint (canon must stay
   node-agnostic, #1446): `SEARXNG_URL` comes from the process environment,
   else the node's `~/.hermes/.env` (the same file the Firecrawl key is read

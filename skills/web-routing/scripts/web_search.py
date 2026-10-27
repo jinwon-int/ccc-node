@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """web-search — query Firecrawl Search (default) or explicit fleet SearXNG.
 
-Usage: web_search.py <query> [--limit N] [--provider firecrawl|searxng]
+Usage: web_search.py <query> [--limit N] [--provider firecrawl|searxng] [--lang auto|all|CODE]
 
 Environment:
   FIRECRAWL_API_URL  valid HTTP(S) API base (default https://api.firecrawl.dev);
@@ -13,7 +13,15 @@ Environment:
                      this fleet-canon copy: no node-specific default is
                      embedded; the current endpoint is documented in the
                      Family Wiki pages/services/searxng.md)
+  SEARXNG_LANGUAGE   default --lang for --provider searxng (else ~/.hermes/.env;
+                     default `auto`)
   WEB_SEARCH_LIMIT   default result count (default 5, hard max 10)
+
+SearXNG language (--lang): `auto` sends `language=ko` when the query contains
+Hangul and `language=en` otherwise; `all` or a code such as `ko`, `en`,
+`en-US` is sent as given. An instance's own default language otherwise applies
+to every engine, and some engines (Bing) return nothing or off-language junk
+when the locale does not fit the query. Firecrawl ignores --lang.
 
 Default provider is Firecrawl Search. SearXNG runs only when --provider searxng
 is set. This helper never silently switches providers: Firecrawl failure stays
@@ -30,6 +38,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -49,6 +58,8 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SEARXNG_TIMEOUT = 15
 FIRECRAWL_TIMEOUT = 60
 VALID_PROVIDERS = {"searxng", "firecrawl"}
+_LANG_RE = re.compile(r"^(auto|all|[a-z]{2,3}(-[A-Za-z]{2})?)$")
+_HANGUL_RE = re.compile("[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]")
 _API_ENDPOINT_REASONS = frozenset(
     {
         "malformed-url",
@@ -68,7 +79,8 @@ _API_ENDPOINT_REASONS = frozenset(
 
 def _usage() -> None:
     print(
-        "usage: web_search.py <query> [--limit N] [--provider firecrawl|searxng]",
+        "usage: web_search.py <query> [--limit N] [--provider firecrawl|searxng] "
+        "[--lang auto|all|CODE]",
         file=sys.stderr,
     )
 
@@ -253,7 +265,14 @@ def _print_results(query: str, rows: list[tuple[str, str, str, str]]) -> int:
     return 0
 
 
-def _search_searxng(query: str, limit: int) -> int:
+def _searxng_language(query: str, requested: str) -> str:
+    """Resolve --lang: `auto` picks ko for Hangul queries, en otherwise."""
+    if requested == "auto":
+        return "ko" if _HANGUL_RE.search(query) else "en"
+    return requested
+
+
+def _search_searxng(query: str, limit: int, lang: str = "auto") -> int:
     bases = [
         b.strip().rstrip("/")
         for b in (_env_setting("SEARXNG_URL") or DEFAULT_SEARXNG_URL).split(",")
@@ -271,7 +290,9 @@ def _search_searxng(query: str, limit: int) -> int:
     payload = None
     last_error = None
     for base in bases:
-        url = base + "/search?" + urllib.parse.urlencode({"q": query, "format": "json"})
+        url = base + "/search?" + urllib.parse.urlencode(
+            {"q": query, "format": "json", "language": _searxng_language(query, lang)}
+        )
         req = urllib.request.Request(url, headers={"User-Agent": "ccc-web-search/1.0"})
         try:
             with urllib.request.urlopen(req, timeout=SEARXNG_TIMEOUT) as resp:
@@ -369,6 +390,7 @@ def main() -> int:
     except ValueError:
         limit = 5
     provider = "firecrawl"
+    lang = (_env_setting("SEARXNG_LANGUAGE") or "auto").strip()
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -381,7 +403,10 @@ def main() -> int:
         elif argv[i] == "--provider" and i + 1 < len(argv):
             provider = argv[i + 1].strip().lower()
             i += 2
-        elif argv[i] in {"--limit", "--provider"}:
+        elif argv[i] == "--lang" and i + 1 < len(argv):
+            lang = argv[i + 1].strip()
+            i += 2
+        elif argv[i] in {"--limit", "--provider", "--lang"}:
             _usage()
             return 64
         else:
@@ -398,9 +423,15 @@ def main() -> int:
             file=sys.stderr,
         )
         return 64
+    if not _LANG_RE.match(lang):
+        print(
+            f"web-search: invalid language {lang[:20]!r} (use auto, all, or a code like ko, en-US)",
+            file=sys.stderr,
+        )
+        return 64
     if provider == "firecrawl":
         return _search_firecrawl(query, limit)
-    return _search_searxng(query, limit)
+    return _search_searxng(query, limit, lang)
 
 
 if __name__ == "__main__":

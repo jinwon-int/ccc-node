@@ -14,7 +14,7 @@ trap 'rm -rf "$TMP"; [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null' EXI
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 export HOME="$TMP/home"
 mkdir -p "$HOME"
-unset FIRECRAWL_API_KEY FIRECRAWL_API_URL SEARXNG_URL
+unset FIRECRAWL_API_KEY FIRECRAWL_API_URL SEARXNG_URL SEARXNG_LANGUAGE
 
 cat > "$TMP/stub.py" <<'PY'
 import json, re, threading
@@ -24,14 +24,16 @@ from urllib.parse import urlparse, parse_qs
 class Healthy(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/search"):
-            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            qs = parse_qs(urlparse(self.path).query)
+            q = qs.get("q", [""])[0]
+            lang = qs.get("language", ["none"])[0]
             if "array-mode" in q:
                 # A proxy error page / misconfigured instance: valid JSON,
                 # but not the object shape SearXNG promises.
                 body = json.dumps(["not", "an", "object"]).encode()
             else:
                 body = json.dumps({"results": [
-                    {"title": f"Result for {q}", "url": "https://example.org/a", "content": "snippet text", "engine": "stub"},
+                    {"title": f"Result for {q}", "url": "https://example.org/a", "content": f"snippet text lang={lang}", "engine": "stub"},
                     {"title": f"Second result for {q}", "url": "https://example.org/b", "content": "snippet two", "engine": "stub"},
                     {"title": f"Third result for {q}", "url": "https://example.org/c", "content": "snippet three", "engine": "stub"},
                 ], "unresponsive_engines": []}).encode()
@@ -204,6 +206,31 @@ set +e
 python3 "$SEARCH" "unset" --provider searxng >/dev/null 2>"$TMP/err"; rc=$?
 set -e
 ok "unconfigured SearXNG exits 64 and names both sources" '[ "$rc" = 64 ] && grep -q "hermes/.env" "$TMP/err"'
+
+# --lang: auto sends ko for Hangul queries and en otherwise (an instance-wide
+# default locale made Bing return 0 results for every query, 2026-10-27).
+export SEARXNG_URL="http://127.0.0.1:$healthy_port"
+out="$(python3 "$SEARCH" "python asyncio" --provider searxng 2>/dev/null)"
+ok "auto language sends en for a non-Hangul query" 'grep -q "lang=en" <<<"$out"'
+out="$(python3 "$SEARCH" "주택도시보증공사 강제경매" --provider searxng 2>/dev/null)"
+ok "auto language sends ko for a Hangul query" 'grep -q "lang=ko" <<<"$out"'
+out="$(python3 "$SEARCH" "mixed 한글 query" --provider searxng 2>/dev/null)"
+ok "auto language treats any Hangul as ko" 'grep -q "lang=ko" <<<"$out"'
+out="$(python3 "$SEARCH" "anything" --provider searxng --lang all 2>/dev/null)"
+ok "--lang all is passed through" 'grep -q "lang=all" <<<"$out"'
+out="$(SEARXNG_LANGUAGE=ko python3 "$SEARCH" "english words" --provider searxng 2>/dev/null)"
+ok "SEARXNG_LANGUAGE sets the default language" 'grep -q "lang=ko" <<<"$out"'
+out="$(SEARXNG_LANGUAGE=ko python3 "$SEARCH" "english words" --provider searxng --lang en-US 2>/dev/null)"
+ok "explicit --lang beats SEARXNG_LANGUAGE" 'grep -q "lang=en-US" <<<"$out"'
+mkdir -p "$HOME/.hermes"; printf 'SEARXNG_LANGUAGE=all\n' > "$HOME/.hermes/.env"
+out="$(python3 "$SEARCH" "dotenv language" --provider searxng 2>/dev/null)"
+ok "SEARXNG_LANGUAGE is read from ~/.hermes/.env" 'grep -q "lang=all" <<<"$out"'
+rm -f "$HOME/.hermes/.env"
+set +e
+python3 "$SEARCH" "x" --provider searxng --lang 'ko&format=html' >/dev/null 2>"$TMP/err"; rc=$?
+set -e
+ok "invalid --lang is rejected before any request" '[ "$rc" = 64 ] && grep -q "invalid language" "$TMP/err"'
+unset SEARXNG_URL
 
 set +e
 SEARXNG_URL="http://127.0.0.1:$healthy_port" FIRECRAWL_API_URL="http://127.0.0.1:1" python3 "$SEARCH" "no-silent" >/dev/null 2>"$TMP/err"; rc=$?
