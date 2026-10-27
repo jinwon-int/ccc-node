@@ -121,7 +121,7 @@ so a spool notice posted there *as the agent* can bury the work in flight.
 Set `CCC_PUSH_FLEET_RELAY_URL` on the matrix unit and the notifier forwards
 every record to the central fleet alert relay instead — an HMAC-signed
 `POST` (`X-Fleet-Node`, `X-Fleet-Timestamp`, `X-Fleet-Signature:
-sha256=HMAC(secret, "<ts>." + body)`, schema `ccc.fleet-alert.v1`, text
+sha256=HMAC(secret, "<ts>." + body)`, schema `ccc.fleet-alert.v2` (v1 plus `tier`, #2413), text
 already formatted, `dedup` namespaced `node:dedup`). A dedicated bot
 (`@fleet-alerts`) then posts it into the owner's **🔔 플릿 알림** room; the
 agent room receives nothing.

@@ -217,6 +217,12 @@ def serve_connection(
         conn.setblocking(False)
         pacer.mark(now)
         forget(queue, row_id)
+        # Weak receipt (#2413): the frame left for the bot; there is no notice ack.
+        if txn:
+            try:
+                outbox.receipt(queue, txn, "hande", "socket-write", "")
+            except Exception:
+                logging.warning("hande receipt not recorded txn=%s", txn)
         handed += 1
         logging.info("한데 fleet alert handed to the bot txn=%s", txn)
         if max_notices is not None and handed >= max_notices:

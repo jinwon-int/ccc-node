@@ -190,6 +190,10 @@ class SocketLoopTest(_Base):
         self.assertEqual([f["text"] for f in frames], ["first alert", "second alert"])
         self.assertEqual({f["room"] for f in frames}, {"fleet-alerts"})
         self.assertEqual(hande.backlog(self.queue), 0)
+        # #2413: each hand-off leaves a weak receipt (no notice ack from the bot).
+        with outbox.database(self.queue) as conn:
+            kinds = conn.execute("SELECT channel, kind FROM receipts ORDER BY at").fetchall()
+        self.assertEqual(kinds, [("hande", "socket-write")] * 2)
 
     def test_turn_from_the_room_is_answered_with_an_empty_result(self) -> None:
         got: list[dict] = []
