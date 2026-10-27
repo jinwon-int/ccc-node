@@ -8,11 +8,11 @@ Environment:
                      keyed requests require HTTPS, keyless HTTP bases are allowed
   FIRECRAWL_API_KEY  optional; else ~/.hermes/.env FIRECRAWL_API_KEY;
                      if absent, no Authorization header is sent
-  SEARXNG_URL        comma-separated SearXNG base URLs for --provider searxng
-                     (required for searxng in this fleet-canon copy: no
-                     node-specific default is embedded; the current endpoint
-                     is documented in the Family Wiki
-                     pages/services/searxng.md)
+  SEARXNG_URL        comma-separated SearXNG base URLs for --provider searxng;
+                     else ~/.hermes/.env SEARXNG_URL (required for searxng in
+                     this fleet-canon copy: no node-specific default is
+                     embedded; the current endpoint is documented in the
+                     Family Wiki pages/services/searxng.md)
   WEB_SEARCH_LIMIT   default result count (default 5, hard max 10)
 
 Default provider is Firecrawl Search. SearXNG runs only when --provider searxng
@@ -73,8 +73,13 @@ def _usage() -> None:
     )
 
 
-def _firecrawl_key() -> str:
-    env = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+def _env_setting(key: str) -> str:
+    """Process environment first, else the first match in ~/.hermes/.env.
+
+    Accepts `NAME=value` and `export NAME=value` lines; surrounding quotes are
+    stripped. The value is never printed by callers.
+    """
+    env = (os.environ.get(key) or "").strip()
     if env:
         return env
     path = os.path.join(os.path.expanduser("~"), ".hermes", ".env")
@@ -85,11 +90,18 @@ def _firecrawl_key() -> str:
                 if raw.startswith("#") or "=" not in raw:
                     continue
                 name, value = raw.split("=", 1)
-                if name.strip() == "FIRECRAWL_API_KEY":
-                    return value.strip().strip("'\"")
+                name = name.strip()
+                if name.startswith("export "):
+                    name = name[len("export "):].strip()
+                if name == key:
+                    return value.strip().strip("'\"").strip()
     except (OSError, UnicodeError):
         return ""
     return ""
+
+
+def _firecrawl_key() -> str:
+    return _env_setting("FIRECRAWL_API_KEY")
 
 
 def _firecrawl_error(exc: Exception, key: str) -> str:
@@ -244,13 +256,14 @@ def _print_results(query: str, rows: list[tuple[str, str, str, str]]) -> int:
 def _search_searxng(query: str, limit: int) -> int:
     bases = [
         b.strip().rstrip("/")
-        for b in (os.environ.get("SEARXNG_URL") or DEFAULT_SEARXNG_URL).split(",")
+        for b in (_env_setting("SEARXNG_URL") or DEFAULT_SEARXNG_URL).split(",")
         if b.strip()
     ]
     if not bases:
         print(
             "web-search: SEARXNG_URL is not configured for --provider searxng "
-            "(this fleet-canon copy embeds no default; see the Family Wiki "
+            "(set it in the environment or ~/.hermes/.env; this fleet-canon "
+            "copy embeds no default; see the Family Wiki "
             "pages/services/searxng.md)",
             file=sys.stderr,
         )

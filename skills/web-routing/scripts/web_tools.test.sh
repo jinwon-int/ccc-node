@@ -14,7 +14,7 @@ trap 'rm -rf "$TMP"; [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null' EXI
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 export HOME="$TMP/home"
 mkdir -p "$HOME"
-unset FIRECRAWL_API_KEY FIRECRAWL_API_URL
+unset FIRECRAWL_API_KEY FIRECRAWL_API_URL SEARXNG_URL
 
 cat > "$TMP/stub.py" <<'PY'
 import json, re, threading
@@ -185,6 +185,25 @@ set +e
 SEARXNG_URL="http://127.0.0.1:1" python3 "$SEARCH" "down" --provider searxng >/dev/null 2>"$TMP/err"; rc=$?
 set -e
 ok "search reports a bounded SearXNG outage" '[ "$rc" = 69 ] && [ "$(wc -c < "$TMP/err")" -lt 200 ]'
+
+# SEARXNG_URL resolves like FIRECRAWL_API_KEY: process env first, else the
+# node's ~/.hermes/.env (plain or `export`, quoted or not). Nodes keep the
+# endpoint there, so without this the explicit fallback always exited 64.
+mkdir -p "$HOME/.hermes"
+printf '# fleet node env\nSEARXNG_URL=http://127.0.0.1:%s\n' "$healthy_port" > "$HOME/.hermes/.env"
+out="$(python3 "$SEARCH" "dotenv plain" --provider searxng 2>/dev/null)"
+ok "SearXNG endpoint is read from ~/.hermes/.env" 'grep -q "Result for dotenv plain" <<<"$out"'
+printf 'export SEARXNG_URL="http://127.0.0.1:%s"\n' "$healthy_port" > "$HOME/.hermes/.env"
+out="$(python3 "$SEARCH" "dotenv export" --provider searxng 2>/dev/null)"
+ok "quoted export form in ~/.hermes/.env is accepted" 'grep -q "Result for dotenv export" <<<"$out"'
+printf 'SEARXNG_URL=http://127.0.0.1:1\n' > "$HOME/.hermes/.env"
+out="$(SEARXNG_URL="http://127.0.0.1:$healthy_port" python3 "$SEARCH" "env wins" --provider searxng 2>/dev/null)"
+ok "process SEARXNG_URL beats ~/.hermes/.env" 'grep -q "Result for env wins" <<<"$out"'
+rm -f "$HOME/.hermes/.env"
+set +e
+python3 "$SEARCH" "unset" --provider searxng >/dev/null 2>"$TMP/err"; rc=$?
+set -e
+ok "unconfigured SearXNG exits 64 and names both sources" '[ "$rc" = 64 ] && grep -q "hermes/.env" "$TMP/err"'
 
 set +e
 SEARXNG_URL="http://127.0.0.1:$healthy_port" FIRECRAWL_API_URL="http://127.0.0.1:1" python3 "$SEARCH" "no-silent" >/dev/null 2>"$TMP/err"; rc=$?
