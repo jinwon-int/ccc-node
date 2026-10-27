@@ -16,9 +16,16 @@ else
   fail=$((fail+1)); echo "FAIL: fleet-alerts python unit suite"; tail -40 "$TMP/unit.out"
 fi
 
+# 「한데」 lane (#2413): mirror trigger + FLEET-WORKER socket loop, stdlib only.
+if PYTHONPATH="$ROOT/.github/pythonpath" python3 "$ROOT/scripts/fleet-alerts/fleet_alerts_hande_test.py" >"$TMP/hande.out" 2>&1; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); echo "FAIL: fleet-alerts hande lane unit suite"; tail -40 "$TMP/hande.out"
+fi
+
 # The two entrypoints must parse --help without matrix-nio installed
 # (the sender imports the Matrix transport lazily).
-for entry in fleet_alerts_receiver.py fleet_alerts_sender.py; do
+for entry in fleet_alerts_receiver.py fleet_alerts_sender.py fleet_alerts_sender_hande.py; do
   if PYTHONPATH="$ROOT/.github/pythonpath" python3 "$ROOT/scripts/fleet-alerts/$entry" --help >"$TMP/help.out" 2>&1; then
     pass=$((pass+1))
   else
