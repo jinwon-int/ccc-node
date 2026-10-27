@@ -1,0 +1,1 @@
+- **hooks:** `agent-trust-watch.sh` — non-blocking SessionStart warning when a session would load an untrusted `AGENTS.md`/`CLAUDE.md` (shared ancestor roots such as `/tmp`, download dirs outside git) and SessionStart/PostToolUse warning when endpoint hosts or MCP servers change; mtime fast path, off switch `CCC_AGENT_TRUST_WATCH=0`, TM-1306 unchanged (#2538).

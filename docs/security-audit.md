@@ -77,3 +77,23 @@ bash scripts/install-agent-trust-audit-cron.sh --apply --nodes "<ssh aliases>"  
 If a finding is real: do not run agents in that directory, delete the planted
 file, review `~/.codex/config.toml` and Claude settings for MCP/endpoint
 changes, and rotate the agent OAuth/API tokens.
+
+### Non-blocking session warnings (`agent-trust-watch.sh`)
+
+`claude/hooks/agent-trust-watch.sh` adds context, never blocks (TM-1306):
+
+- **SessionStart** — if the session would load an `AGENTS.md`/`CLAUDE.md` from
+  a shared ancestor root (`/`, `/tmp`, `/var/tmp`, `$PREFIX/tmp`, home parent)
+  or from a download directory outside git, or if the cwd itself is in a
+  download directory, the model is told to treat those files as untrusted
+  data, not act on them, and tell the owner. It also reports endpoint/MCP
+  changes since the previous session.
+- **PostToolUse** (`Bash|Write|Edit|MultiEdit`) — compares the mtimes of
+  `~/.claude/settings.json`, `settings.local.json`, `~/.claude.json` and
+  `~/.codex/config.toml` in shell (≈0.03 s); only when one moved does it
+  recompute the fingerprint (endpoint `scheme://host`, MCP name → command
+  basename/host) and warn about additions/removals once.
+
+State: `$CCC_STATE_DIR/agent-trust/{fingerprint.json,mtimes}` (no contents, no
+secret values). Off switch: `CCC_AGENT_TRUST_WATCH=0`. The Codex lane has no
+hooks; it is covered by the weekly fleet sweep.
