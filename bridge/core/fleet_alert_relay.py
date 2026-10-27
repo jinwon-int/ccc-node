@@ -24,6 +24,17 @@ The shared secret lives in an owner-only file (``CCC_PUSH_FLEET_RELAY_SECRET_FIL
 — never in the environment or a record — and is never logged. This module
 has no Matrix or Telegram dependency so it can be unit-tested with a local
 HTTP server.
+
+Receipt read-back (``ccc.fleet-alert-receipt.v1``, #2413 / ccc-node#2137):
+
+- ``GET <base>/v1/receipts/<alertId|txn>`` with the same three headers; the
+  signed bytes are the canonical request line ``"GET <path>"`` (no body).
+- 200 = the receipt view of an alert **this node posted** (metadata only:
+  tier, ``notified``, the owner's ``ok``/``hold`` reply, re-notify/digest
+  flags — never the alert text, Matrix event ids or owner device ids). 404 =
+  unknown id *or* another node's alert (no existence leak); 401/403 as for
+  POST. A delegated-approval caller treats anything but ``notified`` + ``ok``
+  as "not approved" (fail-closed, a2a-nexus#2317 Q1).
 """
 from __future__ import annotations
 
@@ -31,10 +42,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import stat
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -49,6 +62,11 @@ DEFAULT_TIER = "info"
 NODE_HEADER = "X-Fleet-Node"
 TIMESTAMP_HEADER = "X-Fleet-Timestamp"
 SIGNATURE_HEADER = "X-Fleet-Signature"
+ALERTS_PATH = "/v1/alerts"
+RECEIPTS_PATH = "/v1/receipts"
+RECEIPT_SCHEMA = "ccc.fleet-alert-receipt.v1"
+# A 6-char base36 alert id or the queue's ``fleet-<uuid hex>`` txn.
+ALERT_KEY_RE = re.compile(r"^(?:[0-9a-z]{6}|fleet-[0-9a-f]{32})$")
 DEFAULT_TIMEOUT_SECONDS = 10.0
 # Record keys forwarded verbatim (everything else in a spool record is dropped).
 RAW_KEYS = ("ts", "event", "node", "text", "dedup", "chatId", "recipient", "tier")
@@ -100,6 +118,27 @@ def verify(secret: str, timestamp: int, body: bytes, signature: str) -> bool:
         return hmac.compare_digest(sign(secret, timestamp, body), str(signature))
     except (TypeError, ValueError):
         return False
+
+
+def canonical_get(path: str) -> bytes:
+    """The bytes a body-less ``GET`` signs: the request line without the version."""
+    return f"GET {path}".encode("utf-8")
+
+
+def receipts_url(alerts_url: str) -> str:
+    """``…/v1/alerts`` → ``…/v1/receipts`` (the receiver serves both on one bind)."""
+    base = str(alerts_url).rstrip("/")
+    if not base.endswith(ALERTS_PATH):
+        raise ValueError("fleet relay url does not end with /v1/alerts")
+    return base[: -len(ALERTS_PATH)] + RECEIPTS_PATH
+
+
+def normalize_alert_key(value: object) -> str:
+    """``#P3TW6N`` → ``p3tw6n``; raises ``ValueError`` for anything that is not an alert id / txn."""
+    key = str(value or "").strip().lstrip("#").lower()
+    if not ALERT_KEY_RE.match(key):
+        raise ValueError("alert key must be a 6-char alert id or a fleet-… txn")
+    return key
 
 
 def normalize_tier(value: object) -> str:
@@ -181,6 +220,55 @@ class FleetAlertRelay:
         if 400 <= status < 500 and status not in (408, 429):
             raise RelayRejected(f"fleet relay refused record: HTTP {status}")
         raise RelayError(f"fleet relay HTTP {status}")
+
+    def get_receipt(self, key: object, *, url: Optional[str] = None) -> Optional[dict]:
+        """Receipt view of one alert this node posted; ``None`` when the relay knows no such alert.
+
+        ``url`` overrides the receipts endpoint (default: derived from the
+        alerts url). ``RelayRejected`` for a final refusal (signature, unknown
+        node, bad key, malformed answer), ``RelayError`` when the relay is
+        unreachable or answers 5xx/408/429 — the caller decides whether to
+        retry; for approval decisions both mean "not notified" (fail-closed).
+        """
+        alert_key = normalize_alert_key(key)
+        base = (url or receipts_url(self.url)).rstrip("/")
+        full = f"{base}/{alert_key}"
+        path = urllib.parse.urlsplit(full).path
+        ts = int(self._clock())
+        req = urllib.request.Request(
+            full,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                NODE_HEADER: self.node,
+                TIMESTAMP_HEADER: str(ts),
+                SIGNATURE_HEADER: sign(self._secret, ts, canonical_get(path)),
+            },
+        )
+        try:
+            with self._opener(req, timeout=self.timeout) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            status = int(e.code)
+            if status == 404:
+                return None
+            if 400 <= status < 500 and status not in (408, 429):
+                raise RelayRejected(f"fleet relay refused receipt read: HTTP {status}") from None
+            raise RelayError(f"fleet relay HTTP {status}") from None
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            raise RelayError(f"fleet relay unreachable: {e.__class__.__name__}") from None
+        if not 200 <= status < 300:
+            if 400 <= status < 500 and status not in (408, 429):
+                raise RelayRejected(f"fleet relay refused receipt read: HTTP {status}")
+            raise RelayError(f"fleet relay HTTP {status}")
+        try:
+            view = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise RelayRejected("fleet relay receipt is not JSON") from None
+        if not isinstance(view, dict) or view.get("schema") != RECEIPT_SCHEMA or view.get("alert_id") is None:
+            raise RelayRejected("fleet relay receipt has an unexpected shape")
+        return view
 
 
 def relay_from_settings(settings: Any) -> Optional[FleetAlertRelay]:

@@ -232,6 +232,100 @@ class HttpRoundTripTest(_Base):
         self.assertEqual((status, obj["error"]), (503, "queue-unavailable"))
 
 
+class ReceiptEndpointTest(_Base):
+    """``GET /v1/receipts/<key>`` (#2137): signed, scoped to the posting node, metadata only."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.receiver = rx.Receiver(secrets_dir=self.secrets, queue_dir=self.queue)
+        self.httpd = rx.serve(self.receiver, "127.0.0.1", 0)
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}{rx.ALERTS_PATH}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.relay_a = R.FleetAlertRelay(self.url, "ka", "node-a", timeout=5)
+        self.relay_a.post(R.build_payload("node-a", "r1.json", {"event": "Deploy", "text": "x", "tier": "action"}, "body"))
+        self.txn, _ = outbox.pending(self.queue)
+        self.aid = outbox.alert_id_of(self.queue, self.txn)
+
+    def tearDown(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        super().tearDown()
+
+    def _get(self, secret: str, node: str, key: str, ts: int | None = None, sig: str | None = None):
+        path = f"{R.RECEIPTS_PATH}/{key}"
+        ts = int(time.time()) if ts is None else ts
+        headers = {R.NODE_HEADER: node, R.TIMESTAMP_HEADER: str(ts),
+                   R.SIGNATURE_HEADER: sig or R.sign(secret, ts, R.canonical_get(path))}
+        return self.receiver.handle("GET", path, headers, b"")
+
+    def test_receipt_view_is_metadata_only(self) -> None:
+        outbox.delivered(self.queue, self.txn, "$matrix-event-id")
+        outbox.receipt(self.queue, self.txn, "reply", "reply", "ok:hande:owner-iphone-27a879")
+        outbox.receipt(self.queue, self.txn, "renotify", "renotify", "zz9999")
+        view = outbox.receipt_view(outbox.lookup(self.queue, self.aid))
+        self.assertEqual((view["schema"], view["alert_id"], view["tier"], view["node"], view["event"]),
+                         (R.RECEIPT_SCHEMA, self.aid, "action", "node-a", "Deploy"))
+        self.assertTrue(view["notified"])
+        self.assertIsNotNone(view["notified_at"])
+        self.assertEqual((view["reply"]["decision"], view["reply"]["channel"]), ("ok", "hande"))
+        self.assertTrue(view["renotified"])
+        self.assertFalse(view["digested"])
+        dumped = json.dumps(view)
+        for leak in ("$matrix", "owner-iphone", "receipts", "body"):
+            self.assertNotIn(leak, dumped)
+
+    def test_view_before_delivery_and_hold_reply(self) -> None:
+        view = outbox.receipt_view(outbox.lookup(self.queue, self.aid))
+        self.assertEqual((view["notified"], view["notified_at"], view["reply"]), (False, None, None))
+        outbox.receipt(self.queue, self.txn, "reply", "reply", "hold:matrix:@owner:example")
+        self.assertEqual(outbox.receipt_view(outbox.lookup(self.queue, self.aid))["reply"]["decision"], "hold")
+
+    def test_get_is_signed_and_scoped_to_the_posting_node(self) -> None:
+        status, view = self._get("ka", "node-a", self.aid)
+        self.assertEqual((status, view["alert_id"], view["schema"]), (200, self.aid, R.RECEIPT_SCHEMA))
+        self.assertEqual(self._get("ka", "node-a", self.txn)[0], 200)  # txn works too
+        self.assertEqual(self._get("kb", "node-b", self.aid), (404, {"error": "unknown"}))  # not its alert
+        self.assertEqual(self._get("ka", "node-a", "zzzzzz"), (404, {"error": "unknown"}))
+        self.assertEqual(self._get("ka", "node-a", "not-a-key")[0], 400)
+        self.assertEqual(self._get("wrong", "node-a", self.aid), (401, {"error": "bad-signature"}))
+        self.assertEqual(self._get("kc", "node-c", self.aid), (403, {"error": "unknown-node"}))
+        self.assertEqual(self._get("ka", "node-a", self.aid, ts=int(time.time()) - 10_000)[0], 401)
+        self.assertEqual(self.receiver.handle("GET", f"{R.RECEIPTS_PATH}/{self.aid}", {}, b"")[0], 401)
+        self.assertEqual(self.receiver.handle("POST", f"{R.RECEIPTS_PATH}/{self.aid}", {}, b"{}")[0], 404)
+        # A POST-style signature over the (empty) body does not open the GET.
+        ts = int(time.time())
+        self.assertEqual(self._get("ka", "node-a", self.aid, ts=ts, sig=R.sign("ka", ts, b""))[0], 401)
+
+    def test_client_get_receipt_round_trip(self) -> None:
+        self.assertEqual(self.relay_a.get_receipt(f"#{self.aid.upper()}")["notified"], False)
+        self.assertIsNone(self.relay_a.get_receipt("zzzzzz"))
+        self.assertIsNone(R.FleetAlertRelay(self.url, "kb", "node-b", timeout=5).get_receipt(self.aid))
+        with self.assertRaises(R.RelayRejected):
+            R.FleetAlertRelay(self.url, "wrong", "node-a", timeout=5).get_receipt(self.aid)
+        with self.assertRaises(ValueError):
+            self.relay_a.get_receipt("../etc")
+        outbox.delivered(self.queue, self.txn, "$ev")
+        reply.record_reply(self.queue, "ok", self.aid, channel="matrix", who="@o:x", ack=False)
+        view = self.relay_a.get_receipt(self.aid)
+        self.assertEqual((view["notified"], view["reply"]["decision"], view["reply"]["channel"]), (True, "ok", "matrix"))
+
+    def test_receipt_cli_remote_mode_exit_codes(self) -> None:
+        import contextlib
+        import io
+        secret_a = self.secrets / "node-a"
+        base = ["--relay-url", self.url, "--node", "node-a", "--secret-file", str(secret_a)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(rcpt.main(base + [self.aid]), 0)
+        self.assertEqual(json.loads(buf.getvalue())["alert_id"], self.aid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rcpt.main(base + ["zzzzzz"]), rcpt.EXIT_UNKNOWN)
+            self.assertEqual(rcpt.main(["--relay-url", self.url, "--node", "node-c", "--secret-file", str(secret_a), self.aid]),
+                             rcpt.EXIT_REFUSED)
+            self.assertEqual(rcpt.main(["--relay-url", "http://127.0.0.1:9/v1/alerts", "--node", "node-a",
+                                        "--secret-file", str(secret_a), "--timeout", "1", self.aid]), rcpt.EXIT_UNREACHABLE)
+
+
 class _FakeTransport:
     def __init__(self, fail_gate: bool = False) -> None:
         self.matrix_lock = asyncio.Lock()
