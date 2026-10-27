@@ -1,0 +1,47 @@
+# Fleet alert 「한데」 sender (#2413 / family-messenger#460) — systemd unit example for the relay host.
+#
+# Second delivery lane next to fleet-alerts-sender (Matrix): drains the mirror
+# table that fleet_alerts_sender_hande.py attaches to /var/lib/fleet-alerts/queue
+# and hands each alert as a FLEET-WORKER `notice` frame to the dedicated relay
+# bot over a Unix socket. The bot itself is a separate unit (family-messenger
+# `native-mls-bot <relay-url> steward <device> --responder-unix /run/fleet-alerts/responder.sock
+# --identity-file … --rooms-dir … --access-jwt-file …`, same shape as the card
+# bot that has run on the relay host since 2026-10-26); it must run as the user
+# named in --socket-owner. Install: copy to
+# /etc/systemd/system/fleet-alerts-sender-hande.service, then
+#   python3 /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_sender_hande.py --queue /var/lib/fleet-alerts/queue --install-only
+#   systemctl daemon-reload && systemctl enable --now fleet-alerts-sender-hande
+# Prerequisites (scripts/fleet-alerts/README.md, "「한데」 lane"): the relay bot
+# device enrolled for actor fleet-alerts, the 「한데」 fleet alert room created
+# and the bot joined (family-messenger#460). No tokens here; stdlib only.
+[Unit]
+Description=Fleet alert 「한데」 sender (mirror → relay bot notice frames, send-only)
+After=network-online.target fleet-alerts-receiver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccc-node/scripts/fleet-alerts
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+RuntimeDirectory=fleet-alerts
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/python3 /opt/ccc-node/scripts/fleet-alerts/fleet_alerts_sender_hande.py \
+  --queue /var/lib/fleet-alerts/queue \
+  --socket /run/fleet-alerts/responder.sock \
+  --room fleet-alerts \
+  --socket-owner native-relay-bot \
+  --per-min 8
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/fleet-alerts
+
+[Install]
+WantedBy=multi-user.target
