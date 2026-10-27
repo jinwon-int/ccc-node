@@ -57,6 +57,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
+import fleet_alerts_reply as reply  # noqa: E402
 
 ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TURN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -139,12 +140,18 @@ def notice_frame(room: str, body: str) -> str:
     return json.dumps({"type": "notice", "room": room, "text": bounded(body.strip())}, ensure_ascii=False) + "\n"
 
 
-def answer(line: str) -> Optional[str]:
+def answer(line: str, queue: Optional[os.PathLike | str] = None, *, owner_actor: str = "owner") -> Optional[str]:
     """Reply for one inbound frame from the bot, or None.
 
     Only ``turn`` frames get a reply — an empty complete result, so the bot posts
     nothing. Everything else (approve/deny/cancel/tool-result, malformed JSON) is
     ignored: this lane never executes anything on the owner's behalf.
+
+    Stage 3 (#2413): when ``queue`` is given and the turn is an exact
+    ``ok <id>`` / ``hold <id>`` line from a device of ``owner_actor`` (the
+    sender is MLS-authenticated by the bot; peer-bot turns carry ``peer`` and
+    are ignored), the reply receipt is recorded and an ``ack`` row is queued
+    for both rooms. The result stays empty either way.
     """
     try:
         frame = json.loads(line)
@@ -155,6 +162,16 @@ def answer(line: str) -> Optional[str]:
     turn_id = frame.get("turn_id")
     if not isinstance(turn_id, str) or not TURN_ID_RE.match(turn_id):
         return None
+    if queue is not None and not frame.get("peer"):
+        device = reply.hande_sender_device(frame.get("sender"))
+        if device and reply.actor_of(device) == owner_actor:
+            try:
+                out = reply.handle_text(queue, frame.get("prompt"), channel="hande", who=device)
+            except Exception:
+                out = None
+                logging.warning("hande reply not recorded (queue error)")
+            if out:
+                logging.info("hande reply %s alert=%s from=%s", out["outcome"], out["alert_id"], device)
     return json.dumps({"type": "result", "turn_id": turn_id, "status": "complete", "text": ""}) + "\n"
 
 
@@ -180,6 +197,7 @@ def serve_connection(
     poll: float = 1.0,
     max_notices: Optional[int] = None,
     clock=time.time,
+    owner_actor: str = "owner",
 ) -> str:
     """Serve one bot connection until it ends; returns the reason.
 
@@ -200,10 +218,10 @@ def serve_connection(
                 return "oversized frame"
             while b"\n" in inbound:
                 line, inbound = inbound.split(b"\n", 1)
-                reply = answer(line.decode("utf-8", "replace"))
-                if reply:
+                out_frame = answer(line.decode("utf-8", "replace"), queue, owner_actor=owner_actor)
+                if out_frame:
                     conn.setblocking(True)
-                    conn.sendall(reply.encode("utf-8"))
+                    conn.sendall(out_frame.encode("utf-8"))
                     conn.setblocking(False)
                     logging.info("answered a fleet-alert-room turn with an empty result")
         now = clock()
@@ -264,6 +282,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--room", help="relay room id of the 「한데」 fleet alert room ([A-Za-z0-9_-]{1,64})")
     parser.add_argument("--socket-owner", help="user name that may connect (the bot user)")
     parser.add_argument("--per-min", type=int, default=8, help=f"notice pace per minute, 1..{MAX_PER_MIN}")
+    parser.add_argument("--owner-actor", default="owner", help="relay actor whose devices may reply ok/hold <id>")
     parser.add_argument("--install-only", action="store_true", help="create mirror table + trigger and exit")
     parser.add_argument("--uninstall", action="store_true", help="drop mirror table + trigger and exit")
     parser.add_argument("--status", action="store_true", help="print mirror backlog and exit")
@@ -294,7 +313,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         conn, _ = server.accept()
         logging.info("fleet alert bot connected")
         try:
-            reason = serve_connection(conn, args.queue, args.room, pacer)
+            reason = serve_connection(conn, args.queue, args.room, pacer, owner_actor=args.owner_actor)
         except OSError as exc:
             reason = type(exc).__name__
         finally:

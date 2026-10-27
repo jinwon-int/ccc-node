@@ -34,8 +34,9 @@ retired. See "「한데」 lane" below.
 | File | Role |
 |---|---|
 | `fleet_alerts_receiver.py` | HTTP receiver: verifies `X-Fleet-Node` / `X-Fleet-Timestamp` / `X-Fleet-Signature`, enforces the per-node secret allowlist, replay skew and body cap, queues the formatted text. stdlib only. |
-| `fleet_alerts_sender.py` | Send-only Matrix transport (ccc-node `MatrixTransport` with inbound admission disabled) draining the queue into the one configured room with a stable txn id. Needs the bridge venv's matrix extra. |
+| `fleet_alerts_sender.py` | Matrix transport (ccc-node `MatrixTransport`) draining the queue into the one configured room with a stable txn id; inbound is read only for exact `ok/hold <id>` replies, nothing is ever executed. Needs the bridge venv's matrix extra. |
 | `fleet_alerts_sender_hande.py` | 「한데」 lane: mirror table + trigger on the queue (`--install-only` / `--uninstall` / `--status`), Unix-socket FLEET-WORKER port for the relay bot (answers `turn` with an empty result, pushes paced `notice` frames). stdlib only. |
+| `fleet_alerts_reply.py` | Stage 3: deterministic `ok/hold <id>` parser, reply receipt + `ack` row; used by the Matrix sender (admitted owner text) and the 「한데」 lane (owner-device `turn` frames). |
 | `fleet_alerts_policy.py` | Tier policy (stage 2): info digest at 09:00 KST, action/critical re-notify once after 15 min; derived `digest`/`renotify` rows, `meta` table for the digest day. Pure queue operations, no network. |
 | `fleet_alerts_receipt.py` | Operator read of one alert's receipts by alert id or txn (local, metadata only, exit 3 when unknown). |
 | `fleet_alerts_outbox.py` | Shared owner-only queue (0700 dir, 0600 files, flock, dedup fingerprint window, bodies wiped on delivery; v2: `alert_id`, `tier`, `receipts` — migrated in place on first open). |
@@ -77,7 +78,22 @@ Matrix sender before every round):**
 | `action` | at once | once, 15 min after the Matrix receipt, unless a `reply` receipt (`ok/hold <id>`, responder stage) exists — a derived `⏰ 재통지 #id …` row |
 | `critical` | at once | like `action`, `🚨` |
 
-Derived rows carry internal tiers `digest` / `renotify` that a node payload
+**Replies (stage 3).** The owner answers an alert by writing exactly
+`ok <id>` or `hold <id>` in either room. The Matrix sender reads it through
+the transport's normal admission (owner sender, decrypted text, verified
+pinned device); the 「한데」 lane reads it from the relay bot's `turn` frame
+(`sender` = `@<device>:hande`, MLS-authenticated — devices of the owner actor
+only, peer-bot turns ignored). Parsing is a regular expression, never a
+model, so text inside an alert body cannot pass as a reply, and a reply only
+writes a `reply` receipt (which stops the re-notify) and queues a short
+`ack` row (`✅ #id ok 접수 HH:MM — <who> (<channel>)`, `⏸` for hold) that both
+rooms show. Unknown ids and non-actionable rows (info/digest/derived) get an
+`ℹ️`/`❓` ack instead. The first reply stands; later ones are acknowledged as
+`already`. For the 「한데」 room the bot must run that room in **`agent` mode**
+(alert mode never turns room messages into frames; the mode is the bot's
+local `<room>.mode`, other bots are unaffected).
+
+Derived rows carry internal tiers `digest` / `renotify` / `ack` that a node payload
 can never set (`normalize_tier` maps unknown values to `info`). The 「한데」
 mirror copies every non-`info` insert, so both rooms show the same thing: the
 digest and the re-notify rows, never a held info alert. The daily digest is

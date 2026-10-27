@@ -31,7 +31,7 @@ DEFAULT_DEDUP_WINDOW_S = 900.0
 TIERS = ("info", "action", "critical")
 # Derived rows the policy module creates (never accepted from a node payload —
 # the receiver normalises payload tiers with the closed TIERS set).
-INTERNAL_TIERS = ("digest", "renotify")
+INTERNAL_TIERS = ("digest", "renotify", "ack")
 DEFAULT_TIER = "info"
 ALERT_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 ALERT_ID_LEN = 6

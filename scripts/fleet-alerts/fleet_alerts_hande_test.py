@@ -265,6 +265,35 @@ class SocketLoopTest(_Base):
         self.assertEqual(hande.backlog(self.queue), 0)
 
 
+class ReplyTurnTest(_Base):
+    """#2413 stage 3: an owner device's ``ok/hold <id>`` turn becomes a reply receipt; others are ignored."""
+
+    def _turn(self, prompt: str, sender: str = "@owner-web-87576b:hande", **extra) -> str:
+        return json.dumps({"type": "turn", "turn_id": "t-fleet-alerts-1", "prompt": prompt, "sender": sender, "room": "fleet-alerts", **extra})
+
+    def test_owner_turn_records_reply_and_queues_ack_mirrored_to_hande(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "look", tier="action")
+        aid = outbox.alert_id_of(self.queue, txn)
+        out = hande.answer(self._turn(f"ok {aid}"), self.queue)
+        self.assertEqual(json.loads(out)["text"], "")  # the bot still posts nothing itself
+        info = outbox.lookup(self.queue, aid)
+        self.assertEqual([r["ref"] for r in info["receipts"] if r["channel"] == "reply"], ["ok:hande:owner-web-87576b"])
+        rows = self._mirror_rows()  # the ack row is mirrored, so the hande room shows it too
+        self.assertEqual(len(rows), 2)
+        self.assertIn(f"✅ #{aid} ok 접수", rows[1][1])
+
+    def test_peer_turn_other_actor_and_plain_text_are_ignored(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "look", tier="action")
+        aid = outbox.alert_id_of(self.queue, txn)
+        hande.answer(self._turn(f"ok {aid}", peer=True), self.queue)
+        hande.answer(self._turn(f"ok {aid}", sender="@jungin-iphone-1b89e3:hande"), self.queue)
+        hande.answer(self._turn(f"ok {aid}", sender="@owner:matrix.example"), self.queue)
+        hande.answer(self._turn(f"please ok {aid}"), self.queue)
+        hande.answer(self._turn(f"ok {aid}"), None)  # no queue → pure answer
+        self.assertEqual([r for r in outbox.lookup(self.queue, aid)["receipts"] if r["channel"] == "reply"], [])
+        self.assertEqual(hande.backlog(self.queue), 1)
+
+
 class CliTest(_Base):
     def test_status_install_only_and_uninstall(self) -> None:
         import contextlib

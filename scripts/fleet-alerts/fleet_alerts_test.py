@@ -21,6 +21,7 @@ import fleet_alerts_outbox as outbox  # noqa: E402
 import fleet_alerts_policy as policy  # noqa: E402
 import fleet_alerts_receiver as rx  # noqa: E402
 import fleet_alerts_receipt as rcpt  # noqa: E402
+import fleet_alerts_reply as reply  # noqa: E402
 import fleet_alerts_sender as tx  # noqa: E402
 from telegram_bot.core import fleet_alert_relay as R  # noqa: E402
 
@@ -510,6 +511,55 @@ class PolicyTest(_Base):
     def test_tick_never_raises(self) -> None:
         out = policy.tick(Path("relative/not/allowed"), _kst(2026, 10, 27, 9, 0))
         self.assertEqual(out, {"digest": None, "renotify": 0})
+
+
+class ReplyTest(_Base):
+    """#2413 stage 3: deterministic ok/hold <id> → reply receipt + ack row; re-notify stops."""
+
+    def test_parse_is_exact_and_case_insensitive(self) -> None:
+        self.assertEqual(reply.parse_reply("ok p3tw6n"), ("ok", "p3tw6n"))
+        self.assertEqual(reply.parse_reply("  HOLD #P3TW6N \n"), ("hold", "p3tw6n"))
+        for bad in ("ok", "ok p3tw6", "ok p3tw6n please", "okay p3tw6n", "ok p3tw6n; rm -rf /", "⏰ 재통지 #p3tw6n ok p3tw6n", 123, None, "x" * 80):
+            self.assertIsNone(reply.parse_reply(bad), bad)
+
+    def test_record_reply_writes_receipt_and_ack_row_once(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "look", node="node-a", tier="action")
+        aid = outbox.alert_id_of(self.queue, txn)
+        outbox.delivered(self.queue, txn, "$e")
+        out = reply.record_reply(self.queue, "ok", aid, channel="matrix", who="@owner:hs", now=_kst(2026, 10, 27, 17, 5))
+        self.assertEqual(out["outcome"], "recorded")
+        info = outbox.lookup(self.queue, aid)
+        self.assertEqual([(r["channel"], r["kind"], r["ref"]) for r in info["receipts"]][1], ("reply", "reply", "ok:matrix:@owner:hs"))
+        ack = outbox.lookup(self.queue, out["ack_txn"])
+        self.assertEqual((ack["tier"], ack["event"]), ("ack", "FleetAlertReply"))
+        with outbox.database(self.queue) as conn:
+            body = conn.execute("SELECT body FROM alerts WHERE txn=?", (out["ack_txn"],)).fetchone()[0]
+        self.assertRegex(body, rf"^#[0-9a-z]{{6}} ✅ #{aid} ok 접수 17:05 — @owner:hs \(matrix\) · 재통지 중지$")
+        self.assertEqual(policy.pending_deliverable(self.queue)[0], out["ack_txn"])  # ack leaves at once
+        again = reply.record_reply(self.queue, "hold", aid, channel="hande", who="owner-web-87576b")
+        self.assertEqual(again["outcome"], "already")
+        self.assertEqual(sum(1 for r in outbox.lookup(self.queue, aid)["receipts"] if r["channel"] == "reply"), 1)
+        # the reply stops the 15-minute re-notify
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE alerts SET delivered=? WHERE txn=?", (_kst(2026, 10, 27, 10, 0), txn))
+        self.assertEqual(policy.make_renotify(self.queue, _kst(2026, 10, 27, 11, 0)), [])
+
+    def test_unknown_and_not_actionable_outcomes(self) -> None:
+        out = reply.record_reply(self.queue, "ok", "zzzzzz", channel="matrix", who="@owner:hs")
+        self.assertEqual(out["outcome"], "unknown")
+        with outbox.database(self.queue) as conn:
+            self.assertIn("❓ #zzzzzz", conn.execute("SELECT body FROM alerts WHERE txn=?", (out["ack_txn"],)).fetchone()[0])
+        tinfo, _ = outbox.enqueue(self.queue, "quiet", tier="info")
+        out = reply.record_reply(self.queue, "ok", outbox.alert_id_of(self.queue, tinfo), channel="matrix", who="@owner:hs")
+        self.assertEqual(out["outcome"], "not-actionable")
+        self.assertEqual(reply.record_reply(self.queue, "nope", "p3tw6n", channel="matrix", who="x")["outcome"], "invalid")
+        self.assertIsNone(reply.handle_text(self.queue, "just chatting", channel="matrix", who="@owner:hs"))
+
+    def test_hande_sender_device_and_actor_rule(self) -> None:
+        self.assertEqual(reply.hande_sender_device("@owner-web-87576b:hande"), "owner-web-87576b")
+        self.assertIsNone(reply.hande_sender_device("@owner:matrix.example"))
+        self.assertEqual(reply.actor_of("owner-web-87576b"), "owner")
+        self.assertEqual(reply.actor_of("fleet-bot"), "fleet")
 
 
 if __name__ == "__main__":
