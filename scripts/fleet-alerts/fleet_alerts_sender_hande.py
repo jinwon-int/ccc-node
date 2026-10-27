@@ -9,7 +9,9 @@ How it attaches to the existing queue
 The Matrix sender wipes an alert's body once it is delivered, so a second
 reader of ``alerts`` would race it. Instead this lane keeps its own mirror:
 an ``AFTER INSERT`` trigger on ``alerts`` copies ``(txn, body, created)`` into
-``hande_alerts`` at enqueue time, and this process drains that table. The
+``hande_alerts`` at enqueue time (every tier except ``info`` — info alerts
+reach both rooms through the daily digest row, #2413 stage 2), and this
+process drains that table. The
 receiver, the outbox module and the Matrix sender are not modified; one
 channel failing never blocks the other. Same pattern as the card-alert
 feeder that has posted to 「한데」 from the relay host since 2026-10-26.
@@ -67,7 +69,11 @@ TRUNCATION_MARKER = "…(길어서 줄임)"
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS hande_alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, txn TEXT, body TEXT NOT NULL, created REAL NOT NULL)""",
-    f"""CREATE TRIGGER IF NOT EXISTS hande_mirror AFTER INSERT ON alerts BEGIN
+    # Stage 2 (#2413): ``info`` rows are held for the daily digest on the Matrix
+    # side; the digest itself is a derived ``digest`` row, so mirroring only
+    # non-info inserts keeps both rooms identical. The trigger is dropped and
+    # recreated on every install so an older WHEN-less trigger is replaced.
+    f"""CREATE TRIGGER hande_mirror AFTER INSERT ON alerts WHEN NEW.tier <> 'info' BEGIN
         DELETE FROM hande_alerts WHERE created < NEW.created - {MAX_AGE_SECONDS};
         INSERT INTO hande_alerts(txn, body, created) VALUES (NEW.txn, NEW.body, NEW.created);
     END""",
@@ -77,8 +83,9 @@ SCHEMA = (
 # ---- mirror table ----------------------------------------------------------
 
 def install(queue: os.PathLike | str) -> None:
-    """Create the mirror table + trigger (idempotent, under the outbox lock)."""
+    """Create the mirror table and (re)create the trigger (idempotent, under the outbox lock)."""
     with outbox.database(queue) as conn:
+        conn.execute("DROP TRIGGER IF EXISTS hande_mirror")
         for statement in SCHEMA:
             conn.execute(statement)
 

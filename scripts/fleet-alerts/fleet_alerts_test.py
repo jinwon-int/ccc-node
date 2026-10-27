@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
+import fleet_alerts_policy as policy  # noqa: E402
 import fleet_alerts_receiver as rx  # noqa: E402
 import fleet_alerts_receipt as rcpt  # noqa: E402
 import fleet_alerts_sender as tx  # noqa: E402
@@ -250,8 +251,8 @@ class _FakeTransport:
 
 class SenderLoopTest(_Base):
     def test_deliver_one_sends_oldest_marks_delivered_and_stops_on_empty(self) -> None:
-        t1, _ = outbox.enqueue(self.queue, "first")
-        t2, _ = outbox.enqueue(self.queue, "second")
+        t1, _ = outbox.enqueue(self.queue, "first", tier="action")
+        t2, _ = outbox.enqueue(self.queue, "second", tier="action")
         fake = _FakeTransport()
 
         async def run() -> list[bool]:
@@ -264,7 +265,7 @@ class SenderLoopTest(_Base):
         self.assertEqual(outbox.pending_count(self.queue), 0)
 
     def test_gate_failure_raises_and_keeps_the_alert_pending(self) -> None:
-        txn, _ = outbox.enqueue(self.queue, "keep me")
+        txn, _ = outbox.enqueue(self.queue, "keep me", tier="action")
         fake = _FakeTransport(fail_gate=True)
         with self.assertRaises(RuntimeError):
             asyncio.run(tx.deliver_one(self.queue, fake, "!room:hs"))
@@ -409,6 +410,106 @@ class ContractV2Test(_Base):
         self.assertNotIn("secret body", buf.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(rcpt.main(["--queue", str(self.queue), "nope00"]), 3)
+
+
+def _kst(y, m, d, hh, mm=0) -> float:
+    import datetime as dt
+    return dt.datetime(y, m, d, hh, mm, tzinfo=policy.KST).timestamp()
+
+
+class PolicyTest(_Base):
+    """#2413 stage 2: info digest at 09:00 KST, action/critical re-notify once after 15 min."""
+
+    def test_info_is_held_action_and_critical_leave_at_once(self) -> None:
+        outbox.enqueue(self.queue, "quiet", tier="info")
+        self.assertIsNone(policy.pending_deliverable(self.queue))
+        ta, _ = outbox.enqueue(self.queue, "look", tier="action")
+        self.assertEqual(policy.pending_deliverable(self.queue)[0], ta)
+        fake = _FakeTransport()
+        # today's digest already made → the held info row must not leave on its own
+        policy.meta_set(self.queue, policy.META_DIGEST_DAY, policy.kst_day(time.time()))
+        self.assertTrue(asyncio.run(tx.deliver_one(self.queue, fake, "!r")))
+        self.assertFalse(asyncio.run(tx.deliver_one(self.queue, fake, "!r")))  # info still held
+        self.assertEqual(outbox.pending_count(self.queue), 1)
+        self.assertEqual([t[2] for t in fake.sent], [ta])
+
+    def test_digest_due_window_and_once_per_kst_day(self) -> None:
+        self.assertFalse(policy.digest_due(_kst(2026, 10, 27, 8, 59), None))
+        self.assertTrue(policy.digest_due(_kst(2026, 10, 27, 9, 0), None))
+        self.assertTrue(policy.digest_due(_kst(2026, 10, 27, 23, 30), "2026-10-26"))
+        self.assertFalse(policy.digest_due(_kst(2026, 10, 27, 12, 0), "2026-10-27"))
+
+    def test_make_digest_bundles_held_info_rows_and_marks_them_digested(self) -> None:
+        now = _kst(2026, 10, 27, 9, 5)
+        t1, _ = outbox.enqueue(self.queue, "x", node="node-a", body_with_id=lambda i: f"[A] #{i} self-update ok\nmore")
+        t2, _ = outbox.enqueue(self.queue, "y", node="node-b", body_with_id=lambda i: f"[B] #{i} startup banner")
+        ta, _ = outbox.enqueue(self.queue, "act", tier="action")
+        dtxn = policy.make_digest(self.queue, now)
+        self.assertIsNotNone(dtxn)
+        info = outbox.lookup(self.queue, dtxn)
+        self.assertEqual((info["tier"], info["event"], info["node"]), ("digest", "FleetAlertDigest", "relay"))
+        body = policy.pending_deliverable(self.queue)
+        # action row is older → first; the digest row follows
+        self.assertEqual(body[0], ta)
+        with outbox.database(self.queue) as conn:
+            dbody = conn.execute("SELECT body FROM alerts WHERE txn=?", (dtxn,)).fetchone()[0]
+        self.assertRegex(dbody, r"^#[0-9a-z]{6} 📋 플릿 알림 다이제스트 2026-10-27 — info 2건\n• \d\d:\d\d \[A\] #[0-9a-z]{6} self-update ok\n• ")
+        self.assertNotIn("more", dbody)  # first line only
+        for t in (t1, t2):
+            i = outbox.lookup(self.queue, t)
+            self.assertIsNotNone(i["matrix_delivered"])
+            self.assertEqual([(r["channel"], r["kind"], r["ref"]) for r in i["receipts"]], [("digest", "digested", info["alert_id"])])
+        self.assertEqual(policy.meta_get(self.queue, policy.META_DIGEST_DAY), "2026-10-27")
+        self.assertIsNone(policy.make_digest(self.queue, now))  # nothing held now
+        with outbox.database(self.queue) as conn:
+            self.assertEqual(conn.execute("SELECT body FROM alerts WHERE txn=?", (t1,)).fetchone()[0], "")
+
+    def test_tick_makes_digest_only_when_due_and_only_once(self) -> None:
+        outbox.enqueue(self.queue, "x", tier="info")
+        self.assertIsNone(policy.tick(self.queue, _kst(2026, 10, 27, 8, 0))["digest"])
+        d = policy.tick(self.queue, _kst(2026, 10, 27, 9, 1))["digest"]
+        self.assertIsNotNone(d)
+        outbox.enqueue(self.queue, "later", tier="info")
+        self.assertIsNone(policy.tick(self.queue, _kst(2026, 10, 27, 15, 0))["digest"])  # waits for tomorrow
+        self.assertIsNotNone(policy.tick(self.queue, _kst(2026, 10, 28, 9, 0))["digest"])
+
+    def test_renotify_once_after_15_minutes_unless_replied(self) -> None:
+        t0 = _kst(2026, 10, 27, 10, 0)
+        ta, _ = outbox.enqueue(self.queue, "act", node="node-a", tier="action")
+        tc, _ = outbox.enqueue(self.queue, "crit", node="node-b", tier="critical")
+        tr, _ = outbox.enqueue(self.queue, "replied", node="node-c", tier="action")
+        for t in (ta, tc, tr):
+            outbox.delivered(self.queue, t, "$" + t)
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE alerts SET delivered=? WHERE txn IN (?,?,?)", (t0, ta, tc, tr))
+        outbox.receipt(self.queue, tr, "reply", "reply", "ok")
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 14 * 60), [])
+        made = policy.make_renotify(self.queue, t0 + 16 * 60)
+        self.assertEqual(len(made), 2)
+        bodies = []
+        for m in made:
+            with outbox.database(self.queue) as conn:
+                bodies.append(conn.execute("SELECT body, tier FROM alerts WHERE txn=?", (m,)).fetchone())
+        self.assertTrue(all(tier == "renotify" for _, tier in bodies))
+        aid_a, aid_c = outbox.alert_id_of(self.queue, ta), outbox.alert_id_of(self.queue, tc)
+        self.assertTrue(any(f"⏰ 재통지 #{aid_a} (action, 16분 전" in b for b, _ in bodies))
+        self.assertTrue(any(f"🚨 재통지 #{aid_c} (critical" in b for b, _ in bodies))
+        self.assertTrue(any(f"`ok {aid_a}` 또는 `hold {aid_a}`" in b for b, _ in bodies))
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 60 * 60), [])  # only once
+        self.assertEqual([r["kind"] for r in outbox.lookup(self.queue, ta)["receipts"]], ["matrix-event", "renotify"])
+        self.assertEqual([r["kind"] for r in outbox.lookup(self.queue, tr)["receipts"]], ["matrix-event", "reply"])
+        # derived rows leave at once and are strong-receipted like any other row
+        self.assertEqual(policy.pending_deliverable(self.queue)[0], made[0])
+
+    def test_payload_cannot_inject_derived_tiers(self) -> None:
+        self.assertEqual(R.normalize_tier("digest"), "info")
+        self.assertEqual(outbox.normalize_tier("renotify"), "info")
+        txn, _ = outbox.enqueue(self.queue, "x", tier="digest")  # internal callers only
+        self.assertEqual(outbox.lookup(self.queue, txn)["tier"], "digest")
+
+    def test_tick_never_raises(self) -> None:
+        out = policy.tick(Path("relative/not/allowed"), _kst(2026, 10, 27, 9, 0))
+        self.assertEqual(out, {"digest": None, "renotify": 0})
 
 
 if __name__ == "__main__":

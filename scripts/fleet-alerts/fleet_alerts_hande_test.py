@@ -57,19 +57,36 @@ class MirrorTest(_Base):
     def test_install_is_idempotent_and_mirrors_every_enqueue(self) -> None:
         hande.install(self.queue)
         self.assertTrue(hande.installed(self.queue))
-        t1, _ = outbox.enqueue(self.queue, "first", node="node-a", event="AgentCronRun")
-        t2, _ = outbox.enqueue(self.queue, "second", node="node-b", event="SelfUpdate")
+        t1, _ = outbox.enqueue(self.queue, "first", node="node-a", event="AgentCronRun", tier="action")
+        t2, _ = outbox.enqueue(self.queue, "second", node="node-b", event="SelfUpdate", tier="critical")
         self.assertEqual(self._mirror_rows(), [(t1, "first"), (t2, "second")])
         self.assertEqual(hande.backlog(self.queue), 2)
 
+    def test_info_rows_are_not_mirrored_but_the_digest_row_is(self) -> None:
+        import fleet_alerts_policy as policy
+        outbox.enqueue(self.queue, "quiet info", tier="info")
+        self.assertEqual(hande.backlog(self.queue), 0)
+        import datetime as dt
+        now = dt.datetime(2026, 10, 27, 9, 0, tzinfo=policy.KST).timestamp()
+        dtxn = policy.make_digest(self.queue, now)
+        self.assertEqual([txn for txn, _ in self._mirror_rows()], [dtxn])
+
+    def test_install_replaces_an_older_when_less_trigger(self) -> None:
+        with outbox.database(self.queue) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS hande_mirror")
+            conn.execute("CREATE TRIGGER hande_mirror AFTER INSERT ON alerts BEGIN INSERT INTO hande_alerts(txn, body, created) VALUES (NEW.txn, NEW.body, NEW.created); END")
+        hande.install(self.queue)
+        outbox.enqueue(self.queue, "info after reinstall", tier="info")
+        self.assertEqual(hande.backlog(self.queue), 0)
+
     def test_dedup_duplicate_is_not_mirrored_twice(self) -> None:
         fp = outbox.fingerprint("node-a", "r1.json")
-        outbox.enqueue(self.queue, "a", fingerprint=fp)
-        outbox.enqueue(self.queue, "a again", fingerprint=fp)
+        outbox.enqueue(self.queue, "a", fingerprint=fp, tier="action")
+        outbox.enqueue(self.queue, "a again", fingerprint=fp, tier="action")
         self.assertEqual(hande.backlog(self.queue), 1)
 
     def test_matrix_delivery_wipes_outbox_body_but_mirror_keeps_it(self) -> None:
-        txn, _ = outbox.enqueue(self.queue, "keep for hande")
+        txn, _ = outbox.enqueue(self.queue, "keep for hande", tier="action")
         fake = _FakeMatrix()
         self.assertTrue(asyncio.run(tx.deliver_one(self.queue, fake, "!room:hs")))
         self.assertEqual(fake.sent, [txn])
@@ -78,8 +95,8 @@ class MirrorTest(_Base):
         self.assertEqual(hande.next_alert(self.queue)[1:], (txn, "keep for hande"))
 
     def test_next_alert_is_oldest_forget_removes_and_expired_rows_are_dropped(self) -> None:
-        t1, _ = outbox.enqueue(self.queue, "old")
-        t2, _ = outbox.enqueue(self.queue, "new")
+        t1, _ = outbox.enqueue(self.queue, "old", tier="action")
+        t2, _ = outbox.enqueue(self.queue, "new", tier="action")
         with outbox.database(self.queue) as conn:
             conn.execute("UPDATE hande_alerts SET created=created-? WHERE txn=?", (hande.MAX_AGE_SECONDS + 5, t1))
         item = hande.next_alert(self.queue)
@@ -89,16 +106,16 @@ class MirrorTest(_Base):
         self.assertIsNone(hande.next_alert(self.queue))
 
     def test_trigger_prunes_mirror_rows_older_than_24h_on_insert(self) -> None:
-        t1, _ = outbox.enqueue(self.queue, "stale")
+        t1, _ = outbox.enqueue(self.queue, "stale", tier="action")
         with outbox.database(self.queue) as conn:
             conn.execute("UPDATE hande_alerts SET created=created-? WHERE txn=?", (hande.MAX_AGE_SECONDS + 5, t1))
-        outbox.enqueue(self.queue, "fresh")
+        outbox.enqueue(self.queue, "fresh", tier="action")
         self.assertEqual([b for _, b in self._mirror_rows()], ["fresh"])
 
     def test_uninstall_drops_trigger_and_table_and_matrix_sender_is_unaffected(self) -> None:
         hande.uninstall(self.queue)
         self.assertFalse(hande.installed(self.queue))
-        txn, _ = outbox.enqueue(self.queue, "matrix only")
+        txn, _ = outbox.enqueue(self.queue, "matrix only", tier="action")
         with outbox.database(self.queue) as conn:
             names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
         self.assertNotIn("hande_alerts", names)
@@ -108,7 +125,7 @@ class MirrorTest(_Base):
         self.assertEqual(fake.sent, [txn])
 
     def test_outbox_prune_of_delivered_rows_leaves_mirror_alone(self) -> None:
-        txn, _ = outbox.enqueue(self.queue, "x")
+        txn, _ = outbox.enqueue(self.queue, "x", tier="action")
         outbox.delivered(self.queue, txn, "$e")
         self.assertEqual(outbox.prune(self.queue, keep_seconds=-1), 1)
         self.assertEqual(hande.backlog(self.queue), 1)
@@ -177,8 +194,8 @@ class SocketLoopTest(_Base):
         return [json.loads(line) for line in buf.decode("utf-8").split("\n") if line]
 
     def test_mirrored_alerts_arrive_as_notice_frames_in_order_and_are_forgotten(self) -> None:
-        outbox.enqueue(self.queue, "first alert")
-        outbox.enqueue(self.queue, "second alert")
+        outbox.enqueue(self.queue, "first alert", tier="action")
+        outbox.enqueue(self.queue, "second alert", tier="action")
         frames: list[dict] = []
 
         def bot_side(bot: socket.socket) -> None:
@@ -208,8 +225,8 @@ class SocketLoopTest(_Base):
         self.assertEqual(got, [{"type": "result", "turn_id": "t-9", "status": "complete", "text": ""}])
 
     def test_pacer_holds_the_second_notice_inside_the_window(self) -> None:
-        outbox.enqueue(self.queue, "one")
-        outbox.enqueue(self.queue, "two")
+        outbox.enqueue(self.queue, "one", tier="action")
+        outbox.enqueue(self.queue, "two", tier="action")
         frames: list[dict] = []
 
         def bot_side(bot: socket.socket) -> None:
@@ -237,7 +254,7 @@ class SocketLoopTest(_Base):
     def test_blank_body_rows_are_skipped_not_sent(self) -> None:
         with outbox.database(self.queue) as conn:
             conn.execute("INSERT INTO hande_alerts(txn, body, created) VALUES ('fleet-x', '   ', ?)", (1e12,))
-        outbox.enqueue(self.queue, "real")
+        outbox.enqueue(self.queue, "real", tier="action")
         frames: list[dict] = []
 
         def bot_side(bot: socket.socket) -> None:
