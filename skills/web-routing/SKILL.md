@@ -40,11 +40,28 @@ python3 <skill-root>/scripts/web_search.py "검색어" [--limit 5]
   lookup, Tailnet-local privacy, or when Firecrawl search failed (exit 69) or
   returned junk — never an automatic chain. The `mcp__searxng__searxng_web_search`
   tool follows the same policy on lanes that have it.
+- **Pick the provider by the query, before searching** (it is still a
+  deliberate choice, not a fallback chain):
+
+  | Query | Provider |
+  |---|---|
+  | English, technical, official docs, release notes, error messages | Firecrawl (default) |
+  | Korean-language local/life info (places, shops, Naver blogs) | `--provider searxng` |
+  | Korean law, courts, public agencies, administrative procedure | `--provider searxng` |
+  | Korean query where an English/official source is the goal | Firecrawl first |
+
+  A 7-query side-by-side (2026-10-27) found Firecrawl ahead on English and
+  technical queries (official docs ranked first, less spam), while SearXNG's
+  Naver-backed results ranked Korean government and local sources higher.
+  SearXNG returns titles that may not match the URL (SEO spam); check the URL
+  before citing. Its upstream engines throttle or CAPTCHA under load, so
+  `unresponsive_engines` can shrink a result set without an error.
 - This fleet-canon copy embeds no default SearXNG endpoint (canon must stay
-  node-agnostic, #1446): set `SEARXNG_URL` per node — the current value and
-  its failover runbook live in the Family Wiki (`pages/services/searxng.md`).
-  Without it the helper exits 64 with a pointer; the Piri-lane copy keeps a
-  lane-local default.
+  node-agnostic, #1446): `SEARXNG_URL` comes from the process environment,
+  else the node's `~/.hermes/.env` (the same file the Firecrawl key is read
+  from). The current value and its failover runbook live in the Family Wiki
+  (`pages/services/searxng.md`). Without either the helper exits 64 with a
+  pointer; the Piri-lane copy keeps a lane-local default.
 
 ## Known public URL — Firecrawl scrape
 
