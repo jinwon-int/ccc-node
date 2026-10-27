@@ -291,11 +291,19 @@ BPID="$(sed -nE 's/^SSH-EXIT ph ph\.([0-9]+)\..*/\1/p' "$LOG" | head -1)"
 ok "(e) normal exit stopped the second wrapper's reaper" '[ -n "$BPID" ] && [ -z "$(reapers_of ph "$BPID")" ]'
 : > "$LOG"
 kill -KILL "$apid"; wait "$apid" 2>/dev/null
-for _ in $(seq 1 50); do [ -e "$S/$ASTEM.state" ] || [ -e "$S/$ACTL" ] || break; sleep 0.1; done
+# reclaim_stem closes the ctl, then MOVES .state to a .reap.<pid> claim before it
+# removes the phone forward and drops the claim — so "state and ctl gone" is not
+# "reclaim done" (#2552: the FWD-REMOVE line landed after the check on a slow
+# runner). Wait for the forward removal itself and for the claim to be gone.
+for _ in $(seq 1 100); do
+  if grep -qx "FWD-REMOVE tcp:34001" "$LOG" && [ ! -e "$S/$ASTEM.state" ] && [ ! -e "$S/$ACTL" ] \
+     && ! compgen -G "$S/${ASTEM}.reap.*" >/dev/null; then break; fi
+  sleep 0.1
+done
 ok "(e) SIGKILLed wrapper: reaper closed its master" 'grep -qx "SSH-EXIT ph $ACTL" "$LOG" && [ ! -e "$S/$ACTL" ]'
 ok "(e) SIGKILLed wrapper: reaper removed its forward + state" 'grep -qx "FWD-REMOVE tcp:34001" "$LOG" && [ ! -e "$S/$ASTEM.state" ] && [ "$(cnt FWD-REMOVE)" = 1 ]'
 ok "(e) reaper logged to reaper.log, not the MCP stdio" 'grep -q "wrapper $apid died without cleanup" "$S/reaper.log" && ! grep -q "died without cleanup" "$TMP/errA"'
-for _ in $(seq 1 20); do [ -z "$(reapers_of ph "$apid")" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -z "$(reapers_of ph "$apid")" ] && break; sleep 0.1; done
 ok "(e) reaper exited after reclaiming" '[ -z "$(reapers_of ph "$apid")" ]'
 exec 7>&-
 

@@ -1,0 +1,1 @@
+- **tests:** `phone-browser-mcp.test.sh` (e) waits for the reaper to finish reclaiming (FWD-REMOVE logged, `.reap.*` claim gone) instead of for the `.state`/`.ctl` paths to vanish — `reclaim_stem` moves `.state` to a claim before it removes the phone forward, so the old wait raced on slow runners and evicted unrelated PRs from the merge queue (#2552).
