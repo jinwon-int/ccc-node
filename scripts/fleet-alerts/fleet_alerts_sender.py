@@ -1,4 +1,4 @@
-"""Send-only encrypted Matrix sender for the fleet alert bot (#2182). No AI runtime, no inbound commands.
+"""Encrypted Matrix sender for the fleet alert bot (#2182). No AI runtime; the only inbound it reads is ``ok/hold <id>``.
 
 Drains the owner-only queue filled by ``fleet_alerts_receiver.py`` into one
 private E2EE room (the owner's "🔔 플릿 알림" room) as the dedicated bot
@@ -24,6 +24,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
 import fleet_alerts_policy as policy  # noqa: E402
+import fleet_alerts_reply as reply  # noqa: E402
 
 DEFAULT_MSGTYPE = "m.text"
 IDLE_SLEEP_S = 1.0
@@ -63,7 +64,19 @@ def build_transport(config: dict, queue: Path, *, msgtype: str = DEFAULT_MSGTYPE
 
     class FleetAlertsTransport(MatrixTransport):
         def admit_event(self, room: str, event: Any) -> None:
-            # Sync is needed for room/device state, never to execute chat requests.
+            # Never execute chat requests. The base admission is the trust model
+            # (owner sender, decrypted text, verified pinned device); the only
+            # thing we read from an admitted request is an exact reply line
+            # ``ok <id>`` / ``hold <id>`` (#2413 stage 3) → reply receipt + ack.
+            req = super().admit_event(room, event)
+            if req is not None:
+                try:
+                    out = reply.handle_text(queue, req.body, channel="matrix", who=req.sender)
+                except Exception as exc:  # a queue hiccup must not stop the sync leg
+                    logging.warning("matrix reply not recorded reason=%s", type(exc).__name__)
+                    out = None
+                if out:
+                    logging.info("matrix reply %s alert=%s", out["outcome"], out["alert_id"])
             return None
 
         async def dispatch(self) -> None:
