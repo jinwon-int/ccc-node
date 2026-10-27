@@ -92,7 +92,11 @@ fi
   || die "remote gh config directory must not contain parent traversal"
 command -v ssh >/dev/null 2>&1 || die "ssh is unavailable" 69
 
-ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" bash -s -- \
+# The remote block's stdout is the caller's contract (one JSON line), so it is
+# captured and re-emitted unchanged; its exit code is preserved. Nothing below
+# the block may write to stdout.
+set +e
+remote_out="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" bash -s -- \
   "$repo" "$pr" "${expected_head,,}" "$review_config" "$dry_run" \
   "$expected_actor" "$expected_author" "$promotion_base" <<'REMOTE'
 set -euo pipefail
@@ -291,3 +295,23 @@ jq -n --arg repo "$repo" --argjson pr "$pr" --arg actor "$actor" \
   --argjson promotion "$([ -n "$promotion_base" ] && echo true || echo false)" \
   '{ok:true,approved:true,already_approved:($already > 0),repo:$repo,pr:$pr,actor:$actor,author:$author,head:$head,base:$base,promotion:$promotion,check_count:$checks}'
 REMOTE
+)"
+remote_rc=$?
+set -e
+[ -z "$remote_out" ] || printf '%s\n' "$remote_out"
+[ "$remote_rc" -eq 0 ] || exit "$remote_rc"
+
+# Delegated-approval Phase 1 SHADOW recorder (a2a-nexus#2317, ccc-node#2137):
+# after a real (non-dry-run) approval, record which 전결표 tier the structured
+# evidence maps to. Best-effort and quiet on stdout — it never changes or fails
+# the approval above. CCC_DELEGATED_SHADOW=0 disables it.
+if [ "$dry_run" -eq 0 ] && [ "${CCC_DELEGATED_SHADOW:-1}" != "0" ] \
+   && printf '%s' "$remote_out" | jq -e '.ok == true and .approved == true' >/dev/null 2>&1; then
+  shadow_py="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/delegated_approval_shadow.py"
+  if [ -f "$shadow_py" ] && command -v python3 >/dev/null 2>&1; then
+    shadow_args=(record --repo "$repo" --pr "$pr" --head "${expected_head,,}" --approver "$expected_actor")
+    [ -z "$promotion_base" ] || shadow_args+=(--promotion)
+    python3 "$shadow_py" "${shadow_args[@]}" \
+      || echo "delegated-approval shadow: recorder exited $? (approval unaffected)" >&2
+  fi
+fi

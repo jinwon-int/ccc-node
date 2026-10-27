@@ -71,12 +71,12 @@
       "audience": "codex",
       "classification": null,
       "description": "Use when a protected GitHub PR must pass exact-head, green-check, author/reviewer separation, or required-review gates before a normal squash merge; when a jinon86- or seoseo-ai-authored PR needs the other relay-held account's approval; or when landing changes without weakening branch protection.",
-      "files": 6,
+      "files": 8,
       "managed": true,
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "13b40daed45a7c7071f9f305c8f14efc832ecd94022a5a74f8f7b0f8e08d263c"
+      "tree_sha256": "24128e38658e9a36b1fea5f661d39e4ff7ee1c45f915e27abe251feee0c9856c"
     },
     {
       "audience": "codex",
