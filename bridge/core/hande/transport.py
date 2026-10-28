@@ -81,6 +81,13 @@ TURN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # port ceiling so a huge reply never ends the connection.
 MAX_RESULT_TEXT_BYTES = 256 * 1024
 NOTICE_DROP_LOG = 32
+# Notices raised while no bot is connected (#2563): the bridge posts its startup
+# banner ~2 s after start and the bot reconnects ~10 s later, and a background
+# completion can land in the same gap. Held in order and flushed on connect;
+# bounded (oldest dropped first — the bot caps notices per room per minute
+# anyway) and aged out so a notice is never posted long after the fact.
+PENDING_NOTICE_MAX = 16
+PENDING_NOTICE_TTL_S = 600.0
 PROTOCOL = "fleet-worker/1"
 
 # Self-jobs (#2561). The prefix is MatrixBot's ``SELF_JOB_PREFIX``: the runner
@@ -390,6 +397,9 @@ class HandeTransport:
         self._notice_keys: dict[str, str] = {}
         self._notices_dropped = 0
         self._recent_drops: deque[str] = deque(maxlen=NOTICE_DROP_LOG)
+        # (monotonic time, room, text) waiting for a bot to post through (#2563).
+        self._pending_notices: deque[tuple[float, str, str]] = deque()
+        self.pending_notice_ttl_s = PENDING_NOTICE_TTL_S
         self._turns_served = 0
         self._turns_uncertain = 0
         self._clients_seen = 0
@@ -496,8 +506,10 @@ class HandeTransport:
     ) -> str:
         """Unsolicited output. Delivered only when the bot speaks the ``notice`` frame.
 
-        Returns an opaque id either way; a dropped notice is counted in
-        ``health_signals`` (``notices_dropped``) so nothing is claimed sent.
+        With ``notice_frames`` on and no bot connected (it is reconnecting
+        after a restart) the notice is held and posted when it connects
+        (#2563). Returns an opaque id either way; a dropped notice is counted
+        in ``health_signals`` (``notices_dropped``) so nothing is claimed sent.
         """
 
         del msgtype
@@ -507,26 +519,70 @@ class HandeTransport:
             if self._notice_keys.get(key) == text:
                 return key
             self._notice_keys[key] = text
+        if not self.notice_frames:
+            self._dropped("notice")
+            return key or f"dropped-{time.time_ns()}"
         client = self._client
-        if self.notice_frames and client is not None and not client.closed:
+        if client is not None and not client.closed:
+            asyncio.get_running_loop().create_task(self._send_notice(client, room_id, text))
+        else:
+            self._hold_notice(room_id, text)
+        return key or f"notice-{time.time_ns()}"
+
+    async def _send_notice(self, client: _Client, room_id: str, text: str) -> bool:
+        """One ``notice`` frame; a failed send is held for the next bot (#2563)."""
+
+        frame = {"type": "notice", "room": room_id, "text": _bounded_text(text, 8192)}
+        if await client.send(frame):
+            return True
+        self._hold_notice(room_id, text)
+        return False
+
+    def _hold_notice(self, room_id: str, text: str) -> None:
+        self._expire_notices()
+        if len(self._pending_notices) >= PENDING_NOTICE_MAX:
+            self._pending_notices.popleft()
+            self._dropped("notice", "held-overflow")
+        self._pending_notices.append((time.monotonic(), room_id, text))
+
+    def _expire_notices(self) -> None:
+        horizon = time.monotonic() - self.pending_notice_ttl_s
+        while self._pending_notices and self._pending_notices[0][0] < horizon:
+            self._pending_notices.popleft()
+            self._dropped("notice", "held-expired")
+
+    async def _flush_notices(self, client: _Client) -> None:
+        """Post the held notices in order to a bot that just connected."""
+
+        self._expire_notices()
+        while self._pending_notices and not client.closed:
+            _, room_id, text = self._pending_notices.popleft()
             frame = {"type": "notice", "room": room_id, "text": _bounded_text(text, 8192)}
-            asyncio.get_running_loop().create_task(client.send(frame))
-            return key or f"notice-{time.time_ns()}"
-        self._dropped("notice")
-        return key or f"dropped-{time.time_ns()}"
+            if not await client.send(frame):
+                self._pending_notices.appendleft((time.monotonic(), room_id, text))
+                return
+
+    async def _on_connected(self, client: _Client) -> None:
+        # Held notices first (the startup banner reads before any follow-up),
+        # then the self-jobs that were waiting for a bot to post through.
+        try:
+            await self._flush_notices(client)
+        finally:
+            self._kick_self_jobs()
 
     async def _post_notice(self, room_id: str, text: str) -> bool:
         """Send one ``notice`` now (self-job output); a drop is counted like ``enqueue_notice``."""
 
         if not text.strip():
             return False
+        if not self.notice_frames:
+            self._dropped("notice")
+            return False
         client = self._client
-        if self.notice_frames and client is not None and not client.closed:
-            frame = {"type": "notice", "room": room_id, "text": _bounded_text(text, 8192)}
-            if await client.send(frame):
-                return True
-        self._dropped("notice")
-        return False
+        if client is None or client.closed:
+            self._hold_notice(room_id, text)
+            return False
+        return await self._send_notice(client, room_id, text)
 
     # -- self-jobs (#2561) -----------------------------------------------------
 
@@ -767,6 +823,7 @@ class HandeTransport:
             "turns_served": self._turns_served,
             "turns_uncertain": self._turns_uncertain,
             "notices_dropped": self._notices_dropped,
+            "notices_pending": len(self._pending_notices),
             "notice_frames": self.notice_frames,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
@@ -778,10 +835,10 @@ class HandeTransport:
 
     # -- client handling -------------------------------------------------------
 
-    def _dropped(self, kind: str) -> None:
+    def _dropped(self, kind: str, reason: str = "frame-off") -> None:
         self._notices_dropped += 1
         self._recent_drops.append(kind)
-        logger.info("hande %s dropped: bot does not speak that frame yet", kind)
+        logger.info("hande %s dropped (%s)", kind, reason)
 
     async def _serve_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -796,7 +853,7 @@ class HandeTransport:
         self._client = client
         self._clients_seen += 1
         logger.info("hande: bot connected")
-        self._kick_self_jobs()  # pending follow-ups were waiting for a bot to post through
+        asyncio.get_running_loop().create_task(self._on_connected(client))
         try:
             while not self._stopping.is_set():
                 try:

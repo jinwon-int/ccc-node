@@ -733,3 +733,75 @@ async def test_bot_disconnect_does_not_cancel_a_self_job(tmp_path: Path) -> None
         await again.close()
     finally:
         await _stop(served)
+
+
+# -- notices raised while the bot is reconnecting (#2563) -----------------------
+
+
+async def test_notices_raised_before_the_bot_connects_are_held_and_flushed_in_order(
+    tmp_path: Path,
+) -> None:
+    served = await _serve(tmp_path, notice_frames=True)
+    try:
+        served.transport.enqueue_notice("agent", "hande frontend started", key="startup-1")
+        served.transport.enqueue_notice("agent", "hande frontend started", key="startup-1")  # deduped
+        served.transport.enqueue_notice("fleet", "background task finished")
+        signals = served.transport.health_signals()
+        assert signals["notices_pending"] == 2 and signals["notices_dropped"] == 0
+        bot = await FakeBot.connect(served.path)
+        assert await bot.recv() == {
+            "type": "notice",
+            "room": "agent",
+            "text": "hande frontend started",
+        }
+        assert await bot.recv() == {
+            "type": "notice",
+            "room": "fleet",
+            "text": "background task finished",
+        }
+        signals = served.transport.health_signals()
+        assert signals["notices_pending"] == 0 and signals["notices_dropped"] == 0
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_held_notices_age_out_and_overflow_drops_the_oldest(tmp_path: Path) -> None:
+    from telegram_bot.core.hande.transport import PENDING_NOTICE_MAX
+
+    served = await _serve(tmp_path, notice_frames=True)
+    try:
+        served.transport.pending_notice_ttl_s = 0.0
+        served.transport.enqueue_notice("agent", "stale")
+        await asyncio.sleep(0.01)
+        served.transport.pending_notice_ttl_s = 600.0
+        for index in range(PENDING_NOTICE_MAX + 1):
+            served.transport.enqueue_notice("agent", f"n{index}")
+        signals = served.transport.health_signals()
+        # "stale" aged out, "n0" fell off the front.
+        assert signals["notices_dropped"] == 2
+        served.transport.pending_notice_ttl_s = 0.0
+        served.transport.enqueue_notice("agent", "after")  # ages the whole queue out
+        assert served.transport.health_signals()["notices_pending"] == 1
+        served.transport.pending_notice_ttl_s = 600.0
+        bot = await FakeBot.connect(served.path)
+        assert await bot.recv() == {"type": "notice", "room": "agent", "text": "after"}
+        assert served.transport.health_signals()["notices_pending"] == 0
+        assert served.transport.health_signals()["notices_dropped"] == PENDING_NOTICE_MAX + 2
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_held_notices_are_flushed_before_waiting_self_jobs_run(tmp_path: Path) -> None:
+    transport = _self_job_transport(tmp_path)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        transport.enqueue_notice("agent", "hande frontend started")
+        transport.enqueue_self_job("agent", "resume", key="wait:9")
+        bot = await FakeBot.connect(served.path)
+        assert (await bot.recv_kind("notice"))["text"] == "hande frontend started"
+        assert (await bot.recv_kind("notice"))["text"] == "echo:resume"
+        await bot.close()
+    finally:
+        await _stop(served)
