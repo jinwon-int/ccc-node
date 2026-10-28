@@ -16,7 +16,8 @@
 #      CCC_PUSH_ENABLED=false, CCC_PUSH_SPOOL dropped, webhook nudge off, and the
 #      push / fleet-alert relay env sourcing removed (those stay on the Matrix
 #      bridge). The relay variables the exec line still names are defined empty so
-#      `set -u` cannot trip (the 2026-10-26 daegyo restart loop).
+#      `set -u` cannot trip (the 2026-10-26 restart loop on one Termux node whose
+#      launcher defined a relay variable only inside the removed block).
 #   2. ~/.config/ccc-hande/config.json (0600): account @<node>:hande, owner, rooms,
 #      family users, socket path, socket_mode 0600 (bot and bridge share one uid —
 #      no socket_group), approval/tool timeouts, steward on.

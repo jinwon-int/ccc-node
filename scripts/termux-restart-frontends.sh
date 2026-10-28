@@ -43,7 +43,7 @@
 #      steps 2–3 run again for it with its own health file (~/.ccc-hande/
 #      health.json) and service name, after the Matrix step. Before this the
 #      hande bridge kept serving the previous generation after every
-#      self-update (gongyung 2026-10-28: two days on 192aef5 behind f43b29a).
+#      self-update (one Termux node, 2026-10-28: two days on 192aef5 behind f43b29a).
 #      A busy hande bridge gets its own detached follower (--hande-only).
 #   Telegram-retired nodes (#2342): when the operator-owned frontend list
 #      (CCC_FRONTENDS, else ~/.claude/frontends — one name per line, `#`

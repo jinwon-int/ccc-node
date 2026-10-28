@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034  # out*/rc/RUN/CFG/SVC are read via eval inside ok()
 # Tests for install-hande-bridge-termux.sh — hermetic: a fake Termux HOME/PREFIX
-# under $TMP holds a run-matrix launcher shaped like the fleet's (gongyung,
-# 2026-10-28; placeholder values), a fake `sv` records calls, bridge-current points
+# under $TMP holds a run-matrix launcher shaped like a fleet Termux node's
+# (2026-10-28; placeholder values), a fake `sv` records calls, bridge-current points
 # at a fake generation. No Termux, no runit, nothing real started.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

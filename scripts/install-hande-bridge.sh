@@ -84,7 +84,7 @@ CLONE_PATH="$UNIT_DIR/$CLONE"
 [ -f "$CLONE_PATH" ] || die "no $CLONE_PATH to clone — this installer targets nodes whose Matrix frontend is a system unit"
 
 # ccc-node #2526: the checkout is wherever the Matrix unit runs from, not a fixed
-# /opt/ccc-node — yukson/gwakga keep it at /root/ccc-node. Read it off the unit we
+# /opt/ccc-node — two fleet nodes keep it at /root/ccc-node. Read it off the unit we
 # clone (WorkingDirectory=<checkout>/bridge, else the ExecStart interpreter path
 # <checkout>/bridge/venv/bin/python); the old default stays as the last resort.
 # The hande code is checked in THAT checkout, so a /root/ccc-node node no longer

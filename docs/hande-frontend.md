@@ -159,7 +159,7 @@ its own approval where marked):
    `ExecStart` interpreter path), so `/root/ccc-node` nodes need no override (#2526).
    Nodes whose Matrix frontend is a *user* unit are set up by hand per #2380's plan v2
    instead.
-   **Termux nodes** (runit, no root — gongyung, daegyo): `scripts/install-hande-bridge-termux.sh
+   **Termux nodes** (runit, no root): `scripts/install-hande-bridge-termux.sh
    --node <node> [--family-user @actor:hande ...]` instead (#2526) — clones
    `~/.local/share/ccc-matrix/run-matrix` into `~/.local/share/ccc-hande/run-hande` with the
    channel substituted (relay/nudge sourcing removed, push off, every `CCC_MATRIX_*` token
