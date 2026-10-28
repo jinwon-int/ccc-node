@@ -47,7 +47,7 @@ DEFAULT_APPROVAL_TIMEOUT_S = 120
 DEFAULT_TOOL_TIMEOUT_S = 90
 MAX_APPROVAL_TIMEOUT_S = 600
 # ``status_interims``: the Matrix ``⏳ Working`` heartbeat re-posted as interim frames
-# (the port has no editable bubble) — at most once per interval unless the tool changes.
+# (the port has no editable bubble) — at most one line per interval, whatever the tool does.
 DEFAULT_STATUS_INTERIM_INTERVAL_S = 60
 MIN_STATUS_INTERIM_INTERVAL_S = 10
 MAX_STATUS_INTERIM_INTERVAL_S = 3600
