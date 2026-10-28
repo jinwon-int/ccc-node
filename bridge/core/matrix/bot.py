@@ -50,6 +50,7 @@ from telegram_bot.contracts.transport import (  # noqa: F401 (TransportPort re-e
 )
 from telegram_bot.core import restart_handoff, session_resume, tool_policy
 from telegram_bot.core import revert as revert_ops
+from telegram_bot.core.claude_default_model import claude_default_model
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
@@ -3809,11 +3810,16 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             return default
         return value if isinstance(value, str) else default
 
+    def _claude_default_model(self, default: str | None) -> str | None:
+        """What a Claude turn runs on without a /model choice: env, then settings."""
+
+        return claude_default_model(getattr(self._settings, "claude_settings_path", None), default)
+
     def _get_real_model(self, session: Mapping[str, Any]) -> str:
         model = session.get("model")
         if isinstance(model, str) and model:
             return model
-        return self._claude_settings_model("sonnet") or "sonnet"
+        return self._claude_default_model("sonnet") or "sonnet"
 
     async def _cmd_distill(self, *, user_id: int, chat_id: int) -> str:
         key = self._conversation_key(user_id, chat_id)
@@ -3841,7 +3847,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         provider_changed = session.get("provider") != provider
         updates: dict[str, Any] = {"provider": provider, "session_id": None, "new_session": True}
         if provider == "claude":
-            settings_model = self._claude_settings_model(None)
+            # Persist the model the CLI would pick on its own (env, then
+            # settings) so this conversation never pins a model its sibling
+            # bridge (Matrix ↔ hande, same node) is not routed to.
+            settings_model = self._claude_default_model(None)
             if session.get("model") != settings_model:
                 updates["model"] = settings_model
         elif provider_changed:

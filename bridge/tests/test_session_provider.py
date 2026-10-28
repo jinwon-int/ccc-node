@@ -833,7 +833,10 @@ async def test_codex_browsing_empty_and_error_states_are_safe(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
-async def test_claude_model_command_keeps_alias_keyboard_and_settings_default(tmp_path: Path) -> None:
+async def test_claude_model_command_keeps_alias_keyboard_and_settings_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)  # a unit env model would be the default instead
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
     manager = make_manager(tmp_path, "claude")
