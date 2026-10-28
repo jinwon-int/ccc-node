@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for scripts/env-file-guard.py (#2571).
 
-The motivating outage: on gwakga a model-switch apply.sh moved
+The motivating outage (2026-10-27): on one node a model-switch apply.sh moved
 matrix-opus55-high.env into retired/ while ccc-hande-bridge still listed it as
 a required EnvironmentFile, so the bridge's next restart failed and it stayed
 down 14.7 h. These tests drive the CLI end-to-end against a fake systemctl
@@ -230,14 +230,14 @@ class ParseTests(unittest.TestCase):
     def test_parses_newline_and_space_separated_entries(self) -> None:
         value = (
             "/root/.config/ccc-node/matrix-nudge.env (ignore_errors=yes)\n"
-            "/root/.config/ccc-main/matrix-danso.env (ignore_errors=no) "
+            "/root/.config/ccc-main/matrix-persona.env (ignore_errors=no) "
             "/root/.config/ccc-main/matrix-opus55-high.env (ignore_errors=no)\n"
         )
         self.assertEqual(
             guard.parse_environment_files(value),
             [
                 ("/root/.config/ccc-node/matrix-nudge.env", True),
-                ("/root/.config/ccc-main/matrix-danso.env", False),
+                ("/root/.config/ccc-main/matrix-persona.env", False),
                 ("/root/.config/ccc-main/matrix-opus55-high.env", False),
             ],
         )

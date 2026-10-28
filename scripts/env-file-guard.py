@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """env-file-guard: find systemd units that reference an EnvironmentFile (#2571).
 
-Motivating outage (gwakga, 2026-10-27): a node-local model-switch apply.sh
+Motivating outage (2026-10-27, #2571): on one node a node-local model-switch apply.sh
 replaced the Matrix/Telegram drop-ins and moved
 ``/root/.config/ccc-main/matrix-opus55-high.env`` into a ``retired/`` backup
 dir. ``ccc-hande-bridge.service`` -- whose drop-ins

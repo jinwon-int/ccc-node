@@ -191,7 +191,7 @@ once the file is removed.
 
 Several units can reference the same env file, and a *required*
 `EnvironmentFile=` (no leading `-`) whose file is gone makes the unit's next
-start fail with `Failed to load environment files`. On gwakga on 2026-10-27
+start fail with `Failed to load environment files`. On one node on 2026-10-27
 (#2571) a node-local model-switch `apply.sh` replaced the Matrix/Telegram
 drop-ins and moved `/root/.config/ccc-main/matrix-opus55-high.env` into a
 `retired/` backup dir, but `ccc-hande-bridge.service` still required it, so its
