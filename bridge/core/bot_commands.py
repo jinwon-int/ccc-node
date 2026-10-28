@@ -1,7 +1,6 @@
 # ruff: noqa: E402
 import asyncio
 import hashlib
-import json
 import logging
 import re
 from datetime import datetime
@@ -30,6 +29,7 @@ from telegram.ext import (
 )
 from telegram_bot.core import revert as revert_ops
 from telegram_bot.core import restart_handoff
+from telegram_bot.core.claude_default_model import claude_default_model
 from telegram_bot.core.external_wait import (
     ExternalWaitRegistry,
     render_waits,
@@ -473,14 +473,11 @@ class BotCommandMixin:
         session["session_id"] = None
         session["new_session"] = True
 
-        # Claude keeps settings.json synchronization. Codex must not read it.
+        # Claude keeps env/settings.json synchronization (the CLI's own
+        # resolution order: ANTHROPIC_MODEL, then settings). Codex must not read it.
         settings_model = session.get("model")
         if active_provider == "claude":
-            try:
-                with open(self._config.claude_settings_path, "r") as f:
-                    settings_model = json.load(f).get("model")
-            except Exception:
-                settings_model = None
+            settings_model = claude_default_model(self._config.claude_settings_path)
         elif session.get("provider") != active_provider:
             settings_model = None
             updates["model"] = None
@@ -685,14 +682,10 @@ class BotCommandMixin:
         await message.reply_text(reply)
 
     def _get_real_model(self, session: dict) -> str:
-        """Get current model from session or ~/.claude/settings.json"""
+        """Current model: session choice, else env-routed ANTHROPIC_MODEL, else settings.json."""
         if model := session.get("model"):
             return model
-        try:
-            with open(self._config.claude_settings_path, "r") as f:
-                return json.load(f).get("model", "sonnet")
-        except Exception:
-            return "sonnet"
+        return claude_default_model(self._config.claude_settings_path, "sonnet") or "sonnet"
 
     async def _cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):

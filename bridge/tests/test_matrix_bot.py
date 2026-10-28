@@ -584,13 +584,39 @@ async def test_cmd_new(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
 
 
 @pytest.mark.anyio
-async def test_cmd_new_claude_syncs_settings_model(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+async def test_cmd_new_claude_syncs_settings_model(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)  # unit env would win over settings
     bot, _chat, manager = _bot(tmp_path, agent_provider="claude")
     settings_path = tmp_path / "claude" / "settings.json"
     settings_path.parent.mkdir(parents=True)
     settings_path.write_text(json.dumps({"model": "opus"}))
     result = await bot.run_turn(_job("/new"), sink=FakeSink(), session_id=None, room_kind="direct")
     assert "Claude Code" in result.text
+    assert manager.rows[bot.ids.user_id(OWNER)]["model"] == "opus"
+
+
+@pytest.mark.anyio
+async def test_cmd_new_and_model_follow_env_routed_claude_model(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The unit env (main-session drop-in) says Fable while settings.json still
+    # says Opus: the CLI runs Fable, so /new must persist Fable and /model must
+    # mark Fable current — not the stale settings value.
+    bot, _chat, manager = _bot(tmp_path, agent_provider="claude")
+    settings_path = tmp_path / "claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(json.dumps({"model": "opus"}))
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-fable-5-1")
+    listing = await bot.run_turn(_job("/model"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert "• claude-fable-5-1 — claude-fable-5-1 (current)" in listing.text
+    assert "(current)" not in listing.text.split("claude-fable-5-1 (current)")[0]
+    await bot.run_turn(_job("/new"), sink=FakeSink(), session_id=None, room_kind="direct")
+    assert manager.rows[bot.ids.user_id(OWNER)]["model"] == "claude-fable-5-1"
+    # A blank env value is "unset": settings.json is the default again.
+    monkeypatch.setenv("ANTHROPIC_MODEL", "  ")
+    await bot.run_turn(_job("/new"), sink=FakeSink(), session_id=None, room_kind="direct")
     assert manager.rows[bot.ids.user_id(OWNER)]["model"] == "opus"
 
 
@@ -618,7 +644,10 @@ async def test_cmd_model_list_and_select(tmp_path: Path, matrix_config: dict[str
 
 
 @pytest.mark.anyio
-async def test_cmd_model_claude_table_and_provider_guards(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+async def test_cmd_model_claude_table_and_provider_guards(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)  # unit env would mark itself current
     bot, _chat, manager = _bot(tmp_path, agent_provider="claude")
     listing = await bot.run_turn(_job("/model"), sink=FakeSink(), session_id=None, room_kind="direct")
     assert "• sonnet — Claude Sonnet (current)" in listing.text

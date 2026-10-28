@@ -35,6 +35,28 @@ class SessionStartNoticeModelTest(unittest.TestCase):
             text = _notice()
         self.assertIn("◆ Model: kimi k3", text)
 
+    def test_session_model_equal_to_env_model_shows_the_label(self):
+        # Matrix persists the env-routed model on /new; hande persists none.
+        # Both must print the operator label for the same backend.
+        env = {"CCC_MODEL_LABEL": "Claude Fable 5.1 (high)", "ANTHROPIC_MODEL": "claude-fable-5-1"}
+        with mock.patch.dict(os.environ, env):
+            persisted = _notice(model="claude-fable-5-1")
+            unpinned = _notice()
+        self.assertIn("◆ Model: Claude Fable 5.1 (high)", persisted)
+        self.assertIn("◆ Model: Claude Fable 5.1 (high)", unpinned)
+
+    def test_session_model_equal_to_env_model_without_label_stays_raw(self):
+        env = {"CCC_MODEL_LABEL": "", "ANTHROPIC_MODEL": "claude-fable-5-1"}
+        with mock.patch.dict(os.environ, env):
+            text = _notice(model="claude-fable-5-1")
+        self.assertIn("◆ Model: claude-fable-5-1", text)
+
+    def test_label_substitution_is_claude_only(self):
+        env = {"CCC_MODEL_LABEL": "Claude Fable 5.1 (high)", "ANTHROPIC_MODEL": "claude-fable-5-1"}
+        with mock.patch.dict(os.environ, env):
+            text = _notice(model="claude-fable-5-1", provider="codex")
+        self.assertIn("◆ Model: claude-fable-5-1", text)
+
     def test_env_model_used_when_session_model_missing(self):
         env = {"CCC_MODEL_LABEL": "", "ANTHROPIC_MODEL": "k3"}
         with mock.patch.dict(os.environ, env):
