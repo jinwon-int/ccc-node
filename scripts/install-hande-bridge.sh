@@ -24,16 +24,19 @@
 #          [--family-user @actor:hande]... [--clone-from ccc-matrix-bridge.service]
 #          [--bot-group native-relay-bot] [--approval-timeout 600] [--tool-timeout 90]
 #          [--no-start] [--dry-run]
+# The checkout is read off the cloned unit (WorkingDirectory=<checkout>/bridge, else
+# the ExecStart interpreter path), so /root/ccc-node nodes work unaided (#2526).
+# Termux (runit, no root) nodes use install-hande-bridge-termux.sh instead.
 # Test seams (never set in production): CCC_HANDE_INSTALL_ROOT (path prefix for
-# /etc and /run), CCC_HANDE_SYSTEMCTL, CCC_HANDE_TMPFILES, CCC_HANDE_CCC_NODE,
-# CCC_HANDE_CLAUDE_DIR, CCC_HANDE_SETTLE_SECONDS.
+# /etc and /run), CCC_HANDE_SYSTEMCTL, CCC_HANDE_TMPFILES, CCC_HANDE_CCC_NODE
+# (overrides the detected checkout), CCC_HANDE_CLAUDE_DIR, CCC_HANDE_SETTLE_SECONDS.
 set -euo pipefail
 
 NODE="" ROOM="" OWNER_ACTOR="owner" CLONE="ccc-matrix-bridge.service" BOT_GROUP="native-relay-bot"
 APPROVAL_TIMEOUT=600 TOOL_TIMEOUT=90 NO_START=0 DRY_RUN=0
 FAMILY_USERS=()
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "install-hande-bridge: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
@@ -56,7 +59,6 @@ done
 ROOT="${CCC_HANDE_INSTALL_ROOT:-}"
 SYSTEMCTL="${CCC_HANDE_SYSTEMCTL:-systemctl}"
 TMPFILES="${CCC_HANDE_TMPFILES:-systemd-tmpfiles}"
-CCC_NODE="${CCC_HANDE_CCC_NODE:-/opt/ccc-node}"
 CLAUDE_DIR="${CCC_HANDE_CLAUDE_DIR:-${HOME:-/root}/.claude}"
 SETTLE="${CCC_HANDE_SETTLE_SECONDS:-6}"
 
@@ -77,10 +79,30 @@ for u in "${FAMILY_USERS[@]:-}"; do
   [ -z "$u" ] || [[ "$u" =~ ^@[A-Za-z0-9_]{1,32}:hande$ ]] || die "--family-user must look like @actor:hande (got '$u')"
 done
 [[ "$APPROVAL_TIMEOUT" =~ ^[0-9]+$ && "$TOOL_TIMEOUT" =~ ^[0-9]+$ ]] || die "timeouts must be integers (seconds)"
-[ -d "$CCC_NODE/bridge/core/hande" ] || die "$CCC_NODE has no bridge/core/hande — run self-update first (hande frontend not deployed here)"
 getent group "$BOT_GROUP" >/dev/null 2>&1 || die "group '$BOT_GROUP' does not exist — install the native relay bot first (it owns that group)"
 CLONE_PATH="$UNIT_DIR/$CLONE"
 [ -f "$CLONE_PATH" ] || die "no $CLONE_PATH to clone — this installer targets nodes whose Matrix frontend is a system unit"
+
+# ccc-node #2526: the checkout is wherever the Matrix unit runs from, not a fixed
+# /opt/ccc-node — two fleet nodes keep it at /root/ccc-node. Read it off the unit we
+# clone (WorkingDirectory=<checkout>/bridge, else the ExecStart interpreter path
+# <checkout>/bridge/venv/bin/python); the old default stays as the last resort.
+# The hande code is checked in THAT checkout, so a /root/ccc-node node no longer
+# needs the CCC_HANDE_CCC_NODE test seam to get past preflight.
+detect_checkout() {
+  local wd es
+  wd="$(sed -n 's/^WorkingDirectory=\(.*\)$/\1/p' "$CLONE_PATH" | tail -1)"
+  case "$wd" in */bridge) printf '%s unit-WorkingDirectory\n' "${wd%/bridge}"; return 0 ;; esac
+  es="$(sed -n 's|^ExecStart=\([^ ]*\)/bridge/venv/bin/python[0-9.]* .*$|\1|p' "$CLONE_PATH" | tail -1)"
+  if [ -n "$es" ]; then printf '%s unit-ExecStart\n' "$es"; return 0; fi
+  printf '/opt/ccc-node default\n'
+}
+if [ -n "${CCC_HANDE_CCC_NODE:-}" ]; then
+  CCC_NODE="$CCC_HANDE_CCC_NODE"; checkout_from="CCC_HANDE_CCC_NODE"
+else
+  read -r CCC_NODE checkout_from < <(detect_checkout)
+fi
+[ -d "$CCC_NODE/bridge/core/hande" ] || die "$CCC_NODE (from $checkout_from) has no bridge/core/hande — run self-update first (hande frontend not deployed here)"
 
 run_user="$(sed -n 's/^User=\(.*\)$/\1/p' "$CLONE_PATH" | tail -1)"; run_user="${run_user:-root}"
 run_home="$(sed -n 's/^Environment=HOME=\(.*\)$/\1/p' "$CLONE_PATH" | tail -1)"; run_home="${run_home:-/root}"
@@ -108,7 +130,7 @@ append_once() { # <file> <line> <comment>
   say "appended '$line' to $file"
 }
 
-say "== install-hande-bridge: node=$NODE room=$ROOM run-user=$run_user bot-group=$BOT_GROUP clone=$CLONE data=$hande_data"
+say "== install-hande-bridge: node=$NODE room=$ROOM run-user=$run_user bot-group=$BOT_GROUP clone=$CLONE data=$hande_data checkout=$CCC_NODE ($checkout_from)"
 
 # ---- 1. socket directory (tmpfiles) ---------------------------------------------
 write_file "$TMPFILES_CONF" 0644 <<EOF

@@ -38,6 +38,13 @@
 #      `activated`. The pointer is NOT rolled back here (Telegram is serving the
 #      same generation; that call is the operator's — the previous target is in
 #      ~/.ccc-node/bridge-current.prev-<ts>).
+#   4. 「한데」 frontend (#2526): when the runit service ccc-hande-bridge exists
+#      (install-hande-bridge-termux.sh) — or the frontend list names `hande` —
+#      steps 2–3 run again for it with its own health file (~/.ccc-hande/
+#      health.json) and service name, after the Matrix step. Before this the
+#      hande bridge kept serving the previous generation after every
+#      self-update (one Termux node, 2026-10-28: two days on 192aef5 behind f43b29a).
+#      A busy hande bridge gets its own detached follower (--hande-only).
 #   Telegram-retired nodes (#2342): when the operator-owned frontend list
 #      (CCC_FRONTENDS, else ~/.claude/frontends — one name per line, `#`
 #      comments) exists and does NOT name `telegram`, step 1 is skipped
@@ -47,14 +54,17 @@
 #
 # Usage: termux-restart-frontends.sh            (default: both frontends)
 #        termux-restart-frontends.sh --matrix-only [wait_seconds]
+#        termux-restart-frontends.sh --hande-only [wait_seconds]
 #        termux-restart-frontends.sh --verify [survive_seconds]   (read-only:
-#            judge the CURRENT Matrix process with the same rule; no restart)
+#            judge the CURRENT Matrix (and hande, when present) process with
+#            the same rule; no restart)
 #        termux-restart-frontends.sh --dry-run                    (read-only)
 # Env:   CCC_TERMUX_CCC_NODE_DIR (~/.ccc-node), CCC_TERMUX_LAUNCHER (see 1.),
 #        CCC_TERMUX_TELEGRAM_HEALTH (~/.telegram_bot/health.json),
 #        CCC_TERMUX_RECOVERY (1), CCC_TERMUX_MATRIX_DIR
-#        (~/.ccc-matrix), CCC_TERMUX_MATRIX_SERVICE (ccc-matrix-bridge), SVDIR
-#        ($PREFIX/var/service), CCC_TERMUX_RESTART_LOG
+#        (~/.ccc-matrix), CCC_TERMUX_MATRIX_SERVICE (ccc-matrix-bridge),
+#        CCC_TERMUX_HANDE_DIR (~/.ccc-hande), CCC_TERMUX_HANDE_SERVICE
+#        (ccc-hande-bridge), SVDIR ($PREFIX/var/service), CCC_TERMUX_RESTART_LOG
 #        (~/.claude/state/restart-frontends.log), CCC_MATRIX_SURVIVE_SECONDS
 #        (60), CCC_MATRIX_START_SECONDS (90: budget for health.json to report
 #        the new process), CCC_MATRIX_POLL_SECONDS (5), CCC_MATRIX_BUSY_POLL_SECONDS
@@ -63,9 +73,9 @@
 #        step keeps 30 s of it in reserve and truncates the survival window to
 #        what is left, never below 20 s), CCC_FRONTENDS / CCC_FRONTENDS_FILE
 #        (~/.claude/frontends; see "Telegram-retired nodes").
-# Exit:  0 ok (or Matrix busy → follower detached) · <telegram rc> when the
-#        Telegram restart failed · 3 Matrix did not come up / did not survive
-#        the window on the wanted generation · 2 usage.
+# Exit:  0 ok (or a busy frontend → follower detached) · <telegram rc> when the
+#        Telegram restart failed · 3 Matrix or hande did not come up / did not
+#        survive the window on the wanted generation · 2 usage.
 set -u
 
 H="${HOME:?}"
@@ -74,6 +84,9 @@ POINTER="$CN/bridge-current"
 MDIR="${CCC_TERMUX_MATRIX_DIR:-$H/.ccc-matrix}"
 HEALTH="$MDIR/health.json"
 SVC="${CCC_TERMUX_MATRIX_SERVICE:-ccc-matrix-bridge}"
+LABEL="matrix"   # log/report prefix of the frontend the follow functions act on
+HANDE_DIR="${CCC_TERMUX_HANDE_DIR:-$H/.ccc-hande}"
+HANDE_SVC="${CCC_TERMUX_HANDE_SERVICE:-ccc-hande-bridge}"
 SVDIR_="${SVDIR:-${PREFIX:-/usr}/var/service}"
 LOG="${CCC_TERMUX_RESTART_LOG:-$H/.claude/state/restart-frontends.log}"
 TG_HEALTH="${CCC_TERMUX_TELEGRAM_HEALTH:-$H/.telegram_bot/health.json}"
@@ -96,6 +109,26 @@ telegram_enabled() {
     return 0
   fi
   printf '%s\n' "$list" | tr -s ' \t,' '\n' | grep -qx telegram
+}
+
+# #2526: the hande frontend is followed when its runit service dir exists or the
+# frontend list names it (either is how install-hande-bridge-termux.sh leaves a node).
+hande_present() {
+  [ -e "$SVDIR_/$HANDE_SVC" ] && return 0
+  local list
+  if [ -n "${CCC_FRONTENDS:-}" ]; then list="$CCC_FRONTENDS"
+  elif [ -f "$FRONTENDS_FILE" ]; then list="$(sed 's/#.*//' "$FRONTENDS_FILE" 2>/dev/null)"
+  else return 1; fi
+  printf '%s\n' "$list" | tr -s ' \t,' '\n' | grep -qx hande
+}
+# as_hande <fn args...> — run a follow/verify function against the hande frontend
+# (service, health file and log label swapped in, restored afterwards).
+as_hande() {
+  local _svc="$SVC" _mdir="$MDIR" _health="$HEALTH" _label="$LABEL" rc
+  SVC="$HANDE_SVC"; MDIR="$HANDE_DIR"; HEALTH="$MDIR/health.json"; LABEL="hande"
+  "$@"; rc=$?
+  SVC="$_svc"; MDIR="$_mdir"; HEALTH="$_health"; LABEL="$_label"
+  return "$rc"
 }
 
 now() { date +%s; }
@@ -161,7 +194,7 @@ survives() {
     read -r pid started state gen < <(health_fields)
     if [ "$started" != "-" ] && [ "$started" -ge $((since - 2)) ] && alive "$pid" && [ "$gen" = "$w" ]; then break; fi
     if [ $(( $(now) - t0 )) -ge "$START_WAIT" ]; then
-      log "matrix NOT up after ${START_WAIT}s: health pid=${pid} started=${started} gen=${gen} want=${w} (since=${since})"
+      log "$LABEL NOT up after ${START_WAIT}s: health pid=${pid} started=${started} gen=${gen} want=${w} (since=${since})"
       return 3
     fi
     sleep "$POLL"
@@ -172,28 +205,28 @@ survives() {
     local left=$(( deadline - $(now) ))
     if [ "$left" -lt "$window" ]; then
       window=$(( left < MIN_WINDOW ? MIN_WINDOW : left ))
-      log "matrix survival window truncated to ${window}s by restart deadline"
+      log "$LABEL survival window truncated to ${window}s by restart deadline"
     fi
   fi
   local end=$(( $(now) + window ))
   while [ "$(now)" -lt "$end" ]; do
-    if ! alive "$pid"; then log "matrix pid $pid died inside the ${window}s window (gen=$w)"; return 3; fi
+    if ! alive "$pid"; then log "$LABEL pid $pid died inside the ${window}s window (gen=$w)"; return 3; fi
     read -r spid sup < <(sv_run)
-    if [ -n "${spid:-}" ] && [ "$spid" != "$pid" ]; then log "matrix supervised pid changed $pid -> $spid inside the window (crash/restart, gen=$w)"; return 3; fi
+    if [ -n "${spid:-}" ] && [ "$spid" != "$pid" ]; then log "$LABEL supervised pid changed $pid -> $spid inside the window (crash/restart, gen=$w)"; return 3; fi
     sleep "$POLL"
   done
   read -r spid sup < <(sv_run)
   read -r pid2 _ state gen2 < <(health_fields)
   if ! alive "$pid" || [ "$pid2" != "$pid" ] || [ "$gen2" != "$w" ]; then
-    log "matrix changed at the end of the window: pid=$pid now=$pid2 gen=$gen2 want=$w"; return 3
+    log "$LABEL changed at the end of the window: pid=$pid now=$pid2 gen=$gen2 want=$w"; return 3
   fi
   if [ -z "${spid:-}" ] || [ "$spid" != "$pid" ] || [ "${sup:-0}" -lt $(( window - POLL )) ]; then
-    log "matrix sv status disagrees: run pid=${spid:--} uptime=${sup:--}s want pid=$pid uptime>=$((window - POLL))s (gen=$w)"; return 3
+    log "$LABEL sv status disagrees: run pid=${spid:--} uptime=${sup:--}s want pid=$pid uptime>=$((window - POLL))s (gen=$w)"; return 3
   fi
   if [ "$state" != "available" ]; then
-    log "matrix service.state=$state after ${window}s (want available, gen=$w)"; return 3
+    log "$LABEL service.state=$state after ${window}s (want available, gen=$w)"; return 3
   fi
-  log "matrix verified: gen=$w pid=$pid uptime=${sup}s state=$state window=${window}s"
+  log "$LABEL verified: gen=$w pid=$pid uptime=${sup}s state=$state window=${window}s"
   return 0
 }
 
@@ -258,32 +291,47 @@ rollback_pointer() { # after start.sh exit 7: the previous generation is serving
 
 matrix_follow() { # <until_epoch> → 0 ok · 2 busy until deadline · 3 unhealthy
   local w h restart_epoch rc; w="$(want)"; h="$(have)"
-  if [ "$h" = "$w" ]; then log "matrix up to date ($h)"; return 0; fi
+  if [ "$h" = "$w" ]; then log "$LABEL up to date ($h)"; return 0; fi
   while [ "$(busy)" != 0 ]; do
-    [ "$(now)" -ge "$1" ] && { log "matrix busy until deadline (running=${h:-none} want=$w)"; return 2; }
+    [ "$(now)" -ge "$1" ] && { log "$LABEL busy until deadline (running=${h:-none} want=$w)"; return 2; }
     sleep "$BUSY_POLL"
   done
   restart_epoch=$(now)
   SVDIR="$SVDIR_" sv restart "$SVC" >> "$LOG" 2>&1
-  log "matrix restart issued: running=${h:-none} want=$w"
+  log "$LABEL restart issued: running=${h:-none} want=$w"
   survives "$restart_epoch" "$1"; rc=$?
-  [ "$rc" = 0 ] || log "matrix restarted but NOT healthy (rc=$rc): pointer unchanged, operator decision — previous target in $CN/bridge-current.prev-*"
+  [ "$rc" = 0 ] || log "$LABEL restarted but NOT healthy (rc=$rc): pointer unchanged, operator decision — previous target in $CN/bridge-current.prev-*"
   return "$rc"
+}
+
+verify_current() { # read-only judgement of the CURRENT process of $SVC/$HEALTH
+  local pid started state gen rc
+  read -r pid started state gen < <(health_fields)
+  [ "$started" != "-" ] || { echo "$LABEL: no health.json / started_at" >&2; return 3; }
+  survives "$started" 0; rc=$?
+  tail -n 1 "$LOG"; return "$rc"
+}
+dry_run_line() { # one frontend's dry-run fields
+  local w="$1" h spid sup; h="$(have)"
+  read -r spid sup < <(sv_run)
+  printf '%s_running=%s %s_busy=%s sv_pid=%s sv_uptime=%ss' "$LABEL" "${h:-none}" "$LABEL" "$(busy)" "${spid:--}" "${sup:--}"
+  [ "$h" = "$w" ] && printf ' -> no-op' || printf ' -> would-restart-%s-then-verify' "$LABEL"
 }
 
 case "${1:-}" in
   --dry-run)
-    w="$(want)"; h="$(have)"
-    read -r spid sup < <(sv_run)
-    echo "bridge-current=$w matrix_running=${h:-none} matrix_busy=$(busy) sv_pid=${spid:--} sv_uptime=${sup:--}s survive=${SURVIVE}s telegram=$(telegram_enabled && echo enabled || echo retired) -> $([ "$h" = "$w" ] && echo no-op || echo would-restart-matrix-then-verify)"
+    w="$(want)"
+    line="bridge-current=$w $(dry_run_line "$w") survive=${SURVIVE}s telegram=$(telegram_enabled && echo enabled || echo retired)"
+    if hande_present; then line="$line | $(as_hande dry_run_line "$w")"; else line="$line | hande=absent"; fi
+    echo "$line"
     exit 0 ;;
   --verify)
     [ -z "${2:-}" ] || SURVIVE="$2"
-    read -r pid started state gen < <(health_fields)
-    [ "$started" != "-" ] || { echo "matrix: no health.json / started_at" >&2; exit 3; }
-    survives "$started" 0; rc=$?
-    tail -n 1 "$LOG"; exit "$rc" ;;
+    verify_current; rc=$?
+    if hande_present; then as_hande verify_current; hrc=$?; [ "$rc" = 0 ] && rc=$hrc; fi
+    exit "$rc" ;;
   --matrix-only) matrix_follow $(( $(now) + ${2:-3600} )); exit $? ;;
+  --hande-only) as_hande matrix_follow $(( $(now) + ${2:-3600} )); exit $? ;;
   "") ;;
   *) echo "termux-restart-frontends: unknown argument $1" >&2; exit 2 ;;
 esac
@@ -304,5 +352,17 @@ if [ "$m" = 2 ]; then
   log "matrix follower detached (waits up to ${FOLLOWER_WAIT}s for idle)"
   m=0
 fi
+# #2526: the hande frontend follows bridge-current the same way (own health file,
+# own service, own follower). A missing hande service is not an error.
+hn=0
+if hande_present; then
+  as_hande matrix_follow "$deadline_m"; hn=$?
+  if [ "$hn" = 2 ]; then
+    ( nohup setsid bash "$0" --hande-only "$FOLLOWER_WAIT" > /dev/null 2>&1 < /dev/null & )
+    log "hande follower detached (waits up to ${FOLLOWER_WAIT}s for idle)"
+    hn=0
+  fi
+fi
 [ "$rc" != 0 ] && exit "$rc"
-exit "$m"
+[ "$m" != 0 ] && exit "$m"
+exit "$hn"

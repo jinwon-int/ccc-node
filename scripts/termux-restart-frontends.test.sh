@@ -53,6 +53,7 @@ case "$1" in
   restart)
     [ "${FAKE_RESTART_NOOP:-0}" = 1 ] && exit 0
     date +%s > "$FAKE_STARTED_FILE"
+    case "$2" in ccc-hande-bridge) export WH_DIR="$HOME/.ccc-hande" ;; *) export WH_DIR="$HOME/.ccc-matrix" ;; esac
     write_health "$FAKE_NEW_PID" "$(date +%s)" "${FAKE_STATE:-available}" "$FAKE_NEW_GEN" 0 ;;
   status)
     if [ -n "${FAKE_KILL_ON_STATUS:-}" ]; then
@@ -60,15 +61,16 @@ case "$1" in
       for _ in $(seq 300); do kill -0 "$FAKE_KILL_ON_STATUS" 2>/dev/null || break; sleep 0.1; done
     fi
     started=$(cat "$FAKE_STARTED_FILE" 2>/dev/null || echo 0)
-    pid="${FAKE_SV_PID:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["process"]["pid"])' "$HOME/.ccc-matrix/health.json" 2>/dev/null)}"
+    case "$2" in ccc-hande-bridge) hdir="$HOME/.ccc-hande" ;; *) hdir="$HOME/.ccc-matrix" ;; esac
+    pid="${FAKE_SV_PID:-$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["process"]["pid"])' "$hdir/health.json" 2>/dev/null)}"
     printf 'run: %s: (pid %s) %ss; run: log: (pid 1) 999999s\n' "$2" "$pid" "$(( $(date +%s) - started ))" ;;
 esac
 SH
 chmod +x "$TMP/bin/sv" "$HOME/.ccc-node/scripts/bridge-current.sh"
 export PATH="$TMP/bin:$PATH"
 
-write_health() { # <pid> <started_epoch> <state> <gen> <active_requests>
-  python3 - "$HOME/.ccc-matrix/health.json" "$@" <<'PY'
+write_health() { # <pid> <started_epoch> <state> <gen> <active_requests>  (WH_DIR selects the frontend dir; default Matrix)
+  python3 - "${WH_DIR:-$HOME/.ccc-matrix}/health.json" "$@" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 path, pid, started, state, gen, active = sys.argv[1:7]
@@ -284,6 +286,77 @@ ok "CCC_FRONTENDS env (no file) marks Telegram retired" '[ "$rc" = 0 ] && ! grep
 reset
 out="$(CCC_FRONTENDS="matrix,telegram" run)"; rc=$?
 ok "CCC_FRONTENDS comma list naming telegram keeps it" '[ "$rc" = 0 ] && grep -q "bridge-current --path $HOME --restart -d" "$CALLS"'
+
+# ---------------------------------------------------------------- hande frontend follows too (#2526)
+# Until here no hande service dir existed: every case above must have run with
+# "hande=absent" and never touched a hande health file.
+ok "no hande service → nothing hande-related ever ran" '! grep -q hande "$CALLS" && [ ! -e "$HOME/.ccc-hande" ]'
+out="$(run --dry-run)"
+ok "dry-run reports hande=absent without a service dir" '[[ "$out" == *"| hande=absent"* ]]'
+
+export SVDIR="$TMP/svdir"; mkdir -p "$SVDIR/ccc-hande-bridge" "$HOME/.ccc-hande"
+sleep 600 & LIVEH=$!
+sleep 600 & LIVEH2=$!
+hwrite() { WH_DIR="$HOME/.ccc-hande" write_health "$@"; }
+
+# both up to date → hande judged, untouched
+reset; point gen-A; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_SV_PID=$LIVE1"; echo "$(( $(date +%s) - 500 ))" > "$TMP/started"
+out="$(run --dry-run)"
+ok "dry-run shows the hande frontend next to Matrix" '[[ "$out" == *"matrix_running=gen-A"* ]] && [[ "$out" == *"| hande_running=gen-A hande_busy=0"* ]] && [[ "$out" == *"-> no-op"* ]]'
+setfake
+out="$(run)"; rc=$?
+ok "hande up to date: no restart, logged under its own label" '[ "$rc" = 0 ] && ! grep -q "sv restart" "$CALLS" && grep -q "matrix up to date (gen-A)" "$LOG" && grep -q "hande up to date (gen-A)" "$LOG"'
+
+# pointer moved, Matrix already on gen-B (restarted earlier), hande still on gen-A → only hande restarted and verified
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-B 0; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_NEW_PID=$LIVEH2" "FAKE_NEW_GEN=gen-B"
+out="$(run)"; rc=$?
+ok "hande behind the pointer: sv restart ccc-hande-bridge, verified for the window, Matrix untouched" '[ "$rc" = 0 ] && grep -q "sv restart ccc-hande-bridge" "$CALLS" && ! grep -q "sv restart ccc-matrix-bridge" "$CALLS" && grep -q "hande restart issued: running=gen-A want=gen-B" "$LOG" && grep -q "hande verified: gen=gen-B pid=$LIVEH2" "$LOG"'
+ok "Matrix health file untouched by the hande restart" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"process\"][\"pid\"]==int(sys.argv[2])" "$HOME/.ccc-matrix/health.json" "$LIVE1"'
+
+# hande restarted but never comes up → exit 3 even though Matrix is fine
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-B 0; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_RESTART_NOOP=1"
+out="$(run)"; rc=$?
+ok "hande not up after its restart → exit 3" '[ "$rc" = 3 ] && grep -q "hande NOT up after 3s" "$LOG" && grep -q "hande restarted but NOT healthy (rc=3)" "$LOG"'
+
+# both behind: Matrix restarted first, then hande
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_NEW_PID=$LIVE2" "FAKE_NEW_GEN=gen-B"
+out="$(run)"; rc=$?
+ok "both behind: Matrix then hande, both verified, exit 0" '[ "$rc" = 0 ] && grep -q "sv restart ccc-matrix-bridge" "$CALLS" && grep -q "sv restart ccc-hande-bridge" "$CALLS" && grep -q "matrix verified: gen=gen-B" "$LOG" && grep -q "hande verified: gen=gen-B" "$LOG"'
+ok "Matrix restart precedes the hande restart" '[ "$(grep -n "sv restart" "$CALLS" | head -1)" = "$(grep -n "sv restart ccc-matrix-bridge" "$CALLS" | head -1)" ]'
+
+# busy hande until the deadline → its own follower detached, exit 0
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-B 0; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 3
+setfake "FAKE_NEW_PID=$LIVEH2" "FAKE_NEW_GEN=gen-B"
+out="$(CCC_BRIDGE_RESTART_DEADLINE_EPOCH=$(( $(date +%s) + 31 )) run)"; rc=$?
+ok "busy hande: no restart, hande follower detached, exit 0" '[ "$rc" = 0 ] && ! grep -q "sv restart" "$CALLS" && grep -q "hande busy until deadline (running=gen-A want=gen-B)" "$LOG" && grep -q "hande follower detached (waits up to 1s" "$LOG"'
+for _ in $(seq 600); do [ "$(grep -c "hande busy until deadline" "$LOG")" -ge 2 ] && break; sleep 0.1; done
+ok "the detached hande follower gave up on its own (still busy)" '[ "$(grep -c "hande busy until deadline" "$LOG")" -ge 2 ]'
+
+# --hande-only / --verify with both
+reset; point gen-B; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_NEW_PID=$LIVEH2" "FAKE_NEW_GEN=gen-B"
+out="$(run --hande-only 5)"; rc=$?
+ok "--hande-only restarts and verifies only hande" '[ "$rc" = 0 ] && grep -q "sv restart ccc-hande-bridge" "$CALLS" && ! grep -q "sv restart ccc-matrix-bridge" "$CALLS" && ! grep -q bridge-current "$CALLS" && grep -q "hande verified: gen=gen-B" "$LOG"'
+reset; point gen-B; write_health "$LIVE2" "$(( $(date +%s) - 500 ))" available gen-B 0; hwrite "$LIVEH2" "$(( $(date +%s) - 500 ))" available gen-B 0
+setfake; echo "$(( $(date +%s) - 500 ))" > "$TMP/started"
+out="$(run --verify 2)"; rc=$?
+ok "--verify judges both frontends (both healthy → 0)" '[ "$rc" = 0 ] && [[ "$out" == *"matrix verified: gen=gen-B"* ]] && [[ "$out" == *"hande verified: gen=gen-B"* ]]'
+hwrite "$DEAD" "$(( $(date +%s) - 500 ))" available gen-B 0
+out="$(run --verify 2)"; rc=$?
+ok "--verify fails when only hande is dead" '[ "$rc" = 3 ] && [[ "$out" == *"matrix verified"* ]]'
+
+# frontend list naming hande (no service dir yet) also counts as present
+rm -rf "$SVDIR/ccc-hande-bridge"; rm -f "$HOME/.ccc-hande/health.json"
+reset; point gen-A; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; setfake
+out="$(CCC_FRONTENDS="matrix,hande" run --dry-run)"
+ok "frontend list naming hande marks it present" '[[ "$out" == *"| hande_running=none"* ]]'
+out="$(run --dry-run)"
+ok "no service dir and no list entry → absent again" '[[ "$out" == *"| hande=absent"* ]]'
+kill "$LIVEH" "$LIVEH2" 2>/dev/null; unset SVDIR
 
 # ---------------------------------------------------------------- usage
 out="$(run --bogus)"; rc=$?

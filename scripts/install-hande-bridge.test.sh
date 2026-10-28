@@ -68,6 +68,11 @@ run_install() {
   CCC_HANDE_CCC_NODE="$CCCNODE" CCC_HANDE_CLAUDE_DIR="$CLAUDE" CCC_HANDE_SETTLE_SECONDS=0 \
   bash "$SCRIPT" --bot-group "$group" "$@"
 }
+run_install_auto() { # no CCC_HANDE_CCC_NODE: the checkout must come from the cloned unit (#2526)
+  CCC_HANDE_INSTALL_ROOT="$ROOT" CCC_HANDE_SYSTEMCTL="$TMP/bin/systemctl" CCC_HANDE_TMPFILES="$TMP/bin/systemd-tmpfiles" \
+  CCC_HANDE_CLAUDE_DIR="$CLAUDE" CCC_HANDE_SETTLE_SECONDS=0 \
+  bash "$SCRIPT" --bot-group "$group" "$@"
+}
 
 # ---- preflight refusals ----------------------------------------------------------
 out="$(run_install --node 'Bad Name' 2>&1)"; rc=$?
@@ -76,6 +81,29 @@ mv "$CCCNODE/bridge/core/hande" "$CCCNODE/bridge/core/hande.off"
 out="$(run_install --node nodea 2>&1)"; rc=$?
 ok "missing hande code is refused" '[ "$rc" != 0 ] && grep -q "no bridge/core/hande" <<<"$out"'
 mv "$CCCNODE/bridge/core/hande.off" "$CCCNODE/bridge/core/hande"
+
+# ---- #2526: checkout comes from the cloned unit, not a fixed /opt/ccc-node -------------
+# A /root/ccc-node-style node: the Matrix unit's WorkingDirectory names the checkout.
+ALT="$TMP/alt/ccc-node"; mkdir -p "$ALT/bridge/core/hande"
+sed -e "s|/opt/ccc-node|$ALT|g" "$ROOT/etc/systemd/system/ccc-matrix-bridge.service" > "$ROOT/etc/systemd/system/ccc-matrix-alt.service"
+out="$(run_install_auto --node nodea --clone-from ccc-matrix-alt.service --dry-run 2>&1)"; rc=$?
+ok "#2526: checkout detected from the unit's WorkingDirectory (no seam needed)" '[ "$rc" = 0 ] && grep -q "checkout=$ALT (unit-WorkingDirectory)" <<<"$out"'
+# WorkingDirectory absent → the ExecStart interpreter path names it.
+sed -i '/^WorkingDirectory=/d' "$ROOT/etc/systemd/system/ccc-matrix-alt.service"
+out="$(run_install_auto --node nodea --clone-from ccc-matrix-alt.service --dry-run 2>&1)"; rc=$?
+ok "#2526: checkout detected from ExecStart when WorkingDirectory is absent" '[ "$rc" = 0 ] && grep -q "checkout=$ALT (unit-ExecStart)" <<<"$out"'
+# The hande code is checked in THAT checkout; the refusal names the source of the path.
+rm -rf "$ALT/bridge/core/hande"
+out="$(run_install_auto --node nodea --clone-from ccc-matrix-alt.service --dry-run 2>&1)"; rc=$?
+ok "#2526: missing hande code in the detected checkout is refused with the path and its source" '[ "$rc" != 0 ] && grep -q "$ALT (from unit-ExecStart) has no bridge/core/hande" <<<"$out"'
+# Neither hint → the old /opt/ccc-node default (named as such); the seam still overrides.
+sed -i 's|^ExecStart=.*$|ExecStart=/usr/bin/env python3 -m telegram_bot --path /root|' "$ROOT/etc/systemd/system/ccc-matrix-alt.service"
+out="$(run_install_auto --node nodea --clone-from ccc-matrix-alt.service --dry-run 2>&1)"; rc=$?
+# (the host may or may not have a real /opt/ccc-node checkout — either branch must name the default as the source)
+ok "#2526: no hint in the unit → /opt/ccc-node default, named as such" 'grep -qE "checkout=/opt/ccc-node \(default\)|/opt/ccc-node \(from default\) has no bridge/core/hande" <<<"$out"'
+out="$(run_install --node nodea --clone-from ccc-matrix-alt.service --dry-run 2>&1)"; rc=$?
+ok "#2526: CCC_HANDE_CCC_NODE still overrides detection" '[ "$rc" = 0 ] && grep -q "checkout=$CCCNODE (CCC_HANDE_CCC_NODE)" <<<"$out"'
+rm -f "$ROOT/etc/systemd/system/ccc-matrix-alt.service"
 out="$(run_install --node nodea --bot-group no-such-group-zz 2>&1)"; rc=$?
 ok "missing bot group is refused" '[ "$rc" != 0 ] && grep -q "does not exist" <<<"$out"'
 out="$(run_install --node nodea --family-user owner 2>&1)"; rc=$?
