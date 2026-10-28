@@ -221,11 +221,16 @@ class _HandeSink:
         return None
 
     async def status(self, text: str | None) -> None:
-        """Heartbeat as a throttled ``interim`` (``status_interims``).
+        """Heartbeat as ``kind:"status"`` interims (``status_frames``) or throttled
+        plain interims (``status_interims``).
 
         The port has no editable bubble, so the Matrix ``⏳ Working — 10s | Bash: …``
-        line (edited in place every 10 s there) cannot be mirrored one-to-one. With
-        ``status_interims`` on, the heartbeat goes out as an ``interim`` frame — a
+        line (edited in place every 10 s there) cannot be mirrored one-to-one.
+        ``status_frames`` (status-v1) forwards every heartbeat as an interim frame
+        tagged ``kind:"status"``; a status-v1 bot posts those under a
+        ``status-<uuid>`` client_id and the apps show the newest one per sender as
+        a single transient bubble — the real counterpart of the Matrix bubble.
+        Without it, with ``status_interims`` on, the heartbeat goes out as an ``interim`` frame — a
         new room message each time — so it is throttled: the first line as soon as
         the heartbeat starts (Matrix already waits its own threshold), then one
         line per ``status_interim_interval_s`` — and nothing else. The tool label
@@ -237,11 +242,31 @@ class _HandeSink:
         not a ``⏳`` line) are not forwarded.
         """
 
-        if text is None or not self._live() or not self._transport.status_interims:
+        if text is None or not self._live():
             return
         if not text.startswith("⏳"):
             return
         turn = self._turn
+        if self._transport.status_frames:
+            # status-v1 (family-messenger#560, STATUS-V1.md): the bot posts a
+            # ``kind:"status"`` interim as a ``status-<uuid>`` message that the
+            # apps render as ONE transient bubble per sender, replaced on every
+            # line and dropped when the reply lands — so the Matrix cadence goes
+            # through unthrottled. Needs a bot that knows the kind (an older bot
+            # posts it as a plain interim), hence a separate opt-in knob.
+            turn.status_sent += 1
+            turn.status_label = text.partition(" | ")[2].strip() or None
+            await self._client.send(
+                {
+                    "type": "interim",
+                    "kind": "status",
+                    "turn_id": turn.turn_id,
+                    "text": _bounded_text(text, 8192),
+                }
+            )
+            return
+        if not self._transport.status_interims:
+            return
         now = time.monotonic()
         due = (
             turn.status_sent_at is None
@@ -429,6 +454,8 @@ class HandeTransport:
         self.notice_frames = bool(self.c.get("notice_frames"))
         # Heartbeat (``TurnSink.status``) as throttled interim frames; see _HandeSink.status.
         self.status_interims = bool(self.c.get("status_interims"))
+        # status-v1 (family-messenger#560): heartbeat as ``kind:"status"`` interims.
+        self.status_frames = bool(self.c.get("status_frames"))
         self.status_interim_interval_s = float(
             self.c.get("status_interim_interval_s") or DEFAULT_STATUS_INTERIM_INTERVAL_S
         )
@@ -878,6 +905,7 @@ class HandeTransport:
             "notices_pending": len(self._pending_notices),
             "notice_frames": self.notice_frames,
             "status_interims": self.status_interims,
+            "status_frames": self.status_frames,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
             "self_jobs_uncertain": self._self_jobs_uncertain,
