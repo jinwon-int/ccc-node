@@ -85,7 +85,7 @@ class HandeProbeTest(unittest.TestCase):
         self.assertEqual(self.run_probe(), ("RETIRED", "not-installed"))
 
     def test_installed_but_not_running_is_down(self) -> None:
-        # The gwakga 2026-10-27 shape: unit present, EnvironmentFile missing,
+        # The 2026-10-27 outage shape: unit present, EnvironmentFile missing,
         # no bridge process at all while systemd keeps retrying.
         unit = self.fs / "etc/systemd/system/ccc-hande-bridge.service"
         unit.parent.mkdir(parents=True)
@@ -94,7 +94,7 @@ class HandeProbeTest(unittest.TestCase):
         self.assertEqual(self.run_probe(), ("DOWN", "no-process"))
 
     def test_user_unit_and_termux_markers_count_as_installed(self) -> None:
-        user_cfg = self.fs / "home/gongmyoung/.config/ccc-hande/config.json"
+        user_cfg = self.fs / "home/alice/.config/ccc-hande/config.json"
         user_cfg.parent.mkdir(parents=True)
         user_cfg.write_text("{}")
         self.assertEqual(self.run_probe(), ("DOWN", "no-process"))

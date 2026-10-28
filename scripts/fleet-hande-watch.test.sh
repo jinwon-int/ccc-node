@@ -37,7 +37,7 @@ assert test "$rc" = 0
 assert grep -qx 'OK alpha channel=hande reason=available' <<< "$out"
 assert grep -qx 'RETIRED beta channel=hande reason=not-installed' <<< "$out"
 
-# DOWN (the gwakga outage shape) and notices-off both fail the sweep.
+# DOWN (the 2026-10-27 outage shape) and notices-off both fail the sweep.
 printf 'HANDE_STATUS=DOWN\nHANDE_REASON=no-process\nPROBE_COMPLETE=1\n' > "$TMP/reply/delta"
 printf 'HANDE_STATUS=DEGRADED\nHANDE_REASON=notices-off\nPROBE_COMPLETE=1\n' > "$TMP/reply/eps"
 set +e; out=$(run 'alpha delta eps'); rc=$?; set -e
@@ -57,6 +57,11 @@ set +e; out=$(run 'gamma' CCC_FLEET_HANDE_RETRIES=8); rc=$?; set -e
 assert test "$rc" = 1
 assert grep -qx 'UNREACHABLE gamma channel=hande' <<< "$out"
 assert test "$(grep -c '^gamma$' "$TMP/calls")" = 2
+
+# No built-in node list: a standalone run without CCC_FLEET_NODES refuses.
+set +e; out=$(env -u CCC_FLEET_NODES bash "$ROOT/scripts/fleet-hande-watch.sh" 2>&1); rc=$?; set -e
+assert test "$rc" = 2
+assert grep -q 'CCC_FLEET_NODES is required' <<< "$out"
 
 assert python3 -m unittest "$ROOT/scripts/fleet_hande_probe_test.py"
 printf 'PASS=%s FAIL=0\n' "$pass"

@@ -684,10 +684,11 @@ fail=0
 if [ "${CCC_FLEET_MATRIX:-1}" = 1 ]; then
   bash "$(dirname "$0")/fleet-matrix-watch.sh" || fail=1
 fi
-# 「한데」 frontend (#2569): bridge, native bot and notice_frames. gwakga's hande
+# 「한데」 frontend (#2569): bridge, native bot and notice_frames. One node's hande
 # bridge was down 14.7 h on 2026-10-27/28 while this sweep stayed page=no.
+# The node list is this script's own (fleet-hande-watch.sh carries none).
 if [ "${CCC_FLEET_HANDE:-1}" = 1 ]; then
-  bash "$(dirname "$0")/fleet-hande-watch.sh" || fail=1
+  CCC_FLEET_NODES="$NODES" bash "$(dirname "$0")/fleet-hande-watch.sh" || fail=1
 fi
 # probe_node <node> <doctor-flag>: sets $out and $probe_rc, retrying transport
 # failures only (see RETRIES above).

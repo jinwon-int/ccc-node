@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Body-free 「한데」 frontend probe. Transmitted over SSH by fleet-hande-watch.sh (#2569).
 
-gwakga's ccc-hande-bridge could not start from 2026-10-27 19:20 to 2026-10-28
+One node's ccc-hande-bridge could not start from 2026-10-27 19:20 to 2026-10-28
 10:04 KST (a required EnvironmentFile had been retired) while the daily fleet
 sweep watched only Telegram and Matrix and stayed quiet. On every node of the
 fleet the same frontend had also been silently dropping every unsolicited

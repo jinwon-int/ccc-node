@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only 「한데」 frontend watch (#2569). Reports one body-free status per node.
 #
-# gwakga's hande bridge was down for 14.7 h (2026-10-27/28) while this sweep
+# One node's hande bridge was down for 14.7 h (2026-10-27/28) while this sweep
 # watched only Telegram and Matrix, and every hande node dropped all
 # unsolicited notices for days (notice_frames off). The probe names both, plus
 # a missing native bot or a bot that is not connected to the bridge.
@@ -11,7 +11,13 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROBE="$ROOT/scripts/fleet_hande_probe.py"
-NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
+# No built-in node list (fleet node names may not spread, #1451): fleet-bridge-watch
+# passes its own; a standalone run names the nodes explicitly.
+NODES="${CCC_FLEET_NODES:-}"
+if [ -z "$NODES" ]; then
+  echo "fleet-hande-watch: CCC_FLEET_NODES is required (space-separated node list)" >&2
+  exit 2
+fi
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
 SELF="${CCC_FLEET_SELF:-$(hostname -s 2>/dev/null || echo _none_)}"
 # Same bound as the Matrix watch: 12 nodes × (2 × 10s + 2s) = 264s worst case.
