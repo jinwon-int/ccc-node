@@ -1745,7 +1745,8 @@ def write_owner_spool(task, task_id, run_id, scheduled_at, status, headless, at)
         # `failureTier: info` (#2559) opts an edge-triggered watch out of paging: its
         # non-zero exit IS the notice (laptop-online-watch, fleet-bridge-watch), so it
         # joins the digest instead of re-notifying and waiting for an `ok`. The
-        # consecutive-failure alarm (write_failure_alarm_spool) stays `action`.
+        # consecutive-failure alarm (write_failure_alarm_spool) stays `action` while
+        # it fires; its all-`recovered` ("cleared") notice is `info` (#2565).
         'tier': 'info' if status == 'success' else run_failure_tier(task),
         'recipient': recipient,
         'taskId': task_id,
@@ -1885,6 +1886,22 @@ def _prompt_first_run(tasks, state):
     return min(valid) if valid else None
 
 
+def failure_alarm_tier(reasons):
+    """Fleet alert tier of a failure-alarm notice (#2565).
+
+    A firing alarm (threshold / class-change / stale) needs a person → ``action``
+    (15-min re-notify until ``ok``/``hold``). A notice whose every event is
+    ``recovered`` only says the streak ended — there is no decision to make, so it
+    joins the ``info`` digest instead of paging and asking for a reply (the
+    2026-10-28 ``jrucdx``/``yh07ja`` pair). A mixed notice (one alarm clears while
+    another fires) stays ``action``.
+    """
+    reasons = [str(r) for r in (reasons or [])]
+    if reasons and all(r.endswith('=recovered') for r in reasons):
+        return 'info'
+    return 'action'
+
+
 def write_failure_alarm_spool(task_id, run_id, text, reasons, at):
     spool = push_spool_dir()
     ts = fmt_dt(at) or _secure_fs.utc_now_iso()
@@ -1895,7 +1912,7 @@ def write_failure_alarm_spool(task_id, run_id, text, reasons, at):
         'node': socket.gethostname(),
         'text': text,
         'dedup': f"agent-cron-alarm:{task_id}:{run_id}:{','.join(reasons)}",
-        'tier': 'action',
+        'tier': failure_alarm_tier(reasons),
         'recipient': 'owner',
         'taskId': task_id,
         'runId': run_id,
