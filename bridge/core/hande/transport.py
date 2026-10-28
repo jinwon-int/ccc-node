@@ -70,7 +70,12 @@ from typing import Any, Mapping
 
 from telegram_bot.contracts.transport import TurnResult, TurnRunner
 
-from .state import DEFAULT_SOCKET_MODE, ROOM_PATTERN, sender_identity
+from .state import (
+    DEFAULT_SOCKET_MODE,
+    DEFAULT_STATUS_INTERIM_INTERVAL_S,
+    ROOM_PATTERN,
+    sender_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +195,11 @@ class _ActiveTurn:
         self.cancelled = False
         # A self-job (#2561): no bot turn behind it, output rides ``notice``.
         self.self_job = False
+        # Heartbeat-as-interim throttle (status_interims): when the last
+        # ``⏳ Working`` line went out and with which tool label.
+        self.status_sent_at: float | None = None
+        self.status_label: str | None = None
+        self.status_sent = 0
 
     def settle_tool(self, outcome: Mapping[str, Any]) -> None:
         if self.tool is not None and not self.tool[1].done():
@@ -211,8 +221,43 @@ class _HandeSink:
         return None
 
     async def status(self, text: str | None) -> None:
-        del text
-        return None
+        """Heartbeat as a throttled ``interim`` (``status_interims``).
+
+        The port has no editable bubble, so the Matrix ``⏳ Working — 10s | Bash: …``
+        line (edited in place every 10 s there) cannot be mirrored one-to-one. With
+        ``status_interims`` on, the heartbeat goes out as an ``interim`` frame — a
+        new room message each time — so it is throttled: the first line as soon as
+        the heartbeat starts (Matrix already waits its own threshold), then only
+        when the tool label after the first ``" | "`` changes or
+        ``status_interim_interval_s`` has passed. ``None`` (clear) has no frame;
+        answer previews (``🔧 …``/``… ▍``, not a ``⏳`` line) are not forwarded.
+        """
+
+        if text is None or not self._live() or not self._transport.status_interims:
+            return
+        if not text.startswith("⏳"):
+            return
+        turn = self._turn
+        label = text.partition(" | ")[2].strip() or None
+        now = time.monotonic()
+        due = (
+            turn.status_sent_at is None
+            or label != turn.status_label
+            or now - turn.status_sent_at >= self._transport.status_interim_interval_s
+        )
+        if not due:
+            return
+        # Throttle state advances even when the frame is dropped, so a turn with
+        # interim_frames off counts one drop per interval / tool change, not one
+        # per 10-second heartbeat.
+        turn.status_sent_at, turn.status_label = now, label
+        if not self._transport.interim_frames:
+            self._transport._dropped("status", "interim-frames-off")
+            return
+        turn.status_sent += 1
+        await self._client.send(
+            {"type": "interim", "turn_id": turn.turn_id, "text": _bounded_text(text, 8192)}
+        )
 
     async def interim(self, text: str) -> None:
         if not self._live():
@@ -380,6 +425,11 @@ class HandeTransport:
         self._close_task: asyncio.Future[None] | None = None
         self.interim_frames = bool(self.c.get("interim_frames"))
         self.notice_frames = bool(self.c.get("notice_frames"))
+        # Heartbeat (``TurnSink.status``) as throttled interim frames; see _HandeSink.status.
+        self.status_interims = bool(self.c.get("status_interims"))
+        self.status_interim_interval_s = float(
+            self.c.get("status_interim_interval_s") or DEFAULT_STATUS_INTERIM_INTERVAL_S
+        )
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
         self.listen_fd = listen_fd if listen_fd is not None else _systemd_listen_fd()
         self.socket_mode = int(self.c.get("socket_mode") or DEFAULT_SOCKET_MODE)
@@ -825,6 +875,7 @@ class HandeTransport:
             "notices_dropped": self._notices_dropped,
             "notices_pending": len(self._pending_notices),
             "notice_frames": self.notice_frames,
+            "status_interims": self.status_interims,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
             "self_jobs_uncertain": self._self_jobs_uncertain,

@@ -441,6 +441,85 @@ async def test_notice_is_dropped_and_counted_until_the_bot_speaks_it(tmp_path: P
         await _stop(served)
 
 
+async def test_status_interims_forward_the_heartbeat_throttled(tmp_path: Path) -> None:
+    # The port has no editable bubble: with status_interims on, the Matrix
+    # "⏳ Working — Ns | <tool>" heartbeat becomes an interim frame — first line at
+    # once, then only on a tool change or after status_interim_interval_s.
+    served = await _serve(tmp_path, interim_frames=True, status_interims=True, status_interim_interval_s=10)
+    sent: list[str] = []
+
+    async def long_turn(job: Any, sink: Any) -> TurnResult:
+        for text in (
+            "🔧 Bash\nstreaming preview ▍",          # answer preview: never forwarded
+            "⏳ Working — 10s | Bash: ls -la",        # first heartbeat → frame
+            "⏳ Working — 20s | Bash: ls -la",        # same tool, inside the interval → no frame
+            "⏳ Working — 30s | Read: notes.md",      # tool changed → frame
+            "⏳ Working — 40s | Read: notes.md",      # same tool, inside the interval → no frame
+            None,                                     # clear: nothing to redact here
+        ):
+            await sink.status(text)
+            sent.append(text or "<clear>")
+        await sink.interim("half way")
+        return TurnResult(text="done", session_id="s")
+
+    served.runner.behaviour = long_turn
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        await bot.send(bot.turn("t-30", "go"))
+        frames = []
+        while True:
+            frame = await bot.recv()
+            if frame["type"] == "result":
+                break
+            if frame["type"] == "interim":
+                frames.append(frame["text"])
+        assert frames == [
+            "⏳ Working — 10s | Bash: ls -la",
+            "⏳ Working — 30s | Read: notes.md",
+            "half way",
+        ]
+        assert served.transport.health_signals()["status_interims"] is True
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_status_interims_off_by_default_and_need_interim_frames(tmp_path: Path) -> None:
+    # Default: status stays a no-op (today's behaviour). On, but interim_frames off:
+    # the heartbeat is counted as dropped instead of silently vanishing.
+    for overrides, expect_frames, expect_dropped in (
+        ({"interim_frames": True}, [], 0),
+        ({"interim_frames": False, "status_interims": True}, [], 1),
+    ):
+        served = await _serve(tmp_path, **overrides)
+
+        async def beat(job: Any, sink: Any) -> TurnResult:
+            await sink.status("⏳ Working — 10s | Bash: ls")
+            await sink.status("⏳ Working — 20s | Bash: ls")
+            return TurnResult(text="done", session_id="s")
+
+        served.runner.behaviour = beat
+        try:
+            bot = await FakeBot.connect(served.path)
+            await _connected(served)
+            await bot.send(bot.turn("t-31", "go"))
+            frames = []
+            while True:
+                frame = await bot.recv()
+                if frame["type"] == "result":
+                    break
+                if frame["type"] == "interim":
+                    frames.append(frame["text"])
+            assert frames == expect_frames
+            assert served.transport.health_signals()["notices_dropped"] == expect_dropped
+            assert served.transport.health_signals()["status_interims"] is bool(overrides.get("status_interims"))
+            await bot.close()
+        finally:
+            await _stop(served)
+        (tmp_path / "responder.sock").unlink(missing_ok=True)
+
+
 async def test_policy_rooms_and_room_kind(tmp_path: Path) -> None:
     transport = HandeTransport(_config(), FakeRunner(), socket_path=tmp_path / "s.sock")
     assert transport.policy.rooms == {"agent": "direct", "fleet": "mention"}
