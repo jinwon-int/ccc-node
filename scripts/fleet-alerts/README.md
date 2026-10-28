@@ -67,7 +67,9 @@ python3 fleet_alerts_receipt.py --queue /var/lib/fleet-alerts/queue <alertId|txn
 
 Producers set the tier in the spool record (`tier` key): agent-cron marks a
 non-success run and the failure alarm `action`, a success notice `info`;
-records without the key are `info`.
+a task with `failureTier: info` (ccc-node #2559, edge-triggered watches whose
+non-zero exit is the notice) marks its non-success runs `info` too, the alarm
+stays `action`. Records without the key are `info`.
 
 ### Receipt read-back (`ccc.fleet-alert-receipt.v1`, #2137)
 

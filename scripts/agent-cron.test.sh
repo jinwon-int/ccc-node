@@ -1017,6 +1017,31 @@ ok "spool payload is owner-only, canonically redacted, and bridge-compatible" 'f
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$SPOOL" bash "$CMD" run exec-notify-fail --json --at 2026-01-01T00:03:00Z 2>&1)"; rc=$?
 ok "run writes owner-only spool for failed notify task" '[ "$rc" = 1 ] && jq -e ".ok == false and .status == \"failed\" and .notification.delivery == \"spooled\" and .mutations.pushSpoolWrite == true" <<<"$out" >/dev/null && find "$SPOOL" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 jq -s -e "any(.[]; .taskId == \"exec-notify-fail\" and .status == \"failed\" and .recipient == \"owner\")" >/dev/null && [ ! -e "$TMP/exec-store/locks/exec-notify-fail.lock" ]'
+ok "#2413 spool tier: failed run defaults to action, success notice is info" 'find "$SPOOL" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 jq -s -e "any(.[]; .taskId == \"exec-notify-fail\" and .tier == \"action\") and any(.[]; .taskId == \"exec-notify\" and .status == \"success\" and .tier == \"info\")" >/dev/null'
+
+# #2559 failureTier: an edge-triggered watch's non-zero exit is the notice, not a page.
+TIER_STORE="$TMP/tier-store/tasks.json"
+TIER_SPOOL="$TMP/tier-spool"
+mkdir -p "$(dirname "$TIER_STORE")"
+cat > "$TIER_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"tier-info-fail","schedule":"* * * * *","prompt":"Edge Fail","enabled":true,"notify":"owner-on-failure","failureTier":"info","failureAlertAfter":0,"lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-info-ok","schedule":"* * * * *","prompt":"Edge quiet","enabled":true,"notify":"owner","failureTier":"info","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-explicit-action","schedule":"* * * * *","prompt":"Loud Fail","enabled":true,"notify":"owner-on-failure","failureTier":"action","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
+JSON
+out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" bash "$CMD" validate --json)"; rc=$?
+ok "#2559 validate accepts failureTier action|info" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-info-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2559 failureTier=info: failed run is still spooled but as tier=info" '[ "$rc" = 1 ] && jq -e ".status == \"failed\" and .notification.delivery == \"spooled\"" <<<"$out" >/dev/null && f="$(find "$TIER_SPOOL" -maxdepth 1 -type f -name "*tier-info-fail*.json" | head -1)" && jq -e ".event == \"AgentCronRun\" and .status == \"failed\" and .tier == \"info\" and .recipient == \"owner\"" "$f" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-info-ok --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2559 failureTier does not touch a success notice (stays info)" '[ "$rc" = 0 ] && f="$(find "$TIER_SPOOL" -maxdepth 1 -type f -name "*tier-info-ok*.json" | head -1)" && jq -e ".status == \"success\" and .tier == \"info\"" "$f" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-explicit-action --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2559 failureTier=action is the explicit default (pages)" '[ "$rc" = 1 ] && f="$(find "$TIER_SPOOL" -maxdepth 1 -type f -name "*tier-explicit-action*.json" | head -1)" && jq -e ".status == \"failed\" and .tier == \"action\"" "$f" >/dev/null'
+TIER_CRUD="$TMP/tier-crud/tasks.json"
+mkdir -p "$(dirname "$TIER_CRUD")"
+out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" add edge-watch --schedule "*/5 * * * *" --prompt "p" --notify owner-on-failure --failure-alert-after 0 --failure-tier info --json 2>&1)"; rc=$?
+ok "#2559 add --failure-tier info persists the field" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"info\"" "$TIER_CRUD" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" edit edge-watch --failure-tier action --json 2>&1)"; rc=$?
+ok "#2559 edit --failure-tier action flips it back" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"action\"" "$TIER_CRUD" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" edit edge-watch --failure-tier loud --json 2>&1)"; rc=$?
+ok "#2559 --failure-tier rejects values outside action|info without writing" '[ "$rc" != 0 ] && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"action\"" "$TIER_CRUD" >/dev/null'
 
 BAD_SPOOL="$TMP/not-a-dir-spool"
 printf 'not a directory' > "$BAD_SPOOL"
