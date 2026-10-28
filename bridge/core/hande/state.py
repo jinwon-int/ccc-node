@@ -18,6 +18,7 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "notice_frames": false,
       "status_interims": false,
       "status_interim_interval_s": 60,
+      "status_frames": false,
       "tool_timeout_s": 90,
       "steward_tools": true,
       "steward_tools_approve_all": false
@@ -158,6 +159,7 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         "steward_tools",
         "steward_tools_approve_all",
         "status_interims",
+        "status_frames",
     ):
         value = config.get(key, key == "steward_tools")  # steward tools default on
         if type(value) is not bool:

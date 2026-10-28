@@ -526,6 +526,50 @@ async def test_status_interims_off_by_default_and_need_interim_frames(tmp_path: 
         (tmp_path / "responder.sock").unlink(missing_ok=True)
 
 
+async def test_status_frames_forward_every_heartbeat_tagged_status(tmp_path: Path) -> None:
+    # status-v1 (family-messenger#560): with status_frames on, every "⏳ …" heartbeat
+    # goes out as an interim frame tagged kind:"status" at the Matrix cadence — the
+    # bot posts them under a status-<uuid> client_id and the apps collapse them into
+    # one transient bubble. No throttle, independent of interim_frames/status_interims;
+    # previews and None are still skipped; plain interims stay untagged.
+    served = await _serve(tmp_path, interim_frames=False, status_interims=True, status_frames=True)
+
+    async def long_turn(job: Any, sink: Any) -> TurnResult:
+        for text in (
+            "🔧 Bash\nstreaming preview ▍",
+            "⏳ Working — 10s | Bash: ls -la",
+            "⏳ Working — 15s | Bash: git status",
+            "⏳ Working — 20s | Read: notes.md",
+            None,
+        ):
+            await sink.status(text)
+        await sink.interim("plain progress")  # interim_frames off → dropped, not tagged
+        return TurnResult(text="done", session_id="s")
+
+    served.runner.behaviour = long_turn
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        await bot.send(bot.turn("t-32", "go"))
+        frames = []
+        while True:
+            frame = await bot.recv()
+            if frame["type"] == "result":
+                break
+            if frame["type"] == "interim":
+                frames.append(frame)
+        assert frames == [
+            {"type": "interim", "kind": "status", "turn_id": "t-32", "text": "⏳ Working — 10s | Bash: ls -la"},
+            {"type": "interim", "kind": "status", "turn_id": "t-32", "text": "⏳ Working — 15s | Bash: git status"},
+            {"type": "interim", "kind": "status", "turn_id": "t-32", "text": "⏳ Working — 20s | Read: notes.md"},
+        ]
+        signals = served.transport.health_signals()
+        assert signals["status_frames"] is True and signals["notices_dropped"] == 1  # the plain interim
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
 async def test_policy_rooms_and_room_kind(tmp_path: Path) -> None:
     transport = HandeTransport(_config(), FakeRunner(), socket_path=tmp_path / "s.sock")
     assert transport.policy.rooms == {"agent": "direct", "fleet": "mention"}
