@@ -155,8 +155,20 @@ its own approval where marked):
    `/etc/tmpfiles.d/ccc-hande.conf`, `/etc/ccc-hande/config.json`, registers `hande` in
    `~/.claude/frontends` and the unit in `~/.claude/self-update.services`, enables it.
    Requires the hande code on the node (self-update first) and the bot's group (step 2).
+   The checkout is read off the cloned unit (`WorkingDirectory=<checkout>/bridge`, else the
+   `ExecStart` interpreter path), so `/root/ccc-node` nodes need no override (#2526).
    Nodes whose Matrix frontend is a *user* unit are set up by hand per #2380's plan v2
    instead.
+   **Termux nodes** (runit, no root — gongyung, daegyo): `scripts/install-hande-bridge-termux.sh
+   --node <node> [--family-user @actor:hande ...]` instead (#2526) — clones
+   `~/.local/share/ccc-matrix/run-matrix` into `~/.local/share/ccc-hande/run-hande` with the
+   channel substituted (relay/nudge sourcing removed, push off, every `CCC_MATRIX_*` token
+   dropped), writes `~/.config/ccc-hande/config.json` (`socket_mode 0600`, bot and bridge
+   share one uid), the runit service `$PREFIX/var/service/ccc-hande-bridge` (`--no-start`
+   leaves a `down` file) and the socket dir `$PREFIX/var/run/ccc-hande`, and adds `hande` to
+   `~/.claude/frontends`. Requires the hande code in the serving generation behind
+   `~/.ccc-node/bridge-current`. Self-update restarts then follow `bridge-current` for the
+   hande service too (`termux-restart-frontends.sh`, step 4 there; `--dry-run` shows both).
 5. **Owner, app**: make room `<node>` → the node's bot `room join <node>` → invite the bot
    device from the room screen; bot sets the room to `agent` mode (one per bot).
 6. Verify: reply, `/new`, `/model`, a read-only steward tool (no approval), a write tool
@@ -174,5 +186,5 @@ leaving it enrolled but stopped), delete the CF token.
 | Multi-room per node | the bot serves one agent room and sends no `room` | family-messenger#423 (bridge already keys by `(user, room)` when `room` is present) |
 | Live preview (edited bubble) | the port has no edit frame; progress lines are `interim` (`interim_frames`) | family-messenger#423 |
 | Attachments, voice | the bot drops `file-v1-*` messages before the responder | family-messenger#354 follow-up |
-| Termux restart script (`termux-restart-frontends.sh`) | Matrix-only; Termux nodes are last in the rollout | #2380 follow-up |
+| Termux self-update restart-cmd (`~/.claude/self-update.restart-cmd`) | the repo script follows `bridge-current` for `ccc-hande-bridge` since #2526; a node whose restart-cmd is still a pre-#2526 wrapper restarts Matrix only — check with `termux-restart-frontends.sh --dry-run` (`hande_running=` must appear) | #2526 (closed), per-node check |
 | doctor bridge-status probe for the hande unit | doctor reads `.ccc-hande` session/journal paths (PR-3) but has no hande-specific health verdict yet | #2380 follow-up |
