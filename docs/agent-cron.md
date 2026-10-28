@@ -121,7 +121,9 @@ never labelled `retry-exhausted` — its failures stay plain `failed`.
 > `fleet-bridge-watch.sh --state-file PATH` exits 1 only for NEW, STILL
 > (re-alert due) and RECOVERED events (docs/fleet-watch.md, #2086). Add
 > `--failure-alert-after 0` to such a task, because each nonzero exit already
-> pages.
+> pages — and, when the event is informational rather than something a person
+> must act on, `--failure-tier info` so it lands in the daily digest instead of
+> re-notifying (see "Notify modes").
 
 ## Notify modes
 
@@ -131,6 +133,17 @@ for a success notice. The relay prefixes the alert id and records per-channel
 receipts; `info` notices are bundled into one digest at 09:00 KST while
 `action` ones go out at once and are re-notified once after 15 minutes
 (`scripts/fleet-alerts/README.md` "Contract").
+
+`failureTier: info` (`--failure-tier info`, #2559) lowers the tier of a task's
+**non-success run notices** to `info`. It is for edge-triggered watches whose
+non-zero exit *is* the notice (the `laptop ONLINE` transition of
+`laptop-online-watch`, NEW/RECOVERED events of `fleet-bridge-watch`): without
+it every such event pages, re-notifies after 15 minutes and waits for an
+`ok <id>` reply although nobody has to act. The field changes nothing else —
+success notices stay `info`, the consecutive-failure alarm stays `action`
+(so a watch that is itself broken still pages unless it also set
+`--failure-alert-after 0`), and `*-on-failure` still decides *whether* a run
+is spooled. Default `action`; any other value fails validation.
 
 
 - `none` (default) — no spool writes.
