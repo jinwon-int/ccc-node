@@ -83,7 +83,14 @@ class HandeBot(MatrixBot):
         socket_path = getattr(self._settings, "hande_socket_path", None) or config.get(
             "socket_path"
         )
-        return HandeTransport(config, runner, socket_path=socket_path)
+        # Self-jobs not started yet survive a restart here (#2561), like the
+        # Matrix store's ``$self-`` rows.
+        return HandeTransport(
+            config,
+            runner,
+            socket_path=socket_path,
+            self_jobs_path=self._data_dir() / "hande-self-jobs.json",
+        )
 
     def _transport_verdict(self) -> tuple[str, str, int]:
         """``ok`` while the bot is connected; ``error`` once it has been gone past the grace."""
@@ -215,6 +222,6 @@ class HandeBot(MatrixBot):
         }
 
     def startup_banner(self) -> str:
-        # The native bot does not speak the ``notice`` frame yet, so a banner
-        # would only be counted as dropped; keep the text for when it does.
+        # Posted as a ``notice`` frame when ``notice_frames`` is on; counted
+        # as dropped otherwise.
         return "hande frontend started: " + super().startup_banner()

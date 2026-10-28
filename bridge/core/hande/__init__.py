@@ -26,9 +26,13 @@ Mapping (one line each; the long form is ``docs/hande-frontend.md``):
 * ``TurnSink.approval`` → ``approval`` frame, answered by ``approve``/``deny``,
   denied on timeout. ``typing``/``status`` are no-ops; ``interim`` is dropped
   unless the config opts into the ``interim`` frame.
-* Unsolicited output (``enqueue_notice``) needs the ``notice`` frame the bot
-  does not speak yet (family-messenger#423); until then it is counted and
-  dropped, never silently claimed delivered.
+* Unsolicited output (``enqueue_notice``: CI-wait results, background-task
+  completions, restart receipt) is a ``notice`` frame once the config opts
+  into ``notice_frames``; off, it is counted and dropped, never silently
+  claimed delivered.
+* Self-jobs (``enqueue_self_job``, #2561) — the CI-wait resume, a
+  yield-and-continue bundle, a Danso auto-resume — run between bot turns and
+  speak through ``notice`` frames, as Matrix runs its ``$self-`` jobs.
 """
 
 from __future__ import annotations

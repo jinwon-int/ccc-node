@@ -513,3 +513,223 @@ async def test_close_while_the_bot_stays_connected_ends_run(tmp_path: Path) -> N
     finally:
         await bot.close()
         await _stop(served)
+
+
+# -- self-jobs (#2561): the follow-up turns Matrix runs from enqueue_self_job ----
+
+
+def _self_job_transport(tmp_path: Path, runner: FakeRunner | None = None, **overrides: Any):
+    config = _config(**{"notice_frames": True, **overrides})
+    return HandeTransport(
+        config,
+        runner or FakeRunner(),
+        socket_path=tmp_path / "responder.sock",
+        self_jobs_path=tmp_path / "data" / "hande-self-jobs.json",
+    )
+
+
+async def _serve_transport(transport: HandeTransport, path: Path) -> _Served:
+    await transport.open()
+    served = _Served(transport, transport.runner, path)  # type: ignore[arg-type]
+    served.task = asyncio.create_task(transport.run())
+    return served
+
+
+async def test_self_job_is_refused_without_notice_frames_or_an_admitted_route(
+    tmp_path: Path,
+) -> None:
+    off = HandeTransport(_config(), FakeRunner(), socket_path=tmp_path / "s.sock")
+    with pytest.raises(ValueError, match="notice-frames-off"):
+        off.enqueue_self_job("agent", "{}", key="k")
+    on = _self_job_transport(tmp_path)
+    with pytest.raises(ValueError, match="room-not-allowed"):
+        on.enqueue_self_job("nope", "{}", key="k")
+    with pytest.raises(ValueError, match="sender-not-allowed"):
+        on.enqueue_self_job("agent", "{}", key="k", sender="@kid:hande")  # not a family room
+    with pytest.raises(ValueError, match="sender-not-allowed"):
+        on.enqueue_self_job("fleet", "{}", key="k", sender="@stranger:hande")
+    assert on.enqueue_self_job("fleet", "{}", key="k", sender="@kid:hande").startswith("$self-")
+
+
+async def test_self_job_runs_once_the_bot_connects_and_posts_its_reply_as_a_notice(
+    tmp_path: Path,
+) -> None:
+    transport = _self_job_transport(tmp_path)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        event = transport.enqueue_self_job("agent", '{"kind":"resume"}', key="wait:1")
+        assert transport.enqueue_self_job("agent", '{"kind":"resume"}', key="wait:1") == event
+        with pytest.raises(ValueError, match="identity-conflict"):
+            transport.enqueue_self_job("agent", '{"kind":"other"}', key="wait:1")
+        await asyncio.sleep(0.05)
+        assert served.runner.jobs == []  # no bot to post through yet
+        assert transport.health_signals()["self_jobs_pending"] == 1
+        bot = await FakeBot.connect(served.path)
+        notice = await bot.recv_kind("notice")
+        assert notice == {"type": "notice", "room": "agent", "text": 'echo:{"kind":"resume"}'}
+        job = served.runner.jobs[0]
+        assert job["event_id"] == event and event.startswith("$self-")
+        assert job["sender"] == "@owner:hande" and job["room_id"] == "agent"
+        assert served.runner.kinds == ["direct"]
+        signals = transport.health_signals()
+        assert signals["self_jobs_pending"] == 0 and signals["self_jobs_served"] == 1
+        assert transport.active is False
+        await asyncio.sleep(0)
+        assert served.runner.closed == [event]
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_bot_turn_during_a_self_job_is_held_not_refused(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    release = asyncio.Event()
+
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        if str(job["event_id"]).startswith("$self-"):
+            await sink.interim("checking CI")
+            await release.wait()
+            return TurnResult(text="CI green, merged", session_id="s")
+        return TurnResult(text=f"echo:{job['body']}", session_id="s")
+
+    runner.behaviour = behaviour
+    transport = _self_job_transport(tmp_path, runner, interim_frames=True)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:2")
+        assert (await bot.recv_kind("notice"))["text"] == "checking CI"
+        await bot.send(bot.turn("t-30", "hello"))
+        await asyncio.sleep(0.05)
+        assert transport.health_signals()["held_turn"] == "t-30"
+        assert [j["event_id"] for j in runner.jobs][-1].startswith("$self-")
+        release.set()
+        assert (await bot.recv_kind("notice"))["text"] == "CI green, merged"
+        result = await bot.recv_kind("result")
+        assert result["turn_id"] == "t-30" and result["text"] == "echo:hello"
+        assert transport.health_signals()["held_turn"] is None
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_stop_during_a_self_job_cancels_it(tmp_path: Path) -> None:
+    runner = FakeRunner()
+
+    async def forever(job: Any, sink: Any) -> TurnResult:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    runner.behaviour = forever
+    transport = _self_job_transport(tmp_path, runner)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        event = transport.enqueue_self_job("agent", "resume", key="wait:3")
+        await asyncio.wait_for(runner.started.wait(), 5)
+        await bot.send(bot.turn("t-31", "/stop"))
+        result = await bot.recv_kind("result")
+        assert result["turn_id"] == "t-31" and result["status"] == "complete"
+        assert result["text"].startswith("⏹")
+        assert runner.cancelled == [event]
+        assert len(runner.jobs) == 1  # the /stop itself never reached the runner
+        signals = transport.health_signals()
+        assert signals["self_jobs_uncertain"] == 1 and transport.active is False
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_self_job_cannot_ask_for_approval_and_says_so(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    outcomes: list[str] = []
+
+    async def asks(job: Any, sink: Any) -> TurnResult:
+        outcomes.append(await sink.approval_outcome("Bash: git push"))
+        outcomes.append(str((await sink.tool("room_status", {}))["error"]))
+        return TurnResult(text="done", session_id="s")
+
+    runner.behaviour = asks
+    transport = _self_job_transport(tmp_path, runner)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:4")
+        denied = await bot.recv_kind("notice")
+        assert denied["text"].startswith("⚠️ Denied") and "Bash: git push" in denied["text"]
+        assert (await bot.recv_kind("notice"))["text"] == "done"
+        assert outcomes == ["unavailable", "no_active_turn"]
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_pending_self_jobs_survive_a_restart_started_ones_do_not(tmp_path: Path) -> None:
+    first = _self_job_transport(tmp_path)
+    first.enqueue_self_job("agent", "one", key="k1")
+    first.enqueue_self_job("agent", "two", key="k2")
+    path = tmp_path / "data" / "hande-self-jobs.json"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert [e["job"]["body"] for e in json.loads(path.read_text())["pending"]] == ["one", "two"]
+
+    runner = FakeRunner()
+    gate = asyncio.Event()
+
+    async def blocked(job: Any, sink: Any) -> TurnResult:
+        await gate.wait()
+        return TurnResult(text=f"ran:{job['body']}", session_id="s")
+
+    runner.behaviour = blocked
+    second = _self_job_transport(tmp_path, runner)
+    assert second.health_signals()["self_jobs_pending"] == 2
+    # Same key after the restart: still idempotent.
+    assert second.enqueue_self_job("agent", "one", key="k1") == first.enqueue_self_job(
+        "agent", "one", key="k1"
+    )
+    served = await _serve_transport(second, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await asyncio.wait_for(runner.started.wait(), 5)
+        # "one" is running: it is already off disk, so a crash now never re-runs it.
+        assert [e["job"]["body"] for e in json.loads(path.read_text())["pending"]] == ["two"]
+        gate.set()
+        assert (await bot.recv_kind("notice"))["text"] == "ran:one"
+        assert (await bot.recv_kind("notice"))["text"] == "ran:two"
+        assert json.loads(path.read_text())["pending"] == []
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_bot_disconnect_does_not_cancel_a_self_job(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    release = asyncio.Event()
+
+    async def slow(job: Any, sink: Any) -> TurnResult:
+        await release.wait()
+        return TurnResult(text="finished", session_id="s")
+
+    runner.behaviour = slow
+    transport = _self_job_transport(tmp_path, runner)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:5")
+        await asyncio.wait_for(runner.started.wait(), 5)
+        await bot.close()
+        for _ in range(100):
+            if not transport.health_signals()["connected"]:
+                break
+            await asyncio.sleep(0.01)
+        assert runner.cancelled == [] and transport.active is True
+        again = await FakeBot.connect(served.path)
+        await _connected(served)
+        release.set()
+        assert (await again.recv_kind("notice"))["text"] == "finished"
+        await again.close()
+    finally:
+        await _stop(served)
