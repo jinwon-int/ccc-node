@@ -39,7 +39,8 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `TurnSink.typing` / `status` | no-op (the port has no typing or editable bubble) |
 | `TurnSink.interim` | dropped and counted unless `interim_frames: true` (then an `interim` frame the bot must know) |
 | `TurnResult` | `result{status complete\|uncertain, text, session_id[, reason]}`; a cancelled, timed-out or failed turn is `uncertain` and never re-run automatically |
-| `enqueue_notice` (restart receipt, waits status, push spool, async completion) | needs the `notice` frame (family-messenger#423). Until then **counted and dropped** — `health_signals().notices_dropped` — never claimed delivered. Alerts stay on the Telegram fallback (owner decision ②) |
+| `enqueue_notice` (restart receipt, waits status, CI-wait results, async/background completions) | a `notice{room, text}` frame when `notice_frames: true` (the bot speaks it since #474; turn it on once the node's bot is replaced). Off → **counted and dropped** — `health_signals().notices_dropped` — never claimed delivered. The push spool stays with the node's Matrix bridge (one consumer); alerts stay on the Telegram fallback (owner decision ②) |
+| `enqueue_self_job` (CI-wait resume, yield-and-continue bundle, Danso auto-resume) | #2561, as on Matrix: a `$self-…` turn the bridge runs itself — only while the bot is connected and between bot turns, everything it says (reply, interim, a refused approval) as `notice` frames. Refused while `notice_frames` is off. A bot turn arriving meanwhile is **held** (not `rejected`, which would end the owner's message `uncertain`) and starts next; a held `/stop` or `/cancel` cancels the self-job. Approvals cannot be asked inside one (the bot accepts `approval` only for its own turn) → denied with a notice. Pending jobs persist in `bot_data_dir/hande-self-jobs.json` (0600) and are dropped from it when they start (at-most-once) |
 | steward room tools (`room_create/join/invite/remove/close/members/mode/status`) | served (PR-4): `HandeBot` exposes the bot's tool table as an in-process Claude Agent SDK MCP server (`mcp__steward__*`, `core/hande/steward.py`); each call is a `tool` frame → the bot validates, enforces owner-only, executes → `tool-result`. Read-only `room_status`/`room_members` run unasked (as #378); every tool with a side effect first asks the owner through the hande `approval` frame **inside the bridge** (PR-5) — same redacted snapshot and audit ledger as a provider approval, independent of the node's `CCC_BRIDGE_BASH_POLICY` (all eight are pre-allowed at the SDK level so `approve-each` nodes never double-prompt and `auto-approve` nodes never skip it). Claude provider only; `steward_tools: false` turns it off, `steward_tools_approve_all: true` makes read-only calls ask too. One call at a time (`busy`), `tool_timeout_s` (default 90) → `steward_timeout`, cancel → `cancelled` |
 
 Limits follow the port: 64 KiB per inbound line, 512 KiB per outbound line, turn ids
@@ -169,9 +170,9 @@ leaving it enrolled but stopped), delete the CF token.
 
 | Gap | Why | Tracking |
 |---|---|---|
-| Unsolicited output (notices, restart receipt, waits status, push spool) | the bot does not speak a `notice` frame | family-messenger#423 (`notice_frames: true` once it does) |
+| Push spool on the hande bridge | a second spool consumer makes records vanish at random; the node's Matrix bridge keeps it | #2380 |
 | Multi-room per node | the bot serves one agent room and sends no `room` | family-messenger#423 (bridge already keys by `(user, room)` when `room` is present) |
-| Progress lines / live preview | no `interim`/edit frame | family-messenger#423 (`interim_frames`) |
+| Live preview (edited bubble) | the port has no edit frame; progress lines are `interim` (`interim_frames`) | family-messenger#423 |
 | Attachments, voice | the bot drops `file-v1-*` messages before the responder | family-messenger#354 follow-up |
 | Termux restart script (`termux-restart-frontends.sh`) | Matrix-only; Termux nodes are last in the rollout | #2380 follow-up |
 | doctor bridge-status probe for the hande unit | doctor reads `.ccc-hande` session/journal paths (PR-3) but has no hande-specific health verdict yet | #2380 follow-up |

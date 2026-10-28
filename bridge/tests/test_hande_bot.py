@@ -232,3 +232,32 @@ def test_settings_require_hande_config_path(
     settings = Settings()
     assert settings.channel == "hande"
     assert settings.restart_service_unit == "ccc-hande-bridge.service"
+
+
+@pytest.mark.parametrize("notice_frames", [True, False])
+def test_external_wait_resume_becomes_a_hande_self_job(tmp_path: Path, notice_frames: bool) -> None:
+    """The Matrix CI-wait resume seam reaches the hande transport (#2561)."""
+
+    import asyncio
+
+    from telegram_bot.core.matrix.bot import SELF_JOB_EXTERNAL_WAIT_RESUME
+
+    _write(tmp_path, _config(notice_frames=notice_frames))
+    bot = HandeBot(_settings(tmp_path), project_chat=object(), session_manager=object())
+    transport = bot._build_transport(bot.load_config())
+    assert transport.self_jobs_path == tmp_path / "data" / "hande-self-jobs.json"
+    bot._transport = transport
+    user_id, chat_id, _ = bot._job_identity(
+        {"sender": "@owner:hande", "room_id": "agent"}, "direct"
+    )
+    record = {"chat_id": chat_id, "user_id": user_id, "wait_id": "w-1"}
+    ok = asyncio.run(bot._enqueue_external_wait_resume(record, "CI is green; continue"))
+    assert ok is notice_frames  # off: refused, so the monitor reports it instead
+    if notice_frames:
+        job = transport._self_jobs[0]["job"]
+        assert job["room_id"] == "agent" and job["sender"] == "@owner:hande"
+        body = json.loads(job["body"])
+        assert body["kind"] == SELF_JOB_EXTERNAL_WAIT_RESUME
+        assert body["prompt"] == "CI is green; continue" and body["user_id"] == user_id
+    else:
+        assert transport.health_signals()["self_jobs_pending"] == 0

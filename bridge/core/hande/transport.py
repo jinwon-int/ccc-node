@@ -34,16 +34,28 @@ active is ``busy``; after a bridge restart the bot re-offers the same seq and
 the bridge runs it (the bot marks it ``uncertain`` first if it had started).
 
 Implements the surface ``MatrixBot`` drives: ``open``/``run``/``close``,
-``enqueue_notice``, ``room_kind``, ``policy.rooms``, ``health_signals``,
-``active``. ``TurnSink``/``TurnRunner``/``TurnResult`` are the
-``telegram_bot.contracts.transport`` shapes (PR-1).
+``enqueue_notice``, ``enqueue_self_job``, ``room_kind``, ``policy.rooms``,
+``health_signals``, ``active``. ``TurnSink``/``TurnRunner``/``TurnResult`` are
+the ``telegram_bot.contracts.transport`` shapes (PR-1).
+
+Self-jobs (#2561) are the turns the bridge gives itself — the external-wait
+resume after a CI result, a yield-and-continue bundle, a Danso auto-resume —
+exactly as on Matrix (``MatrixTransport.enqueue_self_job``). The bot never
+sent them, so they have no bot turn: they run only while the bot is
+connected, between bot turns, and everything they say (reply, progress, a
+refused approval) goes out as ``notice`` frames. A bot turn that arrives while
+one runs is held, not refused (``rejected`` would end the owner's message as
+``uncertain``), and starts when it ends; a held ``/stop`` or ``/cancel``
+cancels the self-job instead. Pending self-jobs survive a restart in the
+``self_jobs_path`` file; one that had already started is not re-run.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 import grp
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +82,19 @@ TURN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 MAX_RESULT_TEXT_BYTES = 256 * 1024
 NOTICE_DROP_LOG = 32
 PROTOCOL = "fleet-worker/1"
+
+# Self-jobs (#2561). The prefix is MatrixBot's ``SELF_JOB_PREFIX``: the runner
+# tells a self-job from a message by it, and ``$`` is outside TURN_ID_PATTERN,
+# so a bot turn can never pose as one.
+SELF_JOB_PREFIX = "$self-"
+SELF_JOB_QUEUE_MAX = 32
+SELF_JOB_KEYS_MAX = 512
+SELF_JOB_STOP_COMMANDS = ("/stop", "/cancel")
+NOTICE_SELF_JOB_UNCERTAIN = "⚠️ Automatic follow-up turn did not finish ({reason})."
+NOTICE_SELF_JOB_APPROVAL = (
+    "⚠️ Denied: an automatic follow-up turn cannot ask for approval here.\n{text}"
+)
+NOTICE_SELF_JOB_STOPPED = "⏹ Stopped the running automatic follow-up turn."
 
 # Screen delegation (family-messenger #493 「에이전트에게 보내기」 shortcut): the owner's
 # Back Tap sends the on-screen text (screenshot OCR) and the clipboard, starting with
@@ -156,6 +181,8 @@ class _ActiveTurn:
         # One steward tool call at a time per turn (the bot's rule): tool_id -> outcome.
         self.tool: tuple[str, asyncio.Future[Mapping[str, Any]]] | None = None
         self.cancelled = False
+        # A self-job (#2561): no bot turn behind it, output rides ``notice``.
+        self.self_job = False
 
     def settle_tool(self, outcome: Mapping[str, Any]) -> None:
         if self.tool is not None and not self.tool[1].done():
@@ -278,6 +305,50 @@ class _HandeSink:
                 self._turn.tool = None
 
 
+class _SelfJobSink:
+    """``TurnSink`` for a self-job: everything it says goes out as ``notice`` frames.
+
+    The bot only accepts ``approval``/``tool``/``interim`` frames for a turn it
+    started, and it started none of these, so an approval is refused (and the
+    owner told so) and a steward tool call has no turn to run in.
+    """
+
+    def __init__(self, transport: "HandeTransport", turn: _ActiveTurn) -> None:
+        self._transport = transport
+        self._turn = turn
+        self._room = str(turn.job["room_id"])
+
+    def _live(self) -> bool:
+        return self._transport._active is self._turn
+
+    async def typing(self) -> None:
+        return None
+
+    async def status(self, text: str | None) -> None:
+        del text
+        return None
+
+    async def interim(self, text: str) -> None:
+        if not self._live() or not self._transport.interim_frames:
+            return
+        await self._transport._post_notice(self._room, text)
+
+    async def approval_outcome(self, text: str) -> str:
+        if self._live():
+            await self._transport._post_notice(
+                self._room, NOTICE_SELF_JOB_APPROVAL.format(text=_bounded_text(text, 2048))
+            )
+        return "unavailable"
+
+    async def approval(self, description: str, arguments: Any) -> bool:
+        del arguments
+        return await self.approval_outcome(description) == "allow"
+
+    async def tool(self, name: str, arguments: Mapping[str, str]) -> Mapping[str, Any]:
+        del name, arguments
+        return {"ok": False, "error": "no_active_turn"}
+
+
 class HandeTransport:
     """FLEET-WORKER port server; see the module docstring for the frame mapping."""
 
@@ -288,12 +359,14 @@ class HandeTransport:
         *,
         socket_path: str | os.PathLike[str] | None = None,
         listen_fd: int | None = None,
+        self_jobs_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.c = dict(config)
         self.runner = runner
         self.rooms: list[str] = list(self.c["rooms"])
         self.family_rooms = frozenset(self.c.get("family_rooms") or ())
-        self.allowed_users = frozenset([self.c["owner"], *(self.c.get("family_users") or ())])
+        self.family_users = frozenset(self.c.get("family_users") or ())
+        self.allowed_users = frozenset([self.c["owner"], *self.family_users])
         self.account = str(self.c["account"])
         self.approval_timeout_s = int(self.c.get("approval_timeout_s") or 120)
         self.tool_timeout_s = int(self.c.get("tool_timeout_s") or 90)
@@ -320,6 +393,17 @@ class HandeTransport:
         self._turns_served = 0
         self._turns_uncertain = 0
         self._clients_seen = 0
+        # Self-jobs (#2561): FIFO of jobs not started yet (mirrored to
+        # ``self_jobs_path`` when set), key -> (event id, body digest) for
+        # idempotency, the drain task, and the bot turn held behind a self-job.
+        self.self_jobs_path = Path(self_jobs_path).expanduser() if self_jobs_path else None
+        self._self_jobs: deque[dict[str, Any]] = deque()
+        self._self_job_keys: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._self_job_task: asyncio.Task[None] | None = None
+        self._held: tuple[_Client, _ActiveTurn] | None = None
+        self._self_jobs_served = 0
+        self._self_jobs_uncertain = 0
+        self._load_self_jobs()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -381,6 +465,8 @@ class HandeTransport:
         self._stopping.set()
         if self._active is not None and self._active.task is not None:
             self._active.task.cancel()
+        if self._self_job_task is not None and not self._self_job_task.done():
+            self._self_job_task.cancel()
         if self._client is not None:
             await self._client.close()
         if self._server is not None:
@@ -429,6 +515,237 @@ class HandeTransport:
         self._dropped("notice")
         return key or f"dropped-{time.time_ns()}"
 
+    async def _post_notice(self, room_id: str, text: str) -> bool:
+        """Send one ``notice`` now (self-job output); a drop is counted like ``enqueue_notice``."""
+
+        if not text.strip():
+            return False
+        client = self._client
+        if self.notice_frames and client is not None and not client.closed:
+            frame = {"type": "notice", "room": room_id, "text": _bounded_text(text, 8192)}
+            if await client.send(frame):
+                return True
+        self._dropped("notice")
+        return False
+
+    # -- self-jobs (#2561) -----------------------------------------------------
+
+    def enqueue_self_job(
+        self, room_id: str, body: str, *, key: str, sender: str | None = None
+    ) -> str:
+        """Queue a turn the frontend runs for ``sender`` in ``room_id`` (Matrix parity).
+
+        Same admission as ``MatrixTransport.enqueue_self_job``: ``sender``
+        defaults to the owner; anyone else must be a ``family_users`` member in
+        a family room. Idempotent per ``key`` (a different body under a known
+        key is refused). Refused while ``notice_frames`` is off — the turn's
+        output would have nowhere to go, and the caller reports a refusal.
+        """
+
+        if room_id not in self.rooms:
+            raise ValueError("room-not-allowed")
+        owner = str(self.c["owner"])
+        if sender is None:
+            sender = owner
+        elif sender != owner and (
+            sender not in self.family_users or room_id not in self.family_rooms
+        ):
+            raise ValueError("sender-not-allowed")
+        if not self.notice_frames:
+            raise ValueError("notice-frames-off")
+        digest = hashlib.sha256(json.dumps([room_id, sender, body]).encode()).hexdigest()
+        known = self._self_job_keys.get(key)
+        if known is not None:
+            if known[1] != digest:
+                raise ValueError("self-job-identity-conflict")
+            return known[0]
+        if len(self._self_jobs) >= SELF_JOB_QUEUE_MAX:
+            raise ValueError("self-job-queue-full")
+        event_id = SELF_JOB_PREFIX + hashlib.sha256(
+            json.dumps([self.account, room_id, sender, key]).encode()
+        ).hexdigest()[:40]
+        job = {
+            "event_id": event_id,
+            "room_id": room_id,
+            "sender": sender,
+            "device": "self-job",
+            "body": body,
+            "scope": "hande",
+        }
+        self._remember_self_job_key(key, event_id, digest)
+        self._self_jobs.append({"key": key, "digest": digest, "job": job})
+        self._save_self_jobs()
+        self._kick_self_jobs()
+        return event_id
+
+    def _remember_self_job_key(self, key: str, event_id: str, digest: str) -> None:
+        self._self_job_keys[key] = (event_id, digest)
+        while len(self._self_job_keys) > SELF_JOB_KEYS_MAX:
+            self._self_job_keys.popitem(last=False)
+
+    def _load_self_jobs(self) -> None:
+        """Re-queue the self-jobs a previous process accepted but never started."""
+
+        path = self.self_jobs_path
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.warning("hande self-job queue unreadable; starting empty")
+            return
+        entries = data.get("pending") if isinstance(data, dict) else None
+        owner = str(self.c["owner"])
+        for entry in entries if isinstance(entries, list) else ():
+            job = entry.get("job") if isinstance(entry, dict) else None
+            if not isinstance(job, dict) or not all(
+                isinstance(job.get(name), str) for name in ("event_id", "room_id", "sender", "body")
+            ):
+                continue
+            key, digest = entry.get("key"), entry.get("digest")
+            sender, room = job["sender"], job["room_id"]
+            admitted = room in self.rooms and (
+                sender == owner or (sender in self.family_users and room in self.family_rooms)
+            )
+            if (
+                not isinstance(key, str)
+                or not isinstance(digest, str)
+                or not job["event_id"].startswith(SELF_JOB_PREFIX)
+                or not admitted
+                or len(self._self_jobs) >= SELF_JOB_QUEUE_MAX
+            ):
+                logger.info("hande self-job not restored (route no longer admitted or queue full)")
+                continue
+            self._remember_self_job_key(key, job["event_id"], digest)
+            self._self_jobs.append({"key": key, "digest": digest, "job": dict(job)})
+
+    def _save_self_jobs(self) -> None:
+        path = self.self_jobs_path
+        if path is None:
+            return
+        payload = {"version": 1, "pending": list(self._self_jobs)}
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("hande self-job queue not persisted", exc_info=True)
+
+    def _kick_self_jobs(self) -> None:
+        """Start the drain when a self-job may run now; cheap no-op otherwise."""
+
+        if not self._self_jobs or self._stopping.is_set():
+            return
+        task = self._self_job_task
+        if task is not None and not task.done():
+            return  # it re-checks after every await
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._self_job_task = loop.create_task(self._drain_self_jobs())
+
+    def _self_job_ready(self) -> bool:
+        client = self._client
+        return (
+            bool(self._self_jobs)
+            and not self._stopping.is_set()
+            and self._active is None
+            and self._held is None
+            and client is not None
+            and not client.closed
+        )
+
+    async def _drain_self_jobs(self) -> None:
+        """Run queued self-jobs one at a time while the bot is connected and idle."""
+
+        while self._self_job_ready():
+            entry = self._self_jobs.popleft()
+            # At most once: off disk before it starts, so a restart mid-turn
+            # never runs the same follow-up twice.
+            self._save_self_jobs()
+            job = entry["job"]
+            turn = _ActiveTurn(str(job["event_id"]), job)
+            turn.self_job = True
+            self._active = turn
+            turn.task = asyncio.get_running_loop().create_task(self._run_self_job(turn))
+            # ``wait`` (not ``await task``): a ``/stop`` cancels only the turn,
+            # and the drain carries on with the held bot turn and the queue.
+            await asyncio.wait({turn.task})
+            await self._start_held()
+
+    async def _run_self_job(self, turn: _ActiveTurn) -> None:
+        job = turn.job
+        room = str(job["room_id"])
+        result: TurnResult | None = None
+        reason = ""
+        try:
+            result = await self.runner.run(
+                job, sink=_SelfJobSink(self, turn), session_id=None, room_kind=self.room_kind(room)
+            )
+        except asyncio.CancelledError:
+            reason = "stopped" if turn.cancelled else "cancelled"
+        except Exception as error:
+            logger.error("hande self-job failed: %s", type(error).__name__)
+            reason = "error"
+        finally:
+            if self._active is turn:
+                self._active = None
+        self._self_jobs_served += 1
+        if self._stopping.is_set():
+            return
+        if result is not None and getattr(result, "status", "complete") == "complete":
+            await self._post_notice(room, str(getattr(result, "text", "") or ""))
+        else:
+            self._self_jobs_uncertain += 1
+            if not turn.cancelled:  # a /stop is answered by the held turn
+                if result is not None:
+                    reason = reason or str(getattr(result, "status", "uncertain"))
+                await self._post_notice(
+                    room, NOTICE_SELF_JOB_UNCERTAIN.format(reason=reason or "uncertain")
+                )
+        self._hook("turn_closed", job)
+        self._hook("delivered", job)
+
+    async def _stop_self_job(self) -> None:
+        turn = self._active
+        if turn is None or not turn.self_job:
+            return
+        turn.cancelled = True
+        try:
+            await self.runner.cancel(turn.job)
+        except Exception:
+            logger.debug("hande runner.cancel failed", exc_info=True)
+        if turn.task is not None and not turn.task.done():
+            turn.task.cancel()
+
+    async def _start_held(self) -> None:
+        """Start the bot turn that arrived while a self-job ran (or answer its ``/stop``)."""
+
+        held, self._held = self._held, None
+        if held is None:
+            return
+        client, turn = held
+        if client.closed or self._stopping.is_set():
+            return
+        if _is_stop_command(str(turn.job.get("body") or "")):
+            self._turns_served += 1
+            await client.send(
+                {
+                    "type": "result",
+                    "turn_id": turn.turn_id,
+                    "status": "complete",
+                    "text": NOTICE_SELF_JOB_STOPPED,
+                    "session_id": None,
+                }
+            )
+            return
+        self._active = turn
+        turn.task = asyncio.get_running_loop().create_task(self._run_turn(client, turn))
+
     def health_signals(self, now: float | None = None) -> dict[str, Any]:
         del now
         now_mono = time.monotonic()
@@ -451,6 +768,10 @@ class HandeTransport:
             "turns_uncertain": self._turns_uncertain,
             "notices_dropped": self._notices_dropped,
             "notice_frames": self.notice_frames,
+            "self_jobs_pending": len(self._self_jobs),
+            "self_jobs_served": self._self_jobs_served,
+            "self_jobs_uncertain": self._self_jobs_uncertain,
+            "held_turn": self._held[1].turn_id if self._held else None,
             "receive_failures": 0,
             "send_failures": 0,
         }
@@ -475,6 +796,7 @@ class HandeTransport:
         self._client = client
         self._clients_seen += 1
         logger.info("hande: bot connected")
+        self._kick_self_jobs()  # pending follow-ups were waiting for a bot to post through
         try:
             while not self._stopping.is_set():
                 try:
@@ -501,6 +823,8 @@ class HandeTransport:
         finally:
             logger.info("hande: bot disconnected")
             client.closed = True
+            if self._held is not None and self._held[0] is client:
+                self._held = None  # the bot re-offers it after reconnecting
             await self._abandon_turn("worker_gone")
             if self._client is client:
                 self._client = None
@@ -555,7 +879,8 @@ class HandeTransport:
 
     async def _on_turn(self, client: _Client, frame: Mapping[str, Any]) -> bool:
         turn_id = str(frame.get("turn_id") or "")
-        if self._active is not None:
+        active = self._active
+        if active is not None and not (active.self_job and self._held is None):
             await client.send({"type": "rejected", "turn_id": turn_id, "reason": "busy"})
             return True
         job, reason = self._job_for(frame)
@@ -563,6 +888,14 @@ class HandeTransport:
             await client.send({"type": "rejected", "turn_id": turn_id, "reason": reason})
             return True
         turn = _ActiveTurn(turn_id, job)
+        if active is not None:
+            # A self-job is running: hold the owner's turn instead of refusing
+            # it (``rejected`` would end the message as ``uncertain``); the
+            # drain starts it next. A ``/stop`` stops the self-job first.
+            self._held = (client, turn)
+            if _is_stop_command(str(job["body"])):
+                await self._stop_self_job()
+            return True
         self._active = turn
         turn.task = asyncio.get_running_loop().create_task(self._run_turn(client, turn))
         return True
@@ -622,6 +955,7 @@ class HandeTransport:
             )
         self._hook("turn_closed", turn.job)
         self._hook("delivered", turn.job)
+        self._kick_self_jobs()
 
     def _hook(self, name: str, job: Mapping[str, Any]) -> None:
         hook = getattr(self.runner, name, None)
@@ -694,8 +1028,22 @@ class HandeTransport:
 
     async def _on_cancel(self, client: _Client, frame: Mapping[str, Any]) -> bool:
         turn_id = str(frame.get("turn_id") or "")
+        held = self._held
+        if held is not None and held[1].turn_id == turn_id:
+            self._held = None
+            await client.send({"type": "control", "turn_id": turn_id, "accepted": True})
+            await client.send(
+                {
+                    "type": "result",
+                    "turn_id": turn_id,
+                    "status": "uncertain",
+                    "reason": "cancelled",
+                    "session_id": None,
+                }
+            )
+            return True
         turn = self._active
-        found = turn is not None and turn.turn_id == turn_id
+        found = turn is not None and not turn.self_job and turn.turn_id == turn_id
         await client.send({"type": "control", "turn_id": turn_id, "accepted": bool(found)})
         if found:
             assert turn is not None
@@ -720,8 +1068,8 @@ class HandeTransport:
 
     async def _abandon_turn(self, reason: str) -> None:
         turn = self._active
-        if turn is None:
-            return
+        if turn is None or turn.self_job:
+            return  # a self-job belongs to no client; it posts through the next one
         logger.warning("hande: client gone during turn %s (%s)", turn.turn_id, reason)
         for future in turn.approvals.values():
             if not future.done():
@@ -733,6 +1081,11 @@ class HandeTransport:
             logger.debug("hande runner.cancel failed", exc_info=True)
         if turn.task is not None and not turn.task.done():
             turn.task.cancel()
+
+
+def _is_stop_command(body: str) -> bool:
+    words = body.strip().split(maxsplit=1)
+    return bool(words) and words[0].lower() in SELF_JOB_STOP_COMMANDS
 
 
 def _systemd_listen_fd() -> int | None:
