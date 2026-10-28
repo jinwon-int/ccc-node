@@ -7,7 +7,7 @@ skill, a self-update restart-cmd) used to wait for ``health.json``
 Code *background* Bash command — ``run_in_background``, a ``Monitor``, a
 watcher an earlier turn left running — lives on inside the bridge's process
 tree after its turn ended, and the restart SIGKILLs it: the completion notice
-it promised never arrives (2026-10-28, gwakga: ``Killing process …
+it promised never arrives (2026-10-28, one node: ``Killing process …
 (bash|find|sort|head) with signal SIGKILL`` with 0 active requests).
 
 Claude Code runs each Bash-tool command as ``bash -c source
@@ -26,7 +26,7 @@ can carry a command line with secrets. Exit 0 idle, 1 busy, 2 undecidable
 (callers must treat 2 as busy). stdlib only; Linux and Android/Termux ``/proc``.
 
 Usage:
-  bridge-idle-gate.py --unit ccc-hande-bridge [--user gongmyoung] [--json]
+  bridge-idle-gate.py --unit ccc-hande-bridge [--user <account>] [--json]
   bridge-idle-gate.py --main-pid 1234 --health ~/.ccc-hande/health.json
 """
 

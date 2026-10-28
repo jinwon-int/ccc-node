@@ -40,7 +40,7 @@ the caller.
    sees in-flight turns only; a background Bash command an earlier turn left
    running (`run_in_background`, a `Monitor`, a CI watcher) lives on in the
    bridge's process tree and the restart SIGKILLs it, so its promised notice
-   never arrives (#2567: gwakga, 2026-10-28). Loop until the gate says idle
+   never arrives (#2567, 2026-10-28). Loop until the gate says idle
    (exit 0), and skip the restart — reporting why — if it never does:
    ```bash
    G=<ccc-node checkout>/scripts/bridge-idle-gate.py
