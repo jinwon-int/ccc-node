@@ -21,6 +21,14 @@ Status codes mirror the client contract: 202 accepted; 401 (signature /
 timestamp / headers) and 403 (unknown node) and 400 (payload) are final for
 that record; 413 for oversize; 503 when the queue cannot be written (the
 node keeps the record and retries). Logs never contain alert bodies.
+
+Receipt read-back (#2137, a2a-nexus#2317): ``GET /v1/receipts/<alertId|txn>``
+signed the same way over ``"GET <path>"``. A node reads **only the alerts it
+posted itself** — another node's alert and an unknown id are both ``404``
+(no existence leak) — and gets ``fleet_alerts_outbox.receipt_view`` (tier,
+``notified``, the owner's ``ok``/``hold`` reply, re-notify/digest flags; never
+the text, event ids or device ids). Being allowed to read is the same thing
+as being allowed to post: a secret file under ``<secrets-dir>``.
 """
 from __future__ import annotations
 
@@ -41,15 +49,18 @@ import fleet_alerts_outbox as outbox  # noqa: E402
 
 from telegram_bot.core.fleet_alert_relay import (  # noqa: E402
     ACCEPTED_SCHEMAS,
+    ALERT_KEY_RE,
+    ALERTS_PATH,
     NODE_HEADER,
+    RECEIPTS_PATH,
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
+    canonical_get,
     normalize_tier,
     read_secret,
     verify,
 )
 
-ALERTS_PATH = "/v1/alerts"
 HEALTH_PATH = "/healthz"
 NODE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 DEFAULT_SKEW_S = 300
@@ -75,18 +86,18 @@ def node_secret(secrets_dir: Path, node: str) -> Optional[str]:
         return None
 
 
-def check_request(
+def check_signature(
     headers: Mapping[str, str],
-    body: bytes,
+    signed: bytes,
     *,
     secrets_dir: Path,
     now: float,
     skew: float = DEFAULT_SKEW_S,
-    max_body: int = DEFAULT_MAX_BODY,
 ) -> Decision:
-    """Pure admission check: headers + raw body → ``Decision`` (no I/O but the secret file)."""
-    if len(body) > max_body:
-        return Decision(413, "oversize")
+    """Who signed ``signed`` — ``Decision(202, "ok", node)`` or the 401/403 refusal.
+
+    ``signed`` is the POST body, or :func:`canonical_get` of the path for a GET.
+    """
     node = (headers.get(NODE_HEADER) or "").strip()
     ts_raw = (headers.get(TIMESTAMP_HEADER) or "").strip()
     sig = (headers.get(SIGNATURE_HEADER) or "").strip()
@@ -103,8 +114,27 @@ def check_request(
         return Decision(401, "bad-timestamp", node)
     if abs(now - ts) > skew:
         return Decision(401, "stale-timestamp", node)
-    if not verify(secret, ts, body, sig):
+    if not verify(secret, ts, signed, sig):
         return Decision(401, "bad-signature", node)
+    return Decision(202, "ok", node)
+
+
+def check_request(
+    headers: Mapping[str, str],
+    body: bytes,
+    *,
+    secrets_dir: Path,
+    now: float,
+    skew: float = DEFAULT_SKEW_S,
+    max_body: int = DEFAULT_MAX_BODY,
+) -> Decision:
+    """Pure admission check: headers + raw body → ``Decision`` (no I/O but the secret file)."""
+    if len(body) > max_body:
+        return Decision(413, "oversize")
+    who = check_signature(headers, body, secrets_dir=secrets_dir, now=now, skew=skew)
+    if who.status != 202:
+        return who
+    node = who.node
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -197,6 +227,8 @@ class Receiver:
     def handle(self, method: str, path: str, headers: Mapping[str, str], body: bytes) -> tuple[int, dict]:
         if method == "GET" and path == HEALTH_PATH:
             return 200, {"ok": True}
+        if method == "GET" and path.startswith(RECEIPTS_PATH + "/"):
+            return self.receipt(path, headers)
         if method != "POST" or path != ALERTS_PATH:
             return 404, {"error": "not-found"}
         d = check_request(
@@ -216,6 +248,29 @@ class Receiver:
         log.info("accepted node=%s event=%s txn=%s alert=%s tier=%s duplicate=%s",
                  d.node, d.payload.get("event", ""), txn, alert_id, tier, dup)
         return 202, {"accepted": True, "txn": txn, "duplicate": dup, "alertId": alert_id, "tier": tier}
+
+    def receipt(self, path: str, headers: Mapping[str, str]) -> tuple[int, dict]:
+        """``GET /v1/receipts/<key>`` → the signing node's own alert receipt view (#2137)."""
+        who = check_signature(headers, canonical_get(path), secrets_dir=self.secrets_dir, now=self.clock(), skew=self.skew)
+        if who.status != 202:
+            log.warning("receipt refused node=%s reason=%s status=%d", who.node or "?", who.reason, who.status)
+            return who.status, {"error": who.reason}
+        key = path[len(RECEIPTS_PATH) + 1:]
+        if not ALERT_KEY_RE.match(key):
+            return 400, {"error": "bad-key"}
+        try:
+            info = outbox.lookup(self.queue_dir, key)
+        except Exception as exc:
+            log.error("receipt lookup failure node=%s reason=%s", who.node, exc.__class__.__name__)
+            return 503, {"error": "queue-unavailable"}
+        if info is None or info.get("node") != who.node:
+            # Unknown id and another node's alert look the same from outside.
+            log.info("receipt miss node=%s key=%s", who.node, key)
+            return 404, {"error": "unknown"}
+        view = outbox.receipt_view(info)
+        log.info("receipt read node=%s alert=%s notified=%s reply=%s",
+                 who.node, view["alert_id"], view["notified"], (view["reply"] or {}).get("decision"))
+        return 200, view
 
 
 def make_handler(receiver: Receiver) -> type[BaseHTTPRequestHandler]:

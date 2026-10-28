@@ -256,6 +256,42 @@ def render_lookup(info: Optional[dict]) -> str:
     return json.dumps(info, ensure_ascii=False, sort_keys=True)
 
 
+RECEIPT_VIEW_SCHEMA = "ccc.fleet-alert-receipt.v1"
+REPLY_RECEIPT_CHANNEL = "reply"  # written by fleet_alerts_reply (ref ``<ok|hold>:<channel>:<who>``)
+
+
+def receipt_view(info: dict) -> dict:
+    """The over-the-wire receipt (#2137): what a delegated-approval caller may learn about an alert.
+
+    Derived from :func:`lookup` and deliberately narrower than it — no alert
+    text (``lookup`` never has it either), no Matrix event ids, no owner
+    device ids, no per-channel receipt list. ``notified`` is the strong-receipt
+    rule; ``reply`` is the owner's first ``ok``/``hold`` with the channel it
+    came from; ``renotified`` / ``digested`` are policy flags.
+    """
+    receipts = list(info.get("receipts") or [])
+    strong = [r for r in receipts if r.get("kind") in STRONG_RECEIPT_KINDS]
+    reply = None
+    for r in receipts:
+        if r.get("channel") != REPLY_RECEIPT_CHANNEL or r.get("kind") != "reply":
+            continue
+        parts = str(r.get("ref") or "").split(":", 2)
+        if parts[0] in ("ok", "hold"):
+            reply = {"decision": parts[0], "channel": parts[1] if len(parts) > 1 else "", "at": r.get("at")}
+        break  # the first reply stands (fleet_alerts_reply writes one per alert)
+    kinds = {r.get("kind") for r in receipts}
+    return {
+        "schema": RECEIPT_VIEW_SCHEMA,
+        "alert_id": info.get("alert_id"), "txn": info.get("txn"), "tier": info.get("tier"),
+        "node": info.get("node"), "event": info.get("event"), "created": info.get("created"),
+        "notified": bool(strong),
+        "notified_at": min(r["at"] for r in strong) if strong else None,
+        "reply": reply,
+        "renotified": "renotify" in kinds,
+        "digested": "digested" in kinds,
+    }
+
+
 def pending(root: os.PathLike | str) -> Optional[tuple[str, str]]:
     with database(root) as conn:
         return conn.execute(

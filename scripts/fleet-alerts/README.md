@@ -69,6 +69,39 @@ Producers set the tier in the spool record (`tier` key): agent-cron marks a
 non-success run and the failure alarm `action`, a success notice `info`;
 records without the key are `info`.
 
+### Receipt read-back (`ccc.fleet-alert-receipt.v1`, #2137)
+
+The receiver also serves **`GET /v1/receipts/<alertId|txn>`** on the same
+bind, for the delegated-approval flow (a2a-nexus#2317 Q1: an `action` alert
+that was *notified* and answered `ok <id>` is the owner's lightweight
+approval; anything else is "not approved"). Same three headers; the signed
+bytes are the request line **`"GET <path>"`** (`fleet_alert_relay.canonical_get`),
+so a POST body signature never opens a read. Rules:
+
+- A node reads **only alerts it posted itself** (`alerts.node` = signed node).
+  Another node's alert and an unknown id are both `404 {"error":"unknown"}`.
+  Read access = post access: a secret file under `--secrets-dir`, nothing else
+  to configure. A broker that should read its own alerts gets its own node
+  name and secret through the normal provisioning step below.
+- `200` body = `fleet_alerts_outbox.receipt_view`: `schema`, `alert_id`, `txn`,
+  `tier`, `node`, `event`, `created`, `notified` (strong receipt exists),
+  `notified_at`, `reply` (`{"decision":"ok"|"hold","channel":…,"at":…}` or
+  `null`), `renotified`, `digested`. **Never** the alert text, Matrix event
+  ids, owner device ids or the per-channel receipt list — the local
+  `--queue` read keeps those for the operator.
+- `400 bad-key` (not a 6-char id / `fleet-…` txn), `401`/`403` as for POST,
+  `503` when the queue is unreadable.
+
+Client: `FleetAlertRelay.get_receipt(key)` (`None` on 404, `RelayRejected` for
+a final refusal or a malformed answer, `RelayError` when unreachable — for an
+approval decision both mean *not notified*). From a node's shell:
+
+```bash
+python3 fleet_alerts_receipt.py --relay-url "$CCC_PUSH_FLEET_RELAY_URL" --node <node> \
+    --secret-file "$CCC_PUSH_FLEET_RELAY_SECRET_FILE" <alertId>
+# exit 0 found · 3 unknown/not yours · 4 refused · 5 unreachable
+```
+
 **Delivery policy per tier (stage 2, `fleet_alerts_policy.py`, run by the
 Matrix sender before every round):**
 

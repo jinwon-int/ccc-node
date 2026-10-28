@@ -76,6 +76,8 @@ class _Server:
         self.status = 200
         srv = self
 
+        self.body = b"{}"
+
         class H(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 n = int(self.headers.get("Content-Length") or 0)
@@ -84,6 +86,12 @@ class _Server:
                 self.send_response(srv.status)
                 self.end_headers()
                 self.wfile.write(b"{}")
+
+            def do_GET(self):  # noqa: N802
+                srv.requests.append({"path": self.path, "headers": dict(self.headers), "body": b""})
+                self.send_response(srv.status)
+                self.end_headers()
+                self.wfile.write(srv.body)
 
             def log_message(self, *a):  # silence
                 pass
@@ -137,3 +145,51 @@ def test_post_unreachable_is_transient() -> None:
     relay = R.FleetAlertRelay("http://127.0.0.1:9/v1/alerts", "k", "n", timeout=1)
     with pytest.raises(R.RelayError):
         relay.post({"text": "x"})
+
+
+def test_receipt_helpers_derive_url_and_normalize_key() -> None:
+    assert R.receipts_url("http://relay:8795/v1/alerts") == "http://relay:8795/v1/receipts"
+    assert R.receipts_url("http://relay:8795/v1/alerts/") == "http://relay:8795/v1/receipts"
+    with pytest.raises(ValueError):
+        R.receipts_url("http://relay:8795/other")
+    assert R.normalize_alert_key(" #P3TW6N ") == "p3tw6n"
+    assert R.normalize_alert_key("fleet-" + "0" * 32) == "fleet-" + "0" * 32
+    for bad in ("", "abc", "p3tw6n/..", "fleet-xyz", "ab cd ef"):
+        with pytest.raises(ValueError):
+            R.normalize_alert_key(bad)
+    assert R.canonical_get("/v1/receipts/p3tw6n") == b"GET /v1/receipts/p3tw6n"
+
+
+def test_get_receipt_signs_the_request_line_and_parses_the_view(server: _Server) -> None:
+    view = {"schema": R.RECEIPT_SCHEMA, "alert_id": "p3tw6n", "notified": True, "reply": {"decision": "ok"}}
+    server.body = json.dumps(view).encode()
+    relay = R.FleetAlertRelay(server.url, "k", "node-a", clock=lambda: 1700000000.2)
+    assert relay.get_receipt("#P3TW6N") == view
+    req = server.requests[-1]
+    assert req["path"] == "/v1/receipts/p3tw6n"
+    assert req["headers"][R.NODE_HEADER] == "node-a"
+    assert R.verify("k", 1700000000, R.canonical_get("/v1/receipts/p3tw6n"), req["headers"][R.SIGNATURE_HEADER])
+    assert not R.verify("k", 1700000000, b"", req["headers"][R.SIGNATURE_HEADER])  # not a body signature
+
+
+def test_get_receipt_outcomes(server: _Server) -> None:
+    relay = R.FleetAlertRelay(server.url, "k", "node-a", timeout=2)
+    server.status = 404
+    assert relay.get_receipt("p3tw6n") is None
+    for status in (401, 403, 400):
+        server.status = status
+        with pytest.raises(R.RelayRejected):
+            relay.get_receipt("p3tw6n")
+    for status in (503, 429):
+        server.status = status
+        with pytest.raises(R.RelayError):
+            relay.get_receipt("p3tw6n")
+    server.status = 200
+    server.body = b"not json"
+    with pytest.raises(R.RelayRejected):
+        relay.get_receipt("p3tw6n")
+    server.body = json.dumps({"schema": "other", "alert_id": "p3tw6n"}).encode()
+    with pytest.raises(R.RelayRejected):
+        relay.get_receipt("p3tw6n")
+    with pytest.raises(R.RelayError):
+        R.FleetAlertRelay("http://127.0.0.1:9/v1/alerts", "k", "n", timeout=1).get_receipt("p3tw6n")
