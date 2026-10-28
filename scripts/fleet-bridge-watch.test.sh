@@ -5,6 +5,7 @@
 # BOOTPATH / UNREACHABLE) and its exit contract are exercised without a fleet.
 set -uo pipefail
 export CCC_FLEET_MATRIX=0
+export CCC_FLEET_HANDE=0
 # Degraded rechecks re-probe immediately in tests; the real default waits 75s.
 export CCC_FLEET_DEGRADED_RECHECK_DELAY=0
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -57,7 +58,7 @@ run() { # <nodes>
   OUT="$TMP/out"; RC=0
   rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
   CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
-    CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 \
+    CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 CCC_FLEET_HANDE=0 \
     bash "$SC" >"$OUT" 2>&1 || RC=$?
 }
 
@@ -1115,7 +1116,7 @@ run_state() { # <nodes> [extra env...]
   OUT="$TMP/out"; RC=0
   rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
   env CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
-    CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 "${@:2}" \
+    CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 CCC_FLEET_HANDE=0 "${@:2}" \
     bash "$SC" --state-file "$STATE" >"$OUT" 2>"$TMP/err" || RC=$?
 }
 rm -f "$TMP"/reply/beta.2

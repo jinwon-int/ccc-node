@@ -69,6 +69,8 @@
 #                    see is_prepared_runtime
 #   CCC_FLEET_MATRIX set to 0 to skip the separate Matrix process and health
 #                    check. Enabled by default during the channel transition.
+#   CCC_FLEET_HANDE  set to 0 to skip the 「한데」 frontend watch (fleet-hande-watch.sh,
+#                    #2569): bridge process/health, native bot, notice_frames.
 #   CCC_FLEET_DEGRADED_RECHECK_DELAY seconds before a degraded node is asked
 #                    again (default 75, capped at 300); CCC_FLEET_DEGRADED_RECHECK=0
 #                    pages on the first answer instead
@@ -681,6 +683,11 @@ case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=10 ;; esac
 fail=0
 if [ "${CCC_FLEET_MATRIX:-1}" = 1 ]; then
   bash "$(dirname "$0")/fleet-matrix-watch.sh" || fail=1
+fi
+# 「한데」 frontend (#2569): bridge, native bot and notice_frames. gwakga's hande
+# bridge was down 14.7 h on 2026-10-27/28 while this sweep stayed page=no.
+if [ "${CCC_FLEET_HANDE:-1}" = 1 ]; then
+  bash "$(dirname "$0")/fleet-hande-watch.sh" || fail=1
 fi
 # probe_node <node> <doctor-flag>: sets $out and $probe_rc, retrying transport
 # failures only (see RETRIES above).
