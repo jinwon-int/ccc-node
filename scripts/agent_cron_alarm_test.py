@@ -515,6 +515,29 @@ class Integration(unittest.TestCase):
         box.run('t3', 'ok')
         self.assertEqual(len(box.alarms()), 2)
 
+    def test_cleared_notice_is_info_tier_firing_alarm_is_action(self) -> None:
+        # #2565: the "cleared" notice carries no decision — digest, not a 15-min
+        # re-notify asking for `ok`. Every firing alarm stays `action`.
+        box = self.sandbox(['t1', 't2', 't3', 't4', 'solo'])
+        for _ in range(3):
+            box.run('solo', 'exit1')
+        alarms = box.alarms()
+        self.assertEqual([a['reasons'] for a in alarms], [['task=threshold']])
+        self.assertEqual(alarms[0]['tier'], 'action')
+        box.run('solo', 'ok')
+        alarms = box.alarms()
+        self.assertEqual(alarms[-1]['reasons'], ['task=recovered'])
+        self.assertEqual(alarms[-1]['tier'], 'info')
+        self.assertIn('failure alarm cleared', alarms[-1]['text'])
+        for tid in ('t1', 't2', 't3', 't4'):
+            box.run(tid, 'auth')
+        self.assertEqual(box.alarms()[-1]['reasons'], ['node=threshold'])
+        self.assertEqual(box.alarms()[-1]['tier'], 'action')
+        box.run('t2', 'ok')
+        self.assertEqual(box.alarms()[-1]['reasons'], ['node=recovered'])
+        self.assertEqual(box.alarms()[-1]['tier'], 'info')
+        self.assertTrue(all(a['event'] == 'AgentCronFailureAlarm' for a in box.alarms()))
+
     @staticmethod
     def one_shots(*ids: str) -> list[dict]:
         return [{'id': tid, 'schedule': 'at 2026-01-01T00:01:00Z', 'prompt': tid,
