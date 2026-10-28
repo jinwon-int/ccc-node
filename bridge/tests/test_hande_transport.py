@@ -444,21 +444,27 @@ async def test_notice_is_dropped_and_counted_until_the_bot_speaks_it(tmp_path: P
 async def test_status_interims_forward_the_heartbeat_throttled(tmp_path: Path) -> None:
     # The port has no editable bubble: with status_interims on, the Matrix
     # "⏳ Working — Ns | <tool>" heartbeat becomes an interim frame — first line at
-    # once, then only on a tool change or after status_interim_interval_s.
-    served = await _serve(tmp_path, interim_frames=True, status_interims=True, status_interim_interval_s=10)
-    sent: list[str] = []
+    # once, then one per status_interim_interval_s. A changing tool label (the
+    # Bash command on Matrix, different on every quick call) does NOT reopen the
+    # window — the first live turn posted a line every 5 s that way.
+    served = await _serve(
+        tmp_path, interim_frames=True, status_interims=True, status_interim_interval_s=10
+    )
 
     async def long_turn(job: Any, sink: Any) -> TurnResult:
         for text in (
-            "🔧 Bash\nstreaming preview ▍",          # answer preview: never forwarded
-            "⏳ Working — 10s | Bash: ls -la",        # first heartbeat → frame
-            "⏳ Working — 20s | Bash: ls -la",        # same tool, inside the interval → no frame
-            "⏳ Working — 30s | Read: notes.md",      # tool changed → frame
-            "⏳ Working — 40s | Read: notes.md",      # same tool, inside the interval → no frame
-            None,                                     # clear: nothing to redact here
+            "🔧 Bash\nstreaming preview ▍",  # answer preview: never forwarded
+            "⏳ Working — 10s | Bash: ls -la",  # first heartbeat → frame
+            "⏳ Working — 15s | Bash: git status",  # tool label changed, inside the interval → no frame
+            "⏳ Working — 20s | Read: notes.md",  # tool changed, inside the interval → no frame
+            None,  # clear: nothing to redact here
         ):
             await sink.status(text)
-            sent.append(text or "<clear>")
+        # The interval elapsed (test seam: shrink it) → the next heartbeat goes out, once.
+        sink._transport.status_interim_interval_s = 0.0
+        await sink.status("⏳ Working — 1m 10s | Grep: TODO")
+        sink._transport.status_interim_interval_s = 10.0
+        await sink.status("⏳ Working — 1m 15s | Bash: make")  # inside the new window → no frame
         await sink.interim("half way")
         return TurnResult(text="done", session_id="s")
 
@@ -476,7 +482,7 @@ async def test_status_interims_forward_the_heartbeat_throttled(tmp_path: Path) -
                 frames.append(frame["text"])
         assert frames == [
             "⏳ Working — 10s | Bash: ls -la",
-            "⏳ Working — 30s | Read: notes.md",
+            "⏳ Working — 1m 10s | Grep: TODO",
             "half way",
         ]
         assert served.transport.health_signals()["status_interims"] is True

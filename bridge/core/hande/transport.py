@@ -227,10 +227,14 @@ class _HandeSink:
         line (edited in place every 10 s there) cannot be mirrored one-to-one. With
         ``status_interims`` on, the heartbeat goes out as an ``interim`` frame — a
         new room message each time — so it is throttled: the first line as soon as
-        the heartbeat starts (Matrix already waits its own threshold), then only
-        when the tool label after the first ``" | "`` changes or
-        ``status_interim_interval_s`` has passed. ``None`` (clear) has no frame;
-        answer previews (``🔧 …``/``… ▍``, not a ``⏳`` line) are not forwarded.
+        the heartbeat starts (Matrix already waits its own threshold), then one
+        line per ``status_interim_interval_s`` — and nothing else. The tool label
+        after the first ``" | "`` deliberately does NOT reopen the window: on
+        Matrix it carries the Bash command (60 chars) and changes with every quick
+        tool call, which on the first live turn (2026-10-28) posted a line every
+        5 s. The line that does go out still names the tool running at that
+        moment. ``None`` (clear) has no frame; answer previews (``🔧 …``/``… ▍``,
+        not a ``⏳`` line) are not forwarded.
         """
 
         if text is None or not self._live() or not self._transport.status_interims:
@@ -238,19 +242,17 @@ class _HandeSink:
         if not text.startswith("⏳"):
             return
         turn = self._turn
-        label = text.partition(" | ")[2].strip() or None
         now = time.monotonic()
         due = (
             turn.status_sent_at is None
-            or label != turn.status_label
             or now - turn.status_sent_at >= self._transport.status_interim_interval_s
         )
         if not due:
             return
         # Throttle state advances even when the frame is dropped, so a turn with
-        # interim_frames off counts one drop per interval / tool change, not one
-        # per 10-second heartbeat.
-        turn.status_sent_at, turn.status_label = now, label
+        # interim_frames off counts one drop per interval, not one per heartbeat.
+        turn.status_sent_at = now
+        turn.status_label = text.partition(" | ")[2].strip() or None
         if not self._transport.interim_frames:
             self._transport._dropped("status", "interim-frames-off")
             return
