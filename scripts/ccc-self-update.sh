@@ -71,6 +71,8 @@
 #      CCC_SELF_UPDATE_AUTO_RECOVER (default 1; 0 restores the unconditional
 #      wrong-branch fail-closed abort, #1328),
 #      CCC_SELF_UPDATE_SYSTEMCTL (default systemctl; tests inject a fake),
+#      CCC_SELF_UPDATE_JOURNALCTL (default journalctl; tests inject a fake —
+#      read only to name systemd's own reason for a failed restart, #2570),
 #      CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS (180, 720 on Termux;
 #      integer 1..900. Termux: the #1868 owner decision gives the bridge a 180s
 #      candidate window and a 360s recovery window after a candidate timeout;
@@ -179,6 +181,7 @@ fi
 RESTART_COMMAND_TIMEOUT_SECONDS="${CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS-$RESTART_COMMAND_TIMEOUT_DEFAULT}"
 BRANCH="${CCC_SELF_UPDATE_BRANCH:-main}"
 SYSTEMCTL="${CCC_SELF_UPDATE_SYSTEMCTL:-systemctl}"
+JOURNALCTL="${CCC_SELF_UPDATE_JOURNALCTL:-journalctl}"
 
 # Commit-signature verification of the incoming tip (#1591).
 #   warn    — verify and report, but still apply (rollout default)
@@ -1975,8 +1978,108 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && pcmd="$(resolve_prepare
   PREPARE_JSON='[{"name":"prepare","ok":true,"scope":"external"}]'
 fi
 
+# --- failed-restart reason (#2570) ---------------------------------------------
+# A restart-failure notice that only says "1 service failed" left the owner
+# unable to tell which bridge was down (one node, 2026-10-27: 「한데」 stayed down
+# 14.7 h). Name each failed unit plus ONE short line saying why — authored by
+# the service manager itself, never the service's own stdout/stderr (which can
+# carry anything). The journal match pins the trusted, journald-set `_PID` to
+# the manager (PID 1, or the user manager's MainPID) AND the unit field that
+# manager stamps on its own messages (UNIT= / USER_UNIT=), limited to this
+# restart window. Falls back to `systemctl show` (result=<Result>
+# status=<ExecMainStatus>) when the journal yields nothing. Every lookup is
+# time-bounded and the line is sanitized (control/format chars dropped,
+# whitespace collapsed) and capped, so a hostile unit description cannot
+# reshape the notice.
+SERVICE_REASON_MAX_CHARS=160
+SERVICE_REASON_TIMEOUT_SECONDS=5
+# shellcheck disable=SC2016  # Python source, not shell expansions
+SERVICE_REASON_PY='
+import re, sys, unicodedata
+unit, cap, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+data = sys.stdin.buffer.read(65536).decode("utf-8", "replace")
+def clean(s):
+    s = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp", "Co", "Cs") else c for c in s)
+    return " ".join(s.split())
+pick = ""
+if mode == "plain":
+    pick = clean(data)
+else:
+    best = {}
+    for raw in data.splitlines():
+        line = clean(raw)
+        if line.startswith(unit + ": "):
+            line = line[len(unit) + 2:].strip()
+        if not line:
+            continue
+        # Rank 1 is a specific cause ("Failed to load environment files: ..."):
+        # the FIRST one in the window is the root cause, later ones are its
+        # consequences ("Failed to run start task"). Lower ranks are
+        # generic outcomes, where the latest line is the current state.
+        if line.startswith("Failed to start "):
+            rank = 4
+        elif line.startswith("Failed with result"):
+            rank = 3
+        elif line.startswith("Failed to run "):
+            rank = 2
+        elif re.search(r"\b[Ff]ailed (to|at) ", line):
+            rank = 1
+        elif re.search(r"Main process exited|Start request repeated|[Tt]imed out|[Tt]imeout|[Ee]rror|[Dd]enied|[Nn]ot found|[Ff]atal", line):
+            rank = 2
+        else:
+            continue
+        if rank != 1 or rank not in best:
+            best[rank] = line
+    for rank in (1, 2, 3, 4):
+        if rank in best:
+            pick = best[rank]
+            break
+if len(pick) > cap:
+    pick = pick[: cap - 1].rstrip() + "\u2026"
+sys.stdout.write(pick)
+'
+sanitize_service_reason() { # <unit> <journal|plain>  (stdin: raw text)
+  python3 -c "$SERVICE_REASON_PY" "$1" "$SERVICE_REASON_MAX_CHARS" "$2" 2>/dev/null || :
+}
+service_failure_reason() { # <unit> <system|user> <since-epoch>
+  local unit="$1" scope="$2" since="$3" raw="" reason="" mgr_pid="" key val
+  local result="" status="" load=""
+  local -a tprefix=() sargs=() match=()
+  command -v timeout >/dev/null 2>&1 \
+    && tprefix=(timeout --kill-after=1 "$SERVICE_REASON_TIMEOUT_SECONDS")
+  if [ "$scope" = user ]; then
+    sargs=(--user)
+    mgr_pid="$(${tprefix[@]+"${tprefix[@]}"} "$SYSTEMCTL" show -p MainPID --value "user@$(id -u).service" 2>/dev/null | head -n1)"
+    [[ "$mgr_pid" =~ ^[1-9][0-9]*$ ]] && match=("_PID=$mgr_pid" "USER_UNIT=$unit")
+  else
+    match=(_PID=1 "UNIT=$unit")
+  fi
+  if [ "${#match[@]}" -gt 0 ]; then
+    raw="$(${tprefix[@]+"${tprefix[@]}"} "$JOURNALCTL" --no-pager --quiet -o cat \
+      --since "@$since" -n 20 "${match[@]}" 2>/dev/null | head -c 65536)"
+    [ -n "$raw" ] && reason="$(printf '%s\n' "$raw" | sanitize_service_reason "$unit" journal)"
+  fi
+  if [ -z "$reason" ]; then
+    while IFS='=' read -r key val; do
+      case "$key" in
+        Result) result="$val" ;;
+        ExecMainStatus) status="$val" ;;
+        LoadState) load="$val" ;;
+      esac
+    done < <(${tprefix[@]+"${tprefix[@]}"} "$SYSTEMCTL" ${sargs[@]+"${sargs[@]}"} show \
+      -p Result,ExecMainStatus,LoadState "$unit" 2>/dev/null | head -n 10)
+    if [ -n "$result$status" ]; then
+      raw="result=${result:-?} status=${status:-?}"
+      [ -n "$load" ] && [ "$load" != loaded ] && raw="load=$load $raw"
+      reason="$(printf '%s' "$raw" | sanitize_service_reason "$unit" plain)"
+    fi
+  fi
+  printf '%s' "$reason"
+}
+
 # --- restart allowlisted services ----------------------------------------------
 SERVICES_JSON="$PREPARE_JSON"
+FAILED_NAMES=""
 FAILED=0
 RESTARTED=0
 if [ -f "$SERVICES_FILE" ]; then
@@ -1994,6 +2097,7 @@ if [ -f "$SERVICES_FILE" ]; then
     fi
     ok=false
     attempt=0
+    restart_since="$(date +%s)"
     while [ "$attempt" -lt 2 ]; do
       attempt=$((attempt + 1))
       systemctl_scope_args=()
@@ -2009,9 +2113,17 @@ if [ -f "$SERVICES_FILE" ]; then
       [ "$ok" = "true" ] && break
       [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt scope=$scope"
     done
-    [ "$ok" = "true" ] && RESTARTED=$((RESTARTED + 1)) || FAILED=$((FAILED + 1))
-    SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" '. + [{name:$n, ok:$ok, scope:$s}]')"
-    log "service name=$svc ok=$ok scope=$scope"
+    if [ "$ok" = "true" ]; then
+      RESTARTED=$((RESTARTED + 1))
+      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" '. + [{name:$n, ok:$ok, scope:$s}]')"
+      log "service name=$svc ok=$ok scope=$scope"
+    else
+      FAILED=$((FAILED + 1))
+      reason="$(service_failure_reason "$svc" "$scope" "$restart_since")"
+      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" --arg r "$reason" '. + [{name:$n, ok:$ok, scope:$s} + (if $r == "" then {} else {reason:$r} end)]')"
+      log "service name=$svc ok=$ok scope=$scope reason=${reason:-unknown}"
+      FAILED_NAMES="${FAILED_NAMES:+$FAILED_NAMES, }${svc} (${reason:-사유 미확인})"
+    fi
   done < "$SERVICES_FILE"
 else
   log "restart skipped reason=no-services-file path=$SERVICES_FILE"
@@ -2028,7 +2140,7 @@ if [ "$FAILED" -gt 0 ]; then
   write_pending_activation "restart-failed" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
   audit "restart-failures" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
   log "recovery snapshot=$INSTALL_SNAPSHOT_DIR oldSha=$OLD_SHA reason=restart-failure"
-  notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
+  notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 서비스 ${FAILED}개 재시작 실패 — ${FAILED_NAMES} (${RESTARTED}개 성공, 재시도 후). 롤백 자료 보존: ${INSTALL_SNAPSHOT_DIR}. ~/.claude/state/self-update.log 확인 필요." "fail-$NEW_SHA"
   say "self-update: updated to $SHORT_NEW but $FAILED service(s) failed to restart; recovery snapshot retained at $INSTALL_SNAPSHOT_DIR" >&2
   exit 7
 fi

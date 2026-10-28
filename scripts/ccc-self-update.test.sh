@@ -78,12 +78,24 @@ git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
 mkdir -p "$(dirname "$REPO")"
 git clone -q "$ORIGIN" "$REPO"
 
-# Fake systemctl records calls; fails units containing "bad".
+# Fake systemctl records calls; fails units containing "bad". `show` answers
+# the #2570 failure-reason lookups: the user manager's MainPID (from a fixture
+# file) and a Result/ExecMainStatus fallback (per-unit fixture or a default).
 FAKEBIN="$TMP/bin"; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/fakesystemctl" <<SH
 #!/usr/bin/env bash
 echo "\$*" >> "$TMP/systemctl.calls"
 case "\$*" in
+  "show -p MainPID --value user@"*)
+    [ -f "$TMP/fake-user-manager.pid" ] && cat "$TMP/fake-user-manager.pid"
+    exit 0
+    ;;
+  *"show -p Result,ExecMainStatus,LoadState "*)
+    unit="\${*: -1}"
+    if [ -f "$TMP/fake-show/\$unit" ]; then cat "$TMP/fake-show/\$unit"
+    else printf '%s\n' Result=exit-code ExecMainStatus=3 LoadState=loaded; fi
+    exit 0
+    ;;
   *flaky*)
     if [ ! -e "$TMP/flaky.failed" ]; then
       : > "$TMP/flaky.failed"
@@ -95,6 +107,27 @@ esac
 exit 0
 SH
 chmod +x "$FAKEBIN/fakesystemctl"
+
+# Fake journalctl (#2570) models journald's AND-of-fields matching: it prints
+# $TMP/journal/<_PID>/<UNIT or USER_UNIT> only, so a fixture line filed under
+# any other PID (the service's own output) can never be returned.
+cat > "$FAKEBIN/fakejournalctl" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >> "${FAKE_JOURNAL_DIR:?}/../journalctl.calls"
+pid=""; unit=""
+for a in "$@"; do
+  case "$a" in
+    _PID=*) pid="${a#_PID=}" ;;
+    UNIT=*) unit="${a#UNIT=}" ;;
+    USER_UNIT=*) unit="${a#USER_UNIT=}" ;;
+  esac
+done
+[ -n "$pid" ] && [ -n "$unit" ] && [ -f "$FAKE_JOURNAL_DIR/$pid/$unit" ] && cat "$FAKE_JOURNAL_DIR/$pid/$unit"
+exit 0
+SH
+chmod +x "$FAKEBIN/fakejournalctl"
+export FAKE_JOURNAL_DIR="$TMP/journal"
+mkdir -p "$FAKE_JOURNAL_DIR"
 
 export FAKE_CRON="$TMP/crontab.txt"
 : > "$FAKE_CRON"
@@ -120,6 +153,7 @@ run_selfup() {
   CCC_HERMES_DIR="$HERMES" CODEX_HOME="${CODEX_HOME:-$TMP/codex}" \
   CCC_SELF_UPDATE_BRIDGE_PROJECT_ROOT="$TMP/project" \
   CCC_SELF_UPDATE_REPO="${REPO_OVERRIDE:-$REPO}" CCC_SELF_UPDATE_SYSTEMCTL="$FAKEBIN/fakesystemctl" \
+  CCC_SELF_UPDATE_JOURNALCTL="$FAKEBIN/fakejournalctl" \
   CCC_SELF_UPDATE_CRONTAB_CMD="$FAKEBIN/crontab" CCC_CRONTAB_CMD="$FAKEBIN/crontab" \
   FAKE_CRON="$FAKE_CRON" PATH="$FAKEBIN:$PATH" \
   CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=3 \
@@ -649,15 +683,53 @@ rm -f "$CLAUDE/settings.json"
 # --- 3) service restart failure is reported ------------------------------------
 echo change3 > "$TMP/seed/file.txt"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm three && git -C "$TMP/seed" push -q origin main
-printf '%s\n' 'bad-unit' > "$CLAUDE/self-update.services"
+# #2570: besides the original bad-unit (no journal entry -> `systemctl show`
+# fallback), fail three units whose reason must come from systemd's own journal
+# entries: the 2026-10-27 environment-file failure on one node (with a decoy line
+# filed under the service's own PID that must never surface), a hostile overlong
+# line with control/bidi characters, and a user-scope unit read via the user
+# manager's PID.
+printf '%s\n' 'bad-unit' 'bad-hande.service' 'bad-hostile.service' 'user:bad-user.service' 'hermes-broker' > "$CLAUDE/self-update.services"
+mkdir -p "$FAKE_JOURNAL_DIR/1" "$FAKE_JOURNAL_DIR/777" "$FAKE_JOURNAL_DIR/4242"
+printf '%s\n' \
+  'Starting bad-hande.service - hande bridge...' \
+  'bad-hande.service: Failed to load environment files: No such file or directory' \
+  "bad-hande.service: Failed to run 'start' task: No such file or directory" \
+  "bad-hande.service: Failed with result 'resources'." \
+  'Failed to start bad-hande.service - hande bridge.' > "$FAKE_JOURNAL_DIR/1/bad-hande.service"
+printf '%s\n' 'Failed to obey: DECOY-FROM-SERVICE-STDOUT' > "$FAKE_JOURNAL_DIR/777/bad-hande.service"
+printf 'bad-hostile.service: Failed to x \033[31m\342\200\256EVIL\a %s\n' "$(printf 'A%.0s' $(seq 1 400))" \
+  > "$FAKE_JOURNAL_DIR/1/bad-hostile.service"
+printf '%s\n' '4242' > "$TMP/fake-user-manager.pid"
+printf '%s\n' 'bad-user.service: Failed at step EXEC spawning /nope: No such file or directory' \
+  > "$FAKE_JOURNAL_DIR/4242/bad-user.service"
+: > "$TMP/journalctl.calls"
 rm -f "$TMP/spool"/*.json
 out="$(run_selfup run 2>&1)"; rc=$?
+fail_audit() { grep "^{" "$STATE/self-update.log" | grep '"result":"restart-failures"' | tail -1; }
+fail_notice() { jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null; }
 ok "restart failure exits non-zero" '[ "$rc" = 7 ] && grep -q "failed to restart" <<<"$out"'
 ok "restart failure keeps the deployed installed SHA" \
   '[ "$(cat "$STATE/self-update.installed-sha")" = "$(git -C "$REPO" rev-parse HEAD)" ]'
 ok "restart failure audit is explicit and names the degraded service" \
   'grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log" && grep -q "\"name\":\"bad-unit\",\"ok\":false" "$STATE/self-update.log"'
 ok "failure notification queued" 'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "재시작 실패"'
+ok "failure notice counts failed and restarted services (#2570)" \
+  'fail_notice | grep -qF "서비스 4개 재시작 실패 — " && fail_notice | grep -qF "(1개 성공, 재시도 후)"'
+ok "failure notice names the unit with systemd's root-cause line (#2570)" \
+  'fail_notice | grep -qF "bad-hande.service (Failed to load environment files: No such file or directory)"'
+ok "failure reason never comes from a non-manager PID (#2570)" \
+  '! fail_notice | grep -q DECOY && ! grep -q DECOY "$STATE/self-update.log"'
+ok "journal lookups pin the manager PID and unit field (#2570)" \
+  'grep -q -- "_PID=1 UNIT=bad-hande.service" "$TMP/journalctl.calls" && grep -q -- "--since @[0-9]" "$TMP/journalctl.calls" && grep -q -- "_PID=4242 USER_UNIT=bad-user.service" "$TMP/journalctl.calls"'
+ok "user-scope failure reason is read via the user manager (#2570)" \
+  'fail_notice | grep -qF "bad-user.service (Failed at step EXEC spawning /nope: No such file or directory)"'
+ok "no journal entry falls back to systemctl show result/status (#2570)" \
+  'fail_notice | grep -qF "bad-unit (result=exit-code status=3)"'
+ok "hostile reason is sanitized and capped at 160 chars (#2570)" \
+  'r="$(fail_audit | jq -r ".services[] | select(.name == \"bad-hostile.service\") | .reason")" && n="$(jq -rn --arg r "$r" "\$r | length")" && [ "$n" -le 160 ] && [ "$n" -ge 100 ] && [[ "$r" == "Failed to x "*EVIL*"…" ]] && ! LC_ALL=C grep -q "[[:cntrl:]]" <<<"$r" && ! grep -q $'"'"'\xe2\x80\xae'"'"' <<<"$r" && ! fail_notice | LC_ALL=C grep -q $'"'"'\x1b'"'"''
+ok "audit keeps its shape and adds reason only to failed services (#2570)" \
+  'fail_audit | jq -e "(.services | map(select(.ok == false)) | length) == 4 and all(.services[] | select(.ok == false); (.reason | type) == \"string\") and all(.services[] | select(.ok == true); has(\"reason\") | not) and (.services[] | select(.name == \"bad-unit\") | keys) == [\"name\",\"ok\",\"reason\",\"scope\"]" >/dev/null'
 # A restart failure is a half-apply (harness on NEW_SHA, service down), so the
 # recovery snapshot must SURVIVE for the operator to roll back from. Before
 # #869 it was deleted before the restarts even ran, leaving nothing to recover
