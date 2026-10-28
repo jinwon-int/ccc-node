@@ -1,0 +1,1 @@
+- **agent-cron「cleared」(복구) 알림은 `info` 티어로 (#2565).** `AgentCronFailureAlarm` 스풀 레코드는 항상 `tier=action`이어서, "N회 연속 실패 뒤 성공 — 알람 해제" 통지도 15분 뒤 재통지되고 `ok <id>` 회신을 요구했다(2026-10-28 `jrucdx`→`yh07ja`). 결정할 것이 없는 복구 통지는 하루 다이제스트로 간다: `reasons`가 전부 `*=recovered`면 `info`, 하나라도 firing(threshold / class-change / stale)이면 그대로 `action`. 본문·dedup·수신자는 그대로.

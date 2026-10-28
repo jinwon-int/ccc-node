@@ -141,8 +141,10 @@ non-zero exit *is* the notice (the `laptop ONLINE` transition of
 it every such event pages, re-notifies after 15 minutes and waits for an
 `ok <id>` reply although nobody has to act. The field changes nothing else —
 success notices stay `info`, the consecutive-failure alarm stays `action`
-(so a watch that is itself broken still pages unless it also set
-`--failure-alert-after 0`), and `*-on-failure` still decides *whether* a run
+while it fires (so a watch that is itself broken still pages unless it also set
+`--failure-alert-after 0`) — only its all-`recovered` "cleared" notice is `info`
+(#2565: nothing to decide, so it joins the digest instead of re-notifying) — and
+`*-on-failure` still decides *whether* a run
 is spooled. Default `action`; any other value fails validation.
 
 

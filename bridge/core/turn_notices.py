@@ -63,9 +63,19 @@ def session_start_notice_text(
     Banner model label: explicit /model choice first, then the operator
     display label, then the env-routed model (Claude/crush paths only), so
     the notice reflects the real backend instead of a bare "default".
+
+    A persisted model that merely restates the env-routed one (the ``/new``
+    sync on a Claude bridge) is shown as the operator label too, so the two
+    bridges of one node (Matrix persists a model, hande does not) print the
+    same line for the same backend instead of ``claude-fable-5-1`` on one
+    and ``Claude Fable 5.1 (high)`` on the other.
     """
     provider_label = _PROVIDER_LABELS.get(provider, provider.title())
-    display_model = model or os.environ.get("CCC_MODEL_LABEL", "").strip()
+    operator_label = os.environ.get("CCC_MODEL_LABEL", "").strip()
+    env_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+    if model and provider == "claude" and operator_label and model == env_model:
+        model = operator_label
+    display_model = model or operator_label
     if not display_model and provider == "claude":
         display_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
     if not display_model and provider == "crush":
