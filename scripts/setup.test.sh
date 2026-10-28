@@ -1536,5 +1536,52 @@ rc=$?
 ok "a writable parent still installs normally and needs no fallback" \
   '[ "$rc" = 0 ] && [ -d "$plain_home/.claude/hooks" ] && ! grep -q "rollback snapshot in" <<<"$out"'
 
+# ---- #2541: state/node.txt seeded once from an already-decided identity -----
+seed_fn="$(sed -n '/^seed_node_txt()/,/^}/p' "$SETUP")"
+ok "setup.sh exposes seed_node_txt for unit extraction" '[ -n "$seed_fn" ]'
+seed_run() { # seed_run <case> <crontab-text|-NONE-> [VAR=val ...] — prints note output; node.txt at $TMP/seed/<case>/state
+  local cdir="$TMP/seed/$1" tab="$2"; shift 2
+  rm -rf "$cdir"; mkdir -p "$cdir/state" "$cdir/bin"
+  if [ "$tab" != -NONE- ]; then
+    printf '%s\n' "$tab" > "$cdir/crontab.txt"
+    printf '#!/bin/sh\n[ "$1" = -l ] && cat "%s"\n' "$cdir/crontab.txt" > "$cdir/bin/crontab"
+    chmod +x "$cdir/bin/crontab"
+  fi
+  ( set -uo pipefail
+    env -u CCC_NODE "$@" bash -c '
+      set -uo pipefail
+      # shellcheck disable=SC2034  # read by the sourced function
+      CLAUDE_DIR="$1"; DRY="${SEED_DRY:-0}"; OPT_NODE="${SEED_OPT_NODE:-}"
+      note() { printf "  - %s\n" "$*"; }
+      source /dev/stdin <<<"$2"
+      seed_node_txt' _ "$cdir" "$seed_fn" ) 2>&1
+}
+seed_val() { cat "$TMP/seed/$1/state/node.txt" 2>/dev/null; }
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(PATH="$TMP/seed/c1/bin:$REAL_PATH" seed_run c1 '15 * * * * CCC_NODE="node-alpha" /x # m
+#30 * * * * CCC_NODE="node-old" /y')"
+ok "crontab CCC_NODE seeds node.txt; commented lines ignored (#2541)" \
+  '[ "$(seed_val c1)" = node-alpha ] && grep -q "from crontab CCC_NODE" <<<"$out" && [ "$(stat -c %a "$TMP/seed/c1/state/node.txt")" = 600 ]'
+out="$(PATH="$TMP/seed/c2/bin:$REAL_PATH" seed_run c2 '1 * * * * CCC_NODE="node-alpha" /x
+2 * * * * CCC_NODE=node-beta /y')"
+ok "several crontab identities are ambiguous — not seeded (#2541)" \
+  '[ ! -e "$TMP/seed/c2/state/node.txt" ] && grep -q "several CCC_NODE values" <<<"$out"'
+out="$(PATH="$TMP/seed/c3/bin:$REAL_PATH" seed_run c3 '1 * * * * CCC_NODE="node-alpha" /x' SEED_OPT_NODE=node-gamma CCC_NODE=node-beta)"
+ok "--node wins over CCC_NODE and crontab (#2541)" '[ "$(seed_val c3)" = node-gamma ]'
+out="$(PATH="$TMP/seed/c4/bin:$REAL_PATH" seed_run c4 '1 * * * * CCC_NODE="node-alpha" /x' CCC_NODE=node-beta)"
+ok "CCC_NODE wins over crontab (#2541)" '[ "$(seed_val c4)" = node-beta ]'
+out="$(PATH="$TMP/seed/c5/bin:$REAL_PATH" seed_run c5 '1 * * * * CCC_NODE="node-alpha" /x' CCC_NODE=node-beta)"
+printf 'operator-choice\n' > "$TMP/seed/c5/state/node.txt"
+out="$(PATH="$TMP/seed/c5/bin:$REAL_PATH" env CCC_NODE=node-beta bash -c '
+  CLAUDE_DIR="$1"; DRY=0; OPT_NODE=""; note() { :; }; source /dev/stdin <<<"$2"; seed_node_txt' _ "$TMP/seed/c5" "$seed_fn" 2>&1)"
+ok "an existing node.txt is never rewritten (#2541)" '[ "$(seed_val c5)" = operator-choice ]'
+out="$(PATH="$TMP/seed/c6/bin:$REAL_PATH" seed_run c6 -NONE- CCC_NODE="노드")"
+ok "non-slug identity is skipped, not guessed (#2541)" \
+  '[ ! -e "$TMP/seed/c6/state/node.txt" ] && grep -q "is not a node slug" <<<"$out"'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(PATH="$TMP/seed/c7/bin:$REAL_PATH" seed_run c7 '1 * * * * CCC_NODE="node-alpha" /x' SEED_DRY=1)"
+ok "--dry-run reports the seed without writing (#2541)" \
+  '[ ! -e "$TMP/seed/c7/state/node.txt" ] && grep -q "\[dry-run\] seed .* = node-alpha" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
