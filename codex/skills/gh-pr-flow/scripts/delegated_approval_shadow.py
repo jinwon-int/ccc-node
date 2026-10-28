@@ -73,7 +73,9 @@ TEST_RES = (
     re.compile(r"(_test\.py|\.test\.sh|\.test\.mjs|_test\.go|\.test\.ts|\.spec\.ts)$"),
     re.compile(r"(^|/)tests?/"), re.compile(r"(^|/)fixtures/"), re.compile(r"(^|/)test_[^/]+\.py$"),
 )
-ISSUE_RE = re.compile(r"#(\d{1,6})\b")
+# ``#N`` (this repo), ``repo#N`` (same owner) or ``owner/repo#N``. The lookbehind keeps a
+# hyphenated name from being read from its last segment (``a2a-nexus#2317`` → ``a2a-nexus``).
+ISSUE_RE = re.compile(r"(?<![\w/#.-])(?:([\w.-]+(?:/[\w.-]+)?))?#(\d{1,6})\b")
 
 
 def classify_path(path: str) -> str:
@@ -87,7 +89,18 @@ def classify_path(path: str) -> str:
 
 
 def issue_refs(title: str, repo: str) -> list[str]:
-    return sorted({f"{repo}#{n}" for n in ISSUE_RE.findall(title or "")})
+    """``owner/repo#N`` refs from the title: bare ``#N`` is this repo, ``repo#N`` shares its owner."""
+    owner = repo.split("/", 1)[0]
+    refs = set()
+    for prefix, number in ISSUE_RE.findall(title or ""):
+        if not prefix:
+            target = repo
+        elif "/" in prefix:
+            target = prefix
+        else:
+            target = f"{owner}/{prefix}"
+        refs.add(f"{target}#{number}")
+    return sorted(refs)
 
 
 def q2_window(ledger: Iterable[dict], repo: str, refs: list[str], now: float) -> dict:

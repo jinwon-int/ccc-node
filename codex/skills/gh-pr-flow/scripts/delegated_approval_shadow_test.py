@@ -62,6 +62,13 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(sh.issue_refs("feat(x): y (#2413) refs #460", "jinwon-int/ccc-node"),
                          ["jinwon-int/ccc-node#2413", "jinwon-int/ccc-node#460"])
         self.assertEqual(sh.issue_refs("no refs", "jinwon-int/ccc-node"), [])
+        # Cross-repo refs keep their repo (first live row attributed a2a-nexus#2317 to ccc-node).
+        self.assertEqual(sh.issue_refs("feat: shadow recorder (a2a-nexus#2317, #2137)", "jinwon-int/ccc-node"),
+                         ["jinwon-int/a2a-nexus#2317", "jinwon-int/ccc-node#2137"])
+        self.assertEqual(sh.issue_refs("see other-org/their.repo#5 and #5", "jinwon-int/ccc-node"),
+                         ["jinwon-int/ccc-node#5", "other-org/their.repo#5"])
+        self.assertEqual(sh.issue_refs("fix(x): ratchet #1451 vs seoyoon-family-wiki#8397", "jinwon-int/ccc-node"),
+                         ["jinwon-int/ccc-node#1451", "jinwon-int/seoyoon-family-wiki#8397"])
 
 
 class LedgerTest(unittest.TestCase):
