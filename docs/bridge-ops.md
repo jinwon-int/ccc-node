@@ -187,6 +187,42 @@ startup failure cause (exit code, redacted stderr tail) is logged by #1819.
 Rollback: restore the drop-ins; the optional `EnvironmentFile=-` line is inert
 once the file is removed.
 
+## Retiring or replacing an EnvironmentFile
+
+Several units can reference the same env file, and a *required*
+`EnvironmentFile=` (no leading `-`) whose file is gone makes the unit's next
+start fail with `Failed to load environment files`. On one node on 2026-10-27
+(#2571) a node-local model-switch `apply.sh` replaced the Matrix/Telegram
+drop-ins and moved `/root/.config/ccc-main/matrix-opus55-high.env` into a
+`retired/` backup dir, but `ccc-hande-bridge.service` still required it, so its
+next restart failed and the hande bridge stayed down for 14.7 h.
+`scripts/install-hande-bridge.sh` copies the Matrix unit's drop-ins into the
+hande unit, so **every model/provider switch that touches the Matrix drop-ins
+must update `ccc-hande-bridge.service.d/` too**.
+
+Before moving, renaming or deleting an env file:
+
+1. `python3 <checkout>/scripts/env-file-guard.py users <old.env>` (add
+   `--user <name>` for each user manager that runs ccc units). Exit `1` lists
+   every unit that still references it (`required` or `optional`) — do not
+   move it yet. Exit `2` means a manager could not be queried; treat it as
+   unverified, not clean.
+2. Update every listed unit's drop-in (e.g. both `ccc-matrix-bridge` and
+   `ccc-hande-bridge`), then `systemctl daemon-reload`.
+3. Re-run `users <old.env>` until it exits `0`, then move the file.
+4. `python3 <checkout>/scripts/env-file-guard.py check` — exits `1` and lists
+   any unit whose required EnvironmentFiles are missing. Run it before any
+   restart.
+
+The guard inspects loaded `ccc-*` and `native-relay-*` services by default
+(`--unit-glob <glob>` to change, `--all` for every loaded service); a unit file
+that is not loaded is not seen, so daemon-reload after editing drop-ins. It
+prints paths only, never env file contents; `--json` gives a machine-readable
+report for scripts. `--user <name>` uses `systemctl --user -M <name>@`, or plain
+`--user` when `<name>` is the caller (`-M` needs systemd-machined). Model-switch
+scripts are node-local, so they should call `users` before their `mv` and
+`check` after their daemon-reload rather than re-implementing the scan.
+
 ## Health evidence
 
 Useful non-secret evidence is service state, PID, restart count, `health.json` state, recent redacted warning/error classes, source commit, and test output.
