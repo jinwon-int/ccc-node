@@ -233,7 +233,8 @@ jobs:
             scripts/auto-distill \
             scripts/agent_cron_store_lock_test.py \
             scripts/danso_native_memory_test.py \
-            scripts/journal_silence_watch_test.py
+            scripts/journal_silence_watch_test.py \
+            scripts/bridge_idle_gate_test.py
 
   secret-scan:
     name: secret-scan

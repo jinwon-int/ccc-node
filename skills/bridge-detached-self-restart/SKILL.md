@@ -35,6 +35,23 @@ the caller.
 
 ## Procedure
 
+0. **Gate on real idleness, inside the detached script, right before the
+   restart** — not on `health.json` `active_requests` alone. That counter
+   sees in-flight turns only; a background Bash command an earlier turn left
+   running (`run_in_background`, a `Monitor`, a CI watcher) lives on in the
+   bridge's process tree and the restart SIGKILLs it, so its promised notice
+   never arrives (#2567, 2026-10-28). Loop until the gate says idle
+   (exit 0), and skip the restart — reporting why — if it never does:
+   ```bash
+   G=<ccc-node checkout>/scripts/bridge-idle-gate.py
+   python3 "$G" --unit <own-service>            # systemd; add --user <u> for a user unit
+   python3 "$G" --main-pid <pid> --health <BOT_DATA_DIR>/health.json   # Termux/runit
+   # 0 idle · 1 busy (turn, delegated task or tool command) · 2 undecidable → treat as busy
+   ```
+   The gate is stdlib-only, so a node whose checkout predates it can run
+   `ssh <node> 'python3 - --unit <svc>' < scripts/bridge-idle-gate.py`.
+   It prints pids, ages and process names only, never command lines.
+
 1. **Write the restart+verify sequence as a single detached script**, not as
    inline commands. It must itself write its output to a persistent log path
    (not stdout) because stdout is going to the session that's about to die:

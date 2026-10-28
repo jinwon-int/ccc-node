@@ -120,7 +120,7 @@
       "name": "bridge-detached-self-restart",
       "source": "skills/bridge-detached-self-restart",
       "status": "active",
-      "tree_sha256": "d8c020cc4bd7cde26559624282b07bd0d2ed493ed27bedcb6363ea5e7db1794f"
+      "tree_sha256": "e265080c2f0e1037c6a4a3461864a6970043fffe490ae4d9cd595ac5cb79778f"
     },
     {
       "audience": "claude",
