@@ -16,6 +16,8 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "approval_timeout_s": 120,
       "interim_frames": false,
       "notice_frames": false,
+      "status_interims": false,
+      "status_interim_interval_s": 60,
       "tool_timeout_s": 90,
       "steward_tools": true,
       "steward_tools_approve_all": false
@@ -44,6 +46,11 @@ IDENTITY_PATTERN = re.compile(r"@([A-Za-z0-9_]{1,32}):hande")
 DEFAULT_APPROVAL_TIMEOUT_S = 120
 DEFAULT_TOOL_TIMEOUT_S = 90
 MAX_APPROVAL_TIMEOUT_S = 600
+# ``status_interims``: the Matrix ``⏳ Working`` heartbeat re-posted as interim frames
+# (the port has no editable bubble) — at most once per interval unless the tool changes.
+DEFAULT_STATUS_INTERIM_INTERVAL_S = 60
+MIN_STATUS_INTERIM_INTERVAL_S = 10
+MAX_STATUS_INTERIM_INTERVAL_S = 3600
 DEFAULT_SOCKET_MODE = 0o660
 
 
@@ -145,11 +152,29 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
     if type(tool_raw) is not int or not 1 <= tool_raw <= MAX_APPROVAL_TIMEOUT_S:
         raise HandeConfigError(f"hande config 'tool_timeout_s' must be 1..{MAX_APPROVAL_TIMEOUT_S}")
     knobs: dict[str, Any] = {"approval_timeout_s": timeout_raw, "tool_timeout_s": tool_raw}
-    for key in ("interim_frames", "notice_frames", "steward_tools", "steward_tools_approve_all"):
+    for key in (
+        "interim_frames",
+        "notice_frames",
+        "steward_tools",
+        "steward_tools_approve_all",
+        "status_interims",
+    ):
         value = config.get(key, key == "steward_tools")  # steward tools default on
         if type(value) is not bool:
             raise HandeConfigError(f"hande config {key!r} must be true or false")
         knobs[key] = value
+    # Heartbeat-as-interim cadence: the ``⏳ Working`` line is re-posted at most this
+    # often while the tool label is unchanged (a tool change posts at once).
+    interval_raw = config.get("status_interim_interval_s", DEFAULT_STATUS_INTERIM_INTERVAL_S)
+    if (
+        type(interval_raw) is not int
+        or not MIN_STATUS_INTERIM_INTERVAL_S <= interval_raw <= MAX_STATUS_INTERIM_INTERVAL_S
+    ):
+        raise HandeConfigError(
+            "hande config 'status_interim_interval_s' must be "
+            f"{MIN_STATUS_INTERIM_INTERVAL_S}..{MAX_STATUS_INTERIM_INTERVAL_S}"
+        )
+    knobs["status_interim_interval_s"] = interval_raw
     return knobs
 
 

@@ -36,7 +36,8 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `turn.session_id` (always `null` today) | ignored — the session manager is the resume authority, exactly as on Matrix |
 | `turn.prompt` starting with `/` | the Matrix command set (`new model effort usage stop continue history resume revert waits cancelwait distill skills memory_promote restart task_*`); owner-only ones refuse non-owners. Numbered menus (`/resume`, `/revert`) are plain `result` text answered by a bare-number turn |
 | `TurnSink.approval` | `approval{approval_id, action, description=<redacted snapshot>, arguments={}}` → `approve`/`deny` → `approval-resolved`; `approval_timeout_s` (default 120) → denied. Audit ledger as on Matrix |
-| `TurnSink.typing` / `status` | no-op (the port has no typing or editable bubble) |
+| `TurnSink.typing` | no-op (the port has no typing indicator) |
+| `TurnSink.status` (the `⏳ Working — 10s \| Bash: …` heartbeat Matrix edits in place) | no-op by default (no editable bubble). `status_interims: true` forwards it as `interim` frames — a new room message each — throttled: the first line as soon as the heartbeat starts, then only when the tool label after `" \| "` changes or `status_interim_interval_s` (default 60, 10..3600) has passed; `None` has no frame, answer previews are never forwarded; needs `interim_frames` (off → counted in `notices_dropped`). A real in-place status bubble needs an app-layer `status` message kind (family-messenger, tracked with the live-preview gap) |
 | `TurnSink.interim` | dropped and counted unless `interim_frames: true` (then an `interim` frame the bot must know) |
 | `TurnResult` | `result{status complete\|uncertain, text, session_id[, reason]}`; a cancelled, timed-out or failed turn is `uncertain` and never re-run automatically |
 | `enqueue_notice` (restart receipt, waits status, CI-wait results, async/background completions) | a `notice{room, text}` frame when `notice_frames: true` (the bot speaks it since #474; turn it on once the node's bot is replaced). With no bot connected (it reconnects ~10 s after a bridge restart, so the startup banner always lands in that gap) the notice is **held and flushed in order on connect**, before waiting self-jobs (#2563; at most 16, oldest dropped first, aged out after 10 min; `notices_pending`). Off → **counted and dropped** — `health_signals().notices_dropped` — never claimed delivered. The push spool stays with the node's Matrix bridge (one consumer); alerts stay on the Telegram fallback (owner decision ②) |
@@ -79,11 +80,19 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   "approval_timeout_s": 120,
   "interim_frames": false,
   "notice_frames": false,
+  "status_interims": false,
+  "status_interim_interval_s": 60,
   "tool_timeout_s": 90,
   "steward_tools": true,
   "steward_tools_approve_all": false
 }
 ```
+
+- `status_interims` (default off) re-posts the `⏳ Working — Ns | <tool>` heartbeat as
+  interim messages (see the mapping table) — at most one per
+  `status_interim_interval_s` while the tool is unchanged, at once when it changes.
+  Turn it on together with `interim_frames`; on a bridge restart the live config is
+  re-read, so enabling it is a config edit plus `ccc-hande-bridge` restart.
 
 - `account` is this node (`@<node>:hande`, same spelling as its Matrix account
   localpart); `owner` / `family_users` are **actors** (`@owner:hande`), not devices.
