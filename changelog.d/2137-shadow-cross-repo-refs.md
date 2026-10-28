@@ -1,0 +1,1 @@
+- **gh-pr-flow:** the delegated-approval shadow recorder reads cross-repo issue refs from the PR title (`a2a-nexus#2317`, `owner/repo#N`) instead of attributing every `#N` to the approved repo (#2137). Only the Q2 anti-split window keys on these refs; the first live row had grouped a2a-nexus#2317 under ccc-node (conservative direction, no tier change).

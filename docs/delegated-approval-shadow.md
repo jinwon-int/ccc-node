@@ -19,7 +19,8 @@ jinwon-int/ccc-node#2137.
   approval JSON; a recorder failure never changes or fails the approval.
 - It never decides anything, never calls the broker, never reads PR bodies or
   review text (principle 4: structured evidence only — paths, diff totals,
-  issue refs from the title, author/approver, base).
+  issue refs from the title — bare `#N` is this repo, `repo#N` shares its owner,
+  `owner/repo#N` is kept as written — author/approver, base).
 - Off switch: `CCC_DELEGATED_SHADOW=0`. The ratified kill/enable switches
   (`A2A_DELEGATED_APPROVAL_KILL`, `A2A_DELEGATED_APPROVAL`) are only
   **snapshotted** into each row; Phase 1 has no behaviour to switch.
