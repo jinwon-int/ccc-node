@@ -31,6 +31,10 @@ Three modes:
     A timed test described only in relative terms ("며칠", "1~2주", "T+24h",
     "24시간 후") with no absolute datetime anywhere in the paragraph. These
     violate the rule at write time, so they can never be judged on schedule.
+    Shapes that the 2026-10-27 audit measured as false positives (7 of 10) —
+    "당분간" operations, effort estimates, external process durations, quoted
+    rule text, judged checkboxes, outside authors — are demoted to low
+    confidence with a reason code (#2544); see ``classify_relative_paragraph``.
 
 ``followup`` (opt-in, #2324)
     A verdict was posted, and the verdict comment or a later one promised a
@@ -233,6 +237,69 @@ RELATIVE_DURATION = re.compile(
     r"|(?<![\d.])\d+\s*h\s*관측)",
     re.IGNORECASE,
 )
+
+# --- relative mode false positives (#2544) -----------------------------------
+#
+# The 2026-10-27 fleet audit ran relative mode over 42 repos: 10 findings, 7
+# of them false positives. With `--notify high` that is a high-confidence ping
+# every three days for nothing, which is how a real finding gets ignored. The
+# shapes below are each grounded in one of those seven and are *demoted, not
+# dropped* — the low findings stay in the log. The two real ones must stay
+# high: a2a-nexus#2395 "소크: 실제 T2 태스크 수일분" and family-messenger#404
+# "- [ ] 관찰 기간: 공명에서 며칠 운영".
+RELATIVE_KIND = "relative-duration-only"
+# Reason codes (Finding.weak_reason), one per measured shape.
+REL_EXTERNAL_AUTHOR = "external-author"  # esp32-iphone-agent#77
+REL_QUOTED_TERM = "quoted-term"  # family-messenger#179 "'며칠' 식 문구"
+REL_CHECKBOX_JUDGED = "checkbox-verdict-recorded"  # family-messenger#167
+REL_OPERATIONAL = "operational-wording"  # esp32-iphone-agent#74/#60, ccc-node#1864
+REL_PLANNING = "planning-estimate"  # family-messenger#271 "스파이크(1~2주)"
+REL_PROCESS = "process-duration"  # family-messenger#338 "수일 소요"
+
+# Accounts whose words are the fleet's own (skills/external-github-content:
+# jinon86, seoseo-ai and the fleet dependency bots). GitHub renders an app as
+# `app/<name>` or `<name>[bot]`; both normalize to the bare name. Anyone else
+# cannot book a fleet timed test, so their relative wording is conversation.
+FLEET_AUTHORS = frozenset({"jinon86", "seoseo-ai", "dependabot", "jinwon-deps-bot", "github-actions"})
+
+# Words that make a relative duration a genuine observation window. Rules that
+# judge the *wording* (operational / planning / process) never fire when one
+# of these is in the paragraph: "관찰 기간: … 며칠 운영" is a schedule-less
+# observation because it says 관찰, and "소크 … 수일분" because it says 소크.
+OBSERVATION_WORD = re.compile(
+    r"(관찰|관측|소크|카나리|모니터링|지켜\s*보|파일럿|시범\s*운영"
+    r"|soak|canary|monitor|observ|pilot|burn[\s-]?in)",
+    re.IGNORECASE,
+)
+# A relative term quoted as a word, not used: "'며칠' 식 문구를 남기지 않게",
+# a nag citing the booking ("실제 T2 태스크 수일분"). The span must open and
+# close on a non-space character so the gap *between* two quotations is never
+# read as one, and a single quote must not sit inside a word (don't / it's).
+QUOTE_SPAN = re.compile(
+    r'"\S(?:[^"\n]{0,78}\S)?"'
+    r"|“[^”\n]{1,80}”|‘[^’\n]{1,80}’|「[^」\n]{1,80}」|『[^』\n]{1,80}』"
+    r"|(?<![\w'])'\S(?:[^'\n]{0,78}\S)?'(?![\w'])"
+)
+# Markdown task-list item ("- [ ] …", "* [x] …", "1. [ ] …").
+CHECKBOX_LINE = re.compile(r"^(?:[-*+]|\d+[.)])\s+\[[ xX]\]")
+# "당분간" is "for the time being": a standing arrangement, not a test window.
+OPERATIONAL_TERM = re.compile(r"^당분간$")
+# A work-effort estimate attached to a plan item: "스파이크(1~2주)", or the
+# duration alone in brackets right after an item name ("**D. 푸시**(1~2주)").
+PLANNING_NOUN = re.compile(
+    r"(스파이크|spike|구현|개발|작업|공수|일정|마일스톤|milestone|estimate|effort)",
+    re.IGNORECASE,
+)
+PLANNING_WINDOW_CHARS = 15
+# The time an outside procedure takes: "신분증 … 수일 소요", "며칠 걸림", or a
+# review/issuance step just before the term ("심사(통상 수일, …)",
+# family-messenger#584). "승인" is deliberately absent: "승인 후 며칠 운영"
+# can be a real trial.
+PROCESS_SUFFIX = re.compile(
+    r"\s*(?:정도\s*)?(소요|걸(?:림|린다|립니다|려요|려서|리는)|takes?\b|to\s+complete)",
+    re.IGNORECASE,
+)
+PROCESS_NOUN = re.compile(r"(심사|발급|배송|(?<![\w-])review)", re.IGNORECASE)
 
 # Anchor + offset bookings (#2252). a2a-nexus#1504 booked Phase 7-B as
 # "실행 예약: … OnCalendar=2026-10-09 22:00:00 KST" with "B8: 관측 타이머
@@ -647,23 +714,156 @@ def _inferred_hit(
     )
 
 
-def find_relative_only(issue: dict[str, Any]) -> list[str]:
-    """Paragraphs promising a timed test with no absolute datetime at all.
+def _author_login(item: dict[str, Any]) -> str | None:
+    """The GitHub login of an issue or comment, or None when the dump has none."""
+    author = item.get("author")
+    if isinstance(author, dict):
+        author = author.get("login")
+    return str(author) if author else None
 
-    family-messenger#104 said "며칠 관찰 후 완전 삭제" and went unjudged for
-    four days: with no absolute end time, no schedule could exist.
+
+def is_fleet_author(login: str | None) -> bool:
+    """Whether a login is a fleet account. Unknown (no author data) counts as fleet:
+    a JSONL dump without authors must not demote everything."""
+    if not login:
+        return True
+    name = login.strip().lower()
+    if name.startswith("app/"):
+        name = name[len("app/"):]
+    if name.endswith("[bot]"):
+        name = name[: -len("[bot]")]
+    return name in FLEET_AUTHORS
+
+
+def _iter_paragraphs_fenced(text: str) -> Iterator[tuple[str, bool]]:
+    """Like _iter_paragraphs, plus whether the line sits inside a ``` / ~~~ fence.
+
+    A fenced block is quotation: family-messenger#167's nag reproduced the
+    acceptance criterion "(며칠 관측 필요 — 즉시 판정 불가)" inside one.
     """
-    offenders: list[str] = []
-    bodies = [issue.get("body") or ""]
-    bodies += [(comment.get("body") or "") for comment in (issue.get("comments") or [])]
-    for text in bodies:
-        for paragraph in _iter_paragraphs(text):
+    fenced = False
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if stripped:
+            yield stripped, fenced
+
+
+def _is_quoted(paragraph: str, start: int, end: int) -> bool:
+    for pattern in (QUOTE_SPAN, INLINE_CODE):
+        for span in pattern.finditer(paragraph):
+            if span.start() < start and end < span.end():
+                return True
+    return False
+
+
+def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
+    """Operational / planning / process wording for one unquoted relative term."""
+    if OPERATIONAL_TERM.match(match.group(0)):
+        return REL_OPERATIONAL
+    before = paragraph[: match.start()].rstrip(" *_")
+    after = paragraph[match.end():].lstrip(" *_")
+    if before.endswith(("(", "（")) and after.startswith((")", "）")):
+        return REL_PLANNING
+    if PLANNING_NOUN.search(paragraph[max(0, match.start() - PLANNING_WINDOW_CHARS): match.start()]):
+        return REL_PLANNING
+    if PROCESS_SUFFIX.match(paragraph, match.end()):
+        return REL_PROCESS
+    if PROCESS_NOUN.search(paragraph[max(0, match.start() - PLANNING_WINDOW_CHARS): match.start()]):
+        return REL_PROCESS
+    return None
+
+
+def classify_relative_paragraph(
+    paragraph: str,
+    *,
+    author: str | None = None,
+    in_code_block: bool = False,
+    verdict_after: bool = False,
+) -> str | None:
+    """Name the false-positive shape of one relative-only paragraph, if any (#2544).
+
+    Checked in order; the first that applies is the reason code:
+
+    ``external-author``
+        Written by a non-fleet account (``FLEET_AUTHORS``); outside
+        conversation cannot book a fleet timed test (esp32-iphone-agent#77).
+    ``quoted-term``
+        Every relative term is quoted ("…", '…', inline code, or a fenced
+        block): rule text or a citation, not a booking (family-messenger#179).
+    ``checkbox-verdict-recorded``
+        A task-list item, and a verdict comment (strict, as in followup mode)
+        was posted after it (family-messenger#167, PASS recorded).
+
+    The remaining three judge the wording, so they never apply when the
+    paragraph names an observation (``OBSERVATION_WORD``), and every unquoted
+    term must be explained by one of them:
+
+    ``operational-wording``  "당분간" — a standing arrangement.
+    ``planning-estimate``    an effort estimate: a planning noun just before
+                             the term ("스파이크(1~2주)") or the term alone in
+                             brackets after a plan item.
+    ``process-duration``     how long an outside procedure takes ("수일 소요").
+    """
+    if author is not None and not is_fleet_author(author):
+        return REL_EXTERNAL_AUTHOR
+    matches = list(RELATIVE_DURATION.finditer(paragraph))
+    if not matches:
+        return None
+    if in_code_block:
+        return REL_QUOTED_TERM
+    unquoted = [m for m in matches if not _is_quoted(paragraph, m.start(), m.end())]
+    if not unquoted:
+        return REL_QUOTED_TERM
+    if verdict_after and CHECKBOX_LINE.match(paragraph):
+        return REL_CHECKBOX_JUDGED
+    if OBSERVATION_WORD.search(paragraph):
+        return None
+    reasons = [_wording_reason(paragraph, m) for m in unquoted]
+    if all(reasons):
+        return reasons[0]
+    return None
+
+
+def relative_offenders(issue: dict[str, Any]) -> list[tuple[str, str | None]]:
+    """(paragraph, weak_reason) for every relative-only paragraph, in order."""
+    sources: list[tuple[str, str | None, dt.datetime | None]] = [
+        (issue.get("body") or "", _author_login(issue), None)
+    ]
+    for comment in issue.get("comments") or []:
+        sources.append(
+            (comment.get("body") or "", _author_login(comment),
+             parse_github_timestamp(comment["createdAt"]))
+        )
+    verdict_times = [
+        posted for text, _, posted in sources
+        if posted is not None and _verdict_strength(text) == "strict"
+    ]
+    offenders: list[tuple[str, str | None]] = []
+    for text, author, posted in sources:
+        verdict_after = any(posted is None or when > posted for when in verdict_times)
+        for paragraph, fenced in _iter_paragraphs_fenced(text):
             if not RELATIVE_DURATION.search(paragraph):
                 continue
             if _dates_in(paragraph):
                 continue  # an absolute datetime is right there; rule satisfied
-            offenders.append(paragraph[:160])
+            reason = classify_relative_paragraph(
+                paragraph, author=author, in_code_block=fenced, verdict_after=verdict_after
+            )
+            offenders.append((paragraph[:160], reason))
     return offenders
+
+
+def find_relative_only(issue: dict[str, Any]) -> list[str]:
+    """Paragraphs promising a timed test with no absolute datetime at all.
+
+    family-messenger#104 said "며칠 관찰 후 완전 삭제" and went unjudged for
+    four days: with no absolute end time, no schedule could exist. Demoted
+    shapes are included; ``relative_offenders`` carries their reasons.
+    """
+    return [paragraph for paragraph, _ in relative_offenders(issue)]
 
 
 def _is_judged(
@@ -846,17 +1046,24 @@ def judge_issue(issue: dict[str, Any], now: dt.datetime, mode: str) -> Finding |
         return _judge_followup(issue, now, comment_times)
 
     if mode == "relative":
-        offenders = find_relative_only(issue)
+        offenders = relative_offenders(issue)
         if not offenders:
             return None
+        # One undemoted paragraph keeps the issue high; otherwise report the
+        # first demoted one at low confidence (#2544).
+        undemoted = [offender for offender in offenders if offender[1] is None]
+        evidence, demoted_as = undemoted[0] if undemoted else offenders[0]
         return Finding(
             repo=repo,
             number=number,
             title=title,
             url=url,
-            kind="relative-duration-only",
-            paragraph=offenders[0],
+            kind=RELATIVE_KIND,
+            paragraph=evidence,
             last_comment_at=max(comment_times, default=None),
+            confidence="low" if demoted_as else "high",
+            weak_reason=demoted_as,
+            dropped=[f"{why}: {text[:90]}" for text, why in offenders if why],
         )
 
     hits, dropped = collect_hits(issue)
@@ -978,7 +1185,9 @@ def fetch_via_gh(
     using GitHub search (``closed:>=YYYY-MM-DD``, a UTC date). Without it the
     query is exactly the open-only one the other modes always ran.
     """
-    fields = "number,title,url,body,comments,createdAt,updatedAt"
+    # author: relative mode demotes non-fleet wording (#2544); comments
+    # already carry their author.
+    fields = "number,title,url,body,comments,createdAt,updatedAt,author"
     queries: list[tuple[str, list[str]]] = [("open", [])]
     if closed_since is not None:
         fields += ",state,closedAt"
@@ -1037,7 +1246,8 @@ def format_report(findings: Sequence[Finding], now: dt.datetime, mode: str) -> s
                 f" | 경과 {finding.days_overdue}일{mark}"
             )
         else:
-            lines.append(f"### {finding.repo}#{finding.number} | 절대시각 없음")
+            mark = "" if finding.confidence == "high" else f" | 신뢰도 낮음({finding.weak_reason})"
+            lines.append(f"### {finding.repo}#{finding.number} | 절대시각 없음{mark}")
         lines.append(f"    {finding.title[:100]}")
         lines.append(f"    근거: {finding.paragraph[:150]}")
         if finding.last_comment_at:
@@ -1243,11 +1453,12 @@ def build_notify_text(
             lines.append(f"  {url}")
     if len(ordered) > NOTIFY_MAX_FINDINGS:
         lines.append(f"외 {len(ordered) - NOTIFY_MAX_FINDINGS}건")
-    # Followup mode runs from its own installer and cron log (#2324).
-    log_name = (
-        "timed-followup-scan.cron.log" if mode == "followup"
-        else "timed-test-deadline-scan.cron.log"
-    )
+    # Followup (#2324) and relative (#2544) modes run from their own
+    # installers and cron logs.
+    log_name = {
+        "followup": "timed-followup-scan.cron.log",
+        "relative": "timed-relative-scan.cron.log",
+    }.get(mode, "timed-test-deadline-scan.cron.log")
     lines.append(f"신뢰도 {level} 이상 · 전체 목록: {log_name}")
     text = redaction.redact_credentials("\n".join(lines))
     if redaction.contains_credential(text):

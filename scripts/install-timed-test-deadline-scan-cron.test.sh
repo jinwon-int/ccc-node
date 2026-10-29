@@ -91,10 +91,29 @@ ok "custom schedule still single line" '[ "$(marker_count)" = 1 ]'
 ok "custom schedule applied" 'grep -qF "5 * * * *" "$FAKE_CRON"'
 ok "old schedule removed" '! grep -qF "20 9,13,19 * * *" "$FAKE_CRON"'
 
-# relative mode is selectable and lands in the rendered line
-bash "$INSTALLER" --apply --mode relative >/dev/null 2>&1
-ok "relative mode applied" 'grep -qF -- "--mode \"relative\"" "$FAKE_CRON"'
-ok "relative mode still single line" '[ "$(marker_count)" = 1 ]'
+# --mode relative used to REPLACE the expired entry, so no node ran it
+# (#2544). It now delegates to install-timed-relative-scan-cron.sh: its own
+# block and record, and this lane's expired entry and record stay as they were.
+relative_count() { grep -E "# ccc-node:timed-relative-scan gen=h_" "$FAKE_CRON" 2>/dev/null | wc -l | tr -d ' '; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+line_before="$(grep -F "# ccc-node:timed-test-deadline-scan gen=" "$FAKE_CRON")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rec_before="$(cat "$CCC_STATE_DIR/install-timed-test-deadline-scan-cron.json")"
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+out="$(bash "$INSTALLER" --dry-run --mode relative 2>&1)"; rc=$?
+ok "relative dry-run delegates without writing" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "delegating" && [ "$(relative_count)" = 0 ]'
+# shellcheck disable=SC2034
+out="$(bash "$INSTALLER" --apply --mode relative 2>&1)"; rc=$?
+ok "relative mode delegates and exits 0" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "install-timed-relative-scan-cron.sh"'
+ok "relative mode installs its own entry" '[ "$(relative_count)" = 1 ] && grep -F "# ccc-node:timed-relative-scan gen=" "$FAKE_CRON" | grep -qF -- "--mode relative"'
+ok "relative mode keeps the expired entry untouched" '[ "$(marker_count)" = 1 ] && [ "$(grep -F "# ccc-node:timed-test-deadline-scan gen=" "$FAKE_CRON")" = "$line_before" ]'
+ok "relative mode leaves this lane's install record alone" '[ "$(cat "$CCC_STATE_DIR/install-timed-test-deadline-scan-cron.json")" = "$rec_before" ] && [ -f "$CCC_STATE_DIR/install-timed-relative-scan-cron.json" ]'
+ok "delegation passes no schedule it was not given" 'grep -F "# ccc-node:timed-relative-scan gen=" "$FAKE_CRON" | grep -q "^25 9 \* \* \* "'
+bash "$INSTALLER" --apply --mode relative --schedule "26 9 * * *" --notify low >/dev/null 2>&1
+ok "delegation passes explicit schedule and notify" 'grep -F "# ccc-node:timed-relative-scan gen=" "$FAKE_CRON" | grep -q "^26 9 \* \* \* .*--notify \"low\""'
+ok "re-delegating stays idempotent" '[ "$(relative_count)" = 1 ] && [ "$(marker_count)" = 1 ]'
+bash "$INSTALLER" --apply --remove --mode relative >/dev/null 2>&1
+ok "remove with --mode relative removes only the relative entry" '[ "$(relative_count)" = 0 ] && [ "$(marker_count)" = 1 ] && [ ! -f "$CCC_STATE_DIR/install-timed-relative-scan-cron.json" ]'
 
 # an unknown mode is rejected before touching the crontab
 # shellcheck disable=SC2034  # before is read via eval inside ok()

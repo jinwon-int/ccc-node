@@ -860,6 +860,174 @@ class RelativeModeTests(unittest.TestCase):
         self.assertIsNone(scanner.judge_issue(issue, NOW, "relative"))
 
 
+# --- relative mode false positives (#2544) -----------------------------------
+# Reduced from the 2026-10-27 audit's relative findings (7 of 10 false). Each
+# demoted shape gets its own fixture; the two real ones must stay high.
+REL_REPO = "example-org/example-repo"
+REL_AT = "2026-10-20T05:18:54Z"
+
+
+def _rel_comment(body: str, created_at: str = REL_AT, author: str | None = "seoseo-ai") -> dict:
+    comment = _comment(body, created_at)
+    if author is not None:
+        comment["author"] = {"login": author}
+    return comment
+
+
+def _rel_issue(body: str = "", comments: list[dict] | None = None, author: str = "seoseo-ai") -> dict:
+    issue = _issue(number=7, repo=REL_REPO, body=body, comments=comments)
+    issue["author"] = {"login": author}
+    return issue
+
+
+class RelativeFalsePositive2544Tests(unittest.TestCase):
+    def _judge(self, issue: dict) -> scanner.Finding:
+        finding = scanner.judge_issue(issue, NOW, "relative")
+        assert finding is not None
+        self.assertEqual(finding.kind, "relative-duration-only")
+        return finding
+
+    def assertDemoted(self, issue: dict, reason: str) -> None:
+        finding = self._judge(issue)
+        self.assertEqual((finding.confidence, finding.weak_reason), ("low", reason))
+        self.assertTrue(finding.dropped, "demoted paragraphs stay listed")
+
+    def assertFlagged(self, issue: dict) -> None:
+        finding = self._judge(issue)
+        self.assertEqual((finding.confidence, finding.weak_reason), ("high", None))
+
+    # -- demoted shapes --------------------------------------------------------
+    def test_operational_wording_for_the_time_being_is_demoted(self) -> None:
+        # esp32-iphone-agent#74 / #60, ccc-node#1864
+        for line in (
+            "- 운영: 걸린 상태는 USB 분리로만 해제. 페이지 넘김은 당분간 오너 수동.",
+            "- 원인 미확정. 당분간 페이지 넘김은 오너 수동.",
+            "Termux 노드의 라이브 라인을 당분간 중단하고 nunchi+wiki 전용으로 운영하기로 결정",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(comments=[_rel_comment(line)]), "operational-wording")
+
+    def test_planning_estimate_is_demoted(self) -> None:
+        # family-messenger#271: plan table rows with effort estimates.
+        for line in (
+            "| **A. 스파이크**(1~2주) | `ios-ffi` 크레이트 · iOS 2타겟 빌드 · host 테스트 | 빌드 성공 2/2 |",
+            "| **D. 푸시**(1~2주) | 확장 ② + NSE | 10건 중 10건 도착 |",
+            "구현 1~2주 예상, 이후 리뷰",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(body=line, author="jinon86"), "planning-estimate")
+
+    def test_external_process_duration_is_demoted(self) -> None:
+        # family-messenger#338 "수일 소요", #584 "심사(통상 수일, …)".
+        for line in (
+            "4. 신원 확인: 조직 서류 + 계정 소유자 신분증. 수일 소요. 공개 개발자 이름은 법인명.",
+            "인증서 발급은 며칠 걸림",
+            "4. **트랙**: 내부 테스트 → 비공개 테스트 → production 신청 → 심사(통상 수일, 확대 심사 시 7일+).",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(comments=[_rel_comment(line)]), "process-duration")
+
+    def test_quoted_rule_text_is_demoted(self) -> None:
+        # family-messenger#179 and the audit's own wording.
+        for line in (
+            '"며칠" 식 문구를 남기지 않게 절대시각으로 등록한다.',
+            "'며칠' 식 문구를 남기지 않게 절대시각으로 등록한다.",
+            "규칙 문구 인용 “며칠 관찰 후 완전 삭제”라고만 적혀 4일간 판정되지 않았다",
+            "`T+24h` 같은 상대 표기는 금지",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(comments=[_rel_comment(line)]), "quoted-term")
+
+    def test_fenced_block_is_quotation(self) -> None:
+        # family-messenger#167's nag reproduced the criterion inside a fence.
+        body = "### 검출된 문구\n\n```\n- [ ] 확인\n      (며칠 관측 필요 — 즉시 판정 불가)\n```\n"
+        self.assertDemoted(_rel_issue(comments=[_rel_comment(body)]), "quoted-term")
+
+    def test_checkbox_with_a_later_verdict_is_demoted(self) -> None:
+        # family-messenger#167: the criterion was judged PASS in a later comment.
+        body = "- [ ] 복호화 불가 시에도 대체 알림이 표시되는 것을 확인 (며칠 관측 필요 — 즉시 판정 불가)"
+        verdict = _rel_comment(
+            "## 관측 종료 판정 — **합격(PASS)** · 수용 기준 3번\n\n**Verdict**: PASS",
+            "2026-10-08T03:51:46Z",
+        )
+        self.assertDemoted(_rel_issue(body=body, comments=[verdict]), "checkbox-verdict-recorded")
+
+    def test_external_author_conversation_is_demoted(self) -> None:
+        # esp32-iphone-agent#77: an outside maintainer's message in the body.
+        body = "Hi, I've been following your fork. If you have a few days, a PR upstream would be welcome."
+        self.assertDemoted(_rel_issue(body=body, author="outside-maintainer"), "external-author")
+        comment = _rel_comment("I'll test it in a few days", author="outside-maintainer")
+        self.assertDemoted(_rel_issue(comments=[comment]), "external-author")
+
+    def test_fleet_bot_logins_are_fleet(self) -> None:
+        for login in ("jinon86", "seoseo-ai", "app/dependabot", "dependabot[bot]",
+                      "app/jinwon-deps-bot", "github-actions[bot]", "SEOSEO-AI", None, ""):
+            with self.subTest(login=login):
+                self.assertTrue(scanner.is_fleet_author(login))
+        self.assertFalse(scanner.is_fleet_author("outside-maintainer"))
+
+    # -- real findings must stay flagged --------------------------------------
+    def test_soak_for_some_days_stays_high(self) -> None:
+        # a2a-nexus#2395 (true positive), even next to a quoting nag.
+        issue = _rel_issue(
+            author="jinon86",
+            comments=[
+                _rel_comment(
+                    "- 소크: 실제 T2 태스크 수일분. 프록시 로그의 호스트 집합을 수집하고, "
+                    "doctor `egressProxy` ok를 확인한다.", author="jinon86"),
+                _rel_comment('이 소크에는 절대 종료일시가 없어("실제 T2 태스크 수일분") 보완합니다.',
+                             "2026-10-27T02:46:54Z"),
+            ],
+        )
+        self.assertFlagged(issue)
+
+    def test_observation_for_some_days_checkbox_stays_high(self) -> None:
+        # family-messenger#404 (true positive): a checkbox, no verdict yet.
+        body = "- [ ] 관찰 기간: 공명에서 며칠 운영(uncertain·worker_gone 없는지 `journalctl -u bot`)."
+        nag = _rel_comment(
+            '관찰 기간이 "며칠"로만 적혀 있어 보완합니다.\n판정 기준: 관찰 기간 중 응답기 이상 0',
+            "2026-10-27T02:46:54Z",
+        )
+        self.assertFlagged(_rel_issue(body=body, comments=[nag]))
+
+    def test_observation_word_overrides_wording_rules(self) -> None:
+        for line in ("당분간 관찰 후 판단", "카나리 1~2주 소요", "스파이크 후 며칠 모니터링"):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    def test_checkbox_without_a_later_verdict_stays_high(self) -> None:
+        verdict = _rel_comment("## 관측 종료 판정 — 합격", "2026-09-01T00:00:00Z")
+        later = _rel_comment("- [ ] 배포 후 며칠 관측", "2026-09-02T00:00:00Z")
+        self.assertFlagged(_rel_issue(comments=[verdict, later]))
+
+    def test_one_genuine_paragraph_keeps_the_issue_high(self) -> None:
+        issue = _rel_issue(
+            comments=[
+                _rel_comment("페이지 넘김은 당분간 오너 수동."),
+                _rel_comment("배포 후 며칠 관찰한 뒤 판정"),
+            ]
+        )
+        finding = self._judge(issue)
+        self.assertEqual(finding.confidence, "high")
+        self.assertEqual(finding.paragraph, "배포 후 며칠 관찰한 뒤 판정")
+        self.assertEqual(finding.dropped, ["operational-wording: 페이지 넘김은 당분간 오너 수동."])
+
+    def test_unquoted_term_beside_a_quoted_one_stays_high(self) -> None:
+        self.assertFlagged(_rel_issue(comments=[_rel_comment('"며칠" 금지 규칙과 별개로 며칠 관찰 후 삭제')]))
+
+    def test_issue_without_author_data_is_not_external(self) -> None:
+        # JSONL dumps predating the author field must not demote everything.
+        self.assertFlagged(_issue(comments=[_comment("며칠 관찰 후 완전 삭제", REL_AT)]))
+
+    def test_demoted_finding_is_low_in_report_and_dropped_at_high(self) -> None:
+        issue = _rel_issue(comments=[_rel_comment("페이지 넘김은 당분간 오너 수동.")])
+        findings = scanner.scan([issue], NOW, "relative")
+        report = scanner.format_report(findings, NOW, "relative")
+        self.assertIn("| 절대시각 없음 | 신뢰도 낮음(operational-wording)", report)
+        self.assertEqual(scanner.scan([issue], NOW, "relative", min_confidence="high"), [])
+        self.assertEqual(scanner.notify_candidates(findings, "high"), [])
+
+
 class ReposFileTests(unittest.TestCase):
     """An unconfigured scheduled scan must never look like a clean scan.
 
@@ -1339,7 +1507,8 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("절대 종료시각 없음 1건", record["text"])
         self.assertIn("jinwon-int/ccc-node#104 · 절대시각 없음", record["text"])
         self.assertTrue((self.state / "timed-test-deadline-scan.notify-relative.json").is_file())
-        self.assertIn("전체 목록: timed-test-deadline-scan.cron.log", record["text"])
+        # Relative mode runs from its own installer and log (#2544).
+        self.assertIn("전체 목록: timed-relative-scan.cron.log", record["text"])
 
 
     def test_followup_mode_uses_its_own_state_and_wording(self) -> None:
@@ -1595,7 +1764,7 @@ class IncludeClosedDaysTests(unittest.TestCase):
         self.assertEqual(
             run.call_args.args[0],
             ["gh", "issue", "list", "--repo", "o/r", "--state", "open", "--limit", "50",
-             "--json", "number,title,url,body,comments,createdAt,updatedAt"],
+             "--json", "number,title,url,body,comments,createdAt,updatedAt,author"],
         )
         self.assertEqual(issues, [{"number": 1, "repo": "o/r"}])
 
