@@ -25,7 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "main-model-switch.py"
 MAIN = "zzzzzzzzzzzzzz-main-"
-SECRET = "sk-sentinel-do-not-print-7f3a"
+SENTINEL = "sentinel-value-7f3a-do-not-print"
 OLD_MODEL = "claude-old-model-1"
 NEW_MODEL = "claude-new-model-2"
 
@@ -155,7 +155,7 @@ class SwitchTestBase(unittest.TestCase):
             "CCC_AGENT_PROVIDER=claude\n"
             f"ANTHROPIC_MODEL={OLD_MODEL}\n"
             "CLAUDE_CODE_EFFORT_LEVEL=medium\n"
-            f"CLAUDE_CLI_PATH=/opt/fake/{SECRET}/claude\n"
+            f"CLAUDE_CLI_PATH=/opt/fake/{SENTINEL}/claude\n"
             'CCC_MODEL_LABEL="Old Model"\n',
             encoding="utf-8",
         )
@@ -177,7 +177,7 @@ class SwitchTestBase(unittest.TestCase):
         self.mx_drop = self._dropin("ccc-matrix-bridge.service", self.mx_env)
         self.hd_drop = self._dropin("ccc-hande-bridge.service", self.mx_env)
         (self.claude / "settings.json").write_text(
-            json.dumps({"model": OLD_MODEL, "env": {"X": SECRET}}, indent=2) + "\n"
+            json.dumps({"model": OLD_MODEL, "env": {"X": SENTINEL}}, indent=2) + "\n"
         )
         (self.claude / "settings.local.json").write_text(json.dumps({"theme": "dark"}) + "\n")
         sessions = {
@@ -224,7 +224,7 @@ class SwitchTestBase(unittest.TestCase):
             [sys.executable, str(SCRIPT), *base, *target, *args],
             capture_output=True, text=True, env=env, timeout=120, check=False,
         )
-        self.assertNotIn(SECRET, proc.stdout + proc.stderr)
+        self.assertNotIn(SENTINEL, proc.stdout + proc.stderr)
         return proc
 
     def _snapshot(self) -> dict[str, bytes]:
@@ -276,7 +276,7 @@ class SwitchTests(SwitchTestBase):
             self.assertEqual(self._env_value(env, "CLAUDE_CODE_EFFORT_LEVEL"), "high")
             self.assertEqual(self._env_value(env, "CCC_MODEL_LABEL"), '"New Model 2"')
             self.assertEqual(self._env_value(env, "CLAUDE_CLI_PATH"),
-                             f"/opt/fake/{SECRET}/claude")
+                             f"/opt/fake/{SENTINEL}/claude")
         self.assertFalse(self.tg_env.exists())
         self.assertFalse(self.mx_env.exists())
         backup = self._backup_dir()
@@ -291,7 +291,7 @@ class SwitchTests(SwitchTestBase):
         self.assertIn(str(self.hd_drop), paths)
         self.assertIn(str(self.mx_env), paths)
         self.assertIn(str(self.claude / "settings.json"), paths)
-        self.assertNotIn(SECRET, (backup / "manifest.json").read_text())
+        self.assertNotIn(SENTINEL, (backup / "manifest.json").read_text())
         calls = self._calls()
         self.assertIn(["daemon-reload"], calls)
         self.assertFalse(any(c[:1] == ["restart"] for c in calls))
@@ -300,7 +300,7 @@ class SwitchTests(SwitchTestBase):
         proc = self._run()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         settings = json.loads((self.claude / "settings.json").read_text())
-        self.assertEqual(settings, {"model": NEW_MODEL, "env": {"X": SECRET}})
+        self.assertEqual(settings, {"model": NEW_MODEL, "env": {"X": SENTINEL}})
         self.assertEqual(json.loads((self.claude / "settings.local.json").read_text()),
                          {"theme": "dark"})
         for d in self.data_dirs.values():
