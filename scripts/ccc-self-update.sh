@@ -619,40 +619,98 @@ restart_failure_summary() {
 # record once the operator has switched the bridge to the target generation
 # (report_pending_activation), because the operator probe's checkout-path
 # rule can never match a prepared runtime's source directory.
-#   CCC_SELF_UPDATE_SERVING_HEALTH_FILE (default: the idle-gate health file)
+#
+# Which health files identify the serving generation (#2558): every
+# allowlisted frontend's own file — telegram (HEALTH_FILE), matrix
+# (MATRIX_HEALTH_FILE), hande (HANDE_HEALTH_FILE) — mirroring the busy gate.
+# A node that retired its Telegram bridge keeps a frozen ~/.telegram_bot/
+# health.json with a dead pid; reading only that file made every tick
+# identity-unknown while Matrix already served the target. With no allowlist,
+# or none of the three frontends allowlisted (Termux external-restart nodes),
+# the single legacy HEALTH_FILE is used as before.
+#   CCC_SELF_UPDATE_SERVING_HEALTH_FILE (explicit override: that one file only)
 RESTART_BEGIN_EPOCH=0
-serving_head_since() { # <epoch>: print the full serving head, or return 1 when unknown
-  python3 - "${CCC_SELF_UPDATE_SERVING_HEALTH_FILE:-$HEALTH_FILE}" "$1" <<'PY_SERVING'
+serving_health_files() { # print "<label> <path>" lines
+  if [ -n "${CCC_SELF_UPDATE_SERVING_HEALTH_FILE:-}" ]; then
+    printf 'serving %s\n' "$CCC_SELF_UPDATE_SERVING_HEALTH_FILE"
+    return 0
+  fi
+  local any=0
+  if service_allowlisted ccc-telegram-bridge; then printf 'telegram %s\n' "$HEALTH_FILE"; any=1; fi
+  if service_allowlisted ccc-matrix-bridge; then printf 'matrix %s\n' "$MATRIX_HEALTH_FILE"; any=1; fi
+  if service_allowlisted ccc-hande-bridge; then printf 'hande %s\n' "$HANDE_HEALTH_FILE"; any=1; fi
+  [ "$any" = 1 ] || printf 'telegram %s\n' "$HEALTH_FILE"
+}
+# <epoch>: print the full serving head, or return 1 when unknown. Only files
+# written by a live process started at/after <epoch> with a full 40-hex head
+# count. When the live frontends disagree (one unit still on an old
+# generation) this logs `serving-generation result=partial` naming each one
+# and prints the distinct heads comma-joined, which never equals a target, so
+# callers report serving-mismatch instead of identity-unknown.
+serving_head_since() {
+  local label path out first
+  local -a args=()
+  while read -r label path; do
+    [ -n "$label" ] && [ -n "$path" ] && args+=("$label" "$path")
+  done < <(serving_health_files)
+  [ "${#args[@]}" -gt 0 ] || return 1
+  out="$(python3 - "$1" "${args[@]}" <<'PY_SERVING'
 import json, os, sys
 from datetime import datetime
-path, since = sys.argv[1], float(sys.argv[2])
-try:
-    if os.path.getsize(path) > 1024 * 1024:
-        sys.exit(1)
-    with open(path, encoding="utf-8") as handle:
-        data = json.load(handle)
-    started = datetime.fromisoformat(
-        str(data["process"]["started_at"]).replace("Z", "+00:00")
-    ).timestamp()
-    head = data["runtime_generation"]["source_git"]["head"]
-    pid = data["process"]["pid"]
-    if type(pid) is not int or pid <= 1:
-        sys.exit(1)
+since = float(sys.argv[1])
+pairs = sys.argv[2:]
+
+def serving_head(path):
     try:
-        os.kill(pid, 0)  # the writer must still be the live bridge
-    except PermissionError:
-        pass
-except Exception:
+        if os.path.getsize(path) > 1024 * 1024:
+            return None
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        started = datetime.fromisoformat(
+            str(data["process"]["started_at"]).replace("Z", "+00:00")
+        ).timestamp()
+        head = data["runtime_generation"]["source_git"]["head"]
+        pid = data["process"]["pid"]
+        if type(pid) is not int or pid <= 1:
+            return None
+        try:
+            os.kill(pid, 0)  # the writer must still be the live bridge
+        except PermissionError:
+            pass
+    except Exception:
+        return None
+    if (
+        started < since - 2
+        or not isinstance(head, str)
+        or len(head) != 40
+        or any(c not in "0123456789abcdef" for c in head)
+    ):
+        return None
+    return head
+
+found = []
+for i in range(0, len(pairs) - 1, 2):
+    head = serving_head(pairs[i + 1])
+    if head:
+        found.append((pairs[i], head))
+if not found:
     sys.exit(1)
-if (
-    started < since - 2
-    or not isinstance(head, str)
-    or len(head) != 40
-    or any(c not in "0123456789abcdef" for c in head)
-):
-    sys.exit(1)
-print(head)
+heads = sorted({head for _, head in found})
+if len(heads) == 1:
+    print(heads[0])
+else:
+    print("partial " + " ".join("%s=%s" % (label, head[:12]) for label, head in found))
+    print(",".join(heads))
 PY_SERVING
+)" || return 1
+  first="${out%%$'\n'*}"
+  case "$first" in
+    partial\ *)
+      log "serving-generation result=partial ${first#partial }"
+      printf '%s\n' "${out#*$'\n'}"
+      ;;
+    *) printf '%s\n' "$first" ;;
+  esac
 }
 
 run_external_restart() {
