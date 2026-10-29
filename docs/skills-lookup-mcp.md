@@ -111,6 +111,23 @@ server per session until someone re-ran the script. After the family step,
   guards as the family step; `--dry-run` only announces it; failure is a
   warning, never a failed install; `CCC_SETUP_WEB_MCP_LAUNCH=0` opts a node
   out.
+
+Codex counterpart (#2543): right after that step `setup.sh` runs
+`codex/mcp-launch-refresh.py` against `$CODEX_HOME/config.toml` (skipped when
+the file is absent). It rewrites only `[mcp_servers.searxng|firecrawl|context7]`
+tables that are exactly `command = "npx"` + `args = ["-y", "<pkg>[@ver]"]` to
+`command = "node"` + `args = ["<cli>"]`, and only when the runtime user's
+global install exists (`bin` from the package's `package.json`, as
+`global_cli()`; `npm root -g` resolved for the config owner's HOME, then
+`~/.local/lib/node_modules`; `--npm-root` overrides). Just those two lines
+change; the result is re-parsed with `tomllib` and must equal the original
+document apart from them before and after the write (otherwise rollback), a
+backup goes to `~/.claude/state/backups/codex-config.toml.before-mcp-pin-<date>`,
+and config/env values are never printed. Custom launches, other servers and
+`env` tables are untouched and nothing is added or installed; `--dry-run`
+names the servers that would change. Same opt-out, managed-checkout guard and
+non-fatal handling as the Claude step.
+
 Codex, Piri and Danso registration remains out of scope (see below). A running
 Claude session sees a new user-scope server only after it restarts; the
 bridge's owner-profile injection is unchanged.
