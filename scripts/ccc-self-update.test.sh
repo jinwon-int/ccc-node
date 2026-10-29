@@ -1516,8 +1516,10 @@ ok "healthy-old second tick keeps the pending record" '[ -f "$PENDING" ]'
 ok "healthy-old second tick does not page again for the same target (#2148)" \
   '! compgen -G "$TMP/spool/*SelfUpdate*.json" >/dev/null && grep -q "pending-activation notify=suppressed reason=already-notified target=$pending_target" "$STATE/self-update.log"'
 ok "healthy-old second tick keeps the once-per-target marker" '[ "$(head -n1 "$STATE/self-update.activation-notified")" = "$pending_target" ]'
+# Capture first: under pipefail, `status | grep -q` races — grep exits on the
+# match and status's trailing log tail can die of SIGPIPE (141).
 ok "status reports the pending activation read-only" \
-  'run_selfup status | grep -q "pending activation: INCOMPLETE target=${pending_target:0:7}"'
+  'grep -q "pending activation: INCOMPLETE target=${pending_target:0:7}" <<<"$(run_selfup status)"'
 
 # Capture a startup fixture once; probe reads this immutable identity instead of
 # relabeling an old process with the current checkout HEAD.
@@ -1573,6 +1575,49 @@ ok "unhealthy target never triggers an automatic restart" '[ ! -s "$TMP/systemct
 ok "unhealthy target keeps the pending record" '[ -f "$PENDING" ]'
 ok "unhealthy-target outcome is logged" 'grep -q "reason=target-unhealthy target=$pending_target serving=$pending_target" "$STATE/self-update.log"'
 rm -f "$CLAUDE/self-update.serving-generation-cmd" "$CLAUDE/self-update.health-cmd"
+
+# 11d2) #2558: a node that retired its Telegram bridge keeps a frozen
+# ~/.telegram_bot/health.json (dead pid, old head). The allowlisted Matrix and
+# hande frontends identify the serving generation instead, and a frontend left
+# on an old generation is a partial serving-mismatch, not identity-unknown.
+serving_health_2558() { # <file> <head> <pid>
+  python3 - "$1" "$2" "$3" <<'PY2558'
+import datetime, json, sys
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+json.dump({"updated_at": now, "process": {"pid": int(sys.argv[3]), "started_at": now},
+           "runtime_generation": {"source_git": {"head": sys.argv[2]}}}, open(sys.argv[1], "w"))
+PY2558
+}
+run_2558() {
+  (unset CCC_SELF_UPDATE_SERVING_HEALTH_FILE
+   CCC_SELF_UPDATE_HEALTH_FILE="$TMP/tg-health-2558.json" \
+   CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/matrix-health-2558.json" \
+   CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/hande-health-2558.json" \
+   run_selfup run 2>&1)
+}
+cp -p "$PENDING" "$TMP/pending-2558.bak"
+[ -e "$STATE/self-update.activation-notified" ] && cp -p "$STATE/self-update.activation-notified" "$TMP/notified-2558.bak"
+# shellcheck disable=SC2034  # old2558 is re-read via eval inside ok()
+old2558="$(git -C "$REPO" rev-parse HEAD~1)"
+serving_health_2558 "$TMP/tg-health-2558.json" "$old2558" $((2 ** 22 + 7))
+serving_health_2558 "$TMP/matrix-health-2558.json" "$pending_target" "$$"
+serving_health_2558 "$TMP/hande-health-2558.json" "$old2558" "$$"
+printf '%s\n' 'ccc-matrix-bridge.service' 'ccc-hande-bridge.service' '# ccc-telegram-bridge retired' > "$CLAUDE/self-update.services"
+: > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
+out="$(run_2558)"; rc=$?
+ok "#2558 one frontend on an old generation is a partial serving-mismatch, not identity-unknown" \
+  '[ "$rc" = 14 ] && grep -q "serving-generation result=partial matrix=${pending_target:0:12} hande=${old2558:0:12}" "$STATE/self-update.log" && grep -q "reason=serving-mismatch target=$pending_target" "$STATE/self-update.log" && ! grep -q "reason=identity-unknown" "$STATE/self-update.log"'
+ok "#2558 partial mismatch restarts nothing and keeps the pending record" '[ -f "$PENDING" ] && [ ! -s "$TMP/systemctl.calls" ]'
+serving_health_2558 "$TMP/hande-health-2558.json" "$pending_target" "$$"
+: > "$STATE/self-update.log"
+out="$(run_2558)"; rc=$?
+ok "#2558 dead telegram health is ignored; matrix+hande serving the target reconcile" \
+  '[ "$rc" = 0 ] && grep -q "pending-activation result=reconciled target=$pending_target serving=$pending_target" "$STATE/self-update.log" && jq -e ".outcome == \"activated\"" "$PENDING" >/dev/null'
+ok "#2558 reconciliation restarts nothing" '[ ! -s "$TMP/systemctl.calls" ]'
+cp -p "$TMP/pending-2558.bak" "$PENDING"
+[ -e "$TMP/notified-2558.bak" ] && cp -p "$TMP/notified-2558.bak" "$STATE/self-update.activation-notified"
+rm -f "$TMP"/*-health-2558.json "$TMP/pending-2558.bak" "$TMP/notified-2558.bak"
+printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
 
 # 11e) corrupted / unsafe record shapes fail closed and never auto-delete.
 mv "$PENDING" "$TMP/pending.bak"
