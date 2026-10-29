@@ -21,7 +21,7 @@
 # Usage:
 #   service-systemd.sh install   --project-root <dir> [--proxy-url <url>] [--caller <name>]
 #   service-systemd.sh reconcile [--dry-run]
-#   service-systemd.sh memory-guard [--dry-run]
+#   service-systemd.sh memory-guard [--dry-run] [--remove]
 #   service-systemd.sh uninstall [--caller <name>]
 #
 # Memory guard (#1877): install also writes <unit>.d/10-ccc-memory-guard.conf
@@ -30,12 +30,22 @@
 # bridge cgroup instead of taking the whole unit (and every in-flight session)
 # down with it. `memory-guard` writes the same drop-in for an ALREADY installed
 # unit (any BRIDGE_SERVICE_NAME, e.g. ccc-matrix-bridge) and daemon-reloads
-# without restarting. reconcile never touches it. Hosts without systemd (Termux)
-# never reach this script's unit paths.
+# without restarting. daemon-reload alone leaves a RUNNING unit's cgroup at
+# memory.high/max=max until its next start (#2545), so when the unit is active
+# memory-guard also applies the same limits with `systemctl set-property
+# --runtime` (percentages resolved to bytes from MemTotal) and prints the
+# effective /sys/fs/cgroup/<ControlGroup>/memory.{high,max}; a cgroup still at
+# `max` is reported as NOT applied and exits 1. `memory-guard --remove` is the
+# rollback: it removes the generated drop-in, daemon-reloads and, on an active
+# unit, clears the runtime limits (MemoryHigh=infinity MemoryMax=infinity).
+# reconcile never touches it. Hosts without systemd (Termux) never reach this
+# script's unit paths.
 #   CCC_BRIDGE_MEMORY_GUARD=0  install: skip the drop-in
 #   CCC_BRIDGE_MEMORY_HIGH     MemoryHigh= value (default 50%)
 #   CCC_BRIDGE_MEMORY_MAX      MemoryMax= value (default 75%)
 #   Values: 1%..100%, bytes with optional K/M/G/T suffix, or infinity.
+#   The 50%/75% defaults suit large hosts; on a ~3 GB node 50% (~1.5 GB) can
+#   throttle normal sessions, so set explicit per-node values there first.
 #
 # Inputs (resolved by start.sh when dispatched from there):
 #   --project-root  absolute project path (was $PROJECT_ROOT); install only
@@ -50,10 +60,15 @@
 #   CCC_SYSTEMCTL      systemctl command override (default: systemctl)
 #   CCC_SYSTEMD_SCOPE  scope override accepted only with CCC_SYSTEMD_DIR
 #                      (system|user; tests only)
+#   CCC_CGROUP_ROOT    cgroup v2 mount for memory-guard verification
+#                      (default: /sys/fs/cgroup)
+#   CCC_MEMINFO_FILE   MemTotal source for percent limits (default: /proc/meminfo)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSTEMCTL_BIN="${CCC_SYSTEMCTL:-systemctl}"
+CGROUP_ROOT="${CCC_CGROUP_ROOT:-/sys/fs/cgroup}"
+MEMINFO_FILE="${CCC_MEMINFO_FILE:-/proc/meminfo}"
 
 usage() {
     cat <<EOF
@@ -67,7 +82,10 @@ Subcommands:
   memory-guard
               Write the bridge memory-guard drop-in (MemoryHigh/MemoryMax,
               OOMPolicy=continue) for an installed unit and daemon-reload
-              without restarting it (#1877)
+              without restarting it (#1877); an active unit also gets the
+              limits via set-property --runtime and the effective cgroup
+              memory.high/max are verified (#2545). With --remove: delete the
+              generated drop-in and clear the runtime limits (rollback)
   uninstall   Disable the service and remove the unit
   is-managed  Exit 0 iff the bridge unit file exists and systemctl reports it
               active (used by start.sh --restart to avoid supervisor fights)
@@ -82,6 +100,7 @@ Options:
   --caller <name>       Script name shown in usage hints
   --dry-run             Report reconcile/memory-guard actions without writing
                         or systemctl
+  --remove              memory-guard only: roll the guard back instead
   --allow-relocate      Let reconcile move the unit onto THIS checkout even when
                         the installed unit points at a different one. Off by
                         default: relocation is a deliberate act, not drift.
@@ -95,6 +114,7 @@ PROXY_URL_ARG=""
 CALLER=""
 DRY_RUN=0
 ALLOW_RELOCATE=0
+REMOVE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -125,6 +145,10 @@ while [ $# -gt 0 ]; do
             ALLOW_RELOCATE=1
             shift
             ;;
+        --remove)
+            REMOVE=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -143,6 +167,10 @@ if [ -z "$SUBCOMMAND" ]; then
 fi
 if [ "$DRY_RUN" = "1" ] && [ "$SUBCOMMAND" != "reconcile" ] && [ "$SUBCOMMAND" != "memory-guard" ]; then
     echo "❌ Error: --dry-run is supported only with reconcile and memory-guard" >&2
+    exit 1
+fi
+if [ "$REMOVE" = "1" ] && [ "$SUBCOMMAND" != "memory-guard" ]; then
+    echo "❌ Error: --remove is supported only with memory-guard" >&2
     exit 1
 fi
 if [ "$ALLOW_RELOCATE" = "1" ] && [ "$SUBCOMMAND" != "reconcile" ]; then
@@ -309,18 +337,53 @@ memory_limit_kind() {
     fi
 }
 
+# awk helper shared by the byte comparisons/conversions below (awk doubles:
+# no shell integer overflow; exact up to 2^53 bytes).
+MEMORY_BYTES_AWK='function bytes(v,  n, u) {
+    n = v; u = substr(v, length(v), 1)
+    if (u ~ /[KMGT]/) n = substr(v, 1, length(v) - 1); else u = ""
+    n += 0
+    if (u == "K") n *= 1024
+    else if (u == "M") n *= 1048576
+    else if (u == "G") n *= 1073741824
+    else if (u == "T") n *= 1099511627776
+    return n
+}'
+
 memory_limit_not_above() {
-    # True when absolute limit $1 <= $2 (awk doubles: no shell overflow).
-    awk -v a="$1" -v b="$2" 'function bytes(v,  n, u) {
-        n = v; u = substr(v, length(v), 1)
-        if (u ~ /[KMGT]/) n = substr(v, 1, length(v) - 1); else u = ""
-        n += 0
-        if (u == "K") n *= 1024
-        else if (u == "M") n *= 1048576
-        else if (u == "G") n *= 1073741824
-        else if (u == "T") n *= 1099511627776
-        return n
-    } BEGIN { exit !(bytes(a) <= bytes(b)) }'
+    # True when absolute limit $1 <= $2.
+    awk -v a="$1" -v b="$2" "$MEMORY_BYTES_AWK"' BEGIN { exit !(bytes(a) <= bytes(b)) }'
+}
+
+host_memtotal_bytes() {
+    # MemTotal in bytes — the same quantity systemd scales percent limits by.
+    local kb
+    kb="$(awk '$1 == "MemTotal:" { print $2; exit }' "$MEMINFO_FILE" 2>/dev/null)"
+    [[ "$kb" =~ ^[1-9][0-9]*$ ]] || return 1
+    awk -v kb="$kb" 'BEGIN { printf "%.0f\n", kb * 1024 }'
+}
+
+memory_limit_runtime_value() {
+    # Resolve one validated limit to the value handed to set-property --runtime:
+    # bytes (percent of MemTotal, page-aligned down) or infinity.
+    #
+    # Why not read back `systemctl show -p MemoryHigh -p MemoryMax` after the
+    # reload: show reports the MERGED config, and every earlier set-property
+    # --runtime left /run/systemd/system.control/<unit>.d/50-Memory*.conf,
+    # which sorts after 10-ccc-memory-guard.conf. On a rerun with new
+    # CCC_BRIDGE_MEMORY_* values show would echo the stale runtime limit back,
+    # so the values just written are resolved here instead.
+    local value="$1" kind total
+    kind="$(memory_limit_kind "$value")" || return 1
+    case "$kind" in
+        infinity) echo infinity ;;
+        bytes) awk -v v="$value" "$MEMORY_BYTES_AWK"' BEGIN { printf "%.0f\n", bytes(v) }' ;;
+        percent)
+            total="$(host_memtotal_bytes)" || return 1
+            awk -v t="$total" -v p="${value%\%}" \
+                'BEGIN { b = t * p / 100; b -= b % 4096; printf "%.0f\n", b }'
+            ;;
+    esac
 }
 
 resolve_memory_guard() {
@@ -397,8 +460,97 @@ remove_memory_guard_dropin() {
     rmdir -- "$dropin_dir" 2>/dev/null || true
 }
 
+memory_guard_unit_active() {
+    "${SYSTEMCTL[@]}" is-active --quiet "$SYSTEMD_SERVICE" 2>/dev/null
+}
+
+memory_guard_set_runtime() {
+    # set-property --runtime on the RUNNING unit: no restart, MainPID kept. The
+    # values land in /run/systemd/system.control (gone at reboot, when the
+    # drop-in alone carries them). Returns 1 on failure.
+    local high="$1" max="$2"
+    if ! "${SYSTEMCTL[@]}" set-property --runtime "$SYSTEMD_SERVICE" \
+            "MemoryHigh=$high" "MemoryMax=$max"; then
+        echo "❌ ${SYSTEMCTL[*]} set-property --runtime $SYSTEMD_SERVICE MemoryHigh=$high MemoryMax=$max failed" >&2
+        return 1
+    fi
+    echo "🛡️  runtime limits set without restart: ${SYSTEMCTL[*]} set-property --runtime $SYSTEMD_SERVICE MemoryHigh=$high MemoryMax=$max"
+}
+
+memory_guard_verify_cgroup() {
+    # Print the effective cgroup memory.high/max of the running unit and
+    # compare with what was requested ($1/$2: bytes or infinity). A cgroup still
+    # at `max` while a limit was requested is the #2545 half-applied state.
+    # Returns 1 only for that state; unverifiable hosts are reported, not failed.
+    local want_high="$1" want_max="$2" cg dir high max rc=0
+    cg="$("${SYSTEMCTL[@]}" show "$SYSTEMD_SERVICE" -p ControlGroup --value 2>/dev/null)"
+    if [ -z "$cg" ]; then
+        echo "⚪ cgroup verification skipped: $SYSTEMD_SERVICE reports no ControlGroup"
+        return 0
+    fi
+    dir="$CGROUP_ROOT$cg"
+    if [ ! -r "$dir/memory.max" ] || [ ! -r "$dir/memory.high" ]; then
+        echo "⚠️  cgroup verification unavailable: $dir/memory.{high,max} not readable (cgroup v1 or no memory controller)"
+        return 0
+    fi
+    high="$(head -n 1 "$dir/memory.high" 2>/dev/null)"
+    max="$(head -n 1 "$dir/memory.max" 2>/dev/null)"
+    echo "🔎 effective cgroup $dir: memory.high=$high memory.max=$max"
+    if [ "$want_high" != "infinity" ] && [ "$high" = "max" ]; then
+        echo "❌ memory.high is still 'max' — MemoryHigh NOT applied to the running cgroup" >&2
+        rc=1
+    fi
+    if [ "$want_max" != "infinity" ] && [ "$max" = "max" ]; then
+        echo "❌ memory.max is still 'max' — MemoryMax NOT applied to the running cgroup" >&2
+        rc=1
+    fi
+    if [ "$want_high" = "infinity" ] && [ "$high" != "max" ]; then
+        echo "⚠️  memory.high=$high but MemoryHigh=infinity was requested (another drop-in or runtime override?)"
+    fi
+    if [ "$want_max" = "infinity" ] && [ "$max" != "max" ]; then
+        echo "⚠️  memory.max=$max but MemoryMax=infinity was requested (another drop-in or runtime override?)"
+    fi
+    return "$rc"
+}
+
+do_memory_guard_remove_systemd() {
+    # Rollback mirror of memory-guard: drop the generated file, daemon-reload,
+    # and clear the runtime limits on an active unit. OOMPolicy returns to the
+    # unit default (stop) with the reload. A foreign file is never touched.
+    local dropin="$SYSTEMD_UNIT_FILE.d/$MEMORY_GUARD_DROPIN_NAME"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] would remove $dropin (only if generated by ccc-node)"
+        echo "[dry-run] then run: ${SYSTEMCTL[*]} daemon-reload (no stop, start, or restart)"
+        echo "[dry-run] and, if $SYSTEMD_SERVICE is active: ${SYSTEMCTL[*]} set-property --runtime $SYSTEMD_SERVICE MemoryHigh=infinity MemoryMax=infinity"
+        exit 0
+    fi
+    if [ -e "$dropin" ] || [ -L "$dropin" ]; then
+        if [ -L "$dropin" ] || [ ! -f "$dropin" ] \
+           || [ "$(head -n 1 "$dropin" 2>/dev/null)" != "$MEMORY_GUARD_MARKER" ]; then
+            echo "⚠️  $dropin exists and was not generated by ccc-node; left untouched" >&2
+            exit 1
+        fi
+        remove_memory_guard_dropin
+        echo "🗑️  removed memory guard drop-in: $dropin"
+    else
+        echo "⚪ no memory guard drop-in to remove: $dropin"
+    fi
+    if ! "${SYSTEMCTL[@]}" daemon-reload; then
+        echo "❌ daemon-reload failed after removing the drop-in" >&2
+        exit 1
+    fi
+    if ! memory_guard_unit_active; then
+        echo "⚪ $SYSTEMD_SERVICE is not active; no runtime limits to clear"
+        exit 0
+    fi
+    memory_guard_set_runtime infinity infinity || exit 1
+    memory_guard_verify_cgroup infinity infinity || true
+    echo "✅ memory guard rolled back without restart (runtime infinity stays in system.control until reboot)"
+    exit 0
+}
+
 do_memory_guard_systemd() {
-    resolve_memory_guard
+    [ "$REMOVE" = "1" ] || resolve_memory_guard
     systemd_paths
     if [ -z "${CCC_SYSTEMD_DIR:-}" ] && ! command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1; then
         echo "⚪ systemctl not found — no systemd on this host; memory guard not applicable"
@@ -408,32 +560,58 @@ do_memory_guard_systemd() {
         echo "⚪ systemd unit not installed; memory guard skipped: $SYSTEMD_UNIT_FILE"
         exit 0
     fi
+    [ "$REMOVE" = "1" ] && do_memory_guard_remove_systemd
     local dropin="$SYSTEMD_UNIT_FILE.d/$MEMORY_GUARD_DROPIN_NAME"
+    local runtime_high runtime_max
+    if ! runtime_high="$(memory_limit_runtime_value "$MEMORY_GUARD_HIGH")" \
+       || ! runtime_max="$(memory_limit_runtime_value "$MEMORY_GUARD_MAX")"; then
+        echo "❌ Error: cannot resolve MemoryHigh=$MEMORY_GUARD_HIGH / MemoryMax=$MEMORY_GUARD_MAX to bytes (MemTotal unreadable in $MEMINFO_FILE); nothing written" >&2
+        exit 1
+    fi
     if [ "$DRY_RUN" = "1" ]; then
         echo "[dry-run] would write $dropin:"
         render_memory_guard_dropin | sed 's/^/[dry-run]   /'
         echo "[dry-run] then run: ${SYSTEMCTL[*]} daemon-reload (no stop, start, or restart)"
+        echo "[dry-run] and, if $SYSTEMD_SERVICE is active: ${SYSTEMCTL[*]} set-property --runtime $SYSTEMD_SERVICE MemoryHigh=$runtime_high MemoryMax=$runtime_max"
         exit 0
     fi
     local status=0
     write_memory_guard_dropin || status=$?
     case "$status" in
         2)
-            echo "✅ memory guard already current; left untouched: $dropin"
-            exit 0
+            # The file can be current while the running cgroup is not (a
+            # drop-in written by an older memory-guard that only reloaded), so
+            # fall through to the runtime step instead of exiting here.
+            echo "✅ memory guard drop-in already current; left untouched: $dropin"
             ;;
         3) exit 1 ;;
-        0) ;;
+        0)
+            if ! command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || ! "${SYSTEMCTL[@]}" daemon-reload; then
+                echo "❌ daemon-reload failed; drop-in written but not yet loaded: $dropin" >&2
+                exit 1
+            fi
+            echo "✅ memory guard installed (MemoryHigh=$MEMORY_GUARD_HIGH MemoryMax=$MEMORY_GUARD_MAX OOMPolicy=continue); service not restarted: $dropin"
+            ;;
         *)
             echo "❌ Failed to write memory guard drop-in: $dropin" >&2
             exit 1
             ;;
     esac
-    if ! command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || ! "${SYSTEMCTL[@]}" daemon-reload; then
-        echo "❌ daemon-reload failed; drop-in written but not yet loaded: $dropin" >&2
-        exit 1
+    # daemon-reload does not push MemoryHigh/MemoryMax into a running cgroup
+    # (#2545: a live bridge stayed at memory.high/max=max after the reload).
+    if ! memory_guard_unit_active; then
+        echo "⚪ $SYSTEMD_SERVICE is not active; the limits apply on its next start (no runtime change)"
+        # A runtime value from an earlier set-property (e.g. memory-guard
+        # --remove) sorts after the drop-in and would win at that start.
+        local loaded_max
+        loaded_max="$("${SYSTEMCTL[@]}" show "$SYSTEMD_SERVICE" -p MemoryMax --value 2>/dev/null)"
+        if [ "$runtime_max" != "infinity" ] && [ "$loaded_max" = "infinity" ]; then
+            echo "⚠️  loaded MemoryMax=infinity: a runtime override in system.control shadows the drop-in until reboot; start the unit and rerun memory-guard" >&2
+        fi
+        exit 0
     fi
-    echo "✅ memory guard installed (MemoryHigh=$MEMORY_GUARD_HIGH MemoryMax=$MEMORY_GUARD_MAX OOMPolicy=continue); service not restarted: $dropin"
+    memory_guard_set_runtime "$runtime_high" "$runtime_max" || exit 1
+    memory_guard_verify_cgroup "$runtime_high" "$runtime_max" || exit 1
     exit 0
 }
 

@@ -1192,6 +1192,7 @@ class Doctor:
         self.check_bridge_runtime_config()
         self.check_bridge_status()
         self.check_bridge_boot_path()
+        self.check_bridge_memory_guard()
         self.check_continuation_state()
         self.check_session_scope_rows()
         self.check_memory_cache()
@@ -2315,6 +2316,174 @@ class Doctor:
                 f"bridge runs from {running} but no unit declares it",
                 "nothing restarts the bridge on reboot; install the systemd unit if this node should self-start",
             )
+
+    # #1877 drop-in written by bridge/service-systemd.sh (install / memory-guard).
+    MEMORY_GUARD_DROPIN = "10-ccc-memory-guard.conf"
+    BRIDGE_UNIT_RE = re.compile(r"^ccc-[a-z0-9-]*bridge[a-z0-9-]*\.service$")
+
+    def bridge_memory_guard_unit_dirs(self) -> list[tuple[Path, str, bool]]:
+        """(unit dir, scope, runtime-queryable) for the bridge memory-guard check.
+
+        ``CCC_DOCTOR_BRIDGE_UNIT_DIRS`` (``os.pathsep``-separated) replaces the
+        scanned directories and is treated as system scope (test seam). Other
+        accounts' user units are inspected for the drop-in only: this account's
+        ``systemctl --user`` cannot see their runtime state.
+        """
+        override = os.environ.get("CCC_DOCTOR_BRIDGE_UNIT_DIRS")
+        if override is not None:
+            return [(Path(part), "system", True) for part in override.split(os.pathsep) if part]
+        own_user = Path.home() / ".config/systemd/user"
+        dirs: list[tuple[Path, str, bool]] = [
+            (Path("/etc/systemd/system"), "system", True),
+            (own_user, "user", True),
+        ]
+        for other in sorted(Path("/home").glob("*/.config/systemd/user")):
+            if other != own_user:
+                dirs.append((other, "user", False))
+        return dirs
+
+    def _systemctl_show(self, scope: str, unit: str, props: list[str]) -> dict[str, str] | None:
+        """Read-only ``systemctl show``; None when it cannot be asked or fails."""
+        binary = os.environ.get("CCC_DOCTOR_SYSTEMCTL_BIN", "systemctl")
+        executable = shutil.which(binary) if binary else None
+        if not executable:
+            return None
+        args = [executable] + (["--user"] if scope == "user" else []) + ["show", unit]
+        for prop in props:
+            args += ["-p", prop]
+        timeout = subprocess_timeout()
+        try:
+            proc = subprocess.run(
+                args, text=True, capture_output=True, stdin=subprocess.DEVNULL,
+                check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            self.note_timeout(f"systemctl show {unit}", timeout)
+            return None
+        except OSError:
+            return None
+        if proc.returncode != 0:
+            return None
+        values: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                values[key.strip()] = value.strip()
+        return values
+
+    @staticmethod
+    def _memory_guard_wanted(text: str) -> dict[str, str]:
+        """Last MemoryHigh=/MemoryMax= assignment in a drop-in (systemd semantics)."""
+        wanted: dict[str, str] = {}
+        for raw in text.splitlines():
+            key, sep, value = raw.strip().partition("=")
+            if sep and key in ("MemoryHigh", "MemoryMax"):
+                wanted[key] = value.strip()
+        return wanted
+
+    @staticmethod
+    def _cgroup_value_label(value: str) -> str:
+        return f"{int(value) // 1048576}M" if value.isdigit() else value
+
+    def check_bridge_memory_guard(self) -> None:
+        """Bridge units carry the #1877 memory guard, and it reached the running cgroup.
+
+        Two silent gaps (#2545): no ``10-ccc-memory-guard.conf`` at all (one
+        runaway child OOM-kills the whole bridge unit, 2026-09-25), and a
+        drop-in that was only daemon-reloaded, which leaves an ACTIVE unit's
+        cgroup at memory.high/max=max until restart. Read-only: unit files,
+        ``systemctl show`` and the cgroup files. Non-systemd hosts (Termux) skip.
+        """
+        item = "bridge memory guard"
+        override = os.environ.get("CCC_DOCTOR_BRIDGE_UNIT_DIRS")
+        if override is None and not self.has_systemd():
+            self.add("정상", item, "해당 없음 (no systemd on this host)", "none")
+            return
+        units: list[tuple[Path, str, bool]] = []
+        for unit_dir, scope, queryable in self.bridge_memory_guard_unit_dirs():
+            try:
+                candidates = sorted(unit_dir.glob("ccc-*bridge*.service"))
+            except OSError:
+                continue
+            for unit in candidates:
+                if self.BRIDGE_UNIT_RE.match(unit.name) and unit.is_file():
+                    units.append((unit, scope, queryable))
+        if not units:
+            self.add("정상", item, "no bridge systemd unit found", "none")
+            return
+        for unit, scope, queryable in units:
+            self._check_unit_memory_guard(unit, scope, queryable)
+
+    def _check_unit_memory_guard(self, unit: Path, scope: str, queryable: bool) -> None:
+        name = unit.name
+        label = f"bridge memory guard ({name}{' [user]' if scope == 'user' else ''})"
+        rerun = (
+            f"BRIDGE_SERVICE_NAME={name[: -len('.service')]} bridge/service-systemd.sh "
+            "memory-guard (no restart; ~3 GB nodes: set CCC_BRIDGE_MEMORY_HIGH/MAX first, #2545)"
+        )
+        dropin = unit.parent / f"{name}.d" / self.MEMORY_GUARD_DROPIN
+        try:
+            text = _read_regular_text(dropin)
+        except (OSError, UnicodeError):
+            text = None
+        if text is None:
+            self.add(
+                "경고", label,
+                "no memory guard drop-in (MemoryHigh/MemoryMax unset, OOMPolicy=stop)",
+                f"run {rerun}",
+            )
+            return
+        if not queryable:
+            self.add("정상", label, "drop-in present; runtime not checked (another account's user unit)", "none")
+            return
+        props = self._systemctl_show(scope, name, ["ActiveState", "ControlGroup"])
+        if props is None:
+            self.add(
+                "경고", label, "drop-in present; 확인 불가 (systemctl show failed)",
+                f"inspect with: systemctl {'--user ' if scope == 'user' else ''}show {name} -p ActiveState -p ControlGroup",
+            )
+            return
+        state = props.get("ActiveState") or "unknown"
+        if state != "active":
+            self.add("정상", label, f"drop-in present; unit {state} (limits apply at next start)", "none")
+            return
+        cgroup = props.get("ControlGroup") or ""
+        if not cgroup:
+            self.add("정상", label, "drop-in present; active unit reports no ControlGroup", "none")
+            return
+        root = Path(os.environ.get("CCC_DOCTOR_CGROUP_ROOT") or "/sys/fs/cgroup")
+        cg_dir = root / cgroup.lstrip("/")
+        current: dict[str, str] = {}
+        for key, filename in (("MemoryHigh", "memory.high"), ("MemoryMax", "memory.max")):
+            try:
+                value = _read_regular_text(cg_dir / filename)
+            except (OSError, UnicodeError):
+                value = None
+            if value is None:
+                self.add(
+                    "정상", label,
+                    "drop-in present; cgroup v2 memory files unavailable (runtime not verified)",
+                    "none",
+                )
+                return
+            current[key] = value.strip()
+        wanted = self._memory_guard_wanted(text)
+        unapplied = [
+            key for key in ("MemoryHigh", "MemoryMax")
+            if current[key] == "max" and wanted.get(key, "") != "infinity"
+        ]
+        shown = (
+            f"memory.high={self._cgroup_value_label(current['MemoryHigh'])} "
+            f"memory.max={self._cgroup_value_label(current['MemoryMax'])}"
+        )
+        if unapplied:
+            self.add(
+                "경고", label,
+                f"drop-in present but running cgroup {shown} — {'/'.join(unapplied)} not applied (daemon-reload only)",
+                f"rerun {rerun}; it applies the limits with set-property --runtime",
+            )
+            return
+        self.add("정상", label, f"guard applied to running cgroup ({shown})", "none")
 
     def _served_project_root(self) -> Path:
         """Bridge home this doctor diagnoses: override, live same-checkout home, or HOME.
