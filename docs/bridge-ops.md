@@ -219,9 +219,69 @@ The guard inspects loaded `ccc-*` and `native-relay-*` services by default
 that is not loaded is not seen, so daemon-reload after editing drop-ins. It
 prints paths only, never env file contents; `--json` gives a machine-readable
 report for scripts. `--user <name>` uses `systemctl --user -M <name>@`, or plain
-`--user` when `<name>` is the caller (`-M` needs systemd-machined). Model-switch
-scripts are node-local, so they should call `users` before their `mv` and
-`check` after their daemon-reload rather than re-implementing the scan.
+`--user` when `<name>` is the caller (`-M` needs systemd-machined). The main
+model switch is `scripts/main-model-switch.py` (next section), which calls
+`users` before its `mv` and `check` after its daemon-reload; any other script
+that retires env files should do the same rather than re-implementing the scan.
+
+## Main model switch
+
+Switch the bridges' main Claude model with `scripts/main-model-switch.py`
+(#2557), not with a node-local `apply.sh`. It finds every
+`ccc-*-bridge.service.d/` holding a `zzzzzzzzzzzzzz-main-*.conf` drop-in, so a
+hande unit whose drop-in is the copy of the Matrix one is switched together
+with Matrix. For each env file in `/root/.config/ccc-main/` that such a drop-in
+references, it writes `<channel>-<slug>.env` with only `ANTHROPIC_MODEL`,
+`CLAUDE_CODE_EFFORT_LEVEL` and `CCC_MODEL_LABEL` changed (0600). It then rewrites
+**every** main drop-in that pointed at the old file to
+`zzzzzzzzzzzzzz-main-<slug>.conf`. Other drop-ins (`provider.conf`,
+`*-model-parity.conf`, ...) are left alone. The script also updates `"model"` in
+`~/.claude/settings.json` / `settings.local.json` when the key is there. In
+`~/.telegram_bot`, `~/.ccc-matrix` and `~/.ccc-hande` `sessions.json` it updates
+the per-chat `model` (and `effort`, if the chat pinned one) of claude-provider
+chats on a `claude-*` model. The A2A worker model (`A2A_CLAUDE_MODEL`) is out of
+scope.
+
+1. Preview. This writes nothing and prints only paths plus the model id,
+   effort and label being set, never env contents:
+
+   ```bash
+   python3 <checkout>/scripts/main-model-switch.py --model <id> --effort high \
+     --label "<label>" --slug <e.g. fable51-high> --dry-run
+   ```
+
+2. Apply: run the same command without `--dry-run`. `env-file-guard.py check`
+   must pass first; otherwise nothing is changed (exit 2). The script copies
+   every file it touches to `~/.ccc-node/backups/main-<slug>-<node>-<ts>/files/`
+   and lists them in `manifest.json`. Then it writes the new files and runs
+   `daemon-reload`. An old env file moves to that dir's `retired/` only when
+   `env-file-guard.py users <old>` exits 0; a file another unit still uses is
+   kept and reported. If the final `check` fails, everything is rolled back and
+   the script exits 1. A re-run on the same slug changes nothing.
+3. Restart. The script does not restart by default. It prints
+   `bridge-idle-gate.py --unit <u> && systemctl restart <u>` for each active
+   unit that is not already running the model. A restart is an owner-approved
+   step. `--restart` does it for you: each unit waits for the idle gate (at most
+   `--idle-timeout`, default 1800 s), is stopped, gets its own `sessions.json`
+   re-applied while down, is started, and must show the new
+   `ANTHROPIC_MODEL` in `/proc/<MainPID>/environ`. A failure exits 1 and prints
+   the rollback command; nothing is rolled back automatically. The script
+   refuses to restart the unit it is running inside. From a bridge chat,
+   detach it first, for example
+   `systemd-run --unit=main-model-switch --collect python3 ... --restart`
+   (see the `bridge-detached-self-restart` skill).
+4. Roll back with
+   `python3 <checkout>/scripts/main-model-switch.py --rollback <backup-dir>`.
+   Every new drop-in also names this command in its header comment. It
+   restores the recorded drop-ins, env files, settings and sessions, runs
+   `daemon-reload` and `env-file-guard.py check`, and lists the units to
+   restart.
+
+A running bridge keeps its sessions in memory and writes them back on
+shutdown, which can overwrite the per-chat update made before the restart.
+`--restart` therefore runs stop → re-apply that unit's `sessions.json` → start
+(the order the old node-local `apply.sh` used). After a manual
+`systemctl restart`, re-run the same switch once (it is idempotent).
 
 ## Health evidence
 

@@ -183,6 +183,10 @@ grep -q "^Environment=CCC_HANDE_CONFIG_PATH=" <<<"$unit_body" || die "unit trans
 write_file "$UNIT_DIR/$UNIT_NAME" 0644 <<<"$unit_body"
 
 # drop-ins: provider / profile parity, minus the ones that must not run twice
+# The copied main-model drop-in (zzzzzzzzzzzzzz-main-*.conf) keeps pointing at the
+# MATRIX env file in /root/.config/ccc-main. Model switches must therefore go
+# through scripts/main-model-switch.py (#2557), which repoints every unit that
+# shares that env file before retiring it -- never a node-local apply.sh (#2571).
 dropin_src="$UNIT_DIR/$CLONE.d"
 dropin_dst="$UNIT_DIR/$UNIT_NAME.d"
 copied=0 skipped=0
