@@ -237,7 +237,8 @@ jobs:
             scripts/danso_native_memory_test.py \
             scripts/journal_silence_watch_test.py \
             scripts/bridge_idle_gate_test.py \
-            scripts/env_file_guard_test.py
+            scripts/env_file_guard_test.py \
+            scripts/main_model_switch_test.py
 
   secret-scan:
     name: secret-scan
