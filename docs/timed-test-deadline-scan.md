@@ -6,6 +6,10 @@ comment. `scripts/install-timed-test-deadline-scan-cron.sh` runs it three times 
 The opt-in `--mode followup` also reports follow-ups promised by a verdict that
 are past due with nothing posted after them; `scripts/install-timed-followup-scan-cron.sh`
 runs it once a day (see below).
+`--mode relative` reports timed tests written only in relative terms ("며칠",
+"1~2주", "T+24h") with no absolute datetime;
+`scripts/install-timed-relative-scan-cron.sh` runs it once a day next to the
+expired scan (#2544, see below).
 
 ## Install
 
@@ -99,6 +103,98 @@ and appends to `~/.claude/state/timed-followup-scan.cron.log`.
   reverse), because the block parser and ccc-doctor match markers as
   substrings. Installing or removing either lane leaves the other's block
   alone. ccc-doctor reports it as `cron gen timed-followup-scan`.
+
+## Relative mode (#2544)
+
+`--mode relative` reports `relative-duration-only`: a paragraph with a
+relative duration (`며칠`, `몇 일`, `수일`, `1~2주`, `몇 주`, `당분간`,
+`a few days`, `T+24h`, `24시간 후`, `48h 관측`, …) and no absolute date in the
+same paragraph. The rule is broken at write time, so the expired scan can
+never catch these.
+
+The 2026-10-27 audit measured 7 false positives in 10 findings. Those shapes
+are demoted to low confidence (`weak_reason`), not dropped: they stay in the
+log, and the installed `--notify high` leaves them out of the owner notice.
+One undemoted paragraph keeps the whole issue high; the demoted ones are listed
+under `dropped_candidates`. Checked in this order:
+
+| reason code | rule | measured on |
+|---|---|---|
+| `external-author` | the issue body or comment was written by a non-fleet login (fleet: `jinon86`, `seoseo-ai`, the dependabot / jinwon-deps-bot / github-actions bots). An item with no author data counts as fleet. | esp32-iphone-agent#77 |
+| `quoted-term` | every relative term sits inside quotes (`"…"`, `'…'`, `“…”`, `「…」`), inline code, or a fenced code block: rule text or a citation, not a booking | family-messenger#179 |
+| `checkbox-verdict-recorded` | a task-list item (`- [ ]`, `- [x]`), and a strict verdict comment (first-line conclusion or a `판정:`/`Verdict:` label line, as in follow-up mode) was posted after it | family-messenger#167 |
+| `operational-wording` | the term is `당분간` (a standing arrangement) | esp32-iphone-agent#74, #60, ccc-node#1864 |
+| `planning-estimate` | an effort estimate: a planning noun (`스파이크`, `구현`, `개발`, `작업`, `일정`, `spike`, `estimate`, …) within 15 characters before the term, or the term alone in brackets after a plan item (`**D. 푸시**(1~2주)`) | family-messenger#271 |
+| `process-duration` | how long an outside procedure takes: `소요`/`걸림`/`takes` right after the term, or `심사`/`발급`/`배송`/`review` just before it | family-messenger#338, #584 |
+
+The last three judge the wording, so they never apply when the paragraph names
+an observation (`관찰`, `관측`, `소크`, `카나리`, `모니터링`, `파일럿`,
+`시범 운영`, `soak`, `canary`, `monitor`, `observ…`, `pilot`, `burn-in`), and
+every unquoted term in the paragraph must be explained by one of them. The
+audit's two real findings stay high: a2a-nexus#2395 (`소크: 실제 T2 태스크
+수일분`) and family-messenger#404 (`- [ ] 관찰 기간: 공명에서 며칠 운영`, no
+verdict yet).
+
+`gh issue list` now also requests `author` (comments already carry theirs).
+Notices use `notify-relative.json` and point at `timed-relative-scan.cron.log`.
+
+### Relative installer
+
+```
+scripts/install-timed-relative-scan-cron.sh --dry-run   # preview
+scripts/install-timed-relative-scan-cron.sh --apply     # write the crontab entry
+scripts/install-timed-relative-scan-cron.sh --apply --remove
+```
+
+It renders one managed entry (`# ccc-node:timed-relative-scan`, BEGIN/END
+block, gen stamp) that runs
+`timed_test_deadline_scan.py --repos-file ~/.claude/timed-test-deadline-scan.repos
+--mode relative --notify LEVEL --exit-nonzero-on-findings` and appends to
+`~/.claude/state/timed-relative-scan.cron.log`.
+
+- Defaults: `25 9 * * *` (09:25 KST, once a day, between the deadline scan's
+  09:20 and the follow-up scan's 09:35 runs), `--notify high`. Options:
+  `--schedule SPEC`, `--notify high|low|off`. Env overrides use the
+  `CCC_TIMED_RELATIVE_SCAN_*` prefix (`_CMD`, `_REPOS`, `_NOTIFY`, `_CRON`,
+  `_CRON_LOG`).
+- Same repos file as the deadline scan; the installer does not create it.
+- Its own install record (`~/.claude/state/install-timed-relative-scan-cron.json`)
+  carries every option for self-update replay.
+- Separate for the same reasons as the follow-up installer; no marker of the
+  three lanes is a substring of another, so installing or removing one leaves
+  the others alone. ccc-doctor reports it as `cron gen timed-relative-scan`.
+- `install-timed-test-deadline-scan-cron.sh --mode relative` used to replace
+  the expired entry. It now delegates to this installer (passing only
+  `--apply`/`--dry-run`, `--remove` and an explicit `--schedule`/`--notify`)
+  and leaves the expired entry and its record alone. A deadline entry rendered
+  with `--mode relative` before #2544 is restored to expired by re-running
+  `install-timed-test-deadline-scan-cron.sh --apply`.
+- A hand-placed relative block (a crontab block outside the `# ccc-node:`
+  markers) is not touched by this installer. Remove it by hand once the managed
+  entry is installed, or the scan runs twice.
+
+## Scheduled checks must leave the verdict on the issue (#2544)
+
+Twice in October a persistent timer fired on time, collected evidence and
+notified the owner, yet the issue got no verdict comment for 7 days
+(family-messenger#179, wiki-agent#218). The scanner then saw an issue with no
+judgement and, for those two, only reported it at low confidence. Contract for
+any automated recheck (systemd timer, crontab, agent-cron task) that checks a
+timed test:
+
+1. It posts its result to the issue it checks, as a comment — a verdict, or a
+   **verdict draft** headed `판정 초안` that names who confirms it. A notice to
+   the owner or a local evidence file alone is not a recorded verdict.
+2. It checks every judgement criterion written in the booking, not only the
+   one it can automate. When it cannot evaluate a criterion (for example a
+   host-kernel OOM log on another node), the draft says so and does not call
+   the closing condition met. family-messenger#179's check read only CI and
+   reported "닫는 조건 충족" while the OOM criterion had failed.
+3. If it cannot post (no token, read-only lane), it says so in the owner
+   notice, so the owner knows the issue still needs a comment.
+
+The scanner does not yet detect "check ran, no verdict on the issue" as its
+own signal; until it does, this contract is what keeps it from recurring.
 
 ## Owner notice
 

@@ -36,6 +36,13 @@
 # carries no --notify in its argv, so a self-update replay renders the new
 # default (high).
 #
+# RELATIVE MODE (#2544): `--mode relative` used to render relative mode into
+# this installer's single managed entry, replacing the `expired` one, so no
+# node ran it. It now delegates to install-timed-relative-scan-cron.sh (own
+# marker, block and install record) and leaves the expired entry alone. A
+# node whose deadline entry was rendered with --mode relative before that
+# should re-run this installer with --apply to restore expired.
+#
 # The cron entry runs through `bash -lc` so the login profile PATH is loaded;
 # the scanner shells out to `gh`, which a bare cron PATH (especially on Termux,
 # which has no /usr/bin) would not resolve.
@@ -63,6 +70,8 @@ BLOCK_BEGIN="# ccc-node:timed-test-deadline-scan:begin"
 BLOCK_END="# ccc-node:timed-test-deadline-scan:end"
 APPLY=0
 REMOVE=0
+SCHEDULE_SET=0
+NOTIFY_SET=0
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -104,7 +113,9 @@ Options:
   --apply          Write the crontab change.
   --remove         Remove the managed entry (with --apply) instead of adding it.
   --schedule SPEC  Cron schedule (5 fields). Default: "$SCHEDULE".
-  --mode MODE      Scan mode: expired (default) or relative.
+  --mode MODE      Scan mode: expired (default) or relative. relative is
+                   delegated to install-timed-relative-scan-cron.sh (its own
+                   entry; this installer's expired entry is left alone).
   --notify LEVEL   Owner notice via the bridge push spool for findings at this
                    confidence or above: high (default), low, or off (log only).
 
@@ -119,9 +130,9 @@ while [ $# -gt 0 ]; do
     --dry-run) APPLY=0 ;;
     --apply) APPLY=1 ;;
     --remove) REMOVE=1 ;;
-    --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
+    --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; SCHEDULE_SET=1; shift ;;
     --mode) ccc_cron_need_val "$1" "${2:-}"; MODE="$2"; shift ;;
-    --notify) ccc_cron_need_val "$1" "${2:-}"; NOTIFY="$2"; shift ;;
+    --notify) ccc_cron_need_val "$1" "${2:-}"; NOTIFY="$2"; NOTIFY_SET=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -136,6 +147,19 @@ case "$NOTIFY" in
   off|high|low) ;;
   *) echo "unknown --notify: $NOTIFY (expected off, high or low)" >&2; exit 2 ;;
 esac
+
+# Relative mode has its own installer (#2544). Only options given on the
+# command line are passed on; the relative installer's own defaults (daily
+# 09:25, notify high) and CCC_TIMED_RELATIVE_SCAN_* env apply otherwise.
+if [ "$MODE" = relative ]; then
+  delegate=(--dry-run)
+  [ "$APPLY" = 1 ] && delegate=(--apply)
+  [ "$REMOVE" = 1 ] && delegate+=(--remove)
+  [ "$SCHEDULE_SET" = 1 ] && delegate+=(--schedule "$SCHEDULE")
+  [ "$NOTIFY_SET" = 1 ] && delegate+=(--notify "$NOTIFY")
+  echo "note: --mode relative is installed by install-timed-relative-scan-cron.sh (#2544); delegating — the expired entry is left alone" >&2
+  exec bash "$SELF_DIR/install-timed-relative-scan-cron.sh" "${delegate[@]}"
+fi
 
 # --exit-nonzero-on-findings is intentional: it lets ccc-doctor and any future
 # notification lane branch on the exit code without parsing the report. Exit 1

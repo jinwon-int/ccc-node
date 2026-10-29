@@ -1123,7 +1123,7 @@ cdrepo="$TMP/cron-drift-repo"
 mkdir -p "$cdrepo/scripts/lib" "$cdrepo/.claude"
 cp "$ROOT/scripts/lib/installer-gen-stamp.sh" "$cdrepo/scripts/lib/"
 cp "$ROOT/scripts/lib/installer-cron-common.sh" "$cdrepo/scripts/lib/"
-for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-agent-trust-audit-cron install-timed-test-deadline-scan-cron install-timed-followup-scan-cron install-nunchi; do
+for s in install-memory-refresh-cron install-pr-status-poll-cron install-skill-autosave-cron install-cost-ledger-cron install-fleet-skills-sync-cron install-tunnel-audit-cron install-agent-trust-audit-cron install-timed-test-deadline-scan-cron install-timed-followup-scan-cron install-timed-relative-scan-cron install-nunchi; do
   cp "$ROOT/scripts/$s.sh" "$cdrepo/scripts/"
 done
 # shellcheck source=/dev/null
@@ -1138,6 +1138,7 @@ gen_at="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-agent-trust-audi
 gen_nu="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-nunchi.sh")"
 gen_td="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-test-deadline-scan-cron.sh")"
 gen_tf="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-followup-scan-cron.sh")"
+gen_tr="$(ccc_installer_gen_stamp_auto "$cdrepo/scripts/install-timed-relative-scan-cron.sh")"
 cat > "$TMP/cron-drift.py" <<'PY_EOF'
 import json, os, sys
 from pathlib import Path
@@ -1163,10 +1164,10 @@ run_cd() {  # <cron-text> [repo-dir]
 }
 
 cd_out="$(run_cd "")"
-ok "empty crontab: twelve opt-in rows, all 정상" \
-  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 12 ]'
-ok "empty crontab: rows are the twelve known markers" \
-  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen agent-trust-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen timed-followup-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
+ok "empty crontab: thirteen opt-in rows, all 정상" \
+  'jq -e "[.rows[] | select(.klass != \"정상\")] | length == 0" <<<"$cd_out" >/dev/null && [ "$(jq ".rows | length" <<<"$cd_out")" = 13 ]'
+ok "empty crontab: rows are the thirteen known markers" \
+  'jq -e "[.rows[].item] == [\"cron gen memory-refresh\", \"cron gen pr-status-poll\", \"cron gen skill-autosave\", \"cron gen cost-ledger\", \"cron gen fleet-skills-sync\", \"cron gen tunnel-audit\", \"cron gen agent-trust-audit\", \"cron gen t2-starvation-observe\", \"cron gen nunchi\", \"cron gen timed-test-deadline-scan\", \"cron gen timed-followup-scan\", \"cron gen timed-relative-scan\", \"cron gen skill-promotion-results\"]" <<<"$cd_out" >/dev/null'
 
 full_cron="# ccc-node:memory-refresh:begin
 */30 * * * * bash -lc 'x' >> /l 2>&1  # ccc-node:memory-refresh gen=$gen_mr
@@ -1266,6 +1267,26 @@ cd_out="$(run_cd "# ccc-node:timed-followup-scan:begin
 # ccc-node:timed-followup-scan:end")"
 ok "current follow-up stamp is 정상 and the deadline row stays not-installed" \
   'jq -e ".rows[] | select(.item == \"cron gen timed-followup-scan\" and .klass == \"정상\") | .status | contains(\"current\")" <<<"$cd_out" >/dev/null && jq -e ".rows[] | select(.item == \"cron gen timed-test-deadline-scan\") | .status | contains(\"not installed\")" <<<"$cd_out" >/dev/null'
+
+# #2544: the relative scan is a third lane with its own marker; each row
+# counts only its own entry and a stale relative stamp stays on its own row.
+cd_out="$(run_cd "# ccc-node:timed-test-deadline-scan:begin
+20 9,13,19 * * * bash -lc 'x' >> /l 2>&1  # ccc-node:timed-test-deadline-scan gen=$gen_td
+# ccc-node:timed-test-deadline-scan:end
+# ccc-node:timed-relative-scan:begin
+25 9 * * * bash -lc 'z' >> /l 2>&1  # ccc-node:timed-relative-scan gen=h_000000000000
+# ccc-node:timed-relative-scan:end")"
+ok "timed deadline and relative rows each count only their own entry" \
+  'jq -e "[.rows[] | select(.item == \"cron gen timed-test-deadline-scan\" or .item == \"cron gen timed-relative-scan\") | .status | contains(\"lines=1\")] == [true, true]" <<<"$cd_out" >/dev/null'
+ok "stale relative stamp is 경고 on its own row only" \
+  'jq -e ".rows[] | select(.item == \"cron gen timed-relative-scan\" and .klass == \"경고\") | .action | contains(\"install-timed-relative-scan-cron.sh --apply\")" <<<"$cd_out" >/dev/null && jq -e ".rows[] | select(.item == \"cron gen timed-test-deadline-scan\" and .klass == \"정상\")" <<<"$cd_out" >/dev/null'
+ok "relative block markers are known, not unmanaged" \
+  '! jq -e ".rows[] | select(.item == \"cron unmanaged markers\")" <<<"$cd_out" >/dev/null'
+cd_out="$(run_cd "# ccc-node:timed-relative-scan:begin
+25 9 * * * bash -lc 'z' >> /l 2>&1  # ccc-node:timed-relative-scan gen=$gen_tr
+# ccc-node:timed-relative-scan:end")"
+ok "current relative stamp is 정상" \
+  'jq -e ".rows[] | select(.item == \"cron gen timed-relative-scan\" and .klass == \"정상\") | .status | contains(\"current\")" <<<"$cd_out" >/dev/null'
 
 nolbrepo="$TMP/cron-drift-nolib"
 mkdir -p "$nolbrepo/scripts" "$nolbrepo/.claude"

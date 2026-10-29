@@ -163,6 +163,13 @@ CRON_MARKER_INSTALLERS = (
      "scripts/install-timed-followup-scan-cron.sh",
      "run scripts/install-timed-followup-scan-cron.sh --apply "
      "(reads ~/.claude/timed-test-deadline-scan.repos; the scan exits 3 until it exists)"),
+    # timed-relative-scan (#2544): --mode relative, from its own installer for
+    # the same reasons as timed-followup-scan; no marker is a substring of
+    # another.
+    ("timed-relative-scan", "# ccc-node:timed-relative-scan",
+     "scripts/install-timed-relative-scan-cron.sh",
+     "run scripts/install-timed-relative-scan-cron.sh --apply "
+     "(reads ~/.claude/timed-test-deadline-scan.repos; the scan exits 3 until it exists)"),
     # skill-promotion-results (#2239): the publisher's 15-minute
     # `collect --results-only` lane, previously an ad-hoc crontab line nobody
     # rendered. Registered in the same commit as the installer.
@@ -193,6 +200,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:timed-test-deadline-scan:end",
     "# ccc-node:timed-followup-scan:begin",
     "# ccc-node:timed-followup-scan:end",
+    "# ccc-node:timed-relative-scan:begin",
+    "# ccc-node:timed-relative-scan:end",
     "# ccc-node:skill-promotion-results:begin",
     "# ccc-node:skill-promotion-results:end",
 )
