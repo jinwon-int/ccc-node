@@ -34,6 +34,11 @@ echo "\$*" >> "$LC_CALLS"
 exit 0
 EOF
 
+# Fixed MemTotal (4000000 kB = 4096000000 B) so percent limits resolve to
+# known bytes: 50% -> 2048000000, 75% -> 3072000000 (page-aligned already).
+printf 'MemTotal:        4000000 kB\nMemFree:          100000 kB\n' > "$TMP/meminfo"
+export CCC_MEMINFO_FILE="$TMP/meminfo"
+
 PROJECT="$TMP/myproj"
 mkdir -p "$PROJECT"
 FH="$TMP/home"
@@ -391,25 +396,202 @@ for bad in "HIGH=abc" "MAX=0%" "MAX=101%" "HIGH=80% MAX=60%" "HIGH=16G MAX=8G" "
     ok "invalid memory guard ($bad) writes nothing" '[ ! -e "$UG" ]'
 done
 
+# Stateful systemctl stub for memory-guard (#2545): is-active follows
+# $MG/active; `show -p ControlGroup` reports a fake cgroup under $MG/cg;
+# set-property --runtime writes the kernel files the way the real one would
+# (infinity -> max) unless $MG/noapply exists (models the half-applied host).
+MG="$TMP/mg"
+MG_CALLS="$MG/calls"
+MG_STUB="$TMP/systemctl-mg"
+MG_CG="/system.slice/ccc-telegram-bridge.service"
+mkdir -p "$MG/cg$MG_CG"
+write_exec_stub "$MG_STUB" <<EOF
+echo "\$*" >> "$MG_CALLS"
+[ "\$1" = "--user" ] && shift
+case "\$1" in
+    is-active) [ -e "$MG/active" ]; exit ;;
+    show)
+        if [ -e "$MG/active" ]; then st=active; cg="$MG_CG"; else st=inactive; cg=""; fi
+        case "\$*" in
+            *--value*ControlGroup*|*ControlGroup*--value*) echo "\$cg" ;;
+            *--value*MemoryMax*|*MemoryMax*--value*) cat "$MG/loaded-max" 2>/dev/null || echo infinity ;;
+            *) printf 'ActiveState=%s\nControlGroup=%s\n' "\$st" "\$cg" ;;
+        esac
+        exit 0 ;;
+    set-property)
+        [ -e "$MG/noapply" ] && exit 0
+        for kv in "\$@"; do
+            case "\$kv" in
+                MemoryHigh=*) v="\${kv#*=}"; [ "\$v" = infinity ] && v=max; echo "\$v" > "$MG/cg$MG_CG/memory.high" ;;
+                MemoryMax=*) v="\${kv#*=}"; [ "\$v" = infinity ] && v=max; echo "\$v" > "$MG/cg$MG_CG/memory.max" ;;
+            esac
+        done
+        exit 0 ;;
+esac
+exit 0
+EOF
+mg_reset() {
+    # $1 = active|inactive; cgroup back to the unlimited 'max' state.
+    rm -f "$MG/active" "$MG/noapply" "$MG/loaded-max"
+    [ "$1" = "active" ] && : > "$MG/active"
+    echo max > "$MG/cg$MG_CG/memory.high"
+    echo max > "$MG/cg$MG_CG/memory.max"
+    : > "$MG_CALLS"
+}
+mg_run() {
+    # System scope pinned so the expected call lines do not depend on the euid
+    # running the suite (CI is non-root); the user-scope case overrides it.
+    run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMD_SCOPE=system CCC_SYSTEMCTL="$MG_STUB" \
+        CCC_CGROUP_ROOT="$MG/cg" "$@"
+}
+# shellcheck disable=SC2034  # read via eval inside ok()
+RESTARTS='(^|--user )(stop|start|restart|try-restart|reload-or-restart|kill) '
+# shellcheck disable=SC2034  # read via eval inside ok()
+SETPROP_DEFAULT="set-property --runtime ccc-telegram-bridge.service MemoryHigh=2048000000 MemoryMax=3072000000"
+
 # memory-guard on an existing unit (e.g. installed before #1877): dry-run is
-# read-only; the real run writes the drop-in and only daemon-reloads.
+# read-only; the real run writes the drop-in, daemon-reloads, and — on an
+# INACTIVE unit — changes nothing at runtime.
 rm -rf "$SDG"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" CCC_BRIDGE_MEMORY_GUARD=0 \
     bash "$SSD" install --project-root "$PROJECT"
-: > "$SC_CALLS"
-run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard --dry-run
+mg_reset inactive
+mg_run bash "$SSD" memory-guard --dry-run
 okc "$RC" 0 "memory-guard --dry-run exits 0"
 ok "memory-guard --dry-run writes nothing and never calls systemctl" \
-   '[ ! -e "$GG" ] && [ ! -s "$SC_CALLS" ] && grep -q "MemoryMax=75%" "$OUT"'
-run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard
+   '[ ! -e "$GG" ] && [ ! -s "$MG_CALLS" ] && grep -q "MemoryMax=75%" "$OUT"'
+ok "memory-guard --dry-run shows the resolved runtime bytes" \
+   'grep -q "MemoryHigh=2048000000 MemoryMax=3072000000" "$OUT"'
+mg_run bash "$SSD" memory-guard
 okc "$RC" 0 "memory-guard exits 0"
 ok "memory-guard writes the drop-in" 'grep -Fxq "OOMPolicy=continue" "$GG"'
-ok "memory-guard only daemon-reloads (no restart)" '[ "$(cat "$SC_CALLS")" = "$DAEMON_RELOAD" ]'
-: > "$SC_CALLS"
-run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" memory-guard
+ok "memory-guard daemon-reloads" 'grep -qx -- "daemon-reload" "$MG_CALLS"'
+ok "memory-guard never stops/starts/restarts the unit" '! grep -Eq "$RESTARTS" "$MG_CALLS"'
+ok "inactive unit gets no set-property --runtime (#2545)" \
+   '! grep -q "set-property" "$MG_CALLS" && grep -q "not active" "$OUT"'
+mg_reset inactive
+mg_run bash "$SSD" memory-guard
 okc "$RC" 0 "repeated memory-guard exits 0"
-ok "repeated memory-guard is a no-op" \
-   'grep -q "already current" "$OUT" && [ ! -s "$SC_CALLS" ]'
+ok "repeated memory-guard leaves the drop-in alone and skips daemon-reload" \
+   'grep -q "already current" "$OUT" && ! grep -q "daemon-reload" "$MG_CALLS" && ! grep -q "set-property" "$MG_CALLS"'
+mg_reset inactive
+echo 3072000000 > "$MG/loaded-max"
+mg_run bash "$SSD" memory-guard
+ok "inactive unit with the drop-in loaded raises no shadow warning" '! grep -q "shadows the drop-in" "$OUT"'
+mg_reset inactive
+mg_run bash "$SSD" memory-guard
+ok "inactive unit whose loaded MemoryMax is infinity warns about a runtime shadow" \
+   'grep -q "shadows the drop-in" "$OUT"'
+
+# Active unit (#2545): the drop-in alone leaves the running cgroup at max, so
+# the same limits are pushed with set-property --runtime — no restart — and the
+# effective cgroup values are printed.
+rm -f "$GG"
+mg_reset active
+mg_run bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard on an active unit exits 0"
+ok "active unit gets set-property --runtime with percent resolved to bytes" \
+   'grep -qx -- "$SETPROP_DEFAULT" "$MG_CALLS"'
+ok "active unit is not restarted" '! grep -Eq "$RESTARTS" "$MG_CALLS"'
+ok "set-property follows daemon-reload" \
+   '[ "$(grep -nx -- "daemon-reload" "$MG_CALLS" | cut -d: -f1)" -lt "$(grep -n "set-property" "$MG_CALLS" | cut -d: -f1)" ]'
+ok "verification prints the effective cgroup memory.high/max" \
+   'grep -q "memory.high=2048000000 memory.max=3072000000" "$OUT" && ! grep -q "NOT applied" "$OUT"'
+# Drop-in already current (written by a pre-#2545 memory-guard that only
+# reloaded) while the live cgroup is still at max: the rerun must fix it.
+mg_reset active
+mg_run bash "$SSD" memory-guard
+okc "$RC" 0 "rerun with a current drop-in on an active unit exits 0"
+ok "rerun with a current drop-in still applies the runtime limits" \
+   'grep -q "already current" "$OUT" && grep -qx -- "$SETPROP_DEFAULT" "$MG_CALLS" && ! grep -q "daemon-reload" "$MG_CALLS"'
+# Half-applied host: set-property "succeeds" but the cgroup stays at max.
+mg_reset active
+: > "$MG/noapply"
+mg_run bash "$SSD" memory-guard
+okc "$RC" 1 "cgroup still at max after memory-guard exits 1"
+ok "verification reports memory.max=max as NOT applied" \
+   'grep -q "memory.high=max memory.max=max" "$OUT" && grep -q "memory.max is still .max. — MemoryMax NOT applied" "$OUT"'
+# Byte overrides pass through unchanged (K/M/G/T expanded).
+mg_reset active
+mg_run env CCC_BRIDGE_MEMORY_HIGH=1G CCC_BRIDGE_MEMORY_MAX=1536M bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard with byte overrides exits 0"
+ok "byte overrides reach set-property as bytes" \
+   'grep -qx "set-property --runtime ccc-telegram-bridge.service MemoryHigh=1073741824 MemoryMax=1610612736" "$MG_CALLS"'
+# Unreadable MemTotal: refuse before writing anything.
+mg_reset active
+mg_run env CCC_MEMINFO_FILE="$TMP/no-meminfo" bash "$SSD" memory-guard
+okc "$RC" 1 "percent limit without a readable MemTotal exits 1"
+ok "unresolvable limit calls no systemctl" \
+   '[ ! -s "$MG_CALLS" ] && grep -q "MemTotal unreadable" "$OUT"'
+# User scope drives `systemctl --user set-property --runtime`.
+mg_reset active
+mg_run env CCC_SYSTEMD_SCOPE=user bash "$SSD" memory-guard
+ok "user-scope memory-guard uses systemctl --user set-property --runtime" \
+   'grep -qx -- "--user $SETPROP_DEFAULT" "$MG_CALLS"'
+
+# Rollback mirror (--remove): drop-in removed, daemon-reload, runtime limits
+# cleared with infinity on an active unit; nothing at runtime when inactive.
+mg_reset active
+mg_run bash "$SSD" memory-guard --remove --dry-run
+okc "$RC" 0 "memory-guard --remove --dry-run exits 0"
+ok "memory-guard --remove --dry-run writes nothing and never calls systemctl" \
+   '[ -f "$GG" ] && [ ! -s "$MG_CALLS" ] && grep -q "MemoryHigh=infinity MemoryMax=infinity" "$OUT"'
+echo 2048000000 > "$MG/cg$MG_CG/memory.high"; echo 3072000000 > "$MG/cg$MG_CG/memory.max"
+mg_run bash "$SSD" memory-guard --remove
+okc "$RC" 0 "memory-guard --remove exits 0"
+ok "memory-guard --remove deletes the generated drop-in" '[ ! -e "$GG" ]'
+ok "memory-guard --remove clears runtime limits on the active unit" \
+   'grep -qx "set-property --runtime ccc-telegram-bridge.service MemoryHigh=infinity MemoryMax=infinity" "$MG_CALLS" && grep -qx -- "daemon-reload" "$MG_CALLS"'
+ok "memory-guard --remove leaves the cgroup at max and does not restart" \
+   'grep -q "memory.high=max memory.max=max" "$OUT" && ! grep -Eq "$RESTARTS" "$MG_CALLS"'
+mg_reset inactive
+mg_run bash "$SSD" memory-guard --remove
+okc "$RC" 0 "memory-guard --remove on an inactive unit exits 0"
+ok "memory-guard --remove on an inactive unit sets no runtime property" '! grep -q "set-property" "$MG_CALLS"'
+mkdir -p "$UG.d"
+printf '[Service]\nMemoryMax=4G\n' > "$GG"
+mg_reset active
+mg_run bash "$SSD" memory-guard --remove
+okc "$RC" 1 "memory-guard --remove refuses a foreign file"
+ok "memory-guard --remove leaves a foreign file and runtime alone" \
+   'grep -Fxq "MemoryMax=4G" "$GG" && [ ! -s "$MG_CALLS" ]'
+rm -f "$GG"
+run bash "$SSD" reconcile --remove
+okc "$RC" 1 "--remove is refused outside memory-guard"
+
+# Doctor (#2545): a bridge unit without the drop-in, and an active unit whose
+# cgroup is still at max, both warn. Read-only: same stub, fake cgroup.
+doctor_guard_rows() {
+    env CCC_DOCTOR_BRIDGE_UNIT_DIRS="$SDG" CCC_DOCTOR_SYSTEMCTL_BIN="$MG_STUB" \
+        CCC_DOCTOR_CGROUP_ROOT="$MG/cg" python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/scripts")
+from pathlib import Path
+from ccc_doctor import Doctor
+d = Doctor(repo=Path(sys.argv[1]), claude_dir=Path(sys.argv[2]), scope="all")
+d.check_bridge_memory_guard()
+for r in d.rows:
+    print(f"{r.klass}|{r.item}|{r.status}")
+' "$REPO" "$FH/.claude"
+}
+mg_reset active
+# shellcheck disable=SC2034  # DOC_ROWS is read via eval inside ok()
+DOC_ROWS="$(doctor_guard_rows)"
+ok "doctor warns on a bridge unit without the memory guard drop-in" \
+   'grep -q "^경고|bridge memory guard (ccc-telegram-bridge.service)|no memory guard drop-in" <<<"$DOC_ROWS"'
+ok "doctor runs only systemctl show (read-only)" '! grep -qv "^show " "$MG_CALLS"'
+mg_run bash "$SSD" memory-guard
+mg_reset active
+# shellcheck disable=SC2034  # DOC_ROWS is read via eval inside ok()
+DOC_ROWS="$(doctor_guard_rows)"
+ok "doctor warns when the drop-in exists but the active cgroup is still max" \
+   'grep -q "^경고|.*memory.max=max.*not applied" <<<"$DOC_ROWS"'
+ok "doctor stays read-only on the warning path" '[ -s "$MG_CALLS" ] && ! grep -qv "^show " "$MG_CALLS"'
+mg_run bash "$SSD" memory-guard
+# shellcheck disable=SC2034  # DOC_ROWS is read via eval inside ok()
+DOC_ROWS="$(doctor_guard_rows)"
+ok "doctor reports the applied guard as 정상 once memory-guard ran" \
+   'grep -q "^정상|.*guard applied to running cgroup (memory.high=1953M memory.max=2929M)" <<<"$DOC_ROWS"'
 : > "$SC_CALLS"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" bash "$SSD" reconcile
 ok "reconcile leaves the memory-guard drop-in alone" \

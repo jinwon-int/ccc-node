@@ -177,9 +177,26 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > bytes with `K/M/G/T`, or `infinity`) or skip it with `CCC_BRIDGE_MEMORY_GUARD=0`. Reconcile never
 > touches the drop-in; to add it to an existing unit run
 > `bridge/service-systemd.sh memory-guard [--dry-run]` (set `BRIDGE_SERVICE_NAME=ccc-matrix-bridge`
-> for the Matrix frontend). It writes the drop-in and runs only `daemon-reload` — no restart — but
-> the new limits apply to the running cgroup at once. Any later-sorting operator drop-in wins.
-> Hosts without systemd (Termux) are unaffected.
+> for the Matrix frontend). It writes the drop-in and runs `daemon-reload` — no restart. A reload
+> alone does **not** push `MemoryHigh`/`MemoryMax` into a running cgroup (it stays at
+> `memory.high`/`memory.max` = `max` until the next start, #2545), so on an **active** unit
+> `memory-guard` also runs `systemctl set-property --runtime <unit> MemoryHigh=<bytes>
+> MemoryMax=<bytes>` (percentages resolved against `MemTotal`; MainPID unchanged) and prints the
+> effective `/sys/fs/cgroup/<ControlGroup>/memory.{high,max}`. A cgroup still at `max` is reported
+> as **not applied** and the command exits 1. An inactive unit gets no runtime change; the limits
+> apply at its next start. Rerunning on a unit whose drop-in is already current still applies the
+> runtime step, which repairs a unit guarded by an older reload-only `memory-guard`. Rollback:
+> `memory-guard --remove [--dry-run]` deletes the generated drop-in, reloads, and on an active unit
+> clears the runtime limits with `MemoryHigh=infinity MemoryMax=infinity` (`OOMPolicy` returns to
+> `stop`). Runtime values live in `/run/systemd/system.control` until reboot. Any later-sorting
+> operator drop-in wins. Hosts without systemd (Termux) are unaffected. `ccc-doctor` warns per
+> bridge unit (`bridge memory guard (<unit>)`) when the drop-in is missing or an active unit's
+> cgroup is still at `max`.
+>
+> **Per-node values before a fleet rollout.** The `50%`/`75%` defaults suit large hosts. On a
+> ~3 GB-RAM node `MemoryHigh=50%` (~1.5 GB) can throttle ordinary sessions, so measure the bridge
+> peak there first and pass explicit `CCC_BRIDGE_MEMORY_HIGH=` / `CCC_BRIDGE_MEMORY_MAX=` values
+> to `memory-guard` (bytes with `K/M/G/T` or a percentage; `HIGH` must not exceed `MAX`).
 
 > **Restart ownership.** Run `--restart` from a shell outside the serving
 > bridge process tree. An agent turn that tries to restart its own bridge is

@@ -510,6 +510,12 @@ else
   err "doctor bridge boot-path guard tests failed"
   tail -10 "$TMP/doctor-bootpath-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_memory_guard_test.py >"$TMP/doctor-memory-guard-test.out" 2>&1; then
+  say "  ok doctor bridge memory-guard check tests (#2545)"
+else
+  err "doctor bridge memory-guard check tests failed"
+  tail -10 "$TMP/doctor-memory-guard-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_bridge_status_test.py >"$TMP/doctor-bridge-status-test.out" 2>&1; then
   say "  ok doctor bridge status verdict tests"
 else
