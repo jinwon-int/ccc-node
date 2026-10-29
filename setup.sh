@@ -1714,6 +1714,32 @@ else
   note "WARNING: web MCP launch refresh failed — re-run: $SRC/claude/mcp-setup.sh --web-launch-only"
 fi
 
+# Codex web MCP launch refresh (#2543): the Codex counterpart of the block
+# above. setup.sh never renders ~/.codex/config.toml, so a [mcp_servers.*]
+# entry registered as `npx -y <pkg>` stayed there. codex/mcp-launch-refresh.py
+# rewrites only harness-shaped searxng/firecrawl/context7 blocks to
+# `node <global cli>` when the runtime user's global install exists (two lines
+# per block, tomllib-verified, backup under state/backups, rollback on
+# mismatch); it adds no server, installs nothing and never prints config or env
+# values. Same opt-out and managed-checkout guard as above; non-fatal.
+if [ "${CCC_SETUP_WEB_MCP_LAUNCH:-1}" = "0" ]; then
+  note "Codex web MCP launch refresh: disabled (CCC_SETUP_WEB_MCP_LAUNCH=0)"
+elif [ ! -f "$CODEX_DIR/config.toml" ]; then
+  note "Codex web MCP launch refresh: no $CODEX_DIR/config.toml — skipped"
+elif [ "$MANAGED_REPO" != "$SRC_ABS" ] || [ ! -d "$SRC/.git" ] \
+  || [ -z "$src_gitdir" ] || [ "$src_gitdir" != "$src_commondir" ]; then
+  note "Codex web MCP launch refresh: not the self-update managed checkout — skipped"
+elif [ "$DRY" = 1 ]; then
+  python3 "$SRC/codex/mcp-launch-refresh.py" --dry-run --codex-home "$CODEX_DIR" \
+    --backup-dir "$CLAUDE_DIR/state/backups" \
+    || note "WARNING: Codex web MCP launch dry-run failed (config.toml left untouched)"
+elif python3 "$SRC/codex/mcp-launch-refresh.py" --codex-home "$CODEX_DIR" \
+    --backup-dir "$CLAUDE_DIR/state/backups"; then
+  note "Codex web MCP launch registrations checked ($CODEX_DIR/config.toml)"
+else
+  note "WARNING: Codex web MCP launch refresh failed (config.toml left untouched) — re-run: python3 $SRC/codex/mcp-launch-refresh.py"
+fi
+
 # #968: Termux/Android hash-locked installs may need to build packages from
 # source (cryptography 50 has no Android wheel -> maturin -> Rust). A missing
 # toolchain killed the daegyo bridge on 2026-08-06 and the prerequisite lived

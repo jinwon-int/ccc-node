@@ -1296,19 +1296,33 @@ run_setup_web() { # <CCC_SETUP_WEB_MCP_LAUNCH> <home> [extra setup args...]
   local v="$1" home="$2"; shift 2
   : > "$fam_log"
   (cd "$guard_repo" && env -u CLAUDE_CONFIG_DIR HOME="$home" CCC_CLAUDE_DIR="$home/.claude" \
+    CODEX_HOME="$home/.codex" \
     CCC_HERMES_DIR="$home/.hermes" CCC_SETUP_WEB_MCP_LAUNCH="$v" PATH="$fam_bin:$web_bin:$REAL_PATH" \
     bash "$guard_repo/setup.sh" --no-backup "$@" 2>&1)
 }
+# Codex lane (#2543): the same stale `npx -y` registration in CODEX_HOME's
+# config.toml is re-pinned by codex/mcp-launch-refresh.py in the same run.
+write_web_codex_cfg() {
+  mkdir -p "$web_home/.codex" && chmod 700 "$web_home/.codex"
+  printf '[mcp_servers.firecrawl]\ncommand = "npx"\nargs = ["-y", "firecrawl-mcp"]\n\n[mcp_servers.firecrawl.env]\nFIRECRAWL_API_KEY = "%s"\n' \
+    "$web_key" > "$web_home/.codex/config.toml"
+  chmod 600 "$web_home/.codex/config.toml"
+}
 write_web_cfg
+write_web_codex_cfg
 out="$(run_setup_web 1 "$web_home")"; rc=$?
 ok "web MCP: managed checkout re-registers a stale npx launch as node <cli>, key kept" \
   '[ "$rc" = 0 ] && grep -qxF -- "mcp add firecrawl -s user -e FIRECRAWL_API_KEY=$web_key -- node $web_groot/firecrawl-mcp/dist/cli.js" "$fam_log" && grep -q "web MCP launch registrations checked" <<<"$out"'
 ok "web MCP: unregistered servers not added, key never printed" \
   '! grep -Eq "add (searxng|context7)" "$fam_log" && ! grep -qF -- "$web_key" <<<"$out"'
+ok "Codex web MCP: stale npx launch re-pinned to node <cli>, env kept, backup written (#2543)" \
+  'grep -qxF "command = \"node\"" "$web_home/.codex/config.toml" && grep -qxF "args = [\"$web_groot/firecrawl-mcp/dist/cli.js\"]" "$web_home/.codex/config.toml" && grep -qxF "FIRECRAWL_API_KEY = \"$web_key\"" "$web_home/.codex/config.toml" && ls "$web_home/.claude/state/backups/"codex-config.toml.before-mcp-pin-* >/dev/null 2>&1 && grep -q "Codex web MCP launch registrations checked" <<<"$out" && ! grep -Eq "^\[mcp_servers\.(searxng|context7)\]" "$web_home/.codex/config.toml"'
 
 out="$(run_setup_web 0 "$web_home")"
 ok "web MCP: CCC_SETUP_WEB_MCP_LAUNCH=0 opts out (mcp-setup not invoked)" \
   'grep -q "web MCP launch refresh: disabled" <<<"$out" && [ ! -s "$fam_log" ] && ! grep -q "Refreshing web MCP" <<<"$out"'
+ok "Codex web MCP: CCC_SETUP_WEB_MCP_LAUNCH=0 opts out too" \
+  'grep -q "Codex web MCP launch refresh: disabled" <<<"$out"'
 
 out="$(run_setup_web 1 "$other_home")"
 ok "web MCP: skipped when another checkout is the managed repo" \
