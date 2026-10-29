@@ -352,7 +352,7 @@ class NpmRootTests(_Base):
         return mock.patch.dict(os.environ, env, clear=False)
 
     def test_runtime_user_npm_root_from_npmrc_home(self):
-        home = self.tmp / "home-gongmyoung"
+        home = self.tmp / "home-runtime-user"
         user_root = home / ".local" / "lib" / "node_modules"
         clis = self.install_all(user_root)
         bin_dir = self.tmp / "bin"
