@@ -109,9 +109,28 @@ FAKE_SYSTEMCTL = textwrap.dedent(
         active = argv[1] in fixture.get("active", [])
         print("active" if active else "inactive")
         sys.exit(0 if active else 3)
-    if argv[:1] == ["restart"]:
+    if argv[:1] == ["stop"]:
+        # A real bridge writes its in-memory sessions back on shutdown; with
+        # "clobber_on_stop" the fake does the same with the OLD model (#2557).
         unit = argv[1]
-        pid = int(state["pids"].get(unit, 100)) + 1000
+        if unit in fixture.get("clobber_on_stop", []):
+            env = fixture.get("environment", {}).get(unit, "")
+            m = re.search(r"BOT_DATA_DIR=(\\S+)", env)
+            if m:
+                p = Path(m.group(1)) / "sessions.json"
+                data = json.loads(p.read_text())
+                for v in data.values():
+                    if isinstance(v, dict) and str(v.get("model", "")).startswith("claude-") \\
+                            and v.get("provider", "claude") == "claude":
+                        v["model"] = fixture["old_model"]
+                p.write_text(json.dumps(data))
+        state["pids"][unit] = 0
+        save()
+        sys.exit(0)
+    if argv[:1] in (["start"], ["restart"]):
+        unit = argv[1]
+        pid = int(state.get("last_pid", {}).get(unit, state["pids"].get(unit, 100) or 100)) + 1000
+        state.setdefault("last_pid", {})[unit] = pid
         state["pids"][unit] = pid
         save()
         write_proc(unit, pid)
@@ -294,7 +313,7 @@ class SwitchTests(SwitchTestBase):
         self.assertNotIn(SENTINEL, (backup / "manifest.json").read_text())
         calls = self._calls()
         self.assertIn(["daemon-reload"], calls)
-        self.assertFalse(any(c[:1] == ["restart"] for c in calls))
+        self.assertFalse(any(c[:1] in (["restart"], ["stop"], ["start"]) for c in calls))
 
     def test_settings_and_sessions_only_claude_entries(self) -> None:
         proc = self._run()
@@ -385,7 +404,7 @@ class SwitchTests(SwitchTestBase):
         self.assertIn("systemctl restart ccc-matrix-bridge.service", proc.stdout)
         self.assertIn("systemctl restart ccc-hande-bridge.service", proc.stdout)
         self.assertNotIn("systemctl restart ccc-telegram-bridge.service", proc.stdout)
-        self.assertFalse(any(c[:1] == ["restart"] for c in self._calls()))
+        self.assertFalse(any(c[:1] in (["restart"], ["stop"], ["start"]) for c in self._calls()))
 
     def test_bad_arguments_are_rejected(self) -> None:
         proc = self._run("--slug", "../x")
@@ -417,16 +436,35 @@ class RestartTests(SwitchTestBase):
         self._running("ccc-hande-bridge.service", 300)
         proc = self._run("--restart", "--verify-timeout", "5")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        restarts = [c[1] for c in self._calls() if c[:1] == ["restart"]]
-        self.assertEqual(sorted(restarts),
+        starts = [c[1] for c in self._calls() if c[:1] == ["start"]]
+        self.assertEqual(sorted(starts),
                          ["ccc-hande-bridge.service", "ccc-matrix-bridge.service"])
+        # stop -> (sessions) -> start, never a bare restart
+        self.assertFalse(any(c[:1] == ["restart"] for c in self._calls()))
+        names = [c[:2] for c in self._calls() if c[:1] in (["stop"], ["start"])]
+        for unit in ("ccc-matrix-bridge.service", "ccc-hande-bridge.service"):
+            self.assertLess(names.index(["stop", unit]), names.index(["start", unit]))
         self.assertIn(f"ccc-hande-bridge.service: ANTHROPIC_MODEL={NEW_MODEL}", proc.stdout)
         self.assertIn("restart verified", proc.stdout)
         # a second run sees the live model already switched: no further restart
         rerun = self._run("--restart")
         self.assertEqual(rerun.returncode, 0, rerun.stdout + rerun.stderr)
         self.assertIn("already running", rerun.stdout)
-        self.assertEqual(len([c for c in self._calls() if c[:1] == ["restart"]]), 2)
+        self.assertEqual(len([c for c in self._calls() if c[:1] == ["start"]]), 2)
+
+    def test_sessions_written_back_on_stop_are_reapplied(self) -> None:
+        # The bridge rewrites sessions.json from memory (old model) when it
+        # stops; the switch re-applies the new model before start (#2557).
+        self._running("ccc-matrix-bridge.service", 200)
+        self.fixture["clobber_on_stop"] = ["ccc-matrix-bridge.service"]
+        proc = self._run("--restart", "--verify-timeout", "5")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("re-applied to", proc.stdout)
+        data = json.loads((self.data_dirs["matrix"] / "sessions.json").read_text())
+        self.assertEqual(data["telegram_session:1"]["model"], NEW_MODEL)
+        self.assertEqual(data["telegram_session:2"]["model"], NEW_MODEL)
+        self.assertEqual(data["telegram_session:3"]["model"], "gpt-x")
+        self.assertNotIn(SENTINEL, proc.stdout + proc.stderr)
 
     def test_busy_unit_is_not_restarted(self) -> None:
         self._running("ccc-matrix-bridge.service", 200, busy=True)
@@ -436,7 +474,7 @@ class RestartTests(SwitchTestBase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("not idle", proc.stdout)
         self.assertIn("--rollback", proc.stdout)
-        self.assertFalse(any(c[:1] == ["restart"] for c in self._calls()))
+        self.assertFalse(any(c[:1] in (["restart"], ["stop"], ["start"]) for c in self._calls()))
         # the switch itself stays applied (no automatic rollback after restart failure)
         self.assertTrue((self.envd / "matrix-new-high.env").exists())
 
@@ -454,7 +492,7 @@ class RestartTests(SwitchTestBase):
         proc = self._run("--restart")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("systemd-run", proc.stdout)
-        self.assertFalse(any(c[:1] == ["restart"] for c in self._calls()))
+        self.assertFalse(any(c[:1] in (["restart"], ["stop"], ["start"]) for c in self._calls()))
 
 
 if __name__ == "__main__":

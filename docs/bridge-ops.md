@@ -262,7 +262,8 @@ scope.
    `bridge-idle-gate.py --unit <u> && systemctl restart <u>` for each active
    unit that is not already running the model. A restart is an owner-approved
    step. `--restart` does it for you: each unit waits for the idle gate (at most
-   `--idle-timeout`, default 1800 s), is restarted, and must show the new
+   `--idle-timeout`, default 1800 s), is stopped, gets its own `sessions.json`
+   re-applied while down, is started, and must show the new
    `ANTHROPIC_MODEL` in `/proc/<MainPID>/environ`. A failure exits 1 and prints
    the rollback command; nothing is rolled back automatically. The script
    refuses to restart the unit it is running inside. From a bridge chat,
@@ -276,9 +277,11 @@ scope.
    `daemon-reload` and `env-file-guard.py check`, and lists the units to
    restart.
 
-A running bridge keeps its sessions in memory. If it writes `sessions.json`
-before it is restarted, it can overwrite the per-chat update; re-running the
-same switch after the restart fixes that.
+A running bridge keeps its sessions in memory and writes them back on
+shutdown, which can overwrite the per-chat update made before the restart.
+`--restart` therefore runs stop → re-apply that unit's `sessions.json` → start
+(the order the old node-local `apply.sh` used). After a manual
+`systemctl restart`, re-run the same switch once (it is idempotent).
 
 ## Health evidence
 

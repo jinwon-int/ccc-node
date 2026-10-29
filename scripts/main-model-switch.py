@@ -533,15 +533,52 @@ def wait_idle(unit: str, args: argparse.Namespace) -> bool:
         time.sleep(min(args.idle_interval, max(0.0, deadline - time.monotonic())))
 
 
+def reapply_sessions(unit: str, data_dir: Path | None, args: argparse.Namespace) -> None:
+    """Re-apply the per-chat model to the stopped unit's own sessions.json.
+
+    A running bridge keeps its sessions in memory and writes them back on
+    shutdown, which would overwrite the update made before the restart. The
+    pre-#2557 node-local apply.sh avoided that with stop -> edit -> start; this
+    keeps the same order. Only a data dir already in --bridge-data-dirs is
+    touched (its original was backed up when the switch ran).
+    """
+    if data_dir is None:
+        return
+    known = {Path(os.path.expanduser(d)).resolve() for d in args.bridge_data_dirs}
+    if data_dir.resolve() not in known:
+        return
+    path = data_dir / "sessions.json"
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        warn(f"{path}: not readable JSON after stop; skipped")
+        return
+    if not isinstance(data, dict):
+        return
+    changed = _update_sessions(data, args.model, args.effort)
+    if changed:
+        mode, owner = file_meta(path)
+        atomic_write(path, dump_json(data), mode, owner)
+        say(f"{unit}: {path} re-applied to {changed} claude chat(s) while stopped")
+
+
 def restart_unit(unit: str, args: argparse.Namespace) -> bool:
     if f"/{unit}" in _self_cgroup(args.self_cgroup):
         say(f"{unit}: this process runs inside it -- re-run detached (systemd-run)")
         return False
     if not wait_idle(unit, args):
         return False
-    proc = systemctl("restart", unit)
+    _, data_dir = unit_main_pid(unit)
+    proc = systemctl("stop", unit)
     if proc.returncode != 0:
-        say(f"{unit}: systemctl restart failed (exit {proc.returncode})")
+        say(f"{unit}: systemctl stop failed (exit {proc.returncode})")
+        return False
+    reapply_sessions(unit, data_dir, args)
+    proc = systemctl("start", unit)
+    if proc.returncode != 0:
+        say(f"{unit}: systemctl start failed (exit {proc.returncode})")
         return False
     deadline = time.monotonic() + args.verify_timeout
     seen = None
@@ -578,6 +615,8 @@ def handle_restarts(units: list[str], args: argparse.Namespace, backup_dir: Path
             print(
                 f"  python3 {IDLE_GATE} --unit {unit} && systemctl restart {unit}", flush=True
             )
+        say("a bridge writes its in-memory sessions back on shutdown: after a manual restart,"
+            " re-run this switch once (idempotent), or use --restart (stop -> sessions -> start)")
         return EXIT_OK
     failed = [unit for unit in pending if not restart_unit(unit, args)]
     if failed:
