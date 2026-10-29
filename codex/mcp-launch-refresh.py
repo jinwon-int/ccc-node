@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as _dt
+import functools
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from typing import Callable, Union
 
 try:
     import tomllib as _toml
@@ -226,6 +228,9 @@ def resolve_cli(roots: list[str], pkg: str) -> str | None:
 # --- planning -----------------------------------------------------------------
 
 
+RootsSource = Union[list[str], Callable[[], list[str]]]
+
+
 def _is_harness_npx(entry: object, pkg: str) -> bool:
     if not isinstance(entry, dict) or entry.get("command") != "npx":
         return False
@@ -289,13 +294,13 @@ def _edit_block(lines: list[str], name: str, cli: str) -> bool:
     return True
 
 
-def _classify(name: str, entry: object, pkg: str, roots: list[str]) -> tuple[str | None, str]:
+def _classify(name: str, entry: object, pkg: str, roots: RootsSource) -> tuple[str | None, str]:
     """(cli, note): cli is set only for a harness-shaped npx launch with a global install."""
     if not _is_harness_npx(entry, pkg):
         if isinstance(entry, dict) and entry.get("command") == "node":
             return None, f"{name}: already node (unchanged)"
         return None, f"{name}: custom launch — left untouched"
-    cli = resolve_cli(roots, pkg)
+    cli = resolve_cli(roots() if callable(roots) else roots, pkg)
     if not cli:
         return None, (
             f"{name}: SKIPPED — {pkg} is not installed globally "
@@ -304,8 +309,12 @@ def _classify(name: str, entry: object, pkg: str, roots: list[str]) -> tuple[str
     return cli, ""
 
 
-def plan(text: str, roots: list[str]) -> tuple[str, list[tuple[str, str]], list[str]]:
-    """Return (new_text, [(server, cli)], notes). Raises RefreshError."""
+def plan(text: str, roots: RootsSource) -> tuple[str, list[tuple[str, str]], list[str]]:
+    """Return (new_text, [(server, cli)], notes). Raises RefreshError.
+
+    ``roots`` may be a callable so npm is only spawned when some server is a
+    harness-shaped npx launch.
+    """
     try:
         data = _parse(text)
     except RefreshError:
@@ -494,7 +503,10 @@ def refresh(codex_home: Path, *, backup_dir: Path, npm_root: str | None = None,
     config = codex_home / CONFIG_NAME
     try:
         raw, st, text = _load(config)
-        roots = [npm_root] if npm_root else npm_global_roots(runtime_home(config))
+        if npm_root:
+            roots: RootsSource = [npm_root]
+        else:
+            roots = functools.lru_cache(maxsize=1)(lambda: npm_global_roots(runtime_home(config)))
         new_text, changes, notes = plan(text, roots)
         if dry_run:
             for name, _cli in changes:

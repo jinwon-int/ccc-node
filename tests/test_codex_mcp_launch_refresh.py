@@ -230,6 +230,13 @@ class UnchangedTests(_Base):
         self.assert_untouched(original)
         self.assertEqual(out.count("layout not recognized"), 2)
 
+    def test_npm_not_spawned_without_an_npx_candidate(self):
+        original = self.write_config('[mcp_servers.searxng]\ncommand = "node"\nargs = ["/x/cli.js"]\n')
+        with mock.patch.object(mlr, "npm_global_roots", side_effect=AssertionError("npm spawned")):
+            rc, _out, err = self.run_refresh(npm_root="")
+        self.assertEqual(rc, 0, err)
+        self.assert_untouched(original)
+
     def test_no_config_is_a_noop(self):
         rc, out, _err = self.run_refresh()
         self.assertEqual(rc, 0)
