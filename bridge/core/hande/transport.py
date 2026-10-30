@@ -25,6 +25,8 @@ Frames out (to the bot)::
     {"type":"rejected","turn_id":…,"reason":…}
     {"type":"result","turn_id":…,"status":"complete"|"uncertain",
      "text":…,"session_id":…[,"reason":…]}
+    {"type":"notice","room":…,"text":…[,"kind":"status"]}   # no turn; kind
+                                         # status = external-wait line (#2590)
 
 Limits follow the port: 64 KiB per inbound line, 512 KiB per outbound line,
 turn ids ``[A-Za-z0-9_-]{1,128}``. Anything malformed ends the connection
@@ -73,6 +75,7 @@ from telegram_bot.contracts.transport import TurnResult, TurnRunner
 from .state import (
     DEFAULT_SOCKET_MODE,
     DEFAULT_STATUS_INTERIM_INTERVAL_S,
+    DEFAULT_WAIT_STATUS_INTERVAL_S,
     ROOM_PATTERN,
     sender_identity,
 )
@@ -459,6 +462,12 @@ class HandeTransport:
         self.status_interim_interval_s = float(
             self.c.get("status_interim_interval_s") or DEFAULT_STATUS_INTERIM_INTERVAL_S
         )
+        # External-wait status (#2590): ``kind:"status"`` notices, see :meth:`send_status_notice`.
+        self.wait_status_frames = bool(self.c.get("wait_status_frames"))
+        self.wait_status_interval_s = float(
+            self.c.get("wait_status_interval_s") or DEFAULT_WAIT_STATUS_INTERVAL_S
+        )
+        self._wait_status_sent = 0
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
         self.listen_fd = listen_fd if listen_fd is not None else _systemd_listen_fd()
         self.socket_mode = int(self.c.get("socket_mode") or DEFAULT_SOCKET_MODE)
@@ -579,6 +588,52 @@ class HandeTransport:
 
     def room_kind(self, room_id: str) -> str:
         return "family" if room_id in self.family_rooms else "direct"
+
+    def active_room(self) -> str | None:
+        """Room of the turn running now (bot turn or self-job), ``None`` when idle."""
+
+        active = self._active
+        if active is None:
+            return None
+        room = active.job.get("room_id") if isinstance(active.job, Mapping) else None
+        return str(room) if room else None
+
+    @property
+    def wait_status_ready(self) -> bool:
+        """Whether external-wait status lines can go out at all (#2590).
+
+        Needs both knobs: ``wait_status_frames`` (the bot posts a
+        ``kind:"status"`` notice as a status-v1 line) and ``notice_frames``
+        (the bot speaks the ``notice`` frame at all).
+        """
+
+        return self.wait_status_frames and self.notice_frames
+
+    async def send_status_notice(self, room_id: str, text: str) -> bool:
+        """One external-wait status line as a ``kind:"status"`` notice (#2590).
+
+        The bot posts it as a status-v1 message (``status-<uuid>``): not stored,
+        not pushed, shown by the apps as the sender's transient status line,
+        dropped on the sender's next normal message or after 5 minutes. Never
+        held for a reconnecting bot (a stale wait line is worthless; the next
+        re-send carries the current one) and never sent while the knobs are off.
+        """
+
+        if not self.wait_status_ready or room_id not in self.rooms or not text.strip():
+            return False
+        client = self._client
+        if client is None or client.closed:
+            return False
+        frame = {
+            "type": "notice",
+            "room": room_id,
+            "text": _bounded_text(text, 2048),
+            "kind": "status",
+        }
+        if not await client.send(frame):
+            return False
+        self._wait_status_sent += 1
+        return True
 
     def enqueue_notice(
         self, room_id: str, text: str, *, key: str | None = None, msgtype: str = "m.text"
@@ -906,6 +961,8 @@ class HandeTransport:
             "notice_frames": self.notice_frames,
             "status_interims": self.status_interims,
             "status_frames": self.status_frames,
+            "wait_status_frames": self.wait_status_frames,
+            "wait_status_sent": self._wait_status_sent,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
             "self_jobs_uncertain": self._self_jobs_uncertain,
