@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, Optional, Protocol, Tuple
 
 from telegram_bot.core.external_wait import (
+    SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_GITHUB_PR_CHECKS,
     TERMINAL_CANCELLED,
@@ -59,6 +60,19 @@ DEFAULT_RESUME_DAILY_CAP = 10
 NOT_ENQUEUED_GRACE_SECONDS = 180.0
 #: Merge-queue polls back off to this ceiling (group runs take minutes).
 MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS = 120.0
+#: Actions-run polls back off to this ceiling (#2590): builds and release
+#: uploads take minutes, a 5-minute ceiling would add most of a poll to every
+#: wake.
+ACTIONS_RUN_MAX_POLL_INTERVAL_SECONDS = 120.0
+#: Live run statuses (#2590). ``waiting`` is an environment approval gate
+#: (deployment review) — NOT terminal: the run continues once approved.
+ACTIONS_RUN_PENDING_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+#: Completed-run conclusions mapped to a terminal status. ``neutral`` is a
+#: deliberate non-failure; everything not listed (including unknown future
+#: conclusions) is treated as a failure so a promise never silently reports
+#: green for a run that did not succeed.
+ACTIONS_RUN_SUCCESS_CONCLUSIONS = frozenset({"success", "neutral"})
+ACTIONS_RUN_CANCELLED_CONCLUSIONS = frozenset({"cancelled"})
 #: When the base branch's required check set cannot be read, a green rollup
 #: must repeat on this many consecutive polls before it counts (#2507): the
 #: first poll after a push often sees only the fast CodeQL checks.
@@ -100,8 +114,21 @@ class MergeQueueState:
     in_queue: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ActionsRunState:
+    """Body-free picture of one GitHub Actions workflow run (#2590)."""
+
+    status: str  # queued | in_progress | waiting | requested | pending | completed
+    conclusion: str  # "" until completed; success | failure | cancelled | …
+    head_sha: str = ""
+
+
 class WaitTransport(Protocol):
     async def fetch_pr_state(self, repo: str, pr_number: int) -> PrState: ...
+
+
+class ActionsRunTransport(Protocol):
+    async def fetch_actions_run(self, repo: str, run_id: int) -> ActionsRunState: ...
 
 
 class MergeQueueTransport(Protocol):
@@ -257,6 +284,40 @@ class GhCliTransport:
         return _failed_queue_run_id(runs, pr_number)
 
 
+    async def fetch_actions_run(self, repo: str, run_id: int) -> ActionsRunState:
+        """One run's status/conclusion via ``gh api`` (#2590), body-free."""
+        stdout = await _run_gh("api", f"repos/{repo}/actions/runs/{int(run_id)}")
+        try:
+            payload = json.loads(stdout.decode("utf-8", "replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise TransportError("malformed-response")
+        return _actions_run_state_from(payload)
+
+
+def _actions_run_state_from(payload: Any) -> ActionsRunState:
+    if not isinstance(payload, dict):
+        raise TransportError("malformed-response")
+    status = str(payload.get("status") or "").strip().lower()
+    conclusion = str(payload.get("conclusion") or "").strip().lower()
+    if not status or len(status) > 24 or len(conclusion) > 24:
+        raise TransportError("malformed-response")
+    head_sha = str(payload.get("head_sha") or "").strip().lower()
+    return ActionsRunState(status=status, conclusion=conclusion, head_sha=head_sha)
+
+
+def actions_run_terminal(state: ActionsRunState) -> Optional[str]:
+    """Terminal status for a run, or ``None`` while it is still going (#2590)."""
+    if state.status != "completed":
+        # ``waiting`` (environment approval) and unknown live statuses keep
+        # the watch open; expiry still bounds a run nobody approves.
+        return None
+    if state.conclusion in ACTIONS_RUN_SUCCESS_CONCLUSIONS:
+        return TERMINAL_SUCCESS
+    if state.conclusion in ACTIONS_RUN_CANCELLED_CONCLUSIONS:
+        return TERMINAL_CANCELLED
+    return TERMINAL_FAILURE
+
+
 def _merge_queue_state_from(pr: Any) -> MergeQueueState:
     if not isinstance(pr, dict):
         raise TransportError("malformed-response")
@@ -296,6 +357,8 @@ def _classify_gh_error(stderr: bytes) -> str:
     text = stderr.decode("utf-8", "replace")[:400].lower()
     if "rate limit" in text or "ratelimit" in text:
         return "rate-limit"
+    if "not found" in text or "404" in text:
+        return "not-found"
     if "auth" in text or "login" in text or "403" in text or "401" in text:
         return "auth"
     return "gh-error"
@@ -359,6 +422,15 @@ _WAKE_HEADLINE = {
     TERMINAL_CLOSED: "⚠️ PR closed without merging",
 }
 
+#: Actions-run wording (#2590); terminals not listed fall back to the CI map.
+_ACTIONS_RUN_HEADLINE = {
+    TERMINAL_SUCCESS: "✅ Actions run succeeded",
+    TERMINAL_FAILURE: "❌ Actions run failed",
+    TERMINAL_CANCELLED: "⚠️ Actions run cancelled",
+    TERMINAL_EXPIRED: "⏰ Actions run watch expired",
+    TERMINAL_MONITOR_ERROR: "⚠️ Actions run watch failed (GitHub read error)",
+}
+
 
 _SKIP_REASON_TEXT = {
     "session_moved": "the conversation moved to another session",
@@ -379,8 +451,13 @@ def wake_notification_text(
     *absence* of "Continuing automatically.", which reads exactly like a wake
     that did continue — so a dropped promise looked like a kept one.
     """
-    headline = _WAKE_HEADLINE.get(record.get("terminal_status"), "ℹ️ CI watch ended")
-    ref = f"{record.get('repo')}#{record.get('pr_number')} @ {str(record.get('head_sha') or '')[:8]}"
+    if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+        headline = _ACTIONS_RUN_HEADLINE.get(record.get("terminal_status")) or _WAKE_HEADLINE.get(
+            record.get("terminal_status"), "ℹ️ Actions run watch ended"
+        )
+    else:
+        headline = _WAKE_HEADLINE.get(record.get("terminal_status"), "ℹ️ CI watch ended")
+    ref = _wait_ref(record)
     lines = [f"{headline} — {ref}"]
     detail_line = _detail_text(record)
     if detail_line:
@@ -396,10 +473,25 @@ def wake_notification_text(
     return "\n".join(lines)
 
 
+def _wait_ref(record: Dict[str, Any]) -> str:
+    """``repo#pr @ head`` — or ``repo Actions run <id> (<label>)`` (#2590)."""
+    sha = str(record.get("head_sha") or "")[:8]
+    if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+        label = str(record.get("run_label") or "").strip()
+        number = record.get("run_number")
+        ref = f"{record.get('repo')} Actions run {record.get('run_id')}"
+        if label:
+            ref += f" ({label}{f' #{number}' if number else ''})"
+        return f"{ref} @ {sha}" if sha else ref
+    return f"{record.get('repo')}#{record.get('pr_number')} @ {sha}"
+
+
 def _detail_text(record: Dict[str, Any]) -> str:
     detail = record.get("terminal_detail")
     if not isinstance(detail, dict):
         return ""
+    if detail.get("conclusion"):
+        return f"Run conclusion: {detail['conclusion']}"
     if detail.get("failed_run_id"):
         return f"Failed merge-group run: {detail['failed_run_id']}"
     if detail.get("reason") == "never-enqueued":
@@ -418,9 +510,15 @@ def resume_prompt_text(record: Dict[str, Any]) -> str:
             extra += f" failed_run={detail['failed_run_id']}"
         if detail.get("reason"):
             extra += f" reason={detail['reason']}"
+        if detail.get("conclusion"):
+            extra += f" conclusion={detail['conclusion']}"
+    if source == SOURCE_GITHUB_ACTIONS_RUN:
+        target = f"run={record.get('run_id')}"
+    else:
+        target = f"pr={record.get('pr_number')}"
     return (
         f"[external_event: {source} terminal={record.get('terminal_status')} "
-        f"repo={record.get('repo')} pr={record.get('pr_number')} "
+        f"repo={record.get('repo')} {target} "
         f"head={str(record.get('head_sha') or '')[:8]}{extra}]\n{summary}"
     )
 
@@ -528,6 +626,9 @@ class ExternalWaitMonitor:
         if record.get("source") == SOURCE_GITHUB_MERGE_QUEUE:
             await self._poll_merge_queue(record, now)
             return
+        if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+            await self._poll_actions_run(record, now)
+            return
         try:
             state = await self._transport.fetch_pr_state(record["repo"], int(record["pr_number"]))
         except TransportError as exc:
@@ -631,6 +732,37 @@ class ExternalWaitMonitor:
             if run_id:
                 detail["failed_run_id"] = int(run_id)
         self._registry.finish(wait_id, TERMINAL_EVICTED, now=now, detail=detail)
+
+    async def _poll_actions_run(self, record: Dict[str, Any], now: float) -> None:
+        """Watch one workflow run until it completes (#2590).
+
+        ``waiting`` (an environment approval gate) stays open and is recorded
+        as the run's live status so the wait-status line can say so; the
+        status line is refreshed whenever that live status changes.
+        """
+        wait_id = record["wait_id"]
+        fetch = getattr(self._transport, "fetch_actions_run", None)
+        if fetch is None:
+            self._transport_failed(record, TransportError("unsupported-source"), now)
+            return
+        try:
+            state = await fetch(record["repo"], int(record["run_id"]))
+        except TransportError as exc:
+            self._transport_failed(record, exc, now)
+            return
+        except (KeyError, TypeError, ValueError):
+            self._transport_failed(record, TransportError("malformed-record"), now)
+            return
+        self._transport_errors.pop(wait_id, None)
+        terminal = actions_run_terminal(state)
+        if terminal is not None:
+            detail = {"conclusion": state.conclusion} if state.conclusion else None
+            self._registry.finish(wait_id, terminal, now=now, detail=detail)
+            return
+        if self._registry.note_run_status(wait_id, state.status):
+            refreshed = self._registry.get(wait_id) or record
+            await self._sync_status(refreshed)
+        self._reschedule(record, ceiling=ACTIONS_RUN_MAX_POLL_INTERVAL_SECONDS)
 
     def _reschedule(self, record: Dict[str, Any], *, ceiling: float = MAX_POLL_INTERVAL_SECONDS) -> None:
         interval = min(

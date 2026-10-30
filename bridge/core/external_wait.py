@@ -46,7 +46,11 @@ SOURCE_GITHUB_PR_CHECKS = "github_pr_checks"
 #: speculative group run fails — no check rollup or PR state changes — so the
 #: check-rollup source can never wake on it.
 SOURCE_GITHUB_MERGE_QUEUE = "github_merge_queue"
-SOURCES = frozenset({SOURCE_GITHUB_PR_CHECKS, SOURCE_GITHUB_MERGE_QUEUE})
+#: A single GitHub Actions workflow run (#2590): a build, a release upload, a
+#: dispatched job — anything the agent started and would otherwise watch with
+#: an ad-hoc polling loop that ends with the turn. Keyed by run id, not PR.
+SOURCE_GITHUB_ACTIONS_RUN = "github_actions_run"
+SOURCES = frozenset({SOURCE_GITHUB_PR_CHECKS, SOURCE_GITHUB_MERGE_QUEUE, SOURCE_GITHUB_ACTIONS_RUN})
 
 #: Non-terminal registry state.
 STATE_MONITORING = "monitoring"
@@ -95,6 +99,9 @@ ACTIVE_ROUTE_TTL_SECONDS = 6 * 60 * 60
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _MAX_SUMMARY_CHARS = 200
+_MAX_RUN_LABEL_CHARS = 80
+#: Live run status kept on an Actions-run record for display only (#2590).
+_RUN_STATUS_RE = re.compile(r"^[a-z_]{1,24}$")
 
 
 class ExternalWaitValidationError(ValueError):
@@ -122,6 +129,23 @@ def validate_pr_number(pr_number: Any) -> int:
     if value <= 0:
         raise ExternalWaitValidationError("pr must be a positive integer")
     return value
+
+
+def validate_run_id(run_id: Any) -> int:
+    """GitHub Actions run id (``databaseId``) — a positive integer (#2590)."""
+    try:
+        value = int(str(run_id).strip())
+    except (TypeError, ValueError):
+        raise ExternalWaitValidationError("run id must be a positive integer")
+    if value <= 0 or value >= 10**15:
+        raise ExternalWaitValidationError("run id must be a positive integer")
+    return value
+
+
+def validate_run_label(label: Optional[str]) -> str:
+    """Bounded single-line workflow display name (may be empty, #2590)."""
+    text = " ".join(str(label or "").split())[:_MAX_RUN_LABEL_CHARS]
+    return text.strip()
 
 
 def validate_head_sha(head_sha: str) -> str:
@@ -269,30 +293,60 @@ class ExternalWaitRegistry:
         poll_interval_seconds: float,
         now: Optional[float] = None,
         source: str = SOURCE_GITHUB_PR_CHECKS,
+        run_id: Any = None,
+        run_label: Optional[str] = None,
+        run_number: Any = None,
     ) -> str:
-        """Register one wait; returns its id (idempotent per natural key)."""
+        """Register one wait; returns its id (idempotent per natural key).
+
+        An Actions-run wait (#2590) is keyed by ``run_id`` instead of a PR:
+        ``pr_number`` is stored as ``None`` and ``head_sha`` is optional
+        (the run's head, kept for display and webhook acceleration).
+        """
         if source not in SOURCES:
             raise ExternalWaitValidationError(f"unknown wait source: {source}")
         repo = validate_repo(repo)
-        pr_number = validate_pr_number(pr_number)
-        head_sha = validate_head_sha(head_sha)
+        extra: Dict[str, Any] = {}
+        if source == SOURCE_GITHUB_ACTIONS_RUN:
+            run_id = validate_run_id(run_id)
+            pr_number = None
+            head_sha = validate_head_sha(head_sha) if str(head_sha or "").strip() else ""
+            try:
+                number = int(run_number) if run_number is not None and str(run_number).strip() else None
+            except (TypeError, ValueError):
+                number = None
+            extra = {
+                "run_id": run_id,
+                "run_label": validate_run_label(run_label),
+                "run_number": number if number is not None and 0 < number < 10**9 else None,
+                "run_status": None,
+            }
+            natural = (source, repo, run_id, int(user_id), int(chat_id))
+        else:
+            pr_number = validate_pr_number(pr_number)
+            head_sha = validate_head_sha(head_sha)
+            natural = (source, repo, pr_number, head_sha, int(user_id), int(chat_id))
         summary = validate_summary(summary)
         now = self._clock() if now is None else float(now)
-        natural = (source, repo, pr_number, head_sha, int(user_id), int(chat_id))
+
+        def _natural_of(rec: Dict[str, Any]) -> tuple:
+            if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+                return (rec.get("source"), rec.get("repo"), rec.get("run_id"), rec.get("user_id"), rec.get("chat_id"))
+            return (
+                rec.get("source"),
+                rec.get("repo"),
+                rec.get("pr_number"),
+                rec.get("head_sha"),
+                rec.get("user_id"),
+                rec.get("chat_id"),
+            )
 
         def _do(records):
             self._prune(records, now=now)
             for wait_id, rec in records.items():
                 if rec.get("state") != STATE_MONITORING:
                     continue
-                if (
-                    rec.get("source"),
-                    rec.get("repo"),
-                    rec.get("pr_number"),
-                    rec.get("head_sha"),
-                    rec.get("user_id"),
-                    rec.get("chat_id"),
-                ) == natural:
+                if _natural_of(rec) == natural:
                     return wait_id
             wait_id = uuid.uuid4().hex[:12]
             records[wait_id] = {
@@ -314,6 +368,7 @@ class ExternalWaitRegistry:
                 "poll_interval_seconds": max(5.0, float(poll_interval_seconds)),
                 "terminal_status": None,
                 "wake": None,
+                **extra,
             }
             return wait_id
 
@@ -408,6 +463,30 @@ class ExternalWaitRegistry:
             if rec is None or rec.get("state") != STATE_MONITORING or rec.get("queue_seen"):
                 return False
             rec["queue_seen"] = True
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return bool(self._mutate(_do))
+
+    def note_run_status(self, wait_id: str, run_status: str) -> bool:
+        """Remember an Actions run's live status for display (#2590).
+
+        Only short GitHub status tokens (``queued``, ``in_progress``,
+        ``waiting`` …) are kept; the record is rewritten only on a change so
+        a long build does not churn the registry every poll. Returns True when
+        the stored value changed.
+        """
+        value = str(run_status or "").strip().lower()
+        if not _RUN_STATUS_RE.match(value):
+            return False
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None or rec.get("state") != STATE_MONITORING:
+                return False
+            if rec.get("run_status") == value:
+                return False
+            rec["run_status"] = value
             rec["updated_at"] = _utc_now_iso()
             return True
 
@@ -623,11 +702,19 @@ def render_waits(records: List[Dict[str, Any]]) -> str:
     for rec in records:
         state = rec.get("state")
         marker = "⏳" if state == STATE_MONITORING else "🏁"
-        kind = " (merge queue)" if rec.get("source") == SOURCE_GITHUB_MERGE_QUEUE else ""
-        lines.append(
-            f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')}#{rec.get('pr_number')}"
-            f"{kind} @ {str(rec.get('head_sha') or '')[:8]} · {state}"
-        )
+        if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+            label = str(rec.get("run_label") or "").strip() or "workflow"
+            sha = str(rec.get("head_sha") or "")[:8]
+            lines.append(
+                f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')} Actions run {rec.get('run_id')}"
+                f" ({label}){f' @ {sha}' if sha else ''} · {state}"
+            )
+        else:
+            kind = " (merge queue)" if rec.get("source") == SOURCE_GITHUB_MERGE_QUEUE else ""
+            lines.append(
+                f"{marker} `{rec.get('wait_id')}` — {rec.get('repo')}#{rec.get('pr_number')}"
+                f"{kind} @ {str(rec.get('head_sha') or '')[:8]} · {state}"
+            )
         summary = str(rec.get("summary") or "").strip()
         if summary:
             lines.append(f"   ↳ {summary}")
@@ -779,6 +866,7 @@ __all__ = [
     "ACTIVE_ROUTE_TTL_SECONDS",
     "ExternalWaitRegistry",
     "ExternalWaitValidationError",
+    "SOURCE_GITHUB_ACTIONS_RUN",
     "SOURCE_GITHUB_MERGE_QUEUE",
     "SOURCE_GITHUB_PR_CHECKS",
     "SOURCES",
@@ -804,5 +892,7 @@ __all__ = [
     "validate_head_sha",
     "validate_pr_number",
     "validate_repo",
+    "validate_run_id",
+    "validate_run_label",
     "validate_summary",
 ]

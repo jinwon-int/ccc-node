@@ -32,6 +32,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from telegram_bot.core.external_wait import (
     STATE_MONITORING,
+    SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     TERMINAL_CANCELLED,
     TERMINAL_CLOSED,
@@ -142,7 +143,22 @@ def _duration(seconds: float) -> str:
     return f"{hours}h" if minutes == 0 else f"{hours}h{minutes:02d}m"
 
 
+def _actions_run_label(rec: Dict[str, Any]) -> str:
+    """``Actions run <workflow> #<n>`` (#2590); an approval gate is named."""
+    name = redact_credentials(" ".join(str(rec.get("run_label") or "").split()))[:80].strip()
+    number = rec.get("run_number")
+    if name:
+        label = f"Actions run {name}" + (f" #{number}" if number else "")
+    else:
+        label = f"Actions run {rec.get('run_id')}"
+    if rec.get("state") == STATE_MONITORING and rec.get("run_status") == "waiting":
+        label += " (awaiting approval)"
+    return label
+
+
 def _label(rec: Dict[str, Any]) -> str:
+    if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+        return _actions_run_label(rec)
     if rec.get("source") == SOURCE_GITHUB_MERGE_QUEUE:
         return f"PR #{rec.get('pr_number')} merge queue"
     return f"PR #{rec.get('pr_number')} CI"
