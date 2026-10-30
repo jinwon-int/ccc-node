@@ -32,14 +32,20 @@ from .steward import (
     needs_approval,
     qualified,
 )
+from .wait_status import HandeWaitStatusMixin
 
 logger = logging.getLogger(__name__)
 
 _CLIENT_STARTUP_GRACE_S = 120.0
 
 
-class HandeBot(MatrixBot):
-    """``TurnRunner`` over ``ProjectChatHandler`` for the 「한데」 relay bot."""
+class HandeBot(HandeWaitStatusMixin, MatrixBot):
+    """``TurnRunner`` over ``ProjectChatHandler`` for the 「한데」 relay bot.
+
+    The external-wait status projection is the hande one (:mod:`.wait_status`,
+    #2590): ``kind:"status"`` notices re-sent while a wait is watched, instead
+    of the Matrix message that is edited, moved and redacted.
+    """
 
     channel_name = "hande"
     # Re-declared for mypy: MatrixBot sets it in __init__, which mypy cannot

@@ -52,6 +52,12 @@ MAX_APPROVAL_TIMEOUT_S = 600
 DEFAULT_STATUS_INTERIM_INTERVAL_S = 60
 MIN_STATUS_INTERIM_INTERVAL_S = 10
 MAX_STATUS_INTERIM_INTERVAL_S = 3600
+# ``wait_status_frames`` (#2590): the external-wait status line is re-sent this often
+# while a wait is still monitored. The apps drop a status line 5 minutes after its
+# last update (status-v1), so the ceiling stays well under that.
+DEFAULT_WAIT_STATUS_INTERVAL_S = 120
+MIN_WAIT_STATUS_INTERVAL_S = 30
+MAX_WAIT_STATUS_INTERVAL_S = 240
 DEFAULT_SOCKET_MODE = 0o660
 
 
@@ -160,6 +166,7 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         "steward_tools_approve_all",
         "status_interims",
         "status_frames",
+        "wait_status_frames",
     ):
         value = config.get(key, key == "steward_tools")  # steward tools default on
         if type(value) is not bool:
@@ -177,6 +184,17 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
             f"{MIN_STATUS_INTERIM_INTERVAL_S}..{MAX_STATUS_INTERIM_INTERVAL_S}"
         )
     knobs["status_interim_interval_s"] = interval_raw
+    # External-wait status as ``kind:"status"`` notices (#2590): re-send cadence.
+    wait_raw = config.get("wait_status_interval_s", DEFAULT_WAIT_STATUS_INTERVAL_S)
+    if (
+        type(wait_raw) is not int
+        or not MIN_WAIT_STATUS_INTERVAL_S <= wait_raw <= MAX_WAIT_STATUS_INTERVAL_S
+    ):
+        raise HandeConfigError(
+            "hande config 'wait_status_interval_s' must be "
+            f"{MIN_WAIT_STATUS_INTERVAL_S}..{MAX_WAIT_STATUS_INTERVAL_S}"
+        )
+    knobs["wait_status_interval_s"] = wait_raw
     return knobs
 
 

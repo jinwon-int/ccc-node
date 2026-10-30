@@ -92,6 +92,21 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   `kind:"status"` interim frames at the Matrix cadence for a status-v1 bot/app pair (see the
   mapping table); it takes precedence over `status_interims`. Rollout order: relay → bot → apps →
   this knob (config edit + `ccc-hande-bridge` restart).
+- `wait_status_frames` (default off, #2590) shows registered external waits (`gh-ci-wait`:
+  PR checks, merge queue, and any other source the registry gains) after the turn ends. The
+  shared renderer's `⏳ Waiting for results · …` text goes out as a `notice` frame with
+  `kind:"status"`; a bot that knows the kind posts it as a status-v1 line (`status-<uuid>`: not
+  stored, not pushed), so the apps show it at the bottom of the room and in the room-list preview
+  like the `⏳ Working` line. There is no edit or delete on the port, so the line is **re-sent**:
+  on `turn_closed` (the reply just cleared it on the apps), at once when the text changes, and
+  every `wait_status_interval_s` (default 120, 30..240 — under the apps' 5-minute expiry) while a
+  wait is still monitored; it stops when nothing is monitored (the resume turn's reply carries the
+  result). Nothing is sent while a turn runs in that room (its `⏳ Working` line owns the slot) or
+  while no bot is connected (never held). Needs `notice_frames: true` as well, and the
+  `CCC_EXTERNAL_WAIT_STATUS` flag (default on). Rollout: replace the bot with one that knows
+  `notice` + `kind:"status"` first (an older bot posts every re-send as a plain notice), then
+  this knob (config edit + `ccc-hande-bridge` restart). `health_signals()` reports
+  `wait_status_frames` and `wait_status_sent`.
 - `status_interims` (default off) re-posts the `⏳ Working — Ns | <tool>` heartbeat as
   interim messages (see the mapping table) — the first at once, then at most one per
   `status_interim_interval_s` whatever the tool does (the line names the tool running then).
