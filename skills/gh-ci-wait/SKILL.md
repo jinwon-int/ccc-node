@@ -53,6 +53,32 @@ python -m telegram_bot.core.external_wait_cli register \
 
 On success the CLI prints `{"ok": true, "wait_id": "..."}`.
 
+## Actions run 대기 (#2590)
+
+When the next step waits on a **GitHub Actions workflow run** rather than a
+PR — a dispatched build, an AAB/IPA bundle, a TestFlight or release upload —
+register the run itself instead of polling it with a background loop that
+dies with the turn (and that no status line ever shows):
+
+```bash
+python -m telegram_bot.core.external_wait_cli register \
+  --repo owner/name --source actions-run --run-id <databaseId> \
+  --summary "<one-line next step>"
+```
+
+- Take the run id from `gh run list --workflow <file> --limit 1 --json databaseId`
+  (or the URL `gh workflow run` prints). The CLI resolves the run through `gh`
+  and fails closed when it does not exist; workflow name, run number, and head
+  are recorded for display. `--head-sha` is optional and must match the run.
+- Outcomes: `success` (conclusion `success`/`neutral`), `cancelled`, `failure`
+  (any other conclusion — the resumed turn sees `conclusion=<value>`).
+- A run held by an environment approval (`status: waiting`) is **not**
+  terminal: the wait stays open and the status line reads
+  `(awaiting approval)`. Approving the deployment is still a separate,
+  fresh-approval release action — the wait never approves anything.
+- Polls back off to 2 minutes; the default 6h timeout bounds a run nobody
+  approves.
+
 **Re-verify these before relying on them.** Every value above is pinned to the
 CLI's source, not to memory — the CLI is a separate component and may move:
 
@@ -63,6 +89,7 @@ CLI's source, not to memory — the CLI is a separate component and may move:
 | one-shot, exact-head-bound | `grep -n 'TERMINAL_SUPERSEDED\|head_sha' bridge/core/external_wait_cli.py` — a newer head finishes the old wait as superseded |
 | `route-unavailable` token | `grep -n 'route-unavailable' bridge/core/external_wait_cli.py` |
 | `--source merge-queue` and its `merged`/`evicted`/`closed` outcomes | `grep -n '_SOURCE_ALIASES\|_poll_merge_queue' bridge/core/external_wait_cli.py bridge/core/external_wait_monitor.py` |
+| `--source actions-run`, its terminal mapping, `waiting` not terminal | `grep -n 'actions-run\|def actions_run_terminal\|ACTIONS_RUN_' bridge/core/external_wait_cli.py bridge/core/external_wait_monitor.py` |
 
 If a check disagrees with this table, the CLI is authoritative — fix this file,
 do not work around it.

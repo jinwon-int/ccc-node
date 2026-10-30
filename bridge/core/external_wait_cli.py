@@ -18,6 +18,9 @@ Usage (inside an agent turn)::
     python -m telegram_bot.core.external_wait_cli register \
         --repo owner/name --pr 123 --head-sha def5678 --source merge-queue \
         --summary "clean up the branch once it lands"
+    python -m telegram_bot.core.external_wait_cli register \
+        --repo owner/name --source actions-run --run-id 41058887647 \
+        --summary "download the bundle and verify it"
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
 
@@ -27,6 +30,15 @@ queue drops it (the speculative group run failed — the PR stays OPEN with its
 approval and no check changes, so the default source never wakes), or
 ``closed``. An eviction records the failed merge-group run id for the
 resumed turn. Register right after enqueueing.
+
+``--source actions-run`` (#2590) watches one GitHub Actions workflow run by
+``--run-id`` (a dispatched build, a release upload) instead of a PR. The run
+is resolved through ``gh`` at registration — an unknown run fails closed — and
+its workflow name, run number and head are recorded for display. The wait
+ends ``success`` (conclusion success/neutral), ``cancelled``, or ``failure``
+(any other conclusion, recorded for the resumed turn). A run waiting on an
+environment approval stays open and the status line says so. ``--head-sha``
+is optional; when given it must match the run's head.
 
 A new registration for the same PR at a different head supersedes this
 conversation's older pending waits for that PR (#1110): a stale head must
@@ -47,6 +59,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from telegram_bot.core.external_wait import (
+    SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_GITHUB_PR_CHECKS,
     STATE_MONITORING,
@@ -59,6 +72,8 @@ from telegram_bot.core.external_wait import (
     validate_head_sha,
     validate_pr_number,
     validate_repo,
+    validate_run_id,
+    validate_run_label,
     validate_summary,
 )
 from telegram_bot.core.external_wait_monitor import (
@@ -122,6 +137,50 @@ def resolve_full_head_sha(repo: str, head_sha: str) -> str:
             "head SHA resolution returned an unexpected value; registration refused"
         )
     return full
+
+
+def resolve_actions_run(repo: str, run_id: int) -> dict[str, Any]:
+    """Look the run up through ``gh`` at registration (#2590), fail-closed.
+
+    Returns ``{"name", "run_number", "head_sha", "status"}`` (body-free). A
+    run that does not resolve would register a wait that can only end in a
+    monitor error after three polls — refuse it up front instead, like an
+    unresolvable short SHA (#961).
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/actions/runs/{int(run_id)}",
+                "--jq",
+                "{name: .name, run_number: .run_number, head_sha: .head_sha, status: .status}",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ExternalWaitValidationError("Actions run could not be resolved via gh (unavailable or timeout)")
+    if proc.returncode != 0:
+        raise ExternalWaitValidationError("Actions run does not resolve in the repo; check --repo and --run-id")
+    try:
+        payload = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        raise ExternalWaitValidationError("Actions run lookup returned an unexpected value; registration refused")
+    head = str(payload.get("head_sha") or "").strip().lower()
+    try:
+        head = validate_head_sha(head) if head else ""
+    except ExternalWaitValidationError:
+        head = ""
+    number = payload.get("run_number")
+    return {
+        "name": validate_run_label(payload.get("name")),
+        "run_number": number if isinstance(number, int) and number > 0 else None,
+        "head_sha": head,
+        "status": str(payload.get("status") or "").strip().lower()[:24],
+    }
 
 
 def _parse_args(argv: Sequence[str]) -> dict[str, Any]:
@@ -195,14 +254,78 @@ _SOURCE_ALIASES = {
     SOURCE_GITHUB_PR_CHECKS: SOURCE_GITHUB_PR_CHECKS,
     "merge-queue": SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_GITHUB_MERGE_QUEUE: SOURCE_GITHUB_MERGE_QUEUE,
+    "actions-run": SOURCE_GITHUB_ACTIONS_RUN,
+    SOURCE_GITHUB_ACTIONS_RUN: SOURCE_GITHUB_ACTIONS_RUN,
 }
 
 
 def _source_of(raw: Any) -> str:
     key = str(raw or "").strip().lower()
     if key not in _SOURCE_ALIASES:
-        raise ExternalWaitValidationError("source must be 'checks' or 'merge-queue'")
+        raise ExternalWaitValidationError("source must be 'checks', 'merge-queue' or 'actions-run'")
     return _SOURCE_ALIASES[key]
+
+
+def _register_actions_run(home: Path, args: dict[str, Any], route: dict[str, Any]) -> int:
+    """``--source actions-run``: watch one workflow run by id (#2590)."""
+    try:
+        repo = validate_repo(str(args.get("repo", "")))
+        run_id = validate_run_id(args.get("run_id"))
+        summary = validate_summary(args.get("summary"))
+        timeout = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        wanted_head = str(args.get("head_sha", "") or "").strip()
+        wanted_head = validate_head_sha(wanted_head) if wanted_head else ""
+        run = resolve_actions_run(repo, run_id)
+        head_sha = str(run.get("head_sha") or "")
+        if wanted_head and not (head_sha and head_sha.startswith(wanted_head)):
+            raise ExternalWaitValidationError("--head-sha does not match the run's head commit")
+        head_sha = head_sha or wanted_head
+    except ExternalWaitValidationError as exc:
+        _emit({"ok": False, "code": "validation", "message": str(exc)})
+        return RC_USAGE
+    except (TypeError, ValueError):
+        _emit({"ok": False, "code": "validation", "message": "invalid numeric field"})
+        return RC_USAGE
+
+    registry = ExternalWaitRegistry(default_registry_path(home))
+    wait_id = registry.register(
+        repo=repo,
+        pr_number=None,
+        head_sha=head_sha,
+        user_id=int(route["user_id"]),
+        chat_id=int(route["chat_id"]),
+        session_id=route.get("session_id"),
+        summary=summary,
+        timeout_seconds=timeout,
+        poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+        source=SOURCE_GITHUB_ACTIONS_RUN,
+        run_id=run_id,
+        run_label=run.get("name"),
+        run_number=run.get("run_number"),
+    )
+    if not wait_id:
+        _emit({"ok": False, "code": "registry-error"})
+        return RC_REGISTRY_ERROR
+    _emit(
+        {
+            "ok": True,
+            "wait_id": wait_id,
+            "repo": repo,
+            "run_id": run_id,
+            "run_number": run.get("run_number"),
+            "workflow": run.get("name") or "",
+            "head_sha": head_sha,
+            "run_status": run.get("status") or "",
+            "timeout_seconds": int(timeout),
+            "source": SOURCE_GITHUB_ACTIONS_RUN,
+            "superseded": [],
+            "message": (
+                "watching the Actions run; conversation resumes when it completes "
+                f"(wait_id={wait_id})"
+            ),
+        }
+    )
+    return RC_OK
 
 
 def _cmd_register(home: Path, args: dict[str, Any]) -> int:
@@ -220,6 +343,12 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
             }
         )
         return RC_ROUTE_UNAVAILABLE
+    try:
+        if _source_of(args.get("source")) == SOURCE_GITHUB_ACTIONS_RUN:
+            return _register_actions_run(home, args, route)
+    except ExternalWaitValidationError as exc:
+        _emit({"ok": False, "code": "validation", "message": str(exc)})
+        return RC_USAGE
     try:
         repo = validate_repo(str(args.get("repo", "")))
         pr_number = validate_pr_number(args.get("pr"))
@@ -297,6 +426,7 @@ def _cmd_list(home: Path) -> int:
                     "wait_id": rec.get("wait_id"),
                     "repo": rec.get("repo"),
                     "pr": rec.get("pr_number"),
+                    "run_id": rec.get("run_id"),
                     "head_sha": str(rec.get("head_sha") or "")[:8],
                     "source": rec.get("source") or SOURCE_GITHUB_PR_CHECKS,
                     "state": rec.get("state"),
