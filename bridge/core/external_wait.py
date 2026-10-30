@@ -307,6 +307,7 @@ class ExternalWaitRegistry:
             raise ExternalWaitValidationError(f"unknown wait source: {source}")
         repo = validate_repo(repo)
         extra: Dict[str, Any] = {}
+        natural: tuple
         if source == SOURCE_GITHUB_ACTIONS_RUN:
             run_id = validate_run_id(run_id)
             pr_number = None
