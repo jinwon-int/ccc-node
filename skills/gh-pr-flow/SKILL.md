@@ -282,7 +282,16 @@ so the account name is not an identity.
      Enabling the setting is a repository-settings change and a separate
      approval; without it, watch and merge in the foreground instead — with
      `ci-watch.sh` (below), not a hand-rolled loop.
-   - **Watching checks without the bridge wait**: when `gh-ci-wait`
+   - **Waiting on CI: register first (#2603).** When the next step depends on
+     this PR's checks, register a durable wait with the `gh-ci-wait` skill
+     (`external_wait_cli register --repo … --pr <n> --head-sha <full sha>
+     --summary "…"`) and end the turn on the `wait_id`. The registered wait is
+     what shows the `⏳ Waiting for results · PR #<n> CI` line in Hande/Matrix
+     and resumes the conversation even if this session is gone; a background
+     watcher shows nothing and dies with the session (2026-11-01: 0 of 11 nodes
+     had registered a wait in 24 h, so the line never appeared). Do not also run
+     a watcher for the same head — both would continue the work.
+   - **Watching checks without the bridge wait** (fallback only): when `gh-ci-wait`
      registration fails (`route-unavailable`), run
      `bash "$HOME/.claude/skills/gh-pr-flow/ci-watch.sh" --repo <owner/repo> --pr <n> --head <sha>`
      in the background and branch on its exit code (`0` green · `10` failed,
@@ -341,7 +350,13 @@ pr_id="$(gh pr view <n> --repo <owner/repo> --json id --jq .id)"
 gh api graphql \
   -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
   -f id="$pr_id"
-# then watch BOTH the PR state and the queue entry — never "poll until MERGED":
+# then register the queue wait (#2603) — it watches the PR state AND the queue
+# entry, ends merged / evicted (names the failed group run) / closed, shows the
+# ⏳ Waiting line, and resumes the conversation:
+python -m telegram_bot.core.external_wait_cli register \
+  --repo <owner/repo> --pr <n> --head-sha "$(gh pr view <n> --repo <owner/repo> --json headRefOid --jq .headRefOid)" \
+  --source merge-queue --summary "<one-line next step after the queue result>"
+# fallback ONLY if registration fails (route-unavailable) — never both:
 bash "$HOME/.claude/skills/gh-pr-flow/merge-queue-watch.sh" --repo <owner/repo> --pr <n>
 ```
 
@@ -356,7 +371,9 @@ first terminal event: `0` merged, `10` evicted (it names the failed
 unmerged, `12` never enqueued, `20` timeout. The queue deletes the entry the
 moment it squash-lands, so an empty entry is re-confirmed against the PR state
 (`--settle-tries`, default 3 × 5 s) before it becomes `10`/`12` — a PR that
-merged between the two reads reports `merged` (#2208, pr-shepherd#154). Run it in the background and
+merged between the two reads reports `merged` (#2208, pr-shepherd#154). The
+registered `--source merge-queue` wait applies the same terminal rules; when
+you fall back to the script, run it in the background and
 act on the exit code; on `10`, classify the failing job first — an unrelated
 flaky test means re-enqueue the same approved head (and record the flake on
 its issue); a real failure means push the fix, get fresh exact-head approval
@@ -545,6 +562,14 @@ the run is no longer waiting) and `jinon86` already approved it, it reports
 was never approved exits `66` with its state and submits nothing. Approving the
 deployment authorizes only that job to proceed — not a re-run, another
 environment, or a follow-up release.
+
+To wait for the run's result (build, TestFlight or release upload), register
+it instead of a background `gh run watch` (#2603): `external_wait_cli register
+--repo <owner/repo> --source actions-run --run-id <id> --summary "…"` (see
+`gh-ci-wait`). Before dispatching, check `gh run list --workflow <file>` for a
+run another session already started on the same head — two sessions on one
+node dispatched duplicate TestFlight builds on 2026-10-31; the duplicate was
+cancelled before its environment approval.
 
 ## External-author PRs (a2a-nexus#2428)
 

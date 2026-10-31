@@ -263,7 +263,7 @@
       "name": "gh-ci-wait",
       "source": "skills/gh-ci-wait",
       "status": "active",
-      "tree_sha256": "368d8f7eee36b7222d521c7125ca7823d5b741235b6227f723e9c8aedc7d0df5"
+      "tree_sha256": "8ca1f94e2eb7d2411b7a8108ca5cd756776ccaaaf355e2a45cfd79088f1d995d"
     },
     {
       "audience": "claude",
@@ -274,7 +274,7 @@
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "ff9cc7b40b3ebecb7b804d0d80536c5d08235431fbb0c9e3e345e182f5c12e68"
+      "tree_sha256": "4517c0944feccb470a9e1ac1366b5952f3ae78d647f7f013ed8f674dda973ac5"
     },
     {
       "audience": "claude",
