@@ -51,6 +51,16 @@ Rules:
 
 ## Step 2 — Register the job so the *next* session can find it
 
+> Since ccc-node #2605 (layer 3) `detached_jobs.py register` also arms a bridge
+> **detached-job wait** when it runs inside a bridge turn on a node that has the
+> bridge: the conversation's status line shows `⏳ Running detached · <job> — <summary>`
+> and the conversation is woken (`[external_event: detached_job terminal=success|failure|lost …]`)
+> when the log's `EXIT=` marker appears — no watcher process, survives bridge
+> restarts. Outside a turn it prints `bridge wait not armed (route-unavailable)`
+> and the job registry entry still stands. Opt out with `--no-wait` or
+> `CCC_DETACHED_JOBS_NO_WAIT=1`; arm by hand with
+> `python -m telegram_bot.core.external_wait_cli register --source detached-job --unit <job> --log <LOG> --summary "…"`.
+
 **Detaching the work is not enough — the watcher must not be the only record**
 (ccc-node #1258). A `Monitor` until-loop or a bounded `for` poll runs as a child
 of the session process. When the session restarts, the watcher dies while the

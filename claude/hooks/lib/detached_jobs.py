@@ -370,7 +370,59 @@ def cmd_register(argv: List[str]) -> int:
     workdir = _opt(argv, "workdir").strip()
     if workdir:
         rec["workdir"] = workdir
-    return _append(registry_path(_opt(argv, "registry")), rec)
+    rc = _append(registry_path(_opt(argv, "registry")), rec)
+    if rc == 0 and not _opt(argv, "registry") and "--no-wait" not in argv:
+        _arm_bridge_wait(unit, rec["log"], summary)
+    return rc
+
+
+def _bridge_python() -> str:
+    """The bridge venv interpreter when this node runs the ccc bridge, else ''."""
+    explicit = os.environ.get("CCC_BRIDGE_PYTHON", "").strip()
+    candidates = [explicit] if explicit else []
+    candidates.append("/opt/ccc-node/bridge/venv/bin/python")
+    for candidate in candidates:
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+def _arm_bridge_wait(unit: str, log_path: str, summary: str) -> None:
+    """Best-effort: register the job as a bridge ``detached-job`` wait (ccc-node #2605).
+
+    Inside a bridge turn this puts ``⏳ Running detached · <unit>`` on the
+    conversation's status line and wakes the conversation when the log's
+    ``EXIT=`` marker appears — the only background path that survives a bridge
+    restart. Outside a turn (no active route), on a node without the bridge,
+    or when ``CCC_DETACHED_JOBS_NO_WAIT=1`` / ``--no-wait`` / ``--registry``
+    is given, it does nothing; the job registry above is never affected.
+    """
+    if os.environ.get("CCC_DETACHED_JOBS_NO_WAIT", "").strip() in {"1", "true", "yes", "on"}:
+        return
+    python = _bridge_python()
+    if not python:
+        return
+    cmd = [
+        python, "-m", "telegram_bot.core.external_wait_cli", "register",
+        "--source", "detached-job", "--unit", unit, "--log", log_path,
+    ]
+    if summary:
+        cmd += ["--summary", summary]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return
+    out = proc.stdout.decode("utf-8", "ignore").strip().splitlines()
+    line = out[-1] if out else ""
+    try:
+        payload = json.loads(line) if line else {}
+    except ValueError:
+        payload = {}
+    if proc.returncode == 0 and payload.get("ok"):
+        sys.stdout.write(f"bridge wait armed: wait_id={payload.get('wait_id')} (⏳ status line + wake on EXIT)\n")
+    else:
+        code = payload.get("code") or f"rc={proc.returncode}"
+        sys.stdout.write(f"bridge wait not armed ({code}); the job registry entry stands on its own\n")
 
 
 def cmd_ack(argv: List[str]) -> int:
