@@ -88,6 +88,9 @@ class AccessControlGuardTests(unittest.TestCase):
 
             env = os.environ.copy()
             for key in (
+                # conftest pins a private BOT_DATA_DIR (#2600); the real
+                # entrypoint must derive <project>/.telegram_bot itself here.
+                "BOT_DATA_DIR",
                 "PROJECT_ROOT",
                 "TELEGRAM_BOT_TOKEN",
                 "ALLOWED_USER_IDS",
@@ -145,6 +148,9 @@ class AccessControlGuardTests(unittest.TestCase):
 
             env = os.environ.copy()
             for key in (
+                # conftest pins a private BOT_DATA_DIR (#2600); the real
+                # entrypoint must derive <project>/.telegram_bot itself here.
+                "BOT_DATA_DIR",
                 "PROJECT_ROOT",
                 "TELEGRAM_BOT_TOKEN",
                 "ALLOWED_USER_IDS",

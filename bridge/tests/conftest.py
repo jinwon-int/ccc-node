@@ -22,8 +22,11 @@ each test so a test that swaps a module in during its run can't leak that swap t
 the next test.
 """
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -88,6 +91,16 @@ _NON_PREFIXED_BRIDGE_ENV = frozenset(
 )
 _TEST_BOT_TOKEN = "123456:test"
 
+# #2600: PROJECT_ROOT is the bridge checkout itself, so with BOT_DATA_DIR unset
+# the global health reporter and task ledger wrote health.json / tasks.json /
+# tasks.json.bak into <checkout>/bridge/.telegram_bot — on a node whose live
+# bridge runs from that checkout, a test run overwrote the live files. Each
+# test process (each pytest-xdist worker included) gets its own private data
+# dir instead; tests that exercise BOT_DATA_DIR parsing still set or delete it
+# themselves after fixture setup.
+_TEST_BOT_DATA_DIR = Path(tempfile.mkdtemp(prefix="ccc-test-bot-data-"))
+atexit.register(shutil.rmtree, _TEST_BOT_DATA_DIR, ignore_errors=True)
+
 
 def _reset_bridge_environment() -> None:
     """Remove inherited bridge settings without retaining or printing values."""
@@ -98,6 +111,7 @@ def _reset_bridge_environment() -> None:
     # Minimal, fixed test env so the real pydantic config validates on import.
     os.environ["PROJECT_ROOT"] = str(BRIDGE_DIR)
     os.environ["TELEGRAM_BOT_TOKEN"] = _TEST_BOT_TOKEN
+    os.environ["BOT_DATA_DIR"] = str(_TEST_BOT_DATA_DIR)
     # MatrixBot.serve() runs the marker-scoped orphan reaper, which reads the
     # real /proc and signals matching PIDs. A test run on a node that hosts a
     # live bridge must never do that; reaper tests opt back in explicitly.
