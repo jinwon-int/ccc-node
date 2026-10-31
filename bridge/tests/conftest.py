@@ -168,6 +168,36 @@ def _restore_turn_liveness_registry():
             turn_stall._TURN_LIVENESS_SOURCES.update(snapshot)
 
 
+_UNIX_SOCKET_PATH_MAX = 107  # sun_path is 108 bytes including the NUL
+
+
+@pytest.fixture
+def short_tmp_path(tmp_path_factory):
+    """A private temp dir short enough to hold AF_UNIX socket paths (#2598).
+
+    ``tmp_path`` nests under ``$TMPDIR/pytest-of-<user>/pytest-<n>/`` and,
+    under pytest-xdist, an extra ``popen-gw<k>/`` level; with CI's
+    ``TMPDIR=$RUNNER_TEMP/ccc-tmp`` that pushed ``…/responder.sock`` past the
+    108-byte ``sun_path`` limit (``OSError: AF_UNIX path too long``). Socket
+    suites override ``tmp_path`` with this fixture (built on
+    ``tmp_path_factory`` so the override cannot recurse): a pytest temp dir
+    when the base is short enough, otherwise a fresh 0700 ``mkdtemp`` under
+    ``/tmp`` that is removed afterwards.
+    """
+    import shutil
+    import tempfile
+
+    if len(str(tmp_path_factory.getbasetemp())) <= _UNIX_SOCKET_PATH_MAX - 48:
+        yield tmp_path_factory.mktemp("sock", numbered=True)
+        return
+    base = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else None
+    short = Path(tempfile.mkdtemp(prefix="ccc-sock-", dir=base))
+    try:
+        yield short
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
 def _restore_volatile_modules():
     snapshot = {name: sys.modules.get(name) for name in _VOLATILE_MODULES}
