@@ -550,9 +550,14 @@ cat > "$JROOT/1e0a9d2e-0000-4000-8000-000000000001.jsonl" <<'EOF'
 {"type":"message","id":"a4","timestamp":"2026-09-11T08:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"검증 결과를 기록했습니다"}]}}
 EOF
 run10() {
+  # Pin the settle window like every other fixture: without it the sweep falls
+  # back to the 90 s production default, and the three draft-bearing reruns
+  # whose pending count never changes (regrowth/duplicate cases) each waited
+  # the full 90 s — ~270 s of a ~350 s suite, the slowest harness shard in CI.
   env CCC_STATE_DIR="$STATE_DANSO" CLAUDE_PROJECTS_DIR="$PROJECTS_DANSO" CCC_PUSH_SPOOL="$SPOOL_DANSO" \
     CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" \
     CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion10.touched" \
+    CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
     CCC_NODE=testnode CCC_DANSO_STATE_DIR="$DANSO_STATE_FIX" \
     bash "$AUTOSAVE" run
 }
