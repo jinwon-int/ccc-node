@@ -9,8 +9,9 @@ policy through the queue (the 「한데」 mirror copies every non-``info`` inse
 Policy (owner decision 2026-10-27, ccc-node#2413):
 
 ``info``      held, then one **digest** per day at ``DIGEST_HOUR_KST`` (09:00) —
-              a single derived row ``tier=digest`` listing ``#id [node] first line``
-              of every held info alert; the held rows are marked delivered with
+              a single derived row ``tier=digest`` grouping every held info alert by
+              event with its content line and key detail lines (within
+              ``DIGEST_MAX_BYTES``); the held rows are marked delivered with
               a ``digested`` receipt pointing at the digest id.
 ``action``    delivered at once; **re-notified once** ``RENOTIFY_AFTER_S`` (15 min)
               after its strong Matrix receipt unless a ``reply`` receipt (the
@@ -29,7 +30,9 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import re
 import time
+from collections import Counter
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -43,8 +46,12 @@ DERIVED_TIERS = (DIGEST_TIER, RENOTIFY_TIER)
 IMMEDIATE_TIERS = ("action", "critical")
 RENOTIFY_AFTER_S = 15 * 60
 RENOTIFY_LINE_CHARS = 160
-DIGEST_LINE_CHARS = 120
-DIGEST_MAX_LINES = 60
+DIGEST_LINE_CHARS = 120     # bytes of an item's head line (``#id label summary``)
+DIGEST_DETAIL_CHARS = 100   # bytes of one detail line under an item
+DIGEST_DETAIL_LINES = 2     # detail lines per item at full budget (attention lines first)
+DIGEST_GROUP_ITEMS = 3      # items shown per event group; older plain ones fold into "… 외 N건"
+#: The 「한데」 mirror caps a notice at 8000 bytes (fleet_alerts_sender_hande.MAX_TEXT_BYTES); stay well below.
+DIGEST_MAX_BYTES = 7000
 META_DIGEST_DAY = "digest_last_day"  # KST date of the last digest row, YYYY-MM-DD
 
 
@@ -69,14 +76,6 @@ def meta_set(root: os.PathLike | str, key: str, value: str) -> None:
 
 # ---- helpers ---------------------------------------------------------------
 
-def first_line(body: str, limit: int) -> str:
-    line = (body or "").strip().splitlines()[0] if (body or "").strip() else ""
-    data = line.encode("utf-8")
-    if len(data) <= limit:
-        return line
-    return data[: limit - 1].decode("utf-8", "ignore") + "…"
-
-
 def kst_day(now: float) -> str:
     return _dt.datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d")
 
@@ -89,25 +88,116 @@ def digest_due(now: float, last_day: Optional[str]) -> bool:
 
 # ---- digest ------------------------------------------------------------------
 
-def held_info_rows(root: os.PathLike | str) -> list[tuple[str, str, str, str, float]]:
-    """``(txn, alert_id, node, body, created)`` of undelivered info rows, oldest first."""
+def held_info_rows(root: os.PathLike | str) -> list[tuple[str, str, str, str, float, str]]:
+    """``(txn, alert_id, node, body, created, event)`` of undelivered info rows, oldest first."""
     with outbox.database(root) as conn:
         return conn.execute(
-            "SELECT txn, alert_id, node, body, created FROM alerts"
+            "SELECT txn, alert_id, node, body, created, event FROM alerts"
             " WHERE delivered IS NULL AND tier='info' ORDER BY created"
         ).fetchall()
 
 
+# A ccc-node spool alert's first line is only a header ("[진군] #h3g9l4 🔔 ccc-node [AgentCronRun] · jingun");
+# the content starts on line 2. The digest used to show the header alone, i.e. who sent what kind, not what.
+_HEADER_RE = re.compile(r"^\[(?P<label>[^\]]+)\] #(?P<aid>[0-9a-z]+) 🔔 \S+ \[[^\]]+\](?: · \S+)?\s*$")
+# Bookkeeping lines that carry no meaning in a digest (agent-cron run ids, bare timestamps/URLs, empty stream heads).
+_NOISE_RE = re.compile(
+    r"^(?:scheduledAt|runId|exitCode|startedAt|finishedAt|attempt)=\S*$|^(?:stdout|stderr):\s*$"
+    r"|^https?://\S+$|^\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:?\d\d)?$"
+)
+# Explicit problem signals only: status symbols, upper-case verdict words, failure statuses and non-zero failure
+# counts. Plain words like "실패"/"fail" also appear in issue titles and would reorder lists for nothing.
+_ATTENTION_RE = re.compile(
+    r"[⚠✗❌🚨]|\b(?:DOWN|DEGRADED|UNVERIFIED|FAIL(?:ED|URE)?|ERROR)\b|status=(?:fail\w*|error)\b"
+    r"|\bfail(?:ed|ures?)=[1-9]|실패\s*[1-9]"
+)
+
+
+def is_attention(line: str) -> bool:
+    """True for a line that reports a problem; ``failed=0`` / ``실패 0`` style zero counts are not one."""
+    return bool(_ATTENTION_RE.search(line))
+
+
+def _trim(line: str, limit: int) -> str:
+    data = line.encode("utf-8")
+    return line if len(data) <= limit else data[: limit - 3].decode("utf-8", "ignore") + "…"
+
+
+def digest_item(alert_id: str, body: str) -> tuple[str, list[str], bool]:
+    """``(head, detail_lines, attention)`` for one held alert.
+
+    head = ``#id label <first content line>`` for a ccc-node header body, else the first line as-is
+    (it already starts with ``[label] #id``). Details are the remaining content lines with attention
+    lines first; nothing is invented and the caller trims and limits them.
+    """
+    lines = [ln.strip() for ln in (body or "").splitlines() if ln.strip()]
+    if not lines:
+        return (f"#{alert_id}", [], False)
+    m = _HEADER_RE.match(lines[0])
+    content = [ln for ln in (lines[1:] if m else lines) if not _NOISE_RE.search(ln)]
+    if m:
+        head = f"#{m['aid']} {m['label']}" + (f" {content[0]}" if content else "")
+    else:
+        head = content[0] if content else lines[0]
+    rest = content[1:] if content else []
+    details = [ln for ln in rest if is_attention(ln)] + [ln for ln in rest if not is_attention(ln)]
+    return head, details, any(is_attention(ln) for ln in content)
+
+
+def _render_digest(day: str, groups, total: int, items: int, details: int) -> tuple[list[str], bool]:
+    lines = [f"📋 플릿 알림 다이제스트 {day} — info {total}건 · {len(groups)}종"]
+    omitted = False
+    for event, members in groups:
+        nodes = Counter(node or "?" for _r, node, *_ in members)
+        by_node = " (" + "·".join(f"{n} {c}" for n, c in nodes.most_common()) + ")" if len(nodes) > 1 else ""
+        lines.append(f"■ {event or '기타'} {len(members)}건{by_node}")
+        # attention items first, then the latest plain ones; shown in time order
+        ranked = sorted(members, key=lambda m: (not m[4], -m[2]))[:items]
+        for _r, _node, created, head, attention, dlines in sorted(ranked, key=lambda m: m[2]):
+            hhmm = _dt.datetime.fromtimestamp(created, KST).strftime("%H:%M")
+            lines.append(f"• {hhmm} {_trim(head, DIGEST_LINE_CHARS)}")
+            lines.extend(f"   └ {_trim(d, DIGEST_DETAIL_CHARS)}" for d in dlines[:details])
+            omitted = omitted or len(dlines) > details
+        if len(members) > len(ranked):
+            lines.append(f"  … 외 {len(members) - len(ranked)}건")
+            omitted = True
+    return lines, omitted
+
+
 def build_digest(rows, now: float) -> str:
+    """One message for the day's held info rows, grouped by event, within ``DIGEST_MAX_BYTES``.
+
+    Groups with an attention item come first, then by first arrival. Each item shows its content line
+    and up to ``DIGEST_DETAIL_LINES`` detail lines; over budget, detail lines go first, then items, then
+    whole trailing groups (noted at the end).
+    """
     day = kst_day(now)
-    lines = [f"📋 플릿 알림 다이제스트 {day} — info {len(rows)}건"]
-    for txn, alert_id, node, body, created in rows[:DIGEST_MAX_LINES]:
-        hhmm = _dt.datetime.fromtimestamp(created, KST).strftime("%H:%M")
-        # The stored body already starts with "[label] #id " — keep its first line, trimmed.
-        lines.append(f"• {hhmm} {first_line(body, DIGEST_LINE_CHARS)}")
-    if len(rows) > DIGEST_MAX_LINES:
-        lines.append(f"… 외 {len(rows) - DIGEST_MAX_LINES}건 (fleet_alerts_receipt.py로 조회)")
-    return "\n".join(lines)
+    grouped: dict[str, list] = {}
+    for row in rows:
+        _txn, alert_id, node, body, created = row[:5]
+        event = row[5] if len(row) > 5 else ""
+        head, dlines, attention = digest_item(alert_id, body)
+        grouped.setdefault(event or "", []).append((alert_id, node, created, head, attention, dlines))
+    groups = sorted(grouped.items(), key=lambda g: (not any(m[4] for m in g[1]), min(m[2] for m in g[1])))
+    note = "… 일부 생략 — 개별 알림 메타데이터는 fleet_alerts_receipt.py로 조회"
+    for items, details in ((DIGEST_GROUP_ITEMS, DIGEST_DETAIL_LINES), (DIGEST_GROUP_ITEMS, 1),
+                           (DIGEST_GROUP_ITEMS, 0), (1, 0)):
+        lines, omitted = _render_digest(day, groups, len(rows), items, details)
+        text = "\n".join(lines + ([note] if omitted and details < DIGEST_DETAIL_LINES else []))
+        if len(text.encode("utf-8")) <= DIGEST_MAX_BYTES:
+            return text
+    # Still too long at one item per group: drop whole groups from the end.
+    kept = list(groups)
+    while kept:
+        kept.pop()
+        lines, _ = _render_digest(day, kept, len(rows), 1, 0)
+        lines[0] = f"📋 플릿 알림 다이제스트 {day} — info {len(rows)}건 · {len(groups)}종"
+        dropped = groups[len(kept):]
+        tail = f"… 외 {len(dropped)}종 {sum(len(m) for _e, m in dropped)}건 — fleet_alerts_receipt.py로 조회"
+        text = "\n".join(lines + [tail])
+        if len(text.encode("utf-8")) <= DIGEST_MAX_BYTES:
+            return text
+    return _trim(lines[0], DIGEST_MAX_BYTES)
 
 
 def make_digest(root: os.PathLike | str, now: Optional[float] = None) -> Optional[str]:
@@ -127,7 +217,7 @@ def make_digest(root: os.PathLike | str, now: Optional[float] = None) -> Optiona
     )
     digest_id = outbox.alert_id_of(root, txn) or txn
     with outbox.database(root) as conn:
-        for held_txn, _aid, _node, _body, _created in rows:
+        for held_txn, *_rest in rows:
             conn.execute(
                 "UPDATE alerts SET delivered=?, body='' WHERE txn=? AND delivered IS NULL", (now, held_txn)
             )

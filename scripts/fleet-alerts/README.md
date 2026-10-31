@@ -109,7 +109,7 @@ Matrix sender before every round):**
 
 | tier | leaves the queue | re-notify |
 |---|---|---|
-| `info` | held; one **digest** row per day at **09:00 KST** (`📋 플릿 알림 다이제스트 <date> — info N건`, one `• HH:MM [node] #id first-line` per alert, max 60 lines); held rows get a `digested` receipt pointing at the digest id | — |
+| `info` | held; one **digest** row per day at **09:00 KST** (`📋 플릿 알림 다이제스트 <date> — info N건 · K종`; grouped by event as `■ <event> N건 (node counts)`, groups with a problem signal first; each item `• HH:MM #id <label> <first content line>` plus up to 2 `└` detail lines, problem lines first — the ccc-node `🔔` header line and run-id/timestamp/URL bookkeeping are dropped; a group shows its 3 most relevant items then `… 외 N건`; the whole text stays ≤ 7000 bytes (「한데」 cap 8000) by dropping detail lines, then items, then trailing groups); held rows get a `digested` receipt pointing at the digest id | — |
 | `action` | at once | once, 15 min after the Matrix receipt, unless a `reply` receipt (`ok/hold <id>`, responder stage) exists — a derived `⏰ 재통지 #id …` row |
 | `critical` | at once | like `action`, `🚨` |
 
