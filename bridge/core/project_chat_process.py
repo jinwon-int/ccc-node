@@ -3,6 +3,7 @@
 # mypy: disable-error-code="attr-defined"
 
 import asyncio
+import time
 from dataclasses import dataclass
 import logging
 import re
@@ -27,7 +28,13 @@ from telegram_bot.core.danso_worker import (
 )
 from telegram_bot.core.memory_audience import resolve_memory_audience
 from telegram_bot.core.agent_session_registry import ActiveToken
-from telegram_bot.core.external_wait import clear_active_turn, publish_active_turn
+from telegram_bot.core.external_wait import (
+    TERMINAL_SUCCESS,
+    ExternalWaitRegistry,
+    clear_active_turn,
+    default_registry_path,
+    publish_active_turn,
+)
 from telegram_bot.core.project_chat_types import (
     AgentApprovalCallback,
     AgentSessionEntry,
@@ -743,6 +750,74 @@ class ProjectChatProcessMixin:
 
         setter(unsolicited_lifecycle)
 
+    def _register_agent_background_task_listener(
+        self, session: Any, *, user_id: int, chat_id: int
+    ) -> None:
+        """Map the session's background-task transitions to its route (#2605).
+
+        ``ClaudeSession.set_background_task_listener`` calls back with
+        ``("start"|"finish", task_id)`` — ids only, never a command body.
+        A finish is remembered for the route's status line, closes any
+        ``local_task`` label the agent registered for that id (no wake: the
+        harness is already continuing the session), and refreshes the
+        channel's status message through the lifecycle-wired refresher. A
+        start is only observed: the turn's own end-of-reply sync places the
+        line after the reply, as #2081 intended. Sessions without the seam
+        (Codex) keep their current behaviour; everything here is fail-open.
+        """
+
+        setter = getattr(session, "set_background_task_listener", None)
+        if not callable(setter):
+            return
+        key = self._stream_key(user_id, chat_id)
+
+        def on_transition(phase: str, task_id: str) -> None:
+            if phase != "finish":
+                return
+            self._remember_background_finish(key, time.time())
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            loop.create_task(
+                self._after_background_task_finished(user_id, chat_id, task_id),
+                name=f"bg-finish:{user_id}:{chat_id}",
+            )
+
+        setter(on_transition)
+
+    async def _after_background_task_finished(self, user_id: int, chat_id: int, task_id: str) -> None:
+        """Close the task's label (if any) and refresh the route's status line (#2605)."""
+
+        try:
+            registry = ExternalWaitRegistry(default_registry_path(self._external_wait_home()))
+            await _await_offloaded_write(
+                registry.finish_local_tasks,
+                user_id=user_id,
+                chat_id=chat_id,
+                task_id=task_id,
+                terminal_status=TERMINAL_SUCCESS,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Local-task label close failed: route=%s:%s error=%s",
+                user_id,
+                chat_id,
+                type(exc).__name__,
+            )
+        refresher = getattr(self, "_wait_status_refresher", None)
+        if not callable(refresher):
+            return
+        try:
+            await refresher(int(user_id), int(chat_id))
+        except Exception as exc:
+            logger.debug(
+                "Wait status refresh after background task failed: route=%s:%s error=%s",
+                user_id,
+                chat_id,
+                type(exc).__name__,
+            )
+
     def _register_agent_frame_observer(self, session: Any, *, user_id: int, chat_id: int) -> None:
         """Feed adapter-path SDK frames into the /usage recorders.
 
@@ -1079,6 +1154,11 @@ class ProjectChatProcessMixin:
             # Same cadence as the unsolicited route: (re-)register the
             # /usage observation seam each turn.
             self._register_agent_frame_observer(
+                session, user_id=user_id, chat_id=chat_id
+            )
+            # And the background-task transition seam (#2605): the route's
+            # status line follows this session's run-in-background work.
+            self._register_agent_background_task_listener(
                 session, user_id=user_id, chat_id=chat_id
             )
             slot.turn_token = self._agent_session_registry.register_active(

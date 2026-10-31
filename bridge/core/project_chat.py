@@ -227,6 +227,12 @@ class ProjectChatHandler(
         self._agent_runtime = agent_runtime
         self._agent_session_registry = AgentSessionRegistry()
         self._agent_runtime_closed = False
+        # #2605: per-route memory of recently finished run-in-background tasks
+        # (epoch seconds, bounded) and the bot-side status refresher. Both are
+        # body-free; the refresher is wired by the lifecycle layer like the
+        # async-completion sender below.
+        self._background_finished: dict[tuple[int, int], list[float]] = {}
+        self._wait_status_refresher: Any = None
         # Durable, body-free journal for out-of-turn completions (#646 slice
         # 1). Construction stays in-memory only to preserve the composition
         # root's deferred-initialization invariant (no filesystem access
@@ -436,6 +442,17 @@ class ProjectChatHandler(
         except Exception:
             return False
         return bool(getattr(capability, "supports_durable_delivery", False))
+
+    def set_wait_status_refresher(self, refresher: Any) -> None:
+        """Wire the route status refresher (#2605): ``await refresher(user_id, chat_id)``.
+
+        Called when one of the conversation's run-in-background tasks ends so
+        the channel's ⏳ status line turns into its ✅ outcome without waiting
+        for the next bridge-submitted turn. Optional and fail-open; until it is
+        wired the handler only remembers the transition.
+        """
+
+        self._wait_status_refresher = refresher
 
     def set_async_completion_sender(self, sender: Any) -> None:
         """Wire the conversation delivery seam for durable completions (#646).

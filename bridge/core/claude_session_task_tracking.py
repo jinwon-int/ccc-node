@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Mapping
 import re
 from typing import Any
@@ -18,6 +19,8 @@ from claude_agent_sdk import (
 )
 
 from .agent_runtime import JsonValue
+
+logger = logging.getLogger("telegram_bot.core.claude_runtime")
 
 
 _BACKGROUND_TASK_STARTED = re.compile(
@@ -52,7 +55,22 @@ class ClaudeSessionTaskTrackingMixin:
 
     _background_tasks: dict[str, float]
     _background_task_terminal_ids: set[str]
+    _background_task_listener: Callable[[str, str], None] | None
     _content_texts: Callable[[Any], list[str]]
+
+    def _notify_background_task_listener(self, phase: str, task_id: str) -> None:
+        """Tell the optional listener about one real transition (fail-open, #2605).
+
+        Only the id and ``"start"``/``"finish"`` cross the seam — never a
+        command or output body. A raising listener must not break the reader.
+        """
+        listener = getattr(self, "_background_task_listener", None)
+        if listener is None:
+            return
+        try:
+            listener(phase, task_id)
+        except Exception:  # pragma: no cover - defensive seam guard
+            logger.debug("Background-task listener raised: phase=%s", phase)
 
     def background_workload_snapshot(self, now: float) -> tuple[int, float]:
         """Return body-free tracked Claude background-task workload."""
@@ -85,16 +103,21 @@ class ClaudeSessionTaskTrackingMixin:
         task_id = _normalize_task_id(value)
         if task_id is None or task_id in self._background_task_terminal_ids:
             return
-        self._background_tasks.setdefault(task_id, asyncio.get_running_loop().time())
+        if task_id in self._background_tasks:
+            return
+        self._background_tasks[task_id] = asyncio.get_running_loop().time()
+        self._notify_background_task_listener("start", task_id)
 
     def _finish_background_task(self, value: object) -> None:
         task_id = _normalize_task_id(value)
         if task_id is None:
             return
-        self._background_tasks.pop(task_id, None)
+        was_tracked = self._background_tasks.pop(task_id, None) is not None
         if task_id in self._background_task_terminal_ids:
             return
         self._background_task_terminal_ids.add(task_id)
+        if was_tracked:
+            self._notify_background_task_listener("finish", task_id)
 
     @staticmethod
     def _task_update_status(message: TaskUpdatedMessage) -> object:

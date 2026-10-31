@@ -30,9 +30,11 @@ from telegram_bot.core.external_wait_status import (
     STATUS_ENV_FLAG,
     ExternalWaitStatusStore,
     default_status_store_path,
+    merge_background_records,
     plan_status_update,
     reconcile_routes,
     records_for_route,
+    route_background_snapshot,
     status_enabled,
     text_hash_of,
 )
@@ -111,9 +113,16 @@ class BotWaitStatusMixin:
         try:
             registry = self._external_wait_status_registry()
             store = self._external_wait_status_store()
-            records = records_for_route(registry.records(), user_id, chat_id)
+            now = time.time()
+            records = merge_background_records(
+                records_for_route(registry.records(), user_id, chat_id),
+                route_background_snapshot(getattr(self, "_project_chat", None), user_id, chat_id),
+                user_id,
+                chat_id,
+                now,
+            )
             stored = store.get(user_id, chat_id)
-            action, text = plan_status_update(records, stored, time.time())
+            action, text = plan_status_update(records, stored, now)
             if action == "noop":
                 return
             logger.debug(

@@ -50,7 +50,18 @@ SOURCE_GITHUB_MERGE_QUEUE = "github_merge_queue"
 #: dispatched job — anything the agent started and would otherwise watch with
 #: an ad-hoc polling loop that ends with the turn. Keyed by run id, not PR.
 SOURCE_GITHUB_ACTIONS_RUN = "github_actions_run"
-SOURCES = frozenset({SOURCE_GITHUB_PR_CHECKS, SOURCE_GITHUB_MERGE_QUEUE, SOURCE_GITHUB_ACTIONS_RUN})
+#: A run-in-background task of the conversation's own provider session
+#: (#2605, the #2081 §3 follow-up). Nothing polls it: the harness continues
+#: the session itself when the task ends, and the bridge's task tracker
+#: (``claude_session_task_tracking``) closes the record from that frame. The
+#: registry entry only carries the agent's label and deadline so the route's
+#: status message can name the work; a finish never journals a wake.
+SOURCE_LOCAL_TASK = "local_task"
+SOURCES = frozenset(
+    {SOURCE_GITHUB_PR_CHECKS, SOURCE_GITHUB_MERGE_QUEUE, SOURCE_GITHUB_ACTIONS_RUN, SOURCE_LOCAL_TASK}
+)
+#: Sources the monitor never asks a transport about.
+UNPOLLED_SOURCES = frozenset({SOURCE_LOCAL_TASK})
 
 #: Non-terminal registry state.
 STATE_MONITORING = "monitoring"
@@ -71,6 +82,9 @@ TERMINAL_OWNER_CANCEL = "owner-cancel"
 TERMINAL_MERGED = "merged"
 TERMINAL_EVICTED = "evicted"
 TERMINAL_CLOSED = "closed"
+#: A local-task watch whose provider session went away before the task
+#: reported a terminal frame (#2605): the outcome is unknown, not failed.
+TERMINAL_LOST = "lost"
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -84,6 +98,7 @@ TERMINAL_STATUSES = frozenset(
         TERMINAL_MERGED,
         TERMINAL_EVICTED,
         TERMINAL_CLOSED,
+        TERMINAL_LOST,
     }
 )
 
@@ -97,6 +112,8 @@ MAX_WAKE_ATTEMPTS = 10
 ACTIVE_ROUTE_TTL_SECONDS = 6 * 60 * 60
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+#: Same bound as the task tracker's id filter: opaque, body-free, ≤256 chars.
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _MAX_SUMMARY_CHARS = 200
 _MAX_RUN_LABEL_CHARS = 80
@@ -148,6 +165,14 @@ def validate_run_label(label: Optional[str]) -> str:
     return text.strip()
 
 
+def validate_task_id(task_id: Any) -> str:
+    """One opaque background-task id (#2605); never a command or output body."""
+    candidate = str(task_id or "").strip()
+    if not _TASK_ID_RE.fullmatch(candidate):
+        raise ExternalWaitValidationError("task id must be 1-256 chars of [A-Za-z0-9_.-]")
+    return candidate
+
+
 def validate_head_sha(head_sha: str) -> str:
     value = str(head_sha or "").strip().lower()
     if not _SHA_RE.match(value):
@@ -171,6 +196,13 @@ def default_active_turns_path(home: Path) -> Path:
 
 _DETAIL_KEY_RE = re.compile(r"^[a-z_]{1,32}$")
 _DETAIL_TEXT_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,64}$")
+
+
+def _same_route(rec: Dict[str, Any], user_id: int, chat_id: int) -> bool:
+    try:
+        return int(rec.get("user_id")) == int(user_id) and int(rec.get("chat_id")) == int(chat_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
 
 
 def _bounded_detail(detail: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -296,19 +328,32 @@ class ExternalWaitRegistry:
         run_id: Any = None,
         run_label: Optional[str] = None,
         run_number: Any = None,
+        task_id: Any = None,
     ) -> str:
         """Register one wait; returns its id (idempotent per natural key).
 
         An Actions-run wait (#2590) is keyed by ``run_id`` instead of a PR:
         ``pr_number`` is stored as ``None`` and ``head_sha`` is optional
         (the run's head, kept for display and webhook acceleration).
+
+        A local-task wait (#2605) is keyed by ``task_id``; ``repo`` is unused
+        (stored empty) and the record is never due for polling — its
+        ``next_poll_epoch`` is the deadline, so the monitor only ever sees it
+        to expire it.
         """
         if source not in SOURCES:
             raise ExternalWaitValidationError(f"unknown wait source: {source}")
-        repo = validate_repo(repo)
         extra: Dict[str, Any] = {}
         natural: tuple
-        if source == SOURCE_GITHUB_ACTIONS_RUN:
+        if source == SOURCE_LOCAL_TASK:
+            repo = ""
+            pr_number = None
+            head_sha = ""
+            task_id = validate_task_id(task_id)
+            extra = {"task_id": task_id}
+            natural = (source, task_id, int(user_id), int(chat_id))
+        elif source == SOURCE_GITHUB_ACTIONS_RUN:
+            repo = validate_repo(repo)
             run_id = validate_run_id(run_id)
             pr_number = None
             head_sha = validate_head_sha(head_sha) if str(head_sha or "").strip() else ""
@@ -324,6 +369,7 @@ class ExternalWaitRegistry:
             }
             natural = (source, repo, run_id, int(user_id), int(chat_id))
         else:
+            repo = validate_repo(repo)
             pr_number = validate_pr_number(pr_number)
             head_sha = validate_head_sha(head_sha)
             natural = (source, repo, pr_number, head_sha, int(user_id), int(chat_id))
@@ -331,6 +377,8 @@ class ExternalWaitRegistry:
         now = self._clock() if now is None else float(now)
 
         def _natural_of(rec: Dict[str, Any]) -> tuple:
+            if rec.get("source") == SOURCE_LOCAL_TASK:
+                return (rec.get("source"), rec.get("task_id"), rec.get("user_id"), rec.get("chat_id"))
             if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
                 return (rec.get("source"), rec.get("repo"), rec.get("run_id"), rec.get("user_id"), rec.get("chat_id"))
             return (
@@ -365,7 +413,10 @@ class ExternalWaitRegistry:
                 "created_epoch": now,
                 "updated_at": _utc_now_iso(),
                 "expires_epoch": now + max(60.0, float(timeout_seconds)),
-                "next_poll_epoch": now,
+                # Unpolled sources surface to the monitor only at their deadline.
+                "next_poll_epoch": (
+                    now + max(60.0, float(timeout_seconds)) if source in UNPOLLED_SOURCES else now
+                ),
                 "poll_interval_seconds": max(5.0, float(poll_interval_seconds)),
                 "terminal_status": None,
                 "wake": None,
@@ -500,6 +551,7 @@ class ExternalWaitRegistry:
         *,
         now: Optional[float] = None,
         detail: Optional[Dict[str, Any]] = None,
+        wake: bool = True,
     ) -> bool:
         """Terminal transition, journaled before any wake. First write wins.
 
@@ -507,6 +559,9 @@ class ExternalWaitRegistry:
         is marked pending in the same durable write (exactly-once journal).
         ``detail`` carries bounded, body-free facts about the outcome (#2118:
         the failed merge-group run id, or ``reason``), never log content.
+        ``wake=False`` (#2605) records the outcome without a wake: the
+        conversation is already being continued by something else (the
+        harness after a local task), so the monitor must not resume it again.
         """
         if terminal_status not in TERMINAL_STATUSES or terminal_status == TERMINAL_OWNER_CANCEL:
             raise ValueError(f"invalid terminal status: {terminal_status}")
@@ -521,12 +576,45 @@ class ExternalWaitRegistry:
             rec["terminal_status"] = terminal_status
             rec["completed_epoch"] = now_value
             rec["updated_at"] = _utc_now_iso()
-            rec["wake"] = {"state": "pending", "attempts": 0}
+            rec["wake"] = (
+                {"state": "pending", "attempts": 0}
+                if wake
+                else {"state": "skipped", "attempts": 0, "reason": "no-wake"}
+            )
             if clean_detail:
                 rec["terminal_detail"] = clean_detail
             return True
 
         return bool(self._mutate(_do))
+
+    def finish_local_tasks(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        task_id: Optional[str],
+        terminal_status: str,
+        now: Optional[float] = None,
+    ) -> List[str]:
+        """Close this route's monitoring local-task waits without a wake (#2605).
+
+        ``task_id=None`` closes every local-task wait of the route (the
+        session went away: ``TERMINAL_LOST``). Returns the wait ids that made
+        the monitoring -> terminal transition; a route with none is a no-op
+        that never touches the file.
+        """
+        wanted = validate_task_id(task_id) if task_id is not None else None
+        with self._lock:
+            records = self._read()
+        matches = [
+            str(rec.get("wait_id") or "")
+            for rec in records.values()
+            if rec.get("source") == SOURCE_LOCAL_TASK
+            and rec.get("state") == STATE_MONITORING
+            and _same_route(rec, user_id, chat_id)
+            and (wanted is None or rec.get("task_id") == wanted)
+        ]
+        return [wait_id for wait_id in matches if self.finish(wait_id, terminal_status, now=now, wake=False)]
 
     # --- wake journal -------------------------------------------------------------
     def pending_wakes(self) -> List[Dict[str, Any]]:
@@ -617,9 +705,21 @@ class ExternalWaitRegistry:
         def _do(records):
             count = 0
             for rec in records.values():
-                if rec.get("state") == STATE_MONITORING:
-                    rec["next_poll_epoch"] = now_value
-                    count += 1
+                if rec.get("state") != STATE_MONITORING:
+                    continue
+                if rec.get("source") == SOURCE_LOCAL_TASK:
+                    # No provider session survives a restart, so the task's
+                    # terminal frame can never arrive: close the label as
+                    # ``lost`` without a wake (#2605). The harness itself
+                    # resumes nothing here either.
+                    rec["state"] = TERMINAL_LOST
+                    rec["terminal_status"] = TERMINAL_LOST
+                    rec["completed_epoch"] = now_value
+                    rec["updated_at"] = _utc_now_iso()
+                    rec["wake"] = {"state": "skipped", "attempts": 0, "reason": "no-wake"}
+                    continue
+                rec["next_poll_epoch"] = now_value
+                count += 1
             self._prune(records, now=now_value)
             return count
 
@@ -703,7 +803,12 @@ def render_waits(records: List[Dict[str, Any]]) -> str:
     for rec in records:
         state = rec.get("state")
         marker = "⏳" if state == STATE_MONITORING else "🏁"
-        if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+        if rec.get("source") == SOURCE_LOCAL_TASK:
+            lines.append(
+                f"{marker} `{rec.get('wait_id')}` — background task {rec.get('task_id')}"
+                f" (this session) · {state}"
+            )
+        elif rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
             label = str(rec.get("run_label") or "").strip() or "workflow"
             sha = str(rec.get("head_sha") or "")[:8]
             lines.append(

@@ -128,6 +128,9 @@ UnsolicitedLifecycleHandler = Callable[[str, "str | None"], Awaitable[None]]
 # exception-isolated: a broken observer never affects turn processing, and
 # runtimes without the seam (Codex) keep their current behavior.
 SdkFrameObserver = Callable[[Message], None]
+#: ``(phase, task_id)`` with phase ``"start"`` | ``"finish"`` — the body-free
+#: background-task transition seam (#2605); synchronous and fail-open.
+BackgroundTaskListener = Callable[[str, str], None]
 
 
 def _default_sdk_client_factory(options: ClaudeAgentOptions) -> SdkClient:
@@ -348,6 +351,9 @@ class ClaudeSession(
         # The session lifecycle, plus the validated 256-byte id bound, owns the
         # storage boundary; correctness must not depend on an eviction count.
         self._background_task_terminal_ids: set[str] = set()
+        # Optional body-free transition seam (#2605): the chat handler maps
+        # this session to its conversation route and refreshes the status line.
+        self._background_task_listener: BackgroundTaskListener | None = None
         self._sdk_frame_observer: SdkFrameObserver | None = None
         # Monotonic timestamp of the session's last SDK frame or prompt
         # write — the provider-agnostic turn-stall probe's last-activity

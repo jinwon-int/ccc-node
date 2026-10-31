@@ -44,7 +44,9 @@ from telegram_bot.core.external_wait import STATE_MONITORING, conversation_key_o
 from telegram_bot.core.external_wait_status import (
     MAX_RECONCILE_ROUTES,
     reconcile_routes,
+    merge_background_records,
     records_for_route,
+    route_background_snapshot,
     render_wait_status,
     status_enabled,
     text_hash_of,
@@ -121,13 +123,19 @@ class HandeWaitStatusMixin:
             return
         key = conversation_key_of(user_id, chat_id)
         state = self._hande_wait_state()
-        records = records_for_route(self._external_wait_registry().records(), user_id, chat_id)
+        now = time.time()
+        records = merge_background_records(
+            records_for_route(self._external_wait_registry().records(), user_id, chat_id),
+            route_background_snapshot(getattr(self, "_project_chat", None), user_id, chat_id),
+            user_id,
+            chat_id,
+            now,
+        )
         if not any(rec.get("state") == STATE_MONITORING for rec in records):
             # Nothing watched any more: the resume turn's reply carries the
             # result, and the apps drop the old line on that reply.
             state.pop(key, None)
             return
-        now = time.time()
         text = render_wait_status(records, now)
         if text is None:
             state.pop(key, None)

@@ -5,6 +5,7 @@ import bisect
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -551,6 +552,53 @@ class ProjectChatStateMixin:
     _session_guard_last_tree_rss_mb: float
     _session_guard_lock: asyncio.Lock
     _session_guard_runtime_recycles: int
+
+    #: Finished background tasks are remembered this long for the status line.
+    _BACKGROUND_FINISHED_RETENTION_SECONDS = 30 * 60
+    _BACKGROUND_FINISHED_MAX = 8
+    _background_finished: dict[StreamKey, list[float]]
+
+    def _remember_background_finish(self, key: StreamKey, epoch: float) -> None:
+        """Keep a bounded, body-free list of recent terminal frames per route (#2605)."""
+
+        store: dict[StreamKey, list[float]] | None = getattr(self, "_background_finished", None)
+        if store is None:
+            store = self._background_finished = {}
+        cutoff = float(epoch) - self._BACKGROUND_FINISHED_RETENTION_SECONDS
+        kept = [value for value in store.get(key, ()) if value >= cutoff]
+        kept.append(float(epoch))
+        store[key] = kept[-self._BACKGROUND_FINISHED_MAX :]
+
+    def background_workload_for_route(
+        self, user_id: int, chat_id: int
+    ) -> Optional[tuple[int, float, list[float]]]:
+        """``(running, oldest_age_seconds, finished_epochs)`` for one route (#2605).
+
+        Read from the route's resident provider session (the same tracker the
+        session guard consults) plus this handler's finish memory. ``None``
+        when nothing is running and nothing finished recently, so callers
+        render exactly as before. Body-free and read-only; a probe that raises
+        counts as nothing to show.
+        """
+
+        key = self._stream_key(user_id, chat_id)
+        running, oldest_age = 0, 0.0
+        handle = self._agent_session_registry.get_cached(key)
+        session = handle.entry.session if handle is not None else None
+        snapshot = getattr(session, "background_workload_snapshot", None)
+        if callable(snapshot):
+            try:
+                count, age = snapshot(asyncio.get_running_loop().time())
+                running, oldest_age = max(0, int(count)), max(0.0, float(age))
+            except Exception:
+                logger.debug("Background workload probe failed: route=%s:%s", user_id, chat_id)
+                running, oldest_age = 0, 0.0
+        store = getattr(self, "_background_finished", None) or {}
+        cutoff = time.time() - self._BACKGROUND_FINISHED_RETENTION_SECONDS
+        finished = [value for value in store.get(key, ()) if value >= cutoff]
+        if running == 0 and not finished:
+            return None
+        return running, oldest_age, finished
 
     def _stream_key(self, user_id: int, chat_id: int) -> StreamKey:
         """Implemented by the ProjectChatHandler composition root."""

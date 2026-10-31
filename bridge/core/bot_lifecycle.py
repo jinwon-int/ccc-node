@@ -331,6 +331,11 @@ class BotLifecycleMixin(MemoryDistillMixin):
         self._project_chat.set_async_completion_sender(
             build_telegram_sender(application.bot)
         )
+        # A finished run-in-background task refreshes the route's ⏳ status
+        # line (#2605); the handler only knows routes, never the bot.
+        set_refresher = getattr(self._project_chat, "set_wait_status_refresher", None)
+        if callable(set_refresher):
+            set_refresher(self._refresh_external_wait_status)
 
         await self._set_bot_commands()
         logger.info("Bot initialization complete")
