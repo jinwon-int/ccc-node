@@ -139,7 +139,17 @@ def digest_item(alert_id: str, body: str) -> tuple[str, list[str], bool]:
         head = f"#{m['aid']} {m['label']}" + (f" {content[0]}" if content else "")
     else:
         head = content[0] if content else lines[0]
-    rest = content[1:] if content else []
+    # A detail line that would *display* the same as the summary or an earlier line adds nothing: exact repeats
+    # (one line per worker lane) and a cut-off preview followed by its full text both collapse to one.
+    def shown(ln: str) -> str:
+        return _trim(ln, DIGEST_DETAIL_CHARS)
+
+    seen = {shown(content[0])} if content else set()
+    rest = []
+    for ln in content[1:]:
+        if shown(ln) not in seen:
+            seen.add(shown(ln))
+            rest.append(ln)
     details = [ln for ln in rest if is_attention(ln)] + [ln for ln in rest if not is_attention(ln)]
     return head, details, any(is_attention(ln) for ln in content)
 

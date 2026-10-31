@@ -614,6 +614,24 @@ class PolicyTest(_Base):
         self.assertTrue(shown[-1].endswith("A2A task 7 completed"))
         self.assertIn(f"  … 외 {7 - policy.DIGEST_GROUP_ITEMS}건", lines)
 
+    def test_repeated_detail_lines_are_shown_once(self) -> None:
+        body = ("[노드B] #an6l7w 🔔 ccc-node [A2ATerminalBrief] · host-b\n"
+                "A2A Terminal Brief 완료: node-x(완료 1/1)\n"
+                "analysis bridge done: org/repo PR #1 head abc\n"
+                "analysis bridge done: org/repo PR #1 head abc\n"
+                "  analysis bridge done: org/repo PR #1 head abc  \n"
+                "A2A Terminal Brief 완료: node-x(완료 1/1)\n"  # same as the summary line
+                "second distinct line\n"
+                + "preview " + "가" * 40 + " cut\n"            # a cut-off preview …
+                + "preview " + "가" * 40 + " cut and then the full text goes on\n")  # … then its full text
+        head, details, _ = policy.digest_item("an6l7w", body)
+        self.assertEqual(head, "#an6l7w 노드B A2A Terminal Brief 완료: node-x(완료 1/1)")
+        self.assertEqual(details[:2], ["analysis bridge done: org/repo PR #1 head abc", "second distinct line"])
+        self.assertEqual(len(details), 3)  # the preview and its full text display identically → one
+        text = policy.build_digest([self._row(1, "A2ATerminalBrief", "host-b", body)], _kst(2026, 10, 31, 9, 0))
+        self.assertEqual(text.count("analysis bridge done"), 1)
+        self.assertIn("   └ second distinct line", text)
+
     def test_digest_stays_under_the_hande_byte_budget_by_degrading(self) -> None:
         rows = []
         for e in range(30):
