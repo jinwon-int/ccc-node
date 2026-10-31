@@ -41,6 +41,36 @@ class RuntimeHealthReporterTests(unittest.TestCase):
 
             return importlib.reload(health_module)
 
+    def test_concurrent_writers_on_one_data_dir_do_not_steal_each_others_temp(self):
+        # #2598: the fixed health.json.tmp let a second writer on the same
+        # data dir rename the first writer's temp away (FileNotFoundError in
+        # parallel bridge-tests). Each write now uses its own temp.
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            module = self._load_health_module(project_root)
+            data_dir = project_root / ".telegram_bot"
+            reporters = [module.RuntimeHealthReporter(data_dir) for _ in range(4)]
+            errors: list[BaseException] = []
+
+            def hammer(reporter):
+                try:
+                    for _ in range(200):
+                        reporter._write_health_locked()
+                except BaseException as exc:  # noqa: BLE001 - surfaced below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=hammer, args=(r,)) for r in reporters]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            json.loads((data_dir / "health.json").read_text(encoding="utf-8"))
+            self.assertEqual(sorted(p.name for p in data_dir.iterdir()), ["health.json"])
+
     def test_initialize_process_uses_runtime_environment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir)

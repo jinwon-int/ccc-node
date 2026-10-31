@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import threading
 import time
 from copy import deepcopy
@@ -32,6 +33,20 @@ _CODEX_RESUME_MODES = frozenset(
 )
 _CODEX_RESUME_METHODS = frozenset({"thread/resume", "thread/turns/list"})
 _CODEX_RESUME_MAX_SCALAR = (1 << 31) - 1
+
+
+def _current_umask() -> int:
+    """Process umask without mutating it where /proc exposes it (Linux, Termux)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
 
 
 def _utc_now_iso() -> str:
@@ -236,12 +251,25 @@ class RuntimeHealthReporter:
     def _write_health_locked(self) -> None:
         self._ensure_runtime_dir()
         self._state["updated_at"] = _utc_now_iso()
-        temp_path = self._health_file.with_suffix(".json.tmp")
-        temp_path.write_text(
-            json.dumps(self._state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        payload = json.dumps(self._state, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        # A uniquely named temp (as task_ledger / matrix lifecycle already do)
+        # instead of the fixed health.json.tmp: two writers on one data dir —
+        # parallel test workers sharing PROJECT_ROOT (#2598), or an operator
+        # tool next to the bot — could otherwise rename each other's temp away
+        # and fail with FileNotFoundError. The published file keeps the mode
+        # the old write_text() gave it (0o666 & ~umask), not mkstemp's 0o600.
+        fd, raw_temp = tempfile.mkstemp(
+            prefix=f".{self._health_file.name}.", suffix=".tmp", dir=self._bot_data_dir
         )
-        os.replace(temp_path, self._health_file)
+        temp_path = Path(raw_temp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o666 & ~_current_umask())
+                stream.write(payload)
+            os.replace(temp_path, self._health_file)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
 
     def _refresh_runtime_context_locked(self) -> None:
         self._process_mode = os.environ.get("BOT_PROCESS_MODE", "foreground")
