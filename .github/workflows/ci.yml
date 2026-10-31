@@ -290,7 +290,10 @@ jobs:
           # there is no drift-prone duplicate flag). A run below the floor exits
           # non-zero and fails this job. Raising the floor / the ratchet lives in
           # #348; the gate is regression-pinned by tests/test_coverage_floor_gate.py.
-          python -m pytest -q --cov=telegram_bot --cov-report=term --cov-report=xml
+          # #2598: -n auto spreads the ~5.5k tests over the runner's cores
+          # (pytest-xdist, hash-locked in bridge-ci.txt). pytest-cov combines
+          # the worker data, so the same fail_under gate sees the whole suite.
+          python -m pytest -q -n auto --cov=telegram_bot --cov-report=term --cov-report=xml
       - name: Umask-0002 variant (permission-contract suites)
         working-directory: bridge
         env:

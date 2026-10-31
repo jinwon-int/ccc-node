@@ -10,6 +10,10 @@ pip-audit
 # [tool.pytest.ini_options] timeout). CI-only: a hung test fails fast with a
 # stack dump instead of stalling the runner until the job-level timeout.
 pytest-timeout
+# Parallel bridge suite (`pytest -n auto` in the bridge-tests job, #2598).
+# CI-only; pytest-cov combines the per-worker coverage data, so the
+# fail_under gate still sees the whole suite.
+pytest-xdist
 # Pinned build backend so the wheel-smoke job builds with --no-isolation and
 # never fetches an unhashed setuptools at build time (bridge/pyproject.toml
 # requires setuptools>=68).

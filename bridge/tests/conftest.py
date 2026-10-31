@@ -145,6 +145,30 @@ def _contain_registered_module_fakes(request):
 
 
 @pytest.fixture(autouse=True)
+def _restore_turn_liveness_registry():
+    """Keep the process-global turn-liveness registry per-test (#2598).
+
+    Runtimes register themselves in ``core.turn_stall`` on construction
+    (grok, danso, piri, crush, claude), so a test that builds a runtime and
+    never closes it leaks a binding into every later test in the same
+    process. Serial runs hid this only by file order (an adapter suite's
+    ``unregister_turn_liveness("grok")`` happened to run just before the
+    ``registered_turn_liveness_sources() == ()`` assertion); under
+    pytest-xdist the order is not guaranteed. Snapshot and restore it.
+    """
+    from telegram_bot.core import turn_stall
+
+    with turn_stall._TURN_LIVENESS_LOCK:
+        snapshot = dict(turn_stall._TURN_LIVENESS_SOURCES)
+    try:
+        yield
+    finally:
+        with turn_stall._TURN_LIVENESS_LOCK:
+            turn_stall._TURN_LIVENESS_SOURCES.clear()
+            turn_stall._TURN_LIVENESS_SOURCES.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
 def _restore_volatile_modules():
     snapshot = {name: sys.modules.get(name) for name in _VOLATILE_MODULES}
     try:
