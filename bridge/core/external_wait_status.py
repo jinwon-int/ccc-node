@@ -34,11 +34,13 @@ from telegram_bot.core.external_wait import (
     STATE_MONITORING,
     SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
+    SOURCE_LOCAL_TASK,
     TERMINAL_CANCELLED,
     TERMINAL_CLOSED,
     TERMINAL_EVICTED,
     TERMINAL_EXPIRED,
     TERMINAL_FAILURE,
+    TERMINAL_LOST,
     TERMINAL_MERGED,
     TERMINAL_MONITOR_ERROR,
     TERMINAL_OWNER_CANCEL,
@@ -86,7 +88,24 @@ _TERMINAL_LINE = {
     TERMINAL_MERGED: "✅ merged → continuing",
     TERMINAL_EVICTED: "❌ dropped from merge queue → investigating",
     TERMINAL_CLOSED: "⚠️ closed without merging",
+    TERMINAL_LOST: "ℹ️ background watch lost",
 }
+
+#: Local background work (#2605) is not CI: its outcome lines say so.
+_LOCAL_TERMINAL_LINE = {
+    TERMINAL_SUCCESS: "✅ background task finished → continuing",
+    TERMINAL_EXPIRED: "⏰ background task watch expired",
+    TERMINAL_LOST: "ℹ️ background watch lost (session ended)",
+    TERMINAL_OWNER_CANCEL: "🚫 cancelled by owner",
+}
+
+#: Pseudo-source for the bridge's own body-free background-task count
+#: (#2605 layer 1). Never written to the registry: these records are built
+#: per sync from the live session's tracker and live only in the rendered text.
+SOURCE_LOCAL_BACKGROUND = "local_background"
+#: A finished background task keeps its ✅ line this long (then it drops out
+#: like any other stale terminal line).
+BACKGROUND_FINISHED_RETENTION_SECONDS = RECENT_TERMINAL_SECONDS
 
 
 def status_enabled() -> bool:
@@ -156,12 +175,27 @@ def _actions_run_label(rec: Dict[str, Any]) -> str:
     return label
 
 
+def _background_label(rec: Dict[str, Any]) -> str:
+    count = rec.get("task_count")
+    try:
+        count = int(count) if count is not None else 1
+    except (TypeError, ValueError):
+        count = 1
+    return "background task" if count == 1 else f"{count} background tasks"
+
+
 def _label(rec: Dict[str, Any]) -> str:
     if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
         return _actions_run_label(rec)
     if rec.get("source") == SOURCE_GITHUB_MERGE_QUEUE:
         return f"PR #{rec.get('pr_number')} merge queue"
+    if rec.get("source") in (SOURCE_LOCAL_TASK, SOURCE_LOCAL_BACKGROUND):
+        return _background_label(rec)
     return f"PR #{rec.get('pr_number')} CI"
+
+
+def _is_local(rec: Dict[str, Any]) -> bool:
+    return rec.get("source") in (SOURCE_LOCAL_TASK, SOURCE_LOCAL_BACKGROUND)
 
 
 def _summary(rec: Dict[str, Any]) -> str:
@@ -174,6 +208,17 @@ def _summary(rec: Dict[str, Any]) -> str:
 def _monitoring_line(rec: Dict[str, Any]) -> str:
     created = float(rec.get("created_epoch") or 0)
     expires = float(rec.get("expires_epoch") or created)
+    if _is_local(rec):
+        # The harness resumes the session itself when the task ends; the
+        # bridge only shows that the conversation is still busy (#2605).
+        head = f"⏳ Running in background · {_label(rec)}"
+        summary = _summary(rec)
+        if summary:
+            head = f"{head} — {summary}"
+        tail = f"since {_hhmm(created)}" if rec.get("source") == SOURCE_LOCAL_BACKGROUND else (
+            f"registered {_hhmm(created)}, up to {_duration(expires - created)}"
+        )
+        return f"{head} ({tail}; resumes automatically when done)"
     head = f"⏳ Waiting for results · {_label(rec)}"
     summary = _summary(rec)
     if summary:
@@ -183,10 +228,138 @@ def _monitoring_line(rec: Dict[str, Any]) -> str:
 
 def _terminal_line(rec: Dict[str, Any]) -> str:
     status = str(rec.get("terminal_status") or rec.get("state") or "")
-    wording = _TERMINAL_LINE.get(status, "ℹ️ CI watch ended")
+    if _is_local(rec):
+        wording = _LOCAL_TERMINAL_LINE.get(status, "ℹ️ background watch ended")
+    else:
+        wording = _TERMINAL_LINE.get(status, "ℹ️ CI watch ended")
     completed = float(rec.get("completed_epoch") or 0)
     stamp = f" ({_hhmm(completed)})" if completed else ""
     return f"{wording} · {_label(rec)}{stamp}"
+
+
+# --- layer 1: the bridge's own background-task count (#2605) -----------------------
+
+
+def background_records(
+    user_id: int,
+    chat_id: int,
+    running: int,
+    oldest_age_seconds: float,
+    finished_epochs: Iterable[float],
+    now_epoch: float,
+    *,
+    labelled: int = 0,
+    retention_seconds: float = BACKGROUND_FINISHED_RETENTION_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Pseudo-records for the route's untracked background work (pure).
+
+    ``running``/``oldest_age_seconds`` come from the live session's tracker
+    (:meth:`ClaudeSessionTaskTrackingMixin.background_workload_snapshot`);
+    ``labelled`` is how many of them already have a ``local_task`` registry
+    record on this route (shown by their own line, so not counted twice).
+    ``finished_epochs`` are recent terminal frames the handler remembered;
+    those younger than ``retention_seconds`` render as one ✅ line each.
+    Everything here is body-free: counts and clock times only.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        running = max(0, int(running) - max(0, int(labelled)))
+    except (TypeError, ValueError):
+        running = 0
+    if running > 0:
+        started = float(now_epoch) - max(0.0, float(oldest_age_seconds or 0.0))
+        out.append(
+            {
+                "wait_id": f"bg:{conversation_key_of(user_id, chat_id)}",
+                "source": SOURCE_LOCAL_BACKGROUND,
+                "user_id": int(user_id),
+                "chat_id": int(chat_id),
+                "state": STATE_MONITORING,
+                "task_count": running,
+                "summary": None,
+                "created_epoch": started,
+                "expires_epoch": started + 24 * 60 * 60,
+            }
+        )
+    for index, completed in enumerate(sorted(float(value) for value in finished_epochs)):
+        if float(now_epoch) - completed > float(retention_seconds):
+            continue
+        out.append(
+            {
+                "wait_id": f"bg-done:{conversation_key_of(user_id, chat_id)}:{index}",
+                "source": SOURCE_LOCAL_BACKGROUND,
+                "user_id": int(user_id),
+                "chat_id": int(chat_id),
+                "state": TERMINAL_SUCCESS,
+                "terminal_status": TERMINAL_SUCCESS,
+                "task_count": 1,
+                "summary": None,
+                "created_epoch": completed,
+                "completed_epoch": completed,
+            }
+        )
+    return out
+
+
+BackgroundSnapshot = Tuple[int, float, List[float]]
+
+
+def route_background_snapshot(handler: Any, user_id: int, chat_id: int) -> Optional[BackgroundSnapshot]:
+    """Ask the chat handler for the route's live background workload (fail-open).
+
+    ``handler.background_workload_for_route(user_id, chat_id)`` returns
+    ``(running, oldest_age_seconds, finished_epochs)``; a handler without the
+    seam, or one that raises, yields ``None`` so the status renders exactly
+    as before #2605.
+    """
+    probe = getattr(handler, "background_workload_for_route", None)
+    if not callable(probe):
+        return None
+    try:
+        snapshot = probe(int(user_id), int(chat_id))
+    except Exception:
+        logger.debug("Background workload probe failed: route=%s:%s", user_id, chat_id)
+        return None
+    if snapshot is None:
+        return None
+    try:
+        running, oldest_age, finished = snapshot
+        return int(running), float(oldest_age), [float(value) for value in finished]
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_background_records(
+    records: Iterable[Dict[str, Any]],
+    snapshot: Optional[Tuple[int, float, Iterable[float]]],
+    user_id: int,
+    chat_id: int,
+    now_epoch: float,
+) -> List[Dict[str, Any]]:
+    """Registry records of a route plus its live background pseudo-records.
+
+    ``snapshot`` is ``(running, oldest_age_seconds, finished_epochs)`` from
+    the chat handler, or ``None`` when the route has no live session or the
+    handler does not expose the seam — then the records pass through
+    unchanged. Labelled ``local_task`` waits that are still monitoring are
+    subtracted from the running count so one task never shows twice.
+    """
+    route_records = list(records)
+    if snapshot is None:
+        return route_records
+    try:
+        running, oldest_age, finished = snapshot
+    except (TypeError, ValueError):
+        return route_records
+    labelled = sum(
+        1
+        for rec in route_records
+        if rec.get("source") == SOURCE_LOCAL_TASK and rec.get("state") == STATE_MONITORING
+    )
+    extra = background_records(
+        user_id, chat_id, running, oldest_age, finished, now_epoch, labelled=labelled
+    )
+    return _chronological(route_records + extra)
 
 
 def _is_recent_terminal(rec: Dict[str, Any], now_epoch: float, window: float) -> bool:

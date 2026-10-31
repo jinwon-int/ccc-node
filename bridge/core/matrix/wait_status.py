@@ -62,7 +62,9 @@ from telegram_bot.core.external_wait_status import (
     default_status_store_path,
     plan_status_update,
     reconcile_routes,
+    merge_background_records,
     records_for_route,
+    route_background_snapshot,
     status_enabled,
     text_hash_of,
 )
@@ -179,9 +181,15 @@ class MatrixWaitStatusMixin:
                 # no event to edit or redact yet. The transport's delivery
                 # hook re-runs this sync once the row is out.
                 return
-        records = records_for_route(self._external_wait_registry().records(), user_id, chat_id)
-        room = self.room_for_chat(chat_id)
         now = time.time()
+        records = merge_background_records(
+            records_for_route(self._external_wait_registry().records(), user_id, chat_id),
+            route_background_snapshot(getattr(self, "_project_chat", None), user_id, chat_id),
+            user_id,
+            chat_id,
+            now,
+        )
+        room = self.room_for_chat(chat_id)
         buried = (
             allow_move
             and stored is not None

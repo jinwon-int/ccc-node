@@ -10,6 +10,7 @@ from claude_agent_sdk import Message
 
 if TYPE_CHECKING:
     from .claude_runtime import (
+        BackgroundTaskListener,
         SdkFrameObserver,
         UnsolicitedHandler,
         UnsolicitedLifecycleHandler,
@@ -24,6 +25,7 @@ class ClaudeSessionObserversMixin:
     """Own optional unsolicited-delivery and raw-frame observer seams."""
 
     _sdk_frame_observer: SdkFrameObserver | None
+    _background_task_listener: BackgroundTaskListener | None
     _unsolicited_handler: UnsolicitedHandler | None
     _unsolicited_lifecycle: UnsolicitedLifecycleHandler | None
 
@@ -49,6 +51,19 @@ class ClaudeSessionObserversMixin:
         """
 
         self._unsolicited_lifecycle = handler
+
+    def set_background_task_listener(self, listener: BackgroundTaskListener) -> None:
+        """Register the body-free background-task transition seam (optional, #2605).
+
+        Same optional-seam style as ``set_unsolicited_handler``. The listener
+        is called synchronously with ``("start", task_id)`` when a
+        run-in-background task of this session is first seen and with
+        ``("finish", task_id)`` when its terminal frame (or a roster that no
+        longer lists it) arrives. It is fail-open and never breaks the reader
+        task. Re-registration replaces the route.
+        """
+
+        self._background_task_listener = listener
 
     def set_sdk_frame_observer(self, observer: SdkFrameObserver) -> None:
         """Register the raw-SDK-frame observation route (optional seam).

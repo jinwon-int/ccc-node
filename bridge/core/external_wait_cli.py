@@ -21,6 +21,9 @@ Usage (inside an agent turn)::
     python -m telegram_bot.core.external_wait_cli register \
         --repo owner/name --source actions-run --run-id 41058887647 \
         --summary "download the bundle and verify it"
+    python -m telegram_bot.core.external_wait_cli register \
+        --source local-task --task-id b6gw3sysl \
+        --summary "nightly skill sweep (manual run)" [--timeout-seconds 1800]
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
 
@@ -39,6 +42,13 @@ ends ``success`` (conclusion success/neutral), ``cancelled``, or ``failure``
 (any other conclusion, recorded for the resumed turn). A run waiting on an
 environment approval stays open and the status line says so. ``--head-sha``
 is optional; when given it must match the run's head.
+
+``--source local-task`` (#2605) labels one of this session's own
+run-in-background tasks by its harness task id so the conversation's status
+line can name the work. Nothing polls it: the harness continues the session
+when the task ends and the bridge closes the record from that frame (also when
+the session goes away — ``lost``). It never wakes the conversation; the
+deadline (default 6 h) only turns the line into ``⏰ … expired``.
 
 A new registration for the same PR at a different head supersedes this
 conversation's older pending waits for that PR (#1110): a stale head must
@@ -62,6 +72,7 @@ from telegram_bot.core.external_wait import (
     SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_GITHUB_PR_CHECKS,
+    SOURCE_LOCAL_TASK,
     STATE_MONITORING,
     TERMINAL_SUPERSEDED,
     ExternalWaitRegistry,
@@ -75,6 +86,7 @@ from telegram_bot.core.external_wait import (
     validate_run_id,
     validate_run_label,
     validate_summary,
+    validate_task_id,
 )
 from telegram_bot.core.external_wait_monitor import (
     DEFAULT_POLL_INTERVAL_SECONDS,
@@ -256,14 +268,66 @@ _SOURCE_ALIASES = {
     SOURCE_GITHUB_MERGE_QUEUE: SOURCE_GITHUB_MERGE_QUEUE,
     "actions-run": SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_ACTIONS_RUN: SOURCE_GITHUB_ACTIONS_RUN,
+    "local-task": SOURCE_LOCAL_TASK,
+    SOURCE_LOCAL_TASK: SOURCE_LOCAL_TASK,
 }
 
 
 def _source_of(raw: Any) -> str:
     key = str(raw or "").strip().lower()
     if key not in _SOURCE_ALIASES:
-        raise ExternalWaitValidationError("source must be 'checks', 'merge-queue' or 'actions-run'")
+        raise ExternalWaitValidationError(
+            "source must be 'checks', 'merge-queue', 'actions-run' or 'local-task'"
+        )
     return _SOURCE_ALIASES[key]
+
+
+def _register_local_task(home: Path, args: dict[str, Any], route: dict[str, Any]) -> int:
+    """``--source local-task``: label one of this session's background tasks (#2605)."""
+    try:
+        task_id = validate_task_id(args.get("task_id"))
+        summary = validate_summary(args.get("summary"))
+        timeout = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+    except ExternalWaitValidationError as exc:
+        _emit({"ok": False, "code": "validation", "message": str(exc)})
+        return RC_USAGE
+    except (TypeError, ValueError):
+        _emit({"ok": False, "code": "validation", "message": "invalid numeric field"})
+        return RC_USAGE
+
+    registry = ExternalWaitRegistry(default_registry_path(home))
+    wait_id = registry.register(
+        repo="",
+        pr_number=None,
+        head_sha="",
+        user_id=int(route["user_id"]),
+        chat_id=int(route["chat_id"]),
+        session_id=route.get("session_id"),
+        summary=summary,
+        timeout_seconds=timeout,
+        poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+        source=SOURCE_LOCAL_TASK,
+        task_id=task_id,
+    )
+    if not wait_id:
+        _emit({"ok": False, "code": "registry-error"})
+        return RC_REGISTRY_ERROR
+    _emit(
+        {
+            "ok": True,
+            "wait_id": wait_id,
+            "task_id": task_id,
+            "timeout_seconds": int(timeout),
+            "source": SOURCE_LOCAL_TASK,
+            "superseded": [],
+            "message": (
+                "labelled the background task on the conversation's status line; "
+                "the harness resumes the session when it ends, the bridge closes "
+                f"this record from that frame (wait_id={wait_id})"
+            ),
+        }
+    )
+    return RC_OK
 
 
 def _register_actions_run(home: Path, args: dict[str, Any], route: dict[str, Any]) -> int:
@@ -344,8 +408,11 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
         )
         return RC_ROUTE_UNAVAILABLE
     try:
-        if _source_of(args.get("source")) == SOURCE_GITHUB_ACTIONS_RUN:
+        source = _source_of(args.get("source"))
+        if source == SOURCE_GITHUB_ACTIONS_RUN:
             return _register_actions_run(home, args, route)
+        if source == SOURCE_LOCAL_TASK:
+            return _register_local_task(home, args, route)
     except ExternalWaitValidationError as exc:
         _emit({"ok": False, "code": "validation", "message": str(exc)})
         return RC_USAGE

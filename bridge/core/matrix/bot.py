@@ -802,6 +802,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         transport = self._build_transport(config)
         self._transport = transport
         self._project_chat.set_async_completion_sender(self.async_completion_sender)
+        set_refresher = getattr(self._project_chat, "set_wait_status_refresher", None)
+        if callable(set_refresher):
+            # #2605: a finished background task refreshes the route's status line.
+            set_refresher(self._sync_external_wait_status)
         initialize = bool(getattr(self._settings, "matrix_initialize", False))
         # #2207: in relay mode the spool notifier needs no Matrix session, so it
         # starts now — before the homeserver is even resolved. When DNS is down

@@ -29,6 +29,7 @@ from telegram_bot.core.external_wait import (
     SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_GITHUB_PR_CHECKS,
+    UNPOLLED_SOURCES,
     TERMINAL_CANCELLED,
     TERMINAL_CLOSED,
     TERMINAL_EVICTED,
@@ -620,6 +621,22 @@ class ExternalWaitMonitor:
     async def _poll_one(self, record: Dict[str, Any]) -> None:
         wait_id = record["wait_id"]
         now = self._clock()
+        if record.get("source") in UNPOLLED_SOURCES:
+            # A local-task wait (#2605) has no transport: the harness
+            # continues the session itself and the task tracker closes the
+            # record. The monitor only sees it at its deadline, and a deadline
+            # must not resume the conversation a second time — expire without
+            # a wake and refresh the route's status line.
+            if now >= float(record.get("expires_epoch") or 0):
+                if self._registry.finish(wait_id, TERMINAL_EXPIRED, now=now, wake=False):
+                    await self._sync_status(record)
+            else:
+                self._registry.reschedule(
+                    wait_id,
+                    next_poll_epoch=float(record.get("expires_epoch") or now),
+                    poll_interval_seconds=float(record.get("poll_interval_seconds") or 5.0),
+                )
+            return
         if now >= float(record.get("expires_epoch") or 0):
             self._registry.finish(wait_id, TERMINAL_EXPIRED, now=now)
             return
