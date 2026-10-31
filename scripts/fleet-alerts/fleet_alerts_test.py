@@ -566,49 +566,49 @@ class PolicyTest(_Base):
         return (f"t{i}", f"id{i:04d}", node, body, _kst(2026, 10, 31, hh, mm), event)
 
     def test_digest_shows_content_not_just_the_ccc_node_header(self) -> None:
-        body = ("[진군] #h3g9l4 🔔 ccc-node [AgentCronRun] · jingun\n"
-                "agent-cron fleet alert for task secled-coverage-daily: DOWN=3 (gwakga, yukson, sogyo)\n"
+        body = ("[노드A] #h3g9l4 🔔 ccc-node [AgentCronRun] · node-a\n"
+                "agent-cron fleet alert for task secled-coverage-daily: DOWN=3 (node-b, node-c, node-d)\n"
                 "scheduledAt=2026-10-30T21:00:00Z\nrunId=secled-coverage-daily-1793394000-1151462\nexitCode=1\nstdout:\n"
-                "DOWN gwakga gwakga-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0\n"
-                "DOWN yukson yukson-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0\n"
+                "DOWN node-b node-b-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0\n"
+                "DOWN node-c node-c-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0\n"
                 "SUMMARY day=2026-10-31 ok=8 findings=3\n"
-                "OK seoseo seoseo-web-daily events=285 failed=0 stop=0\n2026-10-30T21:00:00Z")
-        text = policy.build_digest([self._row(1, "AgentCronRun", "jingun", body)], _kst(2026, 10, 31, 9, 0))
+                "OK node-e node-e-web-daily events=285 failed=0 stop=0\n2026-10-30T21:00:00Z")
+        text = policy.build_digest([self._row(1, "AgentCronRun", "node-a", body)], _kst(2026, 10, 31, 9, 0))
         lines = text.splitlines()
         self.assertEqual(lines[0], "📋 플릿 알림 다이제스트 2026-10-31 — info 1건 · 1종")
         self.assertEqual(lines[1], "■ AgentCronRun 1건")
-        self.assertEqual(lines[2], "• 06:00 #h3g9l4 진군 agent-cron fleet alert for task secled-coverage-daily: DOWN=3 (gwakga, yukson, sogyo)")
-        self.assertEqual(lines[3:], ["   └ DOWN gwakga gwakga-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0",
-                                     "   └ DOWN yukson yukson-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0"])
+        self.assertEqual(lines[2], "• 06:00 #h3g9l4 노드A agent-cron fleet alert for task secled-coverage-daily: DOWN=3 (node-b, node-c, node-d)")
+        self.assertEqual(lines[3:], ["   └ DOWN node-b node-b-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0",
+                                     "   └ DOWN node-c node-c-auth-ufw-daily reason=run-missing day=2026-10-31 stop=0"])
         for noise in ("scheduledAt=", "runId=", "exitCode=", "stdout:", "🔔"):
             self.assertNotIn(noise, text)
 
     def test_attention_lines_outrank_plain_ones_and_zero_failures_are_not_attention(self) -> None:
-        body = ("[곽가] #aaaaaa 🔔 ccc-node [SecurityLedgerFleetDaily] · vps7\n"
-                "⚠ 보안장부 플릿 10/31 레인8/11 이벤트106661 수집실패0 ‖ gwakga:allowlist-invalid\n"
+        body = ("[노드B] #aaaaaa 🔔 ccc-node [SecurityLedgerFleetDaily] · host-b\n"
+                "⚠ 보안장부 플릿 10/31 레인8/11 이벤트106661 수집실패0 ‖ node-b:allowlist-invalid\n"
                 "레인 8/11 수집(전일분) · 상세: 각 노드 report.md\n"
-                "bangtong: 이벤트 9377 · 차단 8000 · 실패 0\n"
-                "dungae: 이벤트 9393 · 차단 8000 · 실패 0\n"
-                "✗ gwakga: missing (allowlist-invalid)\n")
-        text = policy.build_digest([self._row(1, "SecurityLedgerFleetDaily", "vps7", body)], _kst(2026, 10, 31, 9, 0))
-        self.assertIn("   └ ✗ gwakga: missing (allowlist-invalid)\n   └ 레인 8/11", text)
-        self.assertFalse(policy.is_attention("bangtong: 이벤트 9377 · 실패 0 · 수집실패0 · failed=0"))
+                "node-f: 이벤트 9377 · 차단 8000 · 실패 0\n"
+                "node-g: 이벤트 9393 · 차단 8000 · 실패 0\n"
+                "✗ node-b: missing (allowlist-invalid)\n")
+        text = policy.build_digest([self._row(1, "SecurityLedgerFleetDaily", "host-b", body)], _kst(2026, 10, 31, 9, 0))
+        self.assertIn("   └ ✗ node-b: missing (allowlist-invalid)\n   └ 레인 8/11", text)
+        self.assertFalse(policy.is_attention("node-f: 이벤트 9377 · 실패 0 · 수집실패0 · failed=0"))
         self.assertTrue(policy.is_attention("task x finished with execution status=failure"))
-        self.assertTrue(policy.is_attention("DOWN gwakga lane reason=x"))
+        self.assertTrue(policy.is_attention("DOWN node-b lane reason=x"))
         self.assertTrue(policy.is_attention("수집실패 2 · failed=3"))
         self.assertFalse(policy.is_attention("설계: 폰 에이전트 실패 작업 일일 정리 → 개선 후보"))  # a title, not a status
 
     def test_groups_repeated_events_attention_first_and_counts_nodes(self) -> None:
-        rows = [self._row(i, "A2ATerminalBrief", "vps7" if i % 2 else "vps4",
+        rows = [self._row(i, "A2ATerminalBrief", "host-b" if i % 2 else "host-e",
                           f"[X] #b{i:05d} 🔔 ccc-node [A2ATerminalBrief] · n\nA2A task {i} completed", 1, i)
                 for i in range(1, 8)]
-        rows.append(self._row(50, "AgentCronRun", "jingun",
-                              "[진군] #c00001 🔔 ccc-node [AgentCronRun] · jingun\nagent-cron task y finished with execution status=failure", 7))
+        rows.append(self._row(50, "AgentCronRun", "node-a",
+                              "[노드A] #c00001 🔔 ccc-node [AgentCronRun] · node-a\nagent-cron task y finished with execution status=failure", 7))
         text = policy.build_digest(rows, _kst(2026, 10, 31, 9, 0))
         lines = text.splitlines()
         self.assertEqual(lines[0], "📋 플릿 알림 다이제스트 2026-10-31 — info 8건 · 2종")
         self.assertEqual(lines[1], "■ AgentCronRun 1건")  # attention group first even though it came last
-        self.assertIn("■ A2ATerminalBrief 7건 (vps7 4·vps4 3)", lines)
+        self.assertIn("■ A2ATerminalBrief 7건 (host-b 4·host-e 3)", lines)
         shown = [ln for ln in lines if "A2A task" in ln]
         self.assertEqual(len(shown), policy.DIGEST_GROUP_ITEMS)  # latest N of a long group
         self.assertTrue(shown[-1].endswith("A2A task 7 completed"))

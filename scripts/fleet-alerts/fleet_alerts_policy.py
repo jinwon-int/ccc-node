@@ -97,7 +97,7 @@ def held_info_rows(root: os.PathLike | str) -> list[tuple[str, str, str, str, fl
         ).fetchall()
 
 
-# A ccc-node spool alert's first line is only a header ("[진군] #h3g9l4 🔔 ccc-node [AgentCronRun] · jingun");
+# A ccc-node spool alert's first line is only a header ("[노드A] #h3g9l4 🔔 ccc-node [AgentCronRun] · node-a");
 # the content starts on line 2. The digest used to show the header alone, i.e. who sent what kind, not what.
 _HEADER_RE = re.compile(r"^\[(?P<label>[^\]]+)\] #(?P<aid>[0-9a-z]+) 🔔 \S+ \[[^\]]+\](?: · \S+)?\s*$")
 # Bookkeeping lines that carry no meaning in a digest (agent-cron run ids, bare timestamps/URLs, empty stream heads).
