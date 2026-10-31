@@ -203,6 +203,11 @@ class _ActiveTurn:
         self.status_sent_at: float | None = None
         self.status_label: str | None = None
         self.status_sent = 0
+        # status-v1 (status_frames): the last ``⏳`` line sent this turn. The apps
+        # drop the sender's status bubble when a normal message from it lands, so
+        # an interim reply would hide the line until the next heartbeat (#2602);
+        # the sink re-posts this text right after each interim.
+        self.status_text: str | None = None
 
     def settle_tool(self, outcome: Mapping[str, Any]) -> None:
         if self.tool is not None and not self.tool[1].done():
@@ -259,14 +264,8 @@ class _HandeSink:
             # posts it as a plain interim), hence a separate opt-in knob.
             turn.status_sent += 1
             turn.status_label = text.partition(" | ")[2].strip() or None
-            await self._client.send(
-                {
-                    "type": "interim",
-                    "kind": "status",
-                    "turn_id": turn.turn_id,
-                    "text": _bounded_text(text, 8192),
-                }
-            )
+            turn.status_text = text
+            await self._send_status_frame(text)
             return
         if not self._transport.status_interims:
             return
@@ -297,6 +296,25 @@ class _HandeSink:
             return
         await self._client.send(
             {"type": "interim", "turn_id": self._turn.turn_id, "text": _bounded_text(text, 8192)}
+        )
+        # status-v1 apps drop this sender's ``⏳`` bubble on the interim just
+        # posted; without a re-post the line stays hidden until the next
+        # heartbeat (5 s at best, often longer), which on chatty turns hid it for
+        # a quarter to a third of the turn (#2602). Re-send the last line at once.
+        # Only with status_frames: a plain-interim status would add a room message.
+        turn = self._turn
+        if self._transport.status_frames and turn.status_text and self._live():
+            self._transport._status_resent += 1
+            await self._send_status_frame(turn.status_text)
+
+    async def _send_status_frame(self, text: str) -> None:
+        await self._client.send(
+            {
+                "type": "interim",
+                "kind": "status",
+                "turn_id": self._turn.turn_id,
+                "text": _bounded_text(text, 8192),
+            }
         )
 
     async def approval_outcome(self, text: str) -> str:
@@ -468,6 +486,8 @@ class HandeTransport:
             self.c.get("wait_status_interval_s") or DEFAULT_WAIT_STATUS_INTERVAL_S
         )
         self._wait_status_sent = 0
+        # #2602: ``⏳`` lines re-posted right after an interim (status_frames).
+        self._status_resent = 0
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
         self.listen_fd = listen_fd if listen_fd is not None else _systemd_listen_fd()
         self.socket_mode = int(self.c.get("socket_mode") or DEFAULT_SOCKET_MODE)
@@ -963,6 +983,7 @@ class HandeTransport:
             "status_frames": self.status_frames,
             "wait_status_frames": self.wait_status_frames,
             "wait_status_sent": self._wait_status_sent,
+            "status_resent": self._status_resent,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
             "self_jobs_uncertain": self._self_jobs_uncertain,

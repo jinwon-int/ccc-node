@@ -576,6 +576,79 @@ async def test_status_frames_forward_every_heartbeat_tagged_status(tmp_path: Pat
         await _stop(served)
 
 
+async def test_status_frames_repost_last_line_after_each_interim(tmp_path: Path) -> None:
+    # #2602: status-v1 apps drop the sender's "⏳" bubble when a normal message from
+    # it lands, so an interim hid the line until the next heartbeat. With
+    # status_frames on, the last line is re-posted right after every interim; an
+    # interim before any heartbeat has nothing to re-post.
+    served = await _serve(tmp_path, interim_frames=True, status_frames=True)
+
+    async def chatty_turn(job: Any, sink: Any) -> TurnResult:
+        await sink.interim("starting")  # no status yet → no re-post
+        await sink.status("⏳ Working — 5s | Bash: ls")
+        await sink.interim("step one done")
+        await sink.status("⏳ Working — 10s | Read: notes.md")
+        await sink.interim("step two done")
+        return TurnResult(text="done", session_id="s")
+
+    served.runner.behaviour = chatty_turn
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        await bot.send(bot.turn("t-33", "go"))
+        frames = []
+        while True:
+            frame = await bot.recv()
+            if frame["type"] == "result":
+                break
+            if frame["type"] == "interim":
+                frames.append((frame.get("kind"), frame["text"]))
+        assert frames == [
+            (None, "starting"),
+            ("status", "⏳ Working — 5s | Bash: ls"),
+            (None, "step one done"),
+            ("status", "⏳ Working — 5s | Bash: ls"),
+            ("status", "⏳ Working — 10s | Read: notes.md"),
+            (None, "step two done"),
+            ("status", "⏳ Working — 10s | Read: notes.md"),
+        ]
+        assert served.transport.health_signals()["status_resent"] == 2
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_status_interims_mode_does_not_repost_after_interim(tmp_path: Path) -> None:
+    # Without status_frames the heartbeat is a plain room message (status_interims);
+    # re-posting it after an interim would add messages, so nothing is re-sent.
+    served = await _serve(
+        tmp_path, interim_frames=True, status_interims=True, status_interim_interval_s=10
+    )
+
+    async def turn(job: Any, sink: Any) -> TurnResult:
+        await sink.status("⏳ Working — 5s | Bash: ls")
+        await sink.interim("progress")
+        return TurnResult(text="done", session_id="s")
+
+    served.runner.behaviour = turn
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        await bot.send(bot.turn("t-34", "go"))
+        frames = []
+        while True:
+            frame = await bot.recv()
+            if frame["type"] == "result":
+                break
+            if frame["type"] == "interim":
+                frames.append((frame.get("kind"), frame["text"]))
+        assert frames == [(None, "⏳ Working — 5s | Bash: ls"), (None, "progress")]
+        assert served.transport.health_signals()["status_resent"] == 0
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
 async def test_policy_rooms_and_room_kind(tmp_path: Path) -> None:
     transport = HandeTransport(_config(), FakeRunner(), socket_path=tmp_path / "s.sock")
     assert transport.policy.rooms == {"agent": "direct", "fleet": "mention"}
