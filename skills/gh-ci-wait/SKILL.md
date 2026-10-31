@@ -14,6 +14,15 @@ you register a durable wait and receive a `wait_id`.
 - You pushed or opened/updated a PR and the next step depends on the CI
   outcome (merge, address failures, re-review).
 - You are about to tell the user "I'll continue when CI finishes".
+- You enqueued a PR (`--source merge-queue`) or wait on a build/TestFlight/
+  release Actions run (`--source actions-run`).
+
+This is the **default** way to wait, not a fallback (#2603): only a registered
+wait shows the `⏳ Waiting for results · …` line in Hande/Matrix (#2590) and
+resumes the conversation after the session is gone. Background watchers
+(`ci-watch.sh`, `merge-queue-watch.sh`, `gh run watch`) show nothing to the
+owner — use them only when registration fails, and never alongside a wait for
+the same head (both would continue the work).
 
 Do NOT use it for sleeps/heartbeats inside the current turn, and never for
 merge/deploy/release actions themselves — CI green never auto-approves
