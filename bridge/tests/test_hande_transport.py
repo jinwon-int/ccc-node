@@ -26,6 +26,12 @@ pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture
+def tmp_path(short_tmp_path):
+    """Unix-socket suite: keep socket paths under the sun_path limit (#2598)."""
+    return short_tmp_path
+
+
+@pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
 

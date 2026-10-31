@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 
 from telegram_bot.core.hande import state
+from telegram_bot.core.hande import bot as hande_bot
 from telegram_bot.core.hande.bot import HandeBot
 from telegram_bot.core.hande.state import HandeConfigError, load_config, validate_config
 from telegram_bot.core.matrix.bot import MatrixBot
@@ -158,7 +160,11 @@ def test_hande_bot_builds_the_hande_transport(tmp_path: Path) -> None:
 def test_transport_verdict_words_the_socket_not_a_sync_loop(tmp_path: Path) -> None:
     _write(tmp_path, _config())
     bot = HandeBot(_settings(tmp_path), project_chat=object(), session_manager=object())
-    bot._health_started = 0.0  # past the startup grace
+    # Genuinely past the startup grace. A literal 0.0 only works when the
+    # host has been up longer than the grace: time.monotonic() is roughly
+    # uptime on Linux, so a fresh CI VM that reached this test within
+    # 120 s of boot (pytest-xdist, #2598) still got "wait".
+    bot._health_started = time.monotonic() - hande_bot._CLIENT_STARTUP_GRACE_S - 1
     bot._transport = SimpleNamespace(
         health_signals=lambda now: {"connected": False, "clients_seen": 1}
     )

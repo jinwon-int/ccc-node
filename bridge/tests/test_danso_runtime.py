@@ -1133,12 +1133,18 @@ async def test_interrupt_or_cancel_reaps_child_and_preserves_journal(configured,
         return [e async for e in session.send_turn('wait')]
     task=asyncio.create_task(collect())
     marker=Path(configured.danso_workspace)/'pid'
+    # The fixture child writes the pid with write_text (truncate, then write),
+    # so the file can exist before it holds the number; under CPU contention
+    # (e.g. pytest-xdist, #2598) the read landed in that window and got ''.
+    pid_text=''
     for _ in range(200):
         if marker.exists():
-            break
+            pid_text=marker.read_text().strip()
+            if pid_text.isdigit():
+                break
         await asyncio.sleep(.01)
-    assert marker.exists()
-    pid=int(marker.read_text())
+    assert pid_text.isdigit(), f'fixture child never published its pid: {pid_text!r}'
+    pid=int(pid_text)
     if cancel:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
