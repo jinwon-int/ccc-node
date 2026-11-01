@@ -626,6 +626,13 @@ kept = (
     "  - url: https://github.com/jinwon-int/a2a-nexus/pull/2428",
     "see https://github.com/jinwon-int/esp32-iphone-agent/issues/77#issuecomment-6291232321",
     "run https://github.com/jinwon-int/ccc-node/actions/runs/40057236011",
+    # name=version pairs (#2620: a CVE recheck alert lost every package version).
+    "node-a: libbrotli1=1.1.0-2ubuntu0.1 restart_needed=none",
+    "libbrotli1=1.1.0-2build2",
+    "libbrotli1=1.1.0-2+deb13u1",
+    "openssl=3.0.13-0ubuntu3.6",
+    "linux-image=6.8.0-136-generic",
+    "nodejs=22.23.4-1nodesource1 chrome=156.0.8078.47-1",
 )
 for raw in kept:
     assert module.redact_for_owner(raw) == raw, raw
@@ -651,6 +658,19 @@ masked = (
     "https://github.com.evil.example/" + "V" * 30,      # look-alike host
     "https://gist.github.com/" + "W" * 30,              # other GitHub host
     "https://github.com/o/" + "X" * 12 + "+" + "Y" * 12,  # base64 char breaks the segment
+    # name=version span (#2620) must not open a side channel:
+    "x=1.2.3" + "A" * 30,                       # over-long value is not partially kept
+    "a" * 20 + "bbbb=1.2.3",                    # over-long name
+    "A" * 20 + "aaaa=1.2.3",                    # name glued to a preceding blob
+    "K" * 30 + "=1.2.3",                        # blob before the `=`
+    "k=1." + "Z" * 30,                          # version-looking prefix, long body
+    "pkg=" + "abcdefghijklmnopqrstuvwxyz",      # value does not start with a digit
+    "Name=1.2.3.4.5.6.7.8.9.10.11.12",          # uppercase name, over-long value
+    "pkg=1.2.3=" + "S" * 30,                    # secret chained after a version
+    "token=1.2.3456789012345678901234",         # credential key wins over the span
+    # both sides short, so only the version shape keeps these masked:
+    "cookie=QWxhZGRpbjpvcGVuIHNl",              # value does not start with a digit
+    "sid=1" + "a" * 20,                          # digit start but no `.`
 )
 for raw in masked:
     out = module.redact_for_owner(raw)
