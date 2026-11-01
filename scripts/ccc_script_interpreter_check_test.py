@@ -278,6 +278,34 @@ class IntegrationCase(unittest.TestCase):
         (self.tmp / "bad.sh").write_text('bash "$D/foo.sh"\n')
         self.assertEqual(CHK.main(["--repo-root", str(self.tmp)]), 0)
 
+    def test_paths_from_limits_the_scan_to_the_named_tracked_files(self):
+        # #2611: the quick phase passes only the changed files, NUL-separated
+        # in a file so a path starting with '-' is not parsed as an option.
+        (self.tmp / "bad.sh").write_text('"$D/foo.sh"\n')
+        (self.tmp / "good.sh").write_text('bash "$D/foo.sh"\n')
+        (self.tmp / "-dash.sh").write_text('"$D/foo.sh"\n')
+        root = str(self.tmp)
+        lst = self.tmp / "paths.lst"
+
+        def run(*paths):
+            lst.write_bytes(b"".join(p.encode() + b"\0" for p in paths))
+            return CHK.main(["--repo-root", root, "--paths-from", str(lst)])
+
+        self.assertEqual(run("good.sh"), 0)
+        self.assertEqual(run("bad.sh"), 1)
+        self.assertEqual(run("good.sh", "bad.sh"), 1)
+        self.assertEqual(run("-dash.sh"), 1)
+        # An empty list scans nothing; an unknown path is ignored, not scanned.
+        self.assertEqual(run(), 0)
+        self.assertEqual(run("nope.sh"), 0)
+        self.assertEqual(
+            CHK.main(["--repo-root", root, "--paths-from", str(self.tmp / "missing")]), 2)
+        findings, scanned, _ = CHK.run_check(self.tmp, ["bad.sh"])
+        full, _, _ = CHK.run_check(self.tmp)
+        self.assertEqual(scanned, 1)
+        self.assertEqual(list(map(str, findings)),
+                         [str(f) for f in full if f.path == "bad.sh"])
+
     def test_missing_repo_root(self):
         self.assertEqual(CHK.main(["--repo-root", str(self.tmp / "nope")]), 2)
 

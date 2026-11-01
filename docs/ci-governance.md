@@ -43,6 +43,13 @@ name and its gate without any branch-protection mutation; the leg jobs are
 deliberately NOT declared as required contexts (a matrix leg rename would
 strand them, and the aggregator already covers them).
 
+`CCC_HARNESS_PHASE=quick` (#2611) is a **local-only** pre-push phase, entered
+through `scripts/quick-check.sh`: the static phase with shellcheck and the
+interpreter-call-site scan limited to files changed since a base ref and only
+the measured-slow inline suites on `QUICK_SKIP_SUITES` skipped. No CI job runs
+it and it gates nothing —
+`validate-harness-static` keeps running the full static phase.
+
 ## validate-harness discovery rules (issue #1484)
 
 `scripts/validate-harness.sh` no longer keeps hand-maintained lists of what

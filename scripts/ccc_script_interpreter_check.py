@@ -823,11 +823,20 @@ def list_tracked_files(repo_root: Path) -> tuple[list[str], str | None]:
         return fallback, f"git ls-files unavailable ({exc}); filesystem walk used"
 
 
-def run_check(repo_root: Path) -> tuple[list[Finding], int, str | None]:
+def run_check(
+    repo_root: Path, only: list[str] | None = None
+) -> tuple[list[Finding], int, str | None]:
+    """Scan every tracked file, or — with ``only`` — just the tracked files
+    named there (#2611 quick phase: changed files). Findings are per call
+    site, so a subset scan reports exactly the subset of a full scan; a path
+    in ``only`` that is not tracked is ignored, never scanned."""
     rels, note = list_tracked_files(repo_root)
+    selected = set(rels)
+    if only is not None:
+        selected &= {str(Path(o)) for o in only}
     findings: list[Finding] = []
     scanned = 0
-    for rel in sorted(set(rels)):
+    for rel in sorted(selected):
         p = repo_root / rel
         if not p.is_file():
             continue
@@ -846,12 +855,27 @@ def run_check(repo_root: Path) -> tuple[list[Finding], int, str | None]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--repo-root", default=".", help="repository root (default: cwd)")
+    ap.add_argument(
+        "--paths-from", default=None, metavar="FILE",
+        help="scan only the repo-relative tracked paths listed in FILE, "
+             "NUL-separated (an empty file scans nothing); default: every "
+             "tracked file. A file, not argv, so a path starting with '-' "
+             "is never parsed as an option (#2611 quick phase).",
+    )
     args = ap.parse_args(argv)
     root = Path(args.repo_root).resolve()
     if not root.is_dir():
         print(f"error: repo root not a directory: {root}", file=sys.stderr)
         return 2
-    findings, scanned, note = run_check(root)
+    only: list[str] | None = None
+    if args.paths_from is not None:
+        try:
+            raw = Path(args.paths_from).read_bytes()
+        except OSError as exc:
+            print(f"error: cannot read --paths-from: {exc}", file=sys.stderr)
+            return 2
+        only = [p for p in raw.decode("utf-8", "surrogateescape").split("\0") if p]
+    findings, scanned, note = run_check(root, only)
     if note:
         print(f"note: {note}")
     for f in findings:
