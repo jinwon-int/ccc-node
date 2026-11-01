@@ -54,6 +54,12 @@ The SessionStart hook (`~/.claude/hooks/load-memory.sh`) auto-injects a snapshot
 ## Fresh Approval Required
 secrets · releases · DB/replay/migration/prune · manual ACKs · emergency hotfixes · provider sends/canaries · host power-down (poweroff/halt/shutdown-without-`-r`, any host) · reboot of an unlisted remote host · non-fleet service lifecycle and config-changing verbs · cross-broker mutations (unless pre-approved in-task).
 
+A merge followed by deploy steps (pilot → fleet) may be approved once as a
+**conditional bundle** (`<n> 묶음 승인`) — pre-declared steps, exact head,
+machine-checkable pass conditions, stop on any deviation. Items on the list
+above are never bundled. Rules: `gh-pr-flow` skill, "Conditional bundled
+approval".
+
 Claude Code's native permission mode is `bypassPermissions`, the Claude
 equivalent of an unrestricted sandbox with no native approval prompts. This node
 runs that native Claude Code posture: the Fresh Approval Required set is
