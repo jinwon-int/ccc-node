@@ -285,11 +285,21 @@ fi
 
 # A ready generation for the target may already exist (an earlier tick built
 # it but the pointer switch or restart did not happen): repoint, do not rebuild.
+# Unless this node runs the Matrix frontend and that generation was built
+# without the Matrix extra (ccc-node#2621: one tick's --extra probe failed, the
+# extra-less build stayed "ready", and every later tick re-found it, refused
+# promotion at the gate and never rebuilt — the node stuck on the old
+# generation until an operator deleted the directory). Such a generation is
+# skipped here, left in place for diagnosis, and a fresh build follows below.
 GEN=""
 for d in "$PREP"/main-"$SHORT"-*/; do
   [ -d "$d" ] || continue
   d="${d%/}"
   if [ "$(gen_head "$d")" = "$TARGET" ] && [ "$(receipt_status "$d/job")" = "ready" ]; then
+    if matrix_frontend_configured && ! matrix_extra_present "$d"; then
+      say "note: ready generation $(basename "$d") lacks the Matrix extra — not reusing it; a fresh build with --extra matrix follows"
+      continue
+    fi
     GEN="$d"; break
   fi
 done
@@ -341,7 +351,17 @@ if matrix_frontend_configured; then
   # Pass --extra matrix when the target's termux_prepare.py supports it
   # (ccc-node#2202). Older tools cannot install the extra; the build still
   # runs but the gate below refuses to promote the result.
-  if git -C "$REPO" show "$TARGET:bridge/termux_prepare.py" 2>/dev/null | grep -q -- '"--extra"'; then
+  # The probe is retried once: a transient `git show` failure (object not yet
+  # readable, index lock) must not be mistaken for "no --extra support" — that
+  # is how an extra-less generation got built in the first place (#2621).
+  tool_src=""
+  for attempt in 1 2; do
+    if tool_src="$(git -C "$REPO" show "$TARGET:bridge/termux_prepare.py" 2>/dev/null)"; then break; fi
+    tool_src=""; [ "$attempt" = 1 ] && sleep 2
+  done
+  if [ -z "$tool_src" ]; then
+    die 3 "cannot read bridge/termux_prepare.py at $SHORT from $REPO (git show failed twice); not building an extra-less generation; pointer unchanged"
+  elif printf '%s' "$tool_src" | grep -q -- '"--extra"'; then
     EXTRA=(--extra matrix)
   else
     say "note: termux_prepare.py at $SHORT has no --extra support; the build cannot include the Matrix extra and will not be promoted"
