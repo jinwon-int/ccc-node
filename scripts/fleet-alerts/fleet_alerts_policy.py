@@ -18,6 +18,9 @@ Policy (owner decision 2026-10-27, ccc-node#2413):
               responder stage, ``ok/hold <id>``) arrived — a derived row
               ``tier=renotify`` that quotes the original id.
 ``critical``  delivered at once, no digest; re-notified like ``action``.
+``notice``    (#2628) delivered at once, no digest, **never re-notified** and not a
+              ``ok/hold`` target — an owner-personal information notice (lotto buy/
+              result) that must reach both rooms now without paging anyone.
 
 Derived tiers (``digest``, ``renotify``) are internal: ``normalize_tier``
 never produces them from a payload, so a node cannot inject one.
@@ -43,7 +46,7 @@ DIGEST_HOUR_KST = 9
 DIGEST_TIER = "digest"
 RENOTIFY_TIER = "renotify"
 DERIVED_TIERS = (DIGEST_TIER, RENOTIFY_TIER)
-IMMEDIATE_TIERS = ("action", "critical")
+IMMEDIATE_TIERS = ("notice", "action", "critical")
 RENOTIFY_AFTER_S = 15 * 60
 RENOTIFY_LINE_CHARS = 160
 DIGEST_LINE_CHARS = 120     # bytes of an item's head line (``#id label summary``)

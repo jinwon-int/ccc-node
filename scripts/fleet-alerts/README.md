@@ -49,7 +49,8 @@ retired. See "「한데」 lane" below.
 signature `sha256=HMAC-SHA256(secret, "<unix-ts>." + body)`.
 
 **v2 (#2413, field-additive).** The body carries `tier` — `info` (default) /
-`action` (a person should look) / `critical` — and the receiver accepts both
+`notice` (#2628: an owner-personal notice that should arrive now, nobody needs
+to act) / `action` (a person should look) / `critical` — and the receiver accepts both
 `ccc.fleet-alert.v1` and `.v2` (an old node simply sends no tier → `info`).
 Every queued alert gets a 6-char **alert id** (base36, derived from the txn,
 unique in the queue) that the owner can quote back (`ok <id>` / `hold <id>`,
@@ -110,6 +111,7 @@ Matrix sender before every round):**
 | tier | leaves the queue | re-notify |
 |---|---|---|
 | `info` | held; one **digest** row per day at **09:00 KST** (`📋 플릿 알림 다이제스트 <date> — info N건 · K종`; grouped by event as `■ <event> N건 (node counts)`, groups with a problem signal first; each item `• HH:MM #id <label> <first content line>` plus up to 2 `└` detail lines, problem lines first — the ccc-node `🔔` header line and run-id/timestamp/URL bookkeeping are dropped; a group shows its 3 most relevant items then `… 외 N건`; the whole text stays ≤ 7000 bytes (「한데」 cap 8000) by dropping detail lines, then items, then trailing groups); held rows get a `digested` receipt pointing at the digest id | — |
+| `notice` | at once (both rooms — the 「한데」 mirror copies every non-`info` insert) | **never**; not an `ok/hold` target (#2628) |
 | `action` | at once | once, 15 min after the Matrix receipt, unless a `reply` receipt (`ok/hold <id>`, responder stage) exists — a derived `⏰ 재통지 #id …` row |
 | `critical` | at once | like `action`, `🚨` |
 

@@ -53,11 +53,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 SCHEMA_V1 = "ccc.fleet-alert.v1"
-# v2 (#2413): v1 plus ``tier`` (info|action|critical, default info). Field-additive —
+# v2 (#2413): v1 plus ``tier`` (info|notice|action|critical, default info). Field-additive —
+# ``notice`` (#2628): delivered at once and mirrored to 「한데」 like action, never re-notified —
 # a v1 receiver ignores ``tier``; the v2 receiver accepts both schema names.
 SCHEMA = "ccc.fleet-alert.v2"
 ACCEPTED_SCHEMAS = (SCHEMA_V1, SCHEMA)
-TIERS = ("info", "action", "critical")
+TIERS = ("info", "notice", "action", "critical")
 DEFAULT_TIER = "info"
 NODE_HEADER = "X-Fleet-Node"
 TIMESTAMP_HEADER = "X-Fleet-Timestamp"

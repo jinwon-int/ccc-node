@@ -61,7 +61,7 @@ def _ack_text(verb: str, alert_id: str, channel: str, who: str, now: float, outc
     if outcome == "already":
         return f"ℹ️ #{alert_id}: 이미 회신이 기록돼 있어 첫 회신을 유지합니다 ({who}, {channel})"
     if outcome == "not-actionable":
-        return f"ℹ️ #{alert_id}: 회신 대상이 아닌 알림입니다(info/다이제스트/파생)"
+        return f"ℹ️ #{alert_id}: 회신 대상이 아닌 알림입니다(info/notice/다이제스트/파생)"
     return f"❓ #{alert_id}: 알 수 없는 알림 번호입니다 ({who}, {channel})"
 
 
