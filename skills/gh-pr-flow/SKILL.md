@@ -631,6 +631,71 @@ instruction, with no owner sign-off on the author.
   explicitly authorizes both for that exact PR.
 - A merge instruction authorizes the merge, not token disclosure, credential
   transfer, release/publish, deploy, restart, migration, or another mutation.
+  The one way to authorize a merge *and* its follow-up deploy steps with a
+  single phrase is the conditional bundle below.
+
+## Conditional bundled approval (#2617)
+
+A change that needs several approval-gated steps in sequence — typically
+cross-account review + merge, a one-node pilot deploy, then a fleet deploy —
+used to cost one owner round trip per step (family-messenger#635: three, plus
+an owner screen check). A conditional bundle lets the owner approve the whole
+chain once, **in the current conversation**, with machine-checkable gates
+between the steps. It is a fresh owner approval, not delegation: it is outside
+the delegated-approval matrix (a2a-nexus#2317 — conversational owner approvals
+are not 전결 subjects) and it never lowers that matrix's L3 set.
+
+**1. Propose first.** Before asking, post one bundle proposal that lists:
+
+- the exact target — repository, PR number, **exact head SHA**;
+- numbered steps, each with its target set (e.g. a one-node pilot, then the
+  named remaining nodes) and its safety mechanism (idle gate, backup,
+  automatic rollback, exact-head helpers);
+- for every step after the first, the **objective pass condition** that must
+  hold before it starts — something the agent can read from a log, API, or
+  receipt, e.g. `RESULT=PASS` and `typing_failed=0` with at least one
+  `typing_started` in the pilot journal, all required checks green on the
+  queue group, bridge MainPID unchanged;
+- the stop conditions (section 3) and the rollback path;
+- the approval phrase: `<n> 묶음 승인` (for the PR `<n>`).
+
+**2. What may be bundled.** Steps the owner could otherwise approve one by
+one in this conversation: cross-account review and merge of that one PR
+(Direction A/B above, still exact-head through the relay helpers), and deploys
+of an artifact built from the resulting `main` that carry an idle gate, a
+backup and an automatic rollback (for example the 한데 bot binary-only
+replacement). **Never bundled** — each still needs its own fresh approval:
+everything on the template's Fresh Approval Required list (secrets,
+releases/publish, environment-deployment approvals, DB/replay/migration/prune,
+manual ACKs, emergency hotfixes, provider sends/canaries, cross-broker
+mutations), external-author PRs, broker/Gateway restarts, and any step whose
+pass condition is an owner observation with no agreed objective proxy.
+
+**3. Stop and ask again when any of these happen** — the remaining steps lose
+the bundle's authority and nothing further runs:
+
+- the PR head moves before merge (a new push, an update-branch), or the
+  merged commit is not the queue group of that head;
+- a pass condition fails, or cannot be read (missing log line, unreadable
+  receipt, timeout) — undeterminable is a failure;
+- any node reports `ROLLED_BACK`, or a target outside the proposal would be
+  touched;
+- more than 24 hours pass since the approval, or the owner says `hold`,
+  `중단`, or `stop`.
+
+An `ABORT_BUSY`-style no-change result (idle gate never opened, nothing
+modified) is not a failure: retry that node within the bundle, and report it.
+
+**4. Reading the owner's reply.** The phrase must come from the owner in the
+current conversation. The owner often answers by pasting one option back from
+a numbered list: a message that repeats **exactly one** proposed option
+selects it. A message that pastes several mutually exclusive options, or only
+a conditional sentence ("보였다면 … 승인을 주세요") without answering it, is
+**not** an approval — ask once more, with the recommended option first.
+
+**5. Evidence.** Post each step's evidence (step, result, IDs, SHAs, PIDs,
+timestamps) to the PR as it completes, and cite the bundle approval message in
+the final report. Record the bundle in the same Wiki log entry as the deploy.
 
 ## Standing approval for mechanical fleet-skills promote PRs (#2239 L3)
 
