@@ -57,8 +57,21 @@ SOURCE_GITHUB_ACTIONS_RUN = "github_actions_run"
 #: registry entry only carries the agent's label and deadline so the route's
 #: status message can name the work; a finish never journals a wake.
 SOURCE_LOCAL_TASK = "local_task"
+#: A detached systemd transient unit (#2605 layer 3, the
+#: ``bridge-safe-detached-run`` recipe): the job appends ``EXIT=<n>`` to its
+#: log when it ends. The monitor polls that marker locally — no GitHub, no
+#: provider session — and wakes the conversation like a CI wait would, which
+#: is the point: this is the one background path that survives a bridge
+#: restart, and nothing else continues the conversation for it.
+SOURCE_DETACHED_JOB = "detached_job"
 SOURCES = frozenset(
-    {SOURCE_GITHUB_PR_CHECKS, SOURCE_GITHUB_MERGE_QUEUE, SOURCE_GITHUB_ACTIONS_RUN, SOURCE_LOCAL_TASK}
+    {
+        SOURCE_GITHUB_PR_CHECKS,
+        SOURCE_GITHUB_MERGE_QUEUE,
+        SOURCE_GITHUB_ACTIONS_RUN,
+        SOURCE_LOCAL_TASK,
+        SOURCE_DETACHED_JOB,
+    }
 )
 #: Sources the monitor never asks a transport about.
 UNPOLLED_SOURCES = frozenset({SOURCE_LOCAL_TASK})
@@ -114,6 +127,8 @@ ACTIVE_ROUTE_TTL_SECONDS = 6 * 60 * 60
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 #: Same bound as the task tracker's id filter: opaque, body-free, ≤256 chars.
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+#: systemd unit names as the detached-run skill picks them (``--unit <job>``).
+_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,200}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _MAX_SUMMARY_CHARS = 200
 _MAX_RUN_LABEL_CHARS = 80
@@ -171,6 +186,32 @@ def validate_task_id(task_id: Any) -> str:
     if not _TASK_ID_RE.fullmatch(candidate):
         raise ExternalWaitValidationError("task id must be 1-256 chars of [A-Za-z0-9_.-]")
     return candidate
+
+
+def validate_unit_name(unit: Any) -> str:
+    """One systemd transient-unit name (#2605 layer 3); ``.service`` is stripped."""
+    candidate = str(unit or "").strip()
+    if candidate.endswith(".service"):
+        candidate = candidate[: -len(".service")]
+    if not _UNIT_RE.fullmatch(candidate):
+        raise ExternalWaitValidationError("unit must be 1-200 chars of [A-Za-z0-9_.:@-]")
+    return candidate
+
+
+def validate_log_path(log_path: Any) -> str:
+    """An absolute, normalized log path with no ``..`` segments (#2605 layer 3).
+
+    Only the path travels: the monitor reads the file's ``EXIT=`` tail and
+    nothing else, and the resume prompt names the path so the agent can read
+    the log itself — never its content.
+    """
+    raw = str(log_path or "").strip()
+    if not raw or len(raw) > 1024:
+        raise ExternalWaitValidationError("log path is required (absolute, at most 1024 chars)")
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded) or ".." in expanded.split(os.sep) or "\x00" in expanded:
+        raise ExternalWaitValidationError("log path must be absolute without '..' segments")
+    return os.path.normpath(expanded)
 
 
 def validate_head_sha(head_sha: str) -> str:
@@ -329,6 +370,8 @@ class ExternalWaitRegistry:
         run_label: Optional[str] = None,
         run_number: Any = None,
         task_id: Any = None,
+        unit: Any = None,
+        log_path: Any = None,
     ) -> str:
         """Register one wait; returns its id (idempotent per natural key).
 
@@ -352,6 +395,14 @@ class ExternalWaitRegistry:
             task_id = validate_task_id(task_id)
             extra = {"task_id": task_id}
             natural = (source, task_id, int(user_id), int(chat_id))
+        elif source == SOURCE_DETACHED_JOB:
+            repo = ""
+            pr_number = None
+            head_sha = ""
+            unit = validate_unit_name(unit)
+            log_path = validate_log_path(log_path)
+            extra = {"unit": unit, "log_path": log_path}
+            natural = (source, unit, log_path, int(user_id), int(chat_id))
         elif source == SOURCE_GITHUB_ACTIONS_RUN:
             repo = validate_repo(repo)
             run_id = validate_run_id(run_id)
@@ -379,6 +430,8 @@ class ExternalWaitRegistry:
         def _natural_of(rec: Dict[str, Any]) -> tuple:
             if rec.get("source") == SOURCE_LOCAL_TASK:
                 return (rec.get("source"), rec.get("task_id"), rec.get("user_id"), rec.get("chat_id"))
+            if rec.get("source") == SOURCE_DETACHED_JOB:
+                return (rec.get("source"), rec.get("unit"), rec.get("log_path"), rec.get("user_id"), rec.get("chat_id"))
             if rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
                 return (rec.get("source"), rec.get("repo"), rec.get("run_id"), rec.get("user_id"), rec.get("chat_id"))
             return (
@@ -807,6 +860,13 @@ def render_waits(records: List[Dict[str, Any]]) -> str:
             lines.append(
                 f"{marker} `{rec.get('wait_id')}` — background task {rec.get('task_id')}"
                 f" (this session) · {state}"
+            )
+        elif rec.get("source") == SOURCE_DETACHED_JOB:
+            detail = rec.get("terminal_detail") if isinstance(rec.get("terminal_detail"), dict) else {}
+            code = detail.get("exit_code") if isinstance(detail, dict) else None
+            lines.append(
+                f"{marker} `{rec.get('wait_id')}` — detached job {rec.get('unit')}"
+                f" · {state}{f' (exit {code})' if code is not None else ''}"
             )
         elif rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
             label = str(rec.get("run_label") or "").strip() or "workflow"

@@ -33,6 +33,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 from telegram_bot.core.external_wait import (
     STATE_MONITORING,
     SOURCE_GITHUB_ACTIONS_RUN,
+    SOURCE_DETACHED_JOB,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_LOCAL_TASK,
     TERMINAL_CANCELLED,
@@ -96,6 +97,16 @@ _LOCAL_TERMINAL_LINE = {
     TERMINAL_SUCCESS: "✅ background task finished → continuing",
     TERMINAL_EXPIRED: "⏰ background task watch expired",
     TERMINAL_LOST: "ℹ️ background watch lost (session ended)",
+    TERMINAL_OWNER_CANCEL: "🚫 cancelled by owner",
+}
+
+#: Detached systemd jobs (#2605 layer 3) wake the conversation when they end.
+_DETACHED_TERMINAL_LINE = {
+    TERMINAL_SUCCESS: "✅ detached job finished → continuing",
+    TERMINAL_FAILURE: "❌ detached job failed → investigating",
+    TERMINAL_LOST: "ℹ️ detached job lost (no EXIT marker) → investigating",
+    TERMINAL_EXPIRED: "⏰ detached job watch expired",
+    TERMINAL_MONITOR_ERROR: "⚠️ detached job watch failed",
     TERMINAL_OWNER_CANCEL: "🚫 cancelled by owner",
 }
 
@@ -191,6 +202,9 @@ def _label(rec: Dict[str, Any]) -> str:
         return f"PR #{rec.get('pr_number')} merge queue"
     if rec.get("source") in (SOURCE_LOCAL_TASK, SOURCE_LOCAL_BACKGROUND):
         return _background_label(rec)
+    if rec.get("source") == SOURCE_DETACHED_JOB:
+        unit = redact_credentials(str(rec.get("unit") or "").strip())[:60]
+        return f"detached job {unit}" if unit else "detached job"
     return f"PR #{rec.get('pr_number')} CI"
 
 
@@ -219,6 +233,12 @@ def _monitoring_line(rec: Dict[str, Any]) -> str:
             f"registered {_hhmm(created)}, up to {_duration(expires - created)}"
         )
         return f"{head} ({tail}; resumes automatically when done)"
+    if rec.get("source") == SOURCE_DETACHED_JOB:
+        head = f"⏳ Running detached · {_label(rec)}"
+        summary = _summary(rec)
+        if summary:
+            head = f"{head} — {summary}"
+        return f"{head} (registered {_hhmm(created)}, up to {_duration(expires - created)})"
     head = f"⏳ Waiting for results · {_label(rec)}"
     summary = _summary(rec)
     if summary:
@@ -230,6 +250,8 @@ def _terminal_line(rec: Dict[str, Any]) -> str:
     status = str(rec.get("terminal_status") or rec.get("state") or "")
     if _is_local(rec):
         wording = _LOCAL_TERMINAL_LINE.get(status, "ℹ️ background watch ended")
+    elif rec.get("source") == SOURCE_DETACHED_JOB:
+        wording = _DETACHED_TERMINAL_LINE.get(status, "ℹ️ detached job watch ended")
     else:
         wording = _TERMINAL_LINE.get(status, "ℹ️ CI watch ended")
     completed = float(rec.get("completed_epoch") or 0)

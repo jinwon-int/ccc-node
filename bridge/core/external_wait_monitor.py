@@ -21,11 +21,13 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, Optional, Protocol, Tuple
 
 from telegram_bot.core.external_wait import (
+    SOURCE_DETACHED_JOB,
     SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_GITHUB_PR_CHECKS,
@@ -35,6 +37,7 @@ from telegram_bot.core.external_wait import (
     TERMINAL_EVICTED,
     TERMINAL_EXPIRED,
     TERMINAL_FAILURE,
+    TERMINAL_LOST,
     TERMINAL_MERGED,
     TERMINAL_MONITOR_ERROR,
     TERMINAL_SUPERSEDED,
@@ -65,6 +68,14 @@ MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS = 120.0
 #: uploads take minutes, a 5-minute ceiling would add most of a poll to every
 #: wake.
 ACTIONS_RUN_MAX_POLL_INTERVAL_SECONDS = 120.0
+#: A detached job's log is a local file: polling it is one stat + an 8 KiB
+#: tail read, so the backoff ceiling stays short (#2605 layer 3).
+DETACHED_JOB_MAX_POLL_INTERVAL_SECONDS = 60.0
+#: Without an ``EXIT=`` marker a log this quiet, whose unit is gone, counts
+#: as lost — the same threshold the hooks-side ``detached_jobs.py`` uses.
+DETACHED_JOB_STALE_SECONDS = 900.0
+#: Only the tail of a (possibly huge) log is read; the marker is appended last.
+_DETACHED_LOG_TAIL_BYTES = 8192
 #: Live run statuses (#2590). ``waiting`` is an environment approval gate
 #: (deployment review) — NOT terminal: the run continues once approved.
 ACTIONS_RUN_PENDING_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
@@ -411,6 +422,94 @@ _TERMINAL_BY_ROLLUP = {
     ROLLUP_CANCELLED: TERMINAL_CANCELLED,
 }
 
+@dataclass(frozen=True)
+class DetachedJobState:
+    """Body-free facts about one detached unit (#2605 layer 3)."""
+
+    exit_code: Optional[int]
+    log_exists: bool
+    log_age_seconds: Optional[float]
+    unit_active: bool
+
+
+def read_exit_marker(log_path: str) -> Optional[int]:
+    """Exit code from the last ``EXIT=<n>`` line of the log's tail, else None.
+
+    Mirrors ``claude/hooks/lib/detached_jobs.py``: a malformed marker still
+    proves the job stopped and is reported as ``-1`` rather than swallowed.
+    """
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as handle:
+            if size > _DETACHED_LOG_TAIL_BYTES:
+                handle.seek(-_DETACHED_LOG_TAIL_BYTES, os.SEEK_END)
+            tail = handle.read().decode("utf-8", "ignore")
+    except OSError:
+        return None
+    code: Optional[int] = None
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line.startswith("EXIT="):
+            continue
+        try:
+            code = int(line[5:].strip())
+        except ValueError:
+            code = -1
+    return code
+
+
+def unit_is_active(unit: str) -> bool:
+    """Best-effort ``systemctl is-active``; absent systemctl means 'cannot tell' (False)."""
+    if not unit:
+        return False
+    name = unit if unit.endswith(".service") else unit + ".service"
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.stdout.decode("utf-8", "ignore").strip() == "active"
+
+
+def inspect_detached_job(log_path: str, unit: str) -> DetachedJobState:
+    """Synchronous probe (run it in a worker thread): marker, log age, unit liveness."""
+    code = read_exit_marker(log_path)
+    try:
+        age: Optional[float] = max(0.0, time.time() - os.path.getmtime(log_path))
+        exists = True
+    except OSError:
+        age, exists = None, False
+    active = False if code is not None else unit_is_active(unit)
+    return DetachedJobState(exit_code=code, log_exists=exists, log_age_seconds=age, unit_active=active)
+
+
+def detached_job_terminal(
+    state: DetachedJobState, *, stale_after: float = DETACHED_JOB_STALE_SECONDS
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """``(terminal_status, detail)`` once the job is over, else None (still running).
+
+    - ``EXIT=0`` → success; any other code → failure (code in the detail);
+    - no marker, no log, unit gone → lost (nothing was ever written);
+    - no marker, log quiet for ``stale_after`` and unit gone → lost;
+    - otherwise the job is running (a fresh log or a live unit).
+    """
+    if state.exit_code is not None:
+        status = TERMINAL_SUCCESS if state.exit_code == 0 else TERMINAL_FAILURE
+        return status, {"exit_code": int(state.exit_code)}
+    if state.unit_active:
+        return None
+    if not state.log_exists:
+        return TERMINAL_LOST, {"reason": "no-log"}
+    if state.log_age_seconds is not None and state.log_age_seconds >= stale_after:
+        return TERMINAL_LOST, {"reason": "no-exit-marker"}
+    return None
+
+
 _WAKE_HEADLINE = {
     TERMINAL_SUCCESS: "✅ CI green",
     TERMINAL_FAILURE: "❌ CI failed",
@@ -430,6 +529,15 @@ _ACTIONS_RUN_HEADLINE = {
     TERMINAL_CANCELLED: "⚠️ Actions run cancelled",
     TERMINAL_EXPIRED: "⏰ Actions run watch expired",
     TERMINAL_MONITOR_ERROR: "⚠️ Actions run watch failed (GitHub read error)",
+}
+
+#: Detached-job wording (#2605 layer 3); terminals not listed fall back to the CI map.
+_DETACHED_JOB_HEADLINE = {
+    TERMINAL_SUCCESS: "✅ Detached job finished",
+    TERMINAL_FAILURE: "❌ Detached job failed",
+    TERMINAL_LOST: "ℹ️ Detached job lost (no EXIT marker)",
+    TERMINAL_EXPIRED: "⏰ Detached job watch expired",
+    TERMINAL_MONITOR_ERROR: "⚠️ Detached job watch failed",
 }
 
 
@@ -456,6 +564,10 @@ def wake_notification_text(
         headline = _ACTIONS_RUN_HEADLINE.get(record.get("terminal_status")) or _WAKE_HEADLINE.get(
             record.get("terminal_status"), "ℹ️ Actions run watch ended"
         )
+    elif record.get("source") == SOURCE_DETACHED_JOB:
+        headline = _DETACHED_JOB_HEADLINE.get(record.get("terminal_status")) or _WAKE_HEADLINE.get(
+            record.get("terminal_status"), "ℹ️ Detached job watch ended"
+        )
     else:
         headline = _WAKE_HEADLINE.get(record.get("terminal_status"), "ℹ️ CI watch ended")
     ref = _wait_ref(record)
@@ -477,6 +589,8 @@ def wake_notification_text(
 def _wait_ref(record: Dict[str, Any]) -> str:
     """``repo#pr @ head`` — or ``repo Actions run <id> (<label>)`` (#2590)."""
     sha = str(record.get("head_sha") or "")[:8]
+    if record.get("source") == SOURCE_DETACHED_JOB:
+        return f"detached job {record.get('unit')}"
     if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
         label = str(record.get("run_label") or "").strip()
         number = record.get("run_number")
@@ -493,6 +607,12 @@ def _detail_text(record: Dict[str, Any]) -> str:
         return ""
     if detail.get("conclusion"):
         return f"Run conclusion: {detail['conclusion']}"
+    if detail.get("exit_code") is not None:
+        return f"Exit code: {detail['exit_code']}"
+    if detail.get("reason") == "no-exit-marker":
+        return "No EXIT marker and the unit is gone — read the log before re-running."
+    if detail.get("reason") == "no-log":
+        return "The log was never written and the unit is gone."
     if detail.get("failed_run_id"):
         return f"Failed merge-group run: {detail['failed_run_id']}"
     if detail.get("reason") == "never-enqueued":
@@ -513,6 +633,15 @@ def resume_prompt_text(record: Dict[str, Any]) -> str:
             extra += f" reason={detail['reason']}"
         if detail.get("conclusion"):
             extra += f" conclusion={detail['conclusion']}"
+        if detail.get("exit_code") is not None:
+            extra += f" exit={detail['exit_code']}"
+    if source == SOURCE_DETACHED_JOB:
+        # No repo/head for a local unit: name the unit and the log so the
+        # resumed turn can read the evidence itself (path only, never content).
+        return (
+            f"[external_event: {source} terminal={record.get('terminal_status')} "
+            f"unit={record.get('unit')} log={record.get('log_path')}{extra}]\n{summary}"
+        )
     if source == SOURCE_GITHUB_ACTIONS_RUN:
         target = f"run={record.get('run_id')}"
     else:
@@ -645,6 +774,9 @@ class ExternalWaitMonitor:
             return
         if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
             await self._poll_actions_run(record, now)
+            return
+        if record.get("source") == SOURCE_DETACHED_JOB:
+            await self._poll_detached_job(record, now)
             return
         try:
             state = await self._transport.fetch_pr_state(record["repo"], int(record["pr_number"]))
@@ -780,6 +912,33 @@ class ExternalWaitMonitor:
             refreshed = self._registry.get(wait_id) or record
             await self._sync_status(refreshed)
         self._reschedule(record, ceiling=ACTIONS_RUN_MAX_POLL_INTERVAL_SECONDS)
+
+    async def _poll_detached_job(self, record: Dict[str, Any], now: float) -> None:
+        """Watch a detached unit's log for its ``EXIT=`` marker (#2605 layer 3).
+
+        Local file + ``systemctl is-active`` only — no transport. The probe
+        runs in a worker thread so a slow disk never stalls the tick. A
+        terminal outcome journals a normal wake: nothing else continues the
+        conversation for a detached unit, unlike a local task.
+        """
+        wait_id = record["wait_id"]
+        try:
+            state = await asyncio.to_thread(
+                self._inspect_detached_job, str(record.get("log_path") or ""), str(record.get("unit") or "")
+            )
+        except Exception:
+            self._transport_failed(record, TransportError("detached-probe-failed"), now)
+            return
+        self._transport_errors.pop(wait_id, None)
+        outcome = detached_job_terminal(state)
+        if outcome is not None:
+            status, detail = outcome
+            self._registry.finish(wait_id, status, now=now, detail=detail)
+            return
+        self._reschedule(record, ceiling=DETACHED_JOB_MAX_POLL_INTERVAL_SECONDS)
+
+    #: Seam for tests: swap the filesystem/systemd probe.
+    _inspect_detached_job = staticmethod(inspect_detached_job)
 
     def _reschedule(self, record: Dict[str, Any], *, ceiling: float = MAX_POLL_INTERVAL_SECONDS) -> None:
         interval = min(

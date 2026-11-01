@@ -24,6 +24,10 @@ Usage (inside an agent turn)::
     python -m telegram_bot.core.external_wait_cli register \
         --source local-task --task-id b6gw3sysl \
         --summary "nightly skill sweep (manual run)" [--timeout-seconds 1800]
+    python -m telegram_bot.core.external_wait_cli register \
+        --source detached-job --unit nightly-compare-20261101 \
+        --log /root/.claude/state/nightly-compare-20261101.log \
+        --summary "read the compare log and report" [--timeout-seconds 7200]
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
 
@@ -50,6 +54,14 @@ when the task ends and the bridge closes the record from that frame (also when
 the session goes away — ``lost``). It never wakes the conversation; the
 deadline (default 6 h) only turns the line into ``⏰ … expired``.
 
+``--source detached-job`` (#2605 layer 3) watches a ``systemd-run`` transient
+unit launched by the ``bridge-safe-detached-run`` recipe: the monitor polls
+the job's log for its ``EXIT=<n>`` marker (local file read; no GitHub) and
+wakes the conversation like a CI wait — ``success`` for ``EXIT=0``,
+``failure`` otherwise (exit code in the event), ``lost`` when the unit is gone
+without a marker. ``detached_jobs.py register`` arms this automatically when
+the bridge is present; the explicit form is for other launchers.
+
 A new registration for the same PR at a different head supersedes this
 conversation's older pending waits for that PR (#1110): a stale head must
 never wake the session with an outdated rollup. ``--keep-previous`` keeps
@@ -71,6 +83,7 @@ from typing import Any, Optional, Sequence
 from telegram_bot.core.external_wait import (
     SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
+    SOURCE_DETACHED_JOB,
     SOURCE_GITHUB_PR_CHECKS,
     SOURCE_LOCAL_TASK,
     STATE_MONITORING,
@@ -85,8 +98,10 @@ from telegram_bot.core.external_wait import (
     validate_repo,
     validate_run_id,
     validate_run_label,
+    validate_log_path,
     validate_summary,
     validate_task_id,
+    validate_unit_name,
 )
 from telegram_bot.core.external_wait_monitor import (
     DEFAULT_POLL_INTERVAL_SECONDS,
@@ -270,6 +285,8 @@ _SOURCE_ALIASES = {
     SOURCE_GITHUB_ACTIONS_RUN: SOURCE_GITHUB_ACTIONS_RUN,
     "local-task": SOURCE_LOCAL_TASK,
     SOURCE_LOCAL_TASK: SOURCE_LOCAL_TASK,
+    "detached-job": SOURCE_DETACHED_JOB,
+    SOURCE_DETACHED_JOB: SOURCE_DETACHED_JOB,
 }
 
 
@@ -277,9 +294,59 @@ def _source_of(raw: Any) -> str:
     key = str(raw or "").strip().lower()
     if key not in _SOURCE_ALIASES:
         raise ExternalWaitValidationError(
-            "source must be 'checks', 'merge-queue', 'actions-run' or 'local-task'"
+            "source must be 'checks', 'merge-queue', 'actions-run', 'local-task' or 'detached-job'"
         )
     return _SOURCE_ALIASES[key]
+
+
+def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, Any]) -> int:
+    """``--source detached-job``: watch a transient unit's EXIT marker (#2605 layer 3)."""
+    try:
+        unit = validate_unit_name(args.get("unit"))
+        log_path = validate_log_path(args.get("log") or args.get("log_path"))
+        summary = validate_summary(args.get("summary"))
+        timeout = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+    except ExternalWaitValidationError as exc:
+        _emit({"ok": False, "code": "validation", "message": str(exc)})
+        return RC_USAGE
+    except (TypeError, ValueError):
+        _emit({"ok": False, "code": "validation", "message": "invalid numeric field"})
+        return RC_USAGE
+
+    registry = ExternalWaitRegistry(default_registry_path(home))
+    wait_id = registry.register(
+        repo="",
+        pr_number=None,
+        head_sha="",
+        user_id=int(route["user_id"]),
+        chat_id=int(route["chat_id"]),
+        session_id=route.get("session_id"),
+        summary=summary,
+        timeout_seconds=timeout,
+        poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+        source=SOURCE_DETACHED_JOB,
+        unit=unit,
+        log_path=log_path,
+    )
+    if not wait_id:
+        _emit({"ok": False, "code": "registry-error"})
+        return RC_REGISTRY_ERROR
+    _emit(
+        {
+            "ok": True,
+            "wait_id": wait_id,
+            "unit": unit,
+            "log_path": log_path,
+            "timeout_seconds": int(timeout),
+            "source": SOURCE_DETACHED_JOB,
+            "superseded": [],
+            "message": (
+                "watching the detached job's EXIT marker; conversation resumes when "
+                f"it ends (wait_id={wait_id})"
+            ),
+        }
+    )
+    return RC_OK
 
 
 def _register_local_task(home: Path, args: dict[str, Any], route: dict[str, Any]) -> int:
@@ -413,6 +480,8 @@ def _cmd_register(home: Path, args: dict[str, Any]) -> int:
             return _register_actions_run(home, args, route)
         if source == SOURCE_LOCAL_TASK:
             return _register_local_task(home, args, route)
+        if source == SOURCE_DETACHED_JOB:
+            return _register_detached_job(home, args, route)
     except ExternalWaitValidationError as exc:
         _emit({"ok": False, "code": "validation", "message": str(exc)})
         return RC_USAGE
