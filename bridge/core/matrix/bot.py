@@ -2498,15 +2498,17 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         return len(tasks)
 
     @staticmethod
-    def _attachment_prompt(path: Path, attachment: Mapping[str, Any], caption: str) -> str:
+    def _attachment_prompt(
+        path: Path, attachment: Mapping[str, Any], caption: str, *, channel: str = "Matrix"
+    ) -> str:
         from telegram_bot.core import media as core_media
 
         if attachment.get("kind") == "image":
-            return core_media.build_image_prompt(path, caption, channel="Matrix")
+            return core_media.build_image_prompt(path, caption, channel=channel)
         return core_media.build_document_prompt(
             path, display_name=str(attachment.get("name") or ""),
             mime_type=str(attachment.get("mimetype") or "") or None,
-            size_bytes=path.stat().st_size, caption=caption, channel="Matrix",
+            size_bytes=path.stat().st_size, caption=caption, channel=channel,
         )
 
     def _control_identity(self, job: Mapping[str, Any]) -> tuple[int, int]:

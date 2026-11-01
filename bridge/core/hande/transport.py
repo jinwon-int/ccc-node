@@ -10,7 +10,9 @@ listening across client lifetimes.
 Frames in (from the bot)::
 
     {"type":"turn","turn_id":"t-12","prompt":"…","session_id":null,
-     "sender":"@owner-pc:hande","room_kind":"family"[,"room":"agent"]}
+     "sender":"@owner-pc:hande","room_kind":"family"[,"room":"agent"]
+     [,"attachment":{"v":1,"path":…,"kind":…,"mime":…,"size":…,"sha256":…,
+                     "caption":""}]}    # #2606, only with attachment_frames on
     {"type":"approve"|"deny","turn_id":"t-12","approval_id":"<nonce>"}
     {"type":"cancel","turn_id":"t-12"}
     {"type":"tool-result", …}            # steward tools: not served here
@@ -72,6 +74,7 @@ from typing import Any, Mapping
 
 from telegram_bot.contracts.transport import TurnResult, TurnRunner
 
+from .attachments import AttachmentFrameError, parse_frame_attachment
 from .state import (
     DEFAULT_SOCKET_MODE,
     DEFAULT_STATUS_INTERIM_INTERVAL_S,
@@ -473,6 +476,13 @@ class HandeTransport:
         self._close_task: asyncio.Future[None] | None = None
         self.interim_frames = bool(self.c.get("interim_frames"))
         self.notice_frames = bool(self.c.get("notice_frames"))
+        # #2606: ``turn.attachment`` (a bot-decrypted file in the spool) is read only
+        # with this on; off, the turn runs on its ``prompt`` (the bot's fallback text).
+        self.attachment_spool_dir = self.c.get("attachment_spool_dir")
+        self.attachment_frames = bool(self.c.get("attachment_frames")) and bool(
+            self.attachment_spool_dir
+        )
+        self._attachments_ignored = 0
         # Heartbeat (``TurnSink.status``) as throttled interim frames; see _HandeSink.status.
         self.status_interims = bool(self.c.get("status_interims"))
         # status-v1 (family-messenger#560): heartbeat as ``kind:"status"`` interims.
@@ -984,6 +994,8 @@ class HandeTransport:
             "wait_status_frames": self.wait_status_frames,
             "wait_status_sent": self._wait_status_sent,
             "status_resent": self._status_resent,
+            "attachment_frames": self.attachment_frames,
+            "attachments_ignored": self._attachments_ignored,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
             "self_jobs_uncertain": self._self_jobs_uncertain,
@@ -1083,7 +1095,7 @@ class HandeTransport:
         if not isinstance(room, str) or not ROOM_PATTERN.fullmatch(room) or room not in self.rooms:
             return None, "room-not-allowed"
         device = str(frame.get("sender") or "")[1:].split(":", 1)[0]
-        job = {
+        job: dict[str, Any] = {
             "event_id": turn_id,
             "room_id": room,
             "sender": sender,
@@ -1091,6 +1103,23 @@ class HandeTransport:
             "body": screen_delegation_body(prompt),
             "scope": "hande",
         }
+        raw_attachment = frame.get("attachment")
+        if raw_attachment is not None:
+            if not self.attachment_frames:
+                self._attachments_ignored += 1
+                logger.info("hande: turn attachment ignored (attachment_frames off)")
+                return job, ""
+            try:
+                attachment = parse_frame_attachment(raw_attachment, str(self.attachment_spool_dir))
+            except AttachmentFrameError as error:
+                logger.warning("hande: turn attachment rejected field=%s", error)
+                return None, "invalid-attachment"
+            if attachment is None:
+                self._attachments_ignored += 1
+                logger.info("hande: turn attachment ignored (unknown version)")
+            else:
+                # HandeBot._run_attachment reads this mapping (never a Matrix one).
+                job["attachment"] = attachment
         return job, ""
 
     async def _on_turn(self, client: _Client, frame: Mapping[str, Any]) -> bool:

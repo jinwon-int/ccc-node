@@ -1013,3 +1013,77 @@ async def test_held_notices_are_flushed_before_waiting_self_jobs_run(tmp_path: P
         await bot.close()
     finally:
         await _stop(served)
+
+
+# -- #2606: turn.attachment ------------------------------------------------------
+
+
+def _attachment(spool: Path, **overrides: Any) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "v": 1,
+        "path": str(spool / ("ab" * 16 + ".bin")),
+        "kind": "image",
+        "mime": "image/jpeg",
+        "size": 3,
+        "sha256": "0" * 64,
+        "caption": "",
+    }
+    value.update(overrides)
+    return value
+
+
+async def test_turn_attachment_is_ignored_while_attachment_frames_is_off(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    served = await _serve(tmp_path, attachment_spool_dir=str(spool))
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-a1", "[첨부: 사진]", attachment=_attachment(spool)))
+        await bot.recv_kind("result")
+        job = served.runner.jobs[0]
+        assert "attachment" not in job and job["body"] == "[첨부: 사진]"  # the bot's fallback
+        signals = served.transport.health_signals()
+        assert signals["attachment_frames"] is False and signals["attachments_ignored"] == 1
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_turn_attachment_reaches_the_runner_when_on(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    served = await _serve(tmp_path, attachment_frames=True, attachment_spool_dir=str(spool))
+    try:
+        bot = await FakeBot.connect(served.path)
+        sent = _attachment(spool, name="IMG.jpg", extra="ignored")
+        await bot.send(bot.turn("t-a2", "[첨부: 사진]", attachment=sent))
+        await bot.recv_kind("result")
+        attachment = served.runner.jobs[0]["attachment"]
+        assert attachment["path"] == sent["path"] and attachment["name"] == "IMG.jpg"
+        assert "extra" not in attachment
+        # An unknown version runs on the fallback prompt instead.
+        await bot.send(bot.turn("t-a3", "[첨부: 사진]", attachment=_attachment(spool, v=2)))
+        await bot.recv_kind("result")
+        assert "attachment" not in served.runner.jobs[1]
+        assert served.transport.health_signals()["attachments_ignored"] == 1
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_malformed_turn_attachment_is_rejected_not_run(tmp_path: Path) -> None:
+    spool = tmp_path / "spool"
+    served = await _serve(tmp_path, attachment_frames=True, attachment_spool_dir=str(spool))
+    try:
+        bot = await FakeBot.connect(served.path)
+        outside = _attachment(spool, path=str(tmp_path / ("ab" * 16 + ".bin")))
+        await bot.send(bot.turn("t-a4", "x", attachment=outside))
+        assert await bot.recv() == {
+            "type": "rejected",
+            "turn_id": "t-a4",
+            "reason": "invalid-attachment",
+        }
+        await bot.send(bot.turn("t-a5", "x", attachment="nope"))
+        assert (await bot.recv())["reason"] == "invalid-attachment"
+        assert served.runner.jobs == []
+        await bot.close()
+    finally:
+        await _stop(served)

@@ -210,6 +210,65 @@ class HandeBot(HandeWaitStatusMixin, MatrixBot):
                 return {"ok": False, "error": f"approval_{outcome}"}
         return await call(name, arguments)
 
+    # -- inbound attachments (#2606) -------------------------------------------
+
+    async def _run_attachment(
+        self, job: Mapping[str, Any], *, user_id: int, chat_id: int, room_id: str, sink: TurnSink
+    ) -> Any:
+        """Run a bot-decrypted 「한데」 attachment with the Telegram/Matrix prompt contract.
+
+        ``job["attachment"]`` is the mapping :func:`.attachments.parse_frame_attachment`
+        returned (the transport sets it only with ``attachment_frames`` on), never
+        a Matrix ``file``. The spool file is taken over into the private
+        ``matrix-media`` directory, verified there and deleted when the turn
+        ends. A failure answers once with the Matrix wording and runs no model.
+        The non-owner refusal already ran in ``MatrixBot.run_turn``.
+        """
+
+        from telegram_bot.core import media as core_media
+        from telegram_bot.core.matrix import media as matrix_media
+        from telegram_bot.core.matrix.bot import (
+            ATTACHMENT_FAILED,
+            ATTACHMENT_FAILED_DEFAULT,
+            _turn_result,
+        )
+
+        from .attachments import adopt, matrix_shape
+
+        attachment = job.get("attachment")
+        spool_dir = self.load_config().get("attachment_spool_dir")
+        if not isinstance(attachment, Mapping) or not spool_dir:
+            return _turn_result(ATTACHMENT_FAILED["invalid"], None)
+        directory = self._data_dir() / matrix_media.MEDIA_DIRNAME
+        shape = matrix_shape(attachment)
+        limit = matrix_media.size_limit(shape, self._settings)
+        path: Path | None = None
+        try:
+            try:
+                core_media.cleanup_stale_document_files(
+                    directory, max_age_seconds=matrix_media.STALE_MEDIA_SECONDS
+                )
+                path = await asyncio.to_thread(
+                    adopt, attachment, spool_dir=str(spool_dir), staging_dir=directory, limit=limit
+                )
+            except matrix_media.AttachmentError as exc:
+                logger.warning(
+                    "hande attachment unavailable reason=%s kind=%s", exc.reason, attachment.get("kind")
+                )
+                return _turn_result(ATTACHMENT_FAILED.get(exc.reason, ATTACHMENT_FAILED_DEFAULT), None)
+            except OSError:
+                logger.warning("hande attachment unavailable reason=storage")
+                return _turn_result(ATTACHMENT_FAILED_DEFAULT, None)
+            prompt = self._attachment_prompt(
+                path, shape, str(attachment.get("caption") or ""), channel="Hande"
+            )
+            return await self._run_message(
+                prompt, user_id=user_id, chat_id=chat_id, room_id=room_id, sink=sink,
+                turn_marker=str(job.get("event_id") or ""),
+            )
+        finally:
+            matrix_media.remove(path)
+
     def _turn_request_extras(self) -> dict[str, Any]:
         if not self._steward_enabled():
             return {}
