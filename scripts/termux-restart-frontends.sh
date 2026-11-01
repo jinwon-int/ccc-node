@@ -73,6 +73,13 @@
 #        step keeps 30 s of it in reserve and truncates the survival window to
 #        what is left, never below 20 s), CCC_FRONTENDS / CCC_FRONTENDS_FILE
 #        (~/.claude/frontends; see "Telegram-retired nodes").
+#        CCC_SELF_UPDATE_RESTART_DEFERRED_FILE (default
+#        ~/.claude/state/self-update.restart-deferred; ccc-node#2626): when a busy
+#        frontend is handed to a detached follower this file gets a line
+#        `<epoch> pending <frontend> want=<gen> max_wait=<s>`, and the follower
+#        appends `<epoch> done <frontend> rc=<n>` when it finishes. self-update
+#        reads it after its own health wait so a hand-off is recorded as
+#        "deferred" (verified on the next tick) instead of a failed restart.
 # Exit:  0 ok (or a busy frontend → follower detached) · <telegram rc> when the
 #        Telegram restart failed · 3 Matrix or hande did not come up / did not
 #        survive the window on the wanted generation · 2 usage.
@@ -96,6 +103,7 @@ POLL="${CCC_MATRIX_POLL_SECONDS:-5}"
 BUSY_POLL="${CCC_MATRIX_BUSY_POLL_SECONDS:-15}"
 MIN_WINDOW="${CCC_MATRIX_MIN_WINDOW_SECONDS:-20}"
 FOLLOWER_WAIT="${CCC_TERMUX_FOLLOWER_WAIT_SECONDS:-3600}"
+DEFERRED_FILE="${CCC_SELF_UPDATE_RESTART_DEFERRED_FILE:-$H/.claude/state/self-update.restart-deferred}"
 FRONTENDS_FILE="${CCC_FRONTENDS_FILE:-$H/.claude/frontends}"
 
 # Operator-owned frontend list (#2342). Absent = legacy default: Telegram runs.
@@ -132,6 +140,11 @@ as_hande() {
 }
 
 now() { date +%s; }
+# Hand-off ledger for self-update (#2626): one line per event, no JSON, no body.
+note_deferred() { # <pending|done> <frontend> [k=v ...]
+  mkdir -p "$(dirname "$DEFERRED_FILE")" 2>/dev/null || :
+  printf '%s %s %s %s\n' "$(now)" "$1" "$2" "${*:3}" >> "$DEFERRED_FILE" 2>/dev/null || :
+}
 log() { mkdir -p "$(dirname "$LOG")" 2>/dev/null || :; printf '%s %s\n' "$(date -Is)" "$*" 2>/dev/null >> "$LOG" || :; }
 want() { basename "$(readlink -f "$POINTER" 2>/dev/null)"; }
 
@@ -330,8 +343,8 @@ case "${1:-}" in
     verify_current; rc=$?
     if hande_present; then as_hande verify_current; hrc=$?; [ "$rc" = 0 ] && rc=$hrc; fi
     exit "$rc" ;;
-  --matrix-only) matrix_follow $(( $(now) + ${2:-3600} )); exit $? ;;
-  --hande-only) as_hande matrix_follow $(( $(now) + ${2:-3600} )); exit $? ;;
+  --matrix-only) matrix_follow $(( $(now) + ${2:-3600} )); frc=$?; note_deferred "done" matrix "rc=$frc"; exit "$frc" ;;
+  --hande-only) as_hande matrix_follow $(( $(now) + ${2:-3600} )); frc=$?; note_deferred "done" hande "rc=$frc"; exit "$frc" ;;
   "") ;;
   *) echo "termux-restart-frontends: unknown argument $1" >&2; exit 2 ;;
 esac
@@ -348,6 +361,7 @@ fi
 deadline_m=$(( ${CCC_BRIDGE_RESTART_DEADLINE_EPOCH:-$(( $(now) + 300 ))} - 30 ))
 matrix_follow "$deadline_m"; m=$?
 if [ "$m" = 2 ]; then
+  note_deferred pending matrix "want=$(want) max_wait=$FOLLOWER_WAIT"
   ( nohup setsid bash "$0" --matrix-only "$FOLLOWER_WAIT" > /dev/null 2>&1 < /dev/null & )
   log "matrix follower detached (waits up to ${FOLLOWER_WAIT}s for idle)"
   m=0
@@ -358,6 +372,7 @@ hn=0
 if hande_present; then
   as_hande matrix_follow "$deadline_m"; hn=$?
   if [ "$hn" = 2 ]; then
+    note_deferred pending hande "want=$(want) max_wait=$FOLLOWER_WAIT"
     ( nohup setsid bash "$0" --hande-only "$FOLLOWER_WAIT" > /dev/null 2>&1 < /dev/null & )
     log "hande follower detached (waits up to ${FOLLOWER_WAIT}s for idle)"
     hn=0

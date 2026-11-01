@@ -237,6 +237,37 @@ ok "outcome-less restart failure is classified command-failed (#1868)" \
   'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"restart-failures\" and .failure_kind == \"command-failed\" and .restart_outcome.restart_exit == 1" >/dev/null'
 rm -rf "$STATE"/self-update-install-rollback.*
 
+# (2d) #2626: the restart command hands a busy frontend to a detached follower
+#      (exit 0 + a `pending` line in the hand-off ledger) and health stays old
+#      → deferred activation (14), not a failed restart (7).
+echo drift3d > "$TMP/seed/file3d.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm five-d && git -C "$TMP/seed" push -q origin main
+cat > "$CLAUDE/self-update.restart-cmd" <<'CMD'
+printf '%s pending hande want=main-deadbeef max_wait=3600\n' "$(date +%s)" >> "$CCC_SELF_UPDATE_RESTART_DEFERRED_FILE"; exit 0
+CMD
+printf '%s\n' 'exit 1' > "$CLAUDE/self-update.health-cmd"
+: > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+out="$(CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=2 run_selfup run 2>&1)"; rc=$?
+ok "follower hand-off exits 14 (deferred), not 7" '[ "$rc" = 14 ] && grep -q "restart deferred to a follower for hande (want=main-deadbeef max_wait=3600)" <<<"$out"'
+ok "deferred hand-off keeps a pending record with outcome external-restart-deferred" \
+  'jq -e ".outcome == \"external-restart-deferred\" and .target_sha == \"$(git -C "$TMP/seed" rev-parse HEAD)\"" "$STATE/self-update.pending-activation.json" >/dev/null'
+ok "deferred hand-off is audited as activation-deferred, never as restart-failures" \
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-deferred\" and .deferred_frontends == \"hande (want=main-deadbeef max_wait=3600)\"" >/dev/null && ! grep -q "\"result\":\"restart-failures\"" "$STATE/self-update.log"'
+ok "deferred hand-off tells the owner it is a deferral, not a failure" 'cat "$TMP/spool"/*.json 2>/dev/null | jq -r .text | grep -q "분리 follower가 유휴해지면 재시작"'
+ok "deferred hand-off retains the recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "the ledger is cleared at the start of each run (only one pending line present)" '[ "$(grep -c "pending hande" "$STATE/self-update.restart-deferred")" = 1 ]'
+# a follower that already reported `done` is no longer a deferral: same hand-off, health still old → genuine failure
+echo drift3e > "$TMP/seed/file3e.txt"
+git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm five-e && git -C "$TMP/seed" push -q origin main
+cat > "$CLAUDE/self-update.restart-cmd" <<'CMD'
+printf '%s pending hande want=main-deadbeef max_wait=3600\n%s done hande rc=3\n' "$(date +%s)" "$(date +%s)" >> "$CCC_SELF_UPDATE_RESTART_DEFERRED_FILE"; exit 0
+CMD
+rm -f "$STATE/self-update.pending-activation.json" "$STATE/self-update.activation-notified"; : > "$STATE/self-update.log"
+out="$(CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=2 run_selfup run 2>&1)"; rc=$?
+ok "a follower that already finished unhealthy is a real restart failure (7)" '[ "$rc" = 7 ] && grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"restart-failures\" and .failure_kind == \"health-timeout\"" >/dev/null'
+rm -f "$CLAUDE/self-update.health-cmd" "$STATE/self-update.pending-activation.json" "$STATE/self-update.activation-notified"
+rm -rf "$STATE"/self-update-install-rollback.*
+
 # (2a) #2142: a restart that comes back serving another generation is not an
 #      activation. The fake restart command plays a bridge that freezes its
 #      startup source head (CCC_TEST_SERVING_HEAD) into health.json.

@@ -163,7 +163,8 @@ ok "process survives but service.state != available → exit 3" '[ "$rc" = 3 ] &
 # ---------------------------------------------------------------- busy until the deadline → follower detached, exit 0
 reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 3
 setfake "FAKE_NEW_PID=$LIVE2" "FAKE_NEW_GEN=gen-B"
-out="$(CCC_BRIDGE_RESTART_DEADLINE_EPOCH=$(( $(date +%s) + 31 )) run)"; rc=$?
+DEFERRED="$TMP/deferred-ledger"; rm -f "$DEFERRED"
+out="$(CCC_BRIDGE_RESTART_DEADLINE_EPOCH=$(( $(date +%s) + 31 )) CCC_SELF_UPDATE_RESTART_DEFERRED_FILE="$DEFERRED" run)"; rc=$?
 ok "busy Matrix until the deadline: no restart, follower detached, exit 0" '[ "$rc" = 0 ] && ! grep -q "sv restart" "$CALLS" && grep -q "matrix busy until deadline (running=gen-A want=gen-B)" "$LOG" && grep -q "follower detached (waits up to 1s" "$LOG"'
 # Wait for the detached 1 s follower to give up (still busy): its own
 # "busy until deadline" line is the second one. Event-driven instead of a
@@ -171,6 +172,10 @@ ok "busy Matrix until the deadline: no restart, follower detached, exit 0" '[ "$
 # where Matrix is idle and it would issue its own `sv restart` (#2295).
 for _ in $(seq 600); do [ "$(grep -c "matrix busy until deadline" "$LOG")" -ge 2 ] && break; sleep 0.1; done
 ok "the detached follower gave up on its own (still busy)" '[ "$(grep -c "matrix busy until deadline" "$LOG")" -ge 2 ]'
+# #2626: the hand-off ledger self-update reads after its health wait
+ok "hand-off ledger records the pending follower (frontend, wanted gen, max wait)" 'grep -qE "^[0-9]+ pending matrix want=gen-B max_wait=1$" "$DEFERRED"'
+for _ in $(seq 100); do grep -q "done matrix" "$DEFERRED" 2>/dev/null && break; sleep 0.1; done
+ok "the follower records its own result in the ledger" 'grep -qE "^[0-9]+ done matrix rc=2$" "$DEFERRED"'
 
 # ---------------------------------------------------------------- window truncated by the deadline
 reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
