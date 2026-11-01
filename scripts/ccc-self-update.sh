@@ -80,7 +80,12 @@
 #      CCC_SELF_UPDATE_RESTART_WAIT_SECONDS (60; separate health-probe budget),
 #      The restart command receives CCC_BRIDGE_RESTART_DEADLINE_EPOCH (this
 #      budget's end) so a bridge recovery attempt can size itself to fit
-#      (#1868). Bridge "available" windows are the bridge's own knobs
+#      (#1868), and CCC_SELF_UPDATE_RESTART_DEFERRED_FILE (default
+#      ~/.claude/state/self-update.restart-deferred, cleared before each run):
+#      a command that hands a busy frontend to a detached follower appends
+#      `<epoch> pending <frontend> …` there (and the follower `… done <frontend>
+#      rc=<n>`); a health-timeout with such a line pending is recorded as
+#      `external-restart-deferred` (exit 14), not as a failed restart (#2626). Bridge "available" windows are the bridge's own knobs
 #      (CCC_BRIDGE_RESTART_READY_TIMEOUT / _RECOVERY_READY_TIMEOUT); put them
 #      in the restart-cmd line when a slow device needs more than the default.
 #      CCC_STATE_DIR, CCC_PUSH_SPOOL, CCC_NODE,
@@ -119,7 +124,9 @@
 #      was never verified active — a pending-activation record exists (or its
 #      bookkeeping failed) and the tick refuses to report convergence from
 #      health alone, or (#2142) an external restart came back serving a
-#      generation other than the installed target, or the commit-provenance
+#      generation other than the installed target, or (#2626) the restart
+#      command handed a busy frontend to a detached follower (outcome
+#      `external-restart-deferred`, verified on the next tick), or the commit-provenance
 #      gate refused (untrusted incoming author under enforce, or an author
 #      lookup that could not complete under ON_ERROR=hold — nothing merged);
 #      other non-zero = aborted
@@ -174,6 +181,11 @@ PREPARE_BUDGET_SOURCE=default
 PREPARE_BUDGET_NOTE=""
 PREPARE_BUDGET_WARNINGS=()
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
+# Hand-off ledger written by the external restart command (#2626): a busy
+# frontend it could not restart inside the budget is left to a detached
+# follower, and that is a deferral, not a failure. Cleared before each run.
+RESTART_DEFERRED_FILE="${CCC_SELF_UPDATE_RESTART_DEFERRED_FILE:-$STATE_DIR/self-update.restart-deferred}"
+RESTART_DEFERRED_SUMMARY=""
 RESTART_COMMAND_TIMEOUT_DEFAULT=180
 if [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]; then
   RESTART_COMMAND_TIMEOUT_DEFAULT=720
@@ -723,7 +735,9 @@ run_external_restart() {
   log_offset="$(wc -c < "$LOG" 2>/dev/null | tr -cd '0-9')"
   [ -n "$log_offset" ] || log_offset=0
   log "external-restart begin timeout=${RESTART_COMMAND_TIMEOUT_SECONDS}s"
+  rm -f "$RESTART_DEFERRED_FILE" 2>/dev/null || :
   CCC_BRIDGE_RESTART_DEADLINE_EPOCH="$(( $(date -u +%s) + RESTART_COMMAND_TIMEOUT_SECONDS ))" \
+  CCC_SELF_UPDATE_RESTART_DEFERRED_FILE="$RESTART_DEFERRED_FILE" \
     run_bounded_operator_cmd "$RESTART_COMMAND_TIMEOUT_SECONDS" "$rcmd"
   rc=$?
   log "external-restart exit=$rc elapsed=$((SECONDS - started))s timeout=${RESTART_COMMAND_TIMEOUT_SECONDS}s"
@@ -748,10 +762,34 @@ run_external_restart() {
       sleep "$pause"
     done
     log "external-restart health-timeout waited=$((SECONDS - started))s"
+    if restart_deferred_pending; then
+      # The command finished (exit 0) but handed a busy frontend to a detached
+      # follower; the old generation still answers health. Not a failure:
+      # the next tick verifies the serving generation (#2626).
+      log "external-restart deferred follower-pending=$RESTART_DEFERRED_SUMMARY"
+      return 2
+    fi
     record_restart_failure 0 "$log_offset" health-timeout
     return 1
   fi
   return 0
+}
+
+# True while the ledger names a frontend handed to a follower that has not
+# reported `done` yet; RESTART_DEFERRED_SUMMARY lists them for the notice.
+restart_deferred_pending() {
+  local pending finished name rest
+  RESTART_DEFERRED_SUMMARY=""
+  [ -r "$RESTART_DEFERRED_FILE" ] || return 1
+  pending="$(awk '$2 == "pending" { print $3 }' "$RESTART_DEFERRED_FILE" 2>/dev/null | sort -u)"
+  finished="$(awk '$2 == "done" { print $3 }' "$RESTART_DEFERRED_FILE" 2>/dev/null | sort -u)"
+  [ -n "$pending" ] || return 1
+  for name in $pending; do
+    printf '%s\n' "$finished" | grep -qx "$name" && continue
+    rest="$(awk -v n="$name" '$2 == "pending" && $3 == n { for (i = 4; i <= NF; i++) printf "%s%s", (i > 4 ? " " : ""), $i }' "$RESTART_DEFERRED_FILE" 2>/dev/null | tail -n1)"
+    RESTART_DEFERRED_SUMMARY="${RESTART_DEFERRED_SUMMARY:+$RESTART_DEFERRED_SUMMARY, }$name${rest:+ ($rest)}"
+  done
+  [ -n "$RESTART_DEFERRED_SUMMARY" ]
 }
 
 snapshot_installed_artifacts() {
@@ -2212,7 +2250,22 @@ fi
 # success.
 if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ]; then
   if resolve_restart_cmd >/dev/null 2>&1; then
-    if run_external_restart; then
+    run_external_restart; restart_rc=$?
+    if [ "$restart_rc" -eq 2 ]; then
+      # Hand-off to a detached follower (#2626): code is installed, part of the
+      # runtime still serves the old generation until the frontend is idle.
+      # Record it as deferred — the next tick reconciles against the serving
+      # generation (#1527) — and tell the owner once, without the failure alarm.
+      KEEP_INSTALL_SNAPSHOT=1
+      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":false,"scope":"external","deferred":true}]')"
+      write_pending_activation "external-restart-deferred" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
+      log "pending-activation result=deferred reason=follower-pending target=$NEW_SHA frontends=$RESTART_DEFERRED_SUMMARY"
+      audit "activation-deferred" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON" "$(jq -nc --arg f "$RESTART_DEFERRED_SUMMARY" '{deferred_frontends: $f}')"
+      notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 코드 갱신·재시작 명령은 끝났고, 작업 중이던 프런트엔드(${RESTART_DEFERRED_SUMMARY})는 분리 follower가 유휴해지면 재시작합니다. 실패가 아니라 보류이며 다음 틱이 서빙 세대로 확인합니다. 롤백 자료: ${INSTALL_SNAPSHOT_DIR}" "pending-$NEW_SHA"
+      say "self-update: updated to $SHORT_NEW; restart deferred to a follower for $RESTART_DEFERRED_SUMMARY — activation is verified on the next tick" >&2
+      exit 14
+    fi
+    if [ "$restart_rc" -eq 0 ]; then
       RESTARTED=1
       SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c '. + [{"name":"external-restart","ok":true,"scope":"external"}]')"
       if serving_head="$(serving_head_since "$RESTART_BEGIN_EPOCH")"; then
