@@ -71,6 +71,11 @@ class MirrorTest(_Base):
         dtxn = policy.make_digest(self.queue, now)
         self.assertEqual([txn for txn, _ in self._mirror_rows()], [dtxn])
 
+    def test_notice_rows_are_mirrored_at_once(self) -> None:
+        # #2628: the trigger copies every non-info insert, so a notice reaches 「한데」 immediately.
+        txn, _ = outbox.enqueue(self.queue, "lotto notice", tier="notice")
+        self.assertEqual([t for t, _ in self._mirror_rows()], [txn])
+
     def test_install_replaces_an_older_when_less_trigger(self) -> None:
         with outbox.database(self.queue) as conn:
             conn.execute("DROP TRIGGER IF EXISTS hande_mirror")

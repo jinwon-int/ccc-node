@@ -681,6 +681,32 @@ class PolicyTest(_Base):
         # derived rows leave at once and are strong-receipted like any other row
         self.assertEqual(policy.pending_deliverable(self.queue)[0], made[0])
 
+    def test_notice_leaves_at_once_is_never_renotified_and_not_an_ok_target(self) -> None:
+        # #2628: owner-personal information notices (lotto buy/result) reach both rooms now
+        # without paging — immediate like action, no digest hold, no 15-min re-notify, no ok/hold.
+        t0 = _kst(2026, 10, 31, 22, 0)
+        tn, _ = outbox.enqueue(self.queue, "lotto result", node="daegyo", tier="notice")
+        aid = outbox.alert_id_of(self.queue, tn)
+        self.assertEqual(outbox.lookup(self.queue, aid)["tier"], "notice")
+        self.assertNotIn(tn, [row[0] for row in policy.held_info_rows(self.queue)])
+        self.assertEqual(policy.pending_deliverable(self.queue)[0], tn)
+        self.assertIsNone(policy.tick(self.queue, t0)["digest"])
+        outbox.delivered(self.queue, tn, "$" + tn)
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE alerts SET delivered=? WHERE txn=?", (t0, tn))
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 16 * 60), [])
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 24 * 60 * 60), [])
+        out = reply.record_reply(self.queue, "ok", aid, channel="hande", who="owner", ack=False)
+        self.assertEqual(out["outcome"], "not-actionable")
+        self.assertEqual([r["kind"] for r in outbox.lookup(self.queue, aid)["receipts"]], ["matrix-event"])
+
+    def test_notice_tier_survives_client_and_queue_normalisation(self) -> None:
+        self.assertIn("notice", R.TIERS)
+        self.assertEqual(R.build_payload("n", "r", {"text": "t", "tier": "Notice"}, "t")["tier"], "notice")
+        self.assertEqual(outbox.normalize_tier("NOTICE"), "notice")
+        self.assertEqual(outbox.normalize_tier("page"), "info")  # still closed: unknown → info
+        self.assertEqual(policy.IMMEDIATE_TIERS, ("notice", "action", "critical"))
+
     def test_payload_cannot_inject_derived_tiers(self) -> None:
         self.assertEqual(R.normalize_tier("digest"), "info")
         self.assertEqual(outbox.normalize_tier("renotify"), "info")
