@@ -1324,8 +1324,32 @@ _OWNER_SAFE_PATH = re.compile(
 _OWNER_SAFE_GITHUB_URL = re.compile(
     r'//github\.com(?:/[A-Za-z0-9_.-]{1,%d}(?=/|$))+' % (_OWNER_LONG_RUN_MIN - 1)
 )
+# `name=version` pairs (#2620): a CVE recheck alert lost every node's
+# `libbrotli1=1.1.0-2ubuntu0.1` — the one field saying whether the patch had
+# landed — because `=`, `.` and `-` are token-alphabet characters, so the pair
+# is one 27-character run. Same invariant as the two spans above, applied to
+# the two sides of the `=`:
+#   * the name is a lowercase package/key word, the value starts with a digit
+#     and contains a `.` — the shape of a version, not of a random token;
+#   * each side is shorter than the run threshold on its own, and the
+#     lookbehind/lookahead force both sides to span a whole sub-run (start of
+#     the run or after `/`·`=`, end of the run or before `/`·`=`), so an
+#     over-long side can never be partially consumed to sneak under the bound.
+#     An over-long value therefore matches nothing and the run stays masked.
+# Credential assignments (`token=`, `password=` …) are masked earlier by
+# _OWNER_REDACTION_HARDENING, before this span is ever consulted.
+_OWNER_SAFE_NAME_VERSION = re.compile(
+    r'(?<![A-Za-z0-9._+-])[a-z0-9][a-z0-9._+-]{0,%d}='
+    r'(?=[A-Za-z0-9._+-]{1,%d}(?![A-Za-z0-9._+-]))'
+    r'[0-9][A-Za-z0-9_+-]*\.[A-Za-z0-9._+-]*'
+    % (_OWNER_LONG_RUN_MIN - 2, _OWNER_LONG_RUN_MIN - 1)
+)
 _OWNER_SAFE_SPANS = re.compile(
-    '%s|%s' % (_OWNER_SAFE_PATH.pattern, _OWNER_SAFE_GITHUB_URL.pattern)
+    '%s|%s|%s' % (
+        _OWNER_SAFE_PATH.pattern,
+        _OWNER_SAFE_GITHUB_URL.pattern,
+        _OWNER_SAFE_NAME_VERSION.pattern,
+    )
 )
 
 
