@@ -940,6 +940,9 @@ hook_run_weight() { # <suite> -> seconds
     claude/hooks/nunchi/bench.test.sh) echo 23 ;;
     scripts/fleet-bridge-watch.test.sh) echo 22 ;;
     claude/hooks/nunchi/nunchi.test.sh) echo 20 ;;
+    # #2611: two real-tree quick runs; 28 s on harness-ci run 41255974255
+    # (unweighted it pushed its shard to 489 s against 311-431 s).
+    scripts/quick-check.test.sh) echo 30 ;;
     *) echo 3 ;;
   esac
 }
