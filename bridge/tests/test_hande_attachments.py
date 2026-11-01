@@ -177,6 +177,43 @@ def test_adopt_refuses_a_file_that_is_not_private(tmp_path: Path) -> None:
     assert list((tmp_path / "staging").iterdir()) == []
 
 
+def test_adopt_accepts_a_group_readable_file_for_a_non_root_bridge(tmp_path: Path) -> None:
+    source = _put(_spool(tmp_path), PNG, mode=0o640)
+    staged = _adopt(tmp_path, _frame(source, PNG))
+    assert staged.read_bytes() == PNG and not source.exists()
+
+
+def test_adopt_refuses_a_world_writable_spool(tmp_path: Path) -> None:
+    spool = _spool(tmp_path)
+    source = _put(spool, PNG)
+    os.chmod(spool, 0o777)
+    try:
+        with pytest.raises(AttachmentError) as error:
+            _adopt(tmp_path, _frame(source, PNG))
+        assert error.value.reason == "invalid"
+        assert source.exists()  # never taken over
+    finally:
+        os.chmod(spool, 0o700)
+
+
+def test_verify_trusts_only_the_bridge_and_the_spool_owner(tmp_path: Path) -> None:
+    from telegram_bot.core.hande.attachments import _verify
+
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    path = _put(staging, PNG)
+    frame = parse_frame_attachment(_frame(_put(_spool(tmp_path), PNG), PNG), str(tmp_path / "spool"))
+    assert frame is not None
+    fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _verify(fd, path.name, frame, frozenset({os.getuid()}))
+        with pytest.raises(AttachmentError) as error:
+            _verify(fd, path.name, frame, frozenset({os.getuid() + 12345}))
+        assert error.value.reason == "invalid"
+    finally:
+        os.close(fd)
+
+
 def test_adopt_never_follows_a_planted_symlink(tmp_path: Path) -> None:
     secret = tmp_path / "secret.txt"
     secret.write_bytes(PNG)

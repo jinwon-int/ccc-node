@@ -95,8 +95,14 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   `attachment_spool_dir` is required with it: the **same absolute path** the bot writes
   decrypted attachments to — a frame `path` is accepted only as a direct child
   `<32 hex>.bin` of exactly this directory. The bot and this bridge must run as the
-  same uid on the same filesystem (the take-over is a `rename`; `EXDEV` is refused,
-  never copied). Size limits are the Matrix ones (`CCC_MAX_DOCUMENT_SIZE_MB`, or
+  same filesystem (the take-over is a `rename`; `EXDEV` is refused, never copied).
+  On Termux both run as one uid (file mode 0600). On a Linux node the bot runs as its own
+  service user: put the spool under the bot's state dir (e.g.
+  `/var/lib/native-relay-bot/attachments`, owned by the bot, group `native-relay-bot`, 2770,
+  in the bot unit's `ReadWritePaths`). The bridge then accepts a file owned by the spool
+  directory's owner with mode 0600 (a root bridge) or 0640 (a bridge user in the bot's group,
+  which needs the group write bit on the directory to rename). A spool directory writable by
+  *other* is refused. Size limits are the Matrix ones (`CCC_MAX_DOCUMENT_SIZE_MB`, or
   `CCC_TELEGRAM_MAX_IMAGE_BYTES` for images under the image context guard). Rollout
   order is the reverse of the frames above, because the bot is the sender here:
   this knob (config edit + `ccc-hande-bridge` restart) **first**, then the bot's own
