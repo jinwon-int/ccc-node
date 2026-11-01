@@ -824,6 +824,12 @@ else
   err "A2A Piri shared memory snapshot producer tests failed"
   tail -10 "$TMP/a2a-piri-memory-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_owner_queue_test.py >"$TMP/owner-queue-test.out" 2>&1; then
+  say "  ok owner action queue collector tests (#2617)"
+else
+  err "owner action queue collector tests failed"
+  tail -10 "$TMP/owner-queue-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_fleet_topology_test.py >"$TMP/fleet-topology-test.out" 2>&1; then
   say "  ok fleet inventory descriptor offline validator tests (#1451)"
 else
