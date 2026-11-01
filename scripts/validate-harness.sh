@@ -47,20 +47,50 @@ fi
 #                                 inline python checks, registration guard,
 #                                 frontmatter, hook wiring, statusline)
 #   CCC_HARNESS_PHASE=hook-tests  only the registration guard + hook-test runs
+#   CCC_HARNESS_PHASE=quick       the static phase minus its two slow parts, for
+#                                 a pre-push signal in seconds (#2611): shellcheck
+#                                 lints only the scripts changed since the base
+#                                 ref (CCC_HARNESS_QUICK_BASE, default
+#                                 merge-base with origin/main; full scope when
+#                                 none resolves), and the few inline suites on
+#                                 QUICK_SKIP_SUITES (each measured >= 1 s) are
+#                                 skipped; every other check still runs. Local
+#                                 only — CI keeps running the full static phase.
+#                                 Entry point: scripts/quick-check.sh
 #   CCC_HARNESS_SHARD=<i>/<n>     run shard i of n of the hook-test work list
 #                                 (implies PHASE=hook-tests when PHASE is unset)
 #   CCC_HARNESS_LIST_ONLY=1       print the shard assignment for every shard
 #                                 (no suite runs) and exit 0
-phase_static=1; phase_hook_tests=1
+phase_static=1; phase_hook_tests=1; phase_quick=0
 if [ -n "${CCC_HARNESS_SHARD:-}" ] && [ -z "${CCC_HARNESS_PHASE:-}" ]; then
   CCC_HARNESS_PHASE="hook-tests"
 fi
 case "${CCC_HARNESS_PHASE:-all}" in
   all) ;;
   static) phase_hook_tests=0 ;;
+  quick) phase_hook_tests=0; phase_quick=1 ;;
   hook-tests) phase_static=0 ;;
-  *) printf 'FAIL: CCC_HARNESS_PHASE must be static|hook-tests|all (got: %s)\n' "$CCC_HARNESS_PHASE"; exit 2 ;;
+  *) printf 'FAIL: CCC_HARNESS_PHASE must be static|quick|hook-tests|all (got: %s)\n' "$CCC_HARNESS_PHASE"; exit 2 ;;
 esac
+# The quick phase skips ONLY these inline suites — each measured >= 1 s
+# (2026-11-01: 9.3 / 5.0 / 2.8 / 1.6 s; together ~19 s of the ~34 s inline
+# block). Everything else in the static phase still runs, whatever its file
+# name: several *_test.py suites are tree guards (e.g. the doctor cron-marker
+# registry), so skipping by name would let a guard slip. Every entry must be
+# invoked below (validate-harness.test.sh pins that, so a rename cannot leave
+# a stale entry that silently skips nothing).
+QUICK_SKIP_SUITES=(
+  scripts/graceful_timeout_copies_test.py
+  scripts/ccc_codex_skills_test.py
+  scripts/ccc_skill_promotion_fairness_test.py
+  scripts/ccc_skill_usage_report_test.py
+)
+quick_skips() { # <suite> -> 0 when the quick phase skips it
+  [ "$phase_quick" = 1 ] || return 1
+  local x
+  for x in "${QUICK_SKIP_SUITES[@]}"; do [ "$x" = "$1" ] && return 0; done
+  return 1
+}
 shard_i=1; shard_n=1
 if [ -n "${CCC_HARNESS_SHARD:-}" ]; then
   if [[ "$CCC_HARNESS_SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] \
@@ -345,10 +375,34 @@ done
 # SC_SCOPE_EXTRA (discovered above, #1484). A new warning-level finding in ANY
 # tracked script fails the run; there is no baseline to hide behind (#1510).
 say "== shellcheck =="
+# Quick phase (#2611): both passes below cost ~2 min on the whole tree, so the
+# pre-push check lints only the files that differ from the base ref (committed
+# or not). The scope is a filter over the SAME discovered lists, so quick can
+# never lint a file the full phase would skip. No resolvable base -> full scope.
+quick_sc_scoped=0
+declare -A QUICK_CHANGED=()
+if [ "${phase_quick:-0}" = 1 ]; then
+  quick_base="${CCC_HARNESS_QUICK_BASE:-}"
+  if [ -z "$quick_base" ]; then
+    quick_base="$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || true)"
+  fi
+  if [ -n "$quick_base" ] && git rev-parse --verify --quiet "$quick_base^{commit}" >/dev/null 2>&1; then
+    while IFS= read -r -d '' f; do QUICK_CHANGED["$f"]=1; done \
+      < <(git diff -z --name-only --diff-filter=ACMRT "$quick_base" -- 2>/dev/null)
+    quick_sc_scoped=1
+    say "  quick: linting only files changed since ${quick_base:0:12} (${#QUICK_CHANGED[@]} changed file(s))"
+  else
+    say "  quick: no base ref resolved (set CCC_HARNESS_QUICK_BASE) — linting the full scope"
+  fi
+fi
+quick_sc_keep() { # <path> -> 0 when the path is in this run's shellcheck scope
+  [ "$quick_sc_scoped" = 1 ] || return 0
+  [ -n "${QUICK_CHANGED[$1]+x}" ]
+}
 if command -v shellcheck >/dev/null 2>&1; then
   SC_PRESENT=()
   for f in "${SC_SCOPE[@]}"; do
-    [ -f "$f" ] && SC_PRESENT+=("$f")
+    [ -f "$f" ] && quick_sc_keep "$f" && SC_PRESENT+=("$f")
   done
   # Batch the whole scope into one shellcheck spawn first; only when that
   # fails re-run per file so the failing script is named next to its findings.
@@ -357,17 +411,26 @@ if command -v shellcheck >/dev/null 2>&1; then
      && shellcheck --severity=warning -e SC2155,SC1090,SC1091 "${SC_PRESENT[@]}" >/dev/null 2>&1; then
     for f in "${SC_PRESENT[@]}"; do say "  ok $f"; done
   else
-    for f in "${SC_PRESENT[@]}"; do
+    for f in ${SC_PRESENT[@]+"${SC_PRESENT[@]}"}; do
       if shellcheck --severity=warning -e SC2155,SC1090,SC1091 "$f"; then say "  ok $f"; else err "shellcheck: $f"; fi
     done
   fi
-  say "  ok warning-level scope: ${#SC_PRESENT[@]} script(s) (every tracked *.sh + ${#SC_SCOPE_EXTRA[@]} extra, no baseline)"
+  if [ "$quick_sc_scoped" = 1 ]; then
+    say "  ok warning-level scope (quick): ${#SC_PRESENT[@]} changed script(s) of ${#SC_SCOPE[@]}"
+  else
+    say "  ok warning-level scope: ${#SC_PRESENT[@]} script(s) (every tracked *.sh + ${#SC_SCOPE_EXTRA[@]} extra, no baseline)"
+  fi
   # 3a) Repo-wide error-severity sweep — a backstop independent of the
   # discovery above: every tracked *.sh gets at least error-level lint with
   # NO exclusions, so a real bug cannot escape shellcheck even if the
   # warning-level scope were ever narrowed again. Clean repo-wide today.
   if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     mapfile -t ALL_SH < <(git ls-files '*.sh')
+    if [ "$quick_sc_scoped" = 1 ]; then
+      QUICK_SH=()
+      for f in ${ALL_SH[@]+"${ALL_SH[@]}"}; do quick_sc_keep "$f" && QUICK_SH+=("$f"); done
+      ALL_SH=(${QUICK_SH[@]+"${QUICK_SH[@]}"})
+    fi
     if [ "${#ALL_SH[@]}" -gt 0 ]; then
       if shellcheck --severity=error "${ALL_SH[@]}"; then
         say "  ok repo-wide shellcheck (severity=error, ${#ALL_SH[@]} scripts)"
@@ -413,8 +476,16 @@ fi
 # (`# ccc:interpreter-ok: <reason>`) are honored. The repo baseline is clean.
 say "== interpreter-named script invocation =="
 if command -v python3 >/dev/null 2>&1; then
-  if python3 scripts/ccc_script_interpreter_check.py --repo-root . >"$TMP/interp-check.out" 2>&1; then
-    say "  ok repo script call sites name an interpreter or a declared seam"
+  # Quick phase (#2611): findings are per call site, so scanning only the
+  # changed files (same scope as shellcheck above) loses nothing for them.
+  interp_scope=()
+  if [ "$quick_sc_scoped" = 1 ]; then
+    : >"$TMP/interp-paths"
+    for f in ${QUICK_CHANGED[@]+"${!QUICK_CHANGED[@]}"}; do printf '%s\0' "$f" >>"$TMP/interp-paths"; done
+    interp_scope=(--paths-from "$TMP/interp-paths")
+  fi
+  if python3 scripts/ccc_script_interpreter_check.py --repo-root . ${interp_scope[@]+"${interp_scope[@]}"} >"$TMP/interp-check.out" 2>&1; then
+    say "  ok repo script call sites name an interpreter or a declared seam$([ "$quick_sc_scoped" = 1 ] && printf ' (quick: changed files)')"
   else
     err "interpreter-less repo script invocation(s) detected"
     tail -10 "$TMP/interp-check.out"
@@ -430,8 +501,8 @@ say "== hook tests =="
 # static phase; only the bash suite runs further down are sharded.
 if [ "$phase_static" = 1 ]; then
 if python3 scripts/ccc_codex_skills.py validate --repo-root . >"$TMP/codex-skills-validate.out" 2>&1 \
-   && python3 scripts/ccc_codex_skills_test.py >"$TMP/codex-skills-test.out" 2>&1; then
-  say "  ok Codex compatibility catalog + managed-skill transaction tests"
+   && { quick_skips scripts/ccc_codex_skills_test.py || python3 scripts/ccc_codex_skills_test.py >"$TMP/codex-skills-test.out" 2>&1; }; then
+  say "  ok Codex compatibility catalog + managed-skill transaction tests$(quick_skips scripts/ccc_codex_skills_test.py && printf ' (quick: transaction tests skipped)')"
 else
   err "Codex managed-skill validation/tests failed"
   tail -10 "$TMP/codex-skills-validate.out" "$TMP/codex-skills-test.out" 2>/dev/null
@@ -588,12 +659,16 @@ else
   err "doctor host Claude login verdict tests failed (a wiped or expiring login may go unseen until the owner's next turn)"
   tail -10 "$TMP/doctor-host-credentials-test.out" 2>/dev/null
 fi
+if quick_skips scripts/graceful_timeout_copies_test.py; then
+  say "  quick: skipped scripts/graceful_timeout_copies_test.py (slow; the static phase / CI runs it)"
+else
 if python3 scripts/graceful_timeout_copies_test.py >"$TMP/graceful-timeout-test.out" 2>&1; then
   say "  ok claude subprocess graceful-timeout copies + signal order (#2397)"
 else
   err "graceful-timeout tests failed (a timed-out claude -p may be SIGKILLed mid OAuth refresh and wipe the host login)"
   tail -10 "$TMP/graceful-timeout-test.out" 2>/dev/null
 fi
+fi # quick_skips
 if python3 scripts/ccc_doctor_promotion_backlog_test.py >"$TMP/doctor-promotion-backlog-test.out" 2>&1; then
   say "  ok doctor skill-promotion backlog verdict tests"
 else
@@ -690,12 +765,16 @@ else
   err "skill-promotion possible-token namespace-URI tests failed"
   tail -10 "$TMP/skill-promotion-namespace-uri-test.out" 2>/dev/null
 fi
+if quick_skips scripts/ccc_skill_promotion_fairness_test.py; then
+  say "  quick: skipped scripts/ccc_skill_promotion_fairness_test.py (slow; the static phase / CI runs it)"
+else
 if python3 scripts/ccc_skill_promotion_fairness_test.py >"$TMP/skill-promotion-fairness-test.out" 2>&1; then
   say "  ok skill-promotion collect fairness tests (#1617)"
 else
   err "skill-promotion collect fairness tests failed (a backlogged node may be starving the rest)"
   tail -10 "$TMP/skill-promotion-fairness-test.out" 2>/dev/null
 fi
+fi # quick_skips
 if python3 scripts/ccc_skill_receipt_terminal_test.py >"$TMP/skill-receipt-terminal-test.out" 2>&1; then
   say "  ok skill-promotion receipt terminal-state tests (#1618)"
 else
@@ -751,12 +830,16 @@ else
   err "fleet inventory descriptor offline validator tests failed"
   tail -10 "$TMP/fleet-topology-test.out" 2>/dev/null
 fi
+if quick_skips scripts/ccc_skill_usage_report_test.py; then
+  say "  quick: skipped scripts/ccc_skill_usage_report_test.py (slow; the static phase / CI runs it)"
+else
 if python3 scripts/ccc_skill_usage_report_test.py >"$TMP/skill-usage-report-test.out" 2>&1; then
   say "  ok read-only skill usage node report + fleet aggregation tests (#2239)"
 else
   err "skill usage report tests failed (missing telemetry may read as non-use)"
   tail -10 "$TMP/skill-usage-report-test.out" 2>/dev/null
 fi
+fi # quick_skips
 fi # phase_static, inline python checks
 # A suite must not inherit the harness environment of the node it runs on
 # (#1064). The per-suite guard `ccc_test_reset_hook_env` (#1023) only reaches

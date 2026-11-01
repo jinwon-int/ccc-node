@@ -109,7 +109,40 @@ Before opening a pull request:
 3. Run the repository's documented checks where practical.
 4. State whether the change is source-only.
 
-Useful local checks:
+Before every push, the quick check gives a signal in seconds (#2611):
+
+```bash
+bash scripts/quick-check.sh            # ~15 s; exit 0 = PASS
+bash scripts/quick-check.sh --verbose  # also print every per-file ok line
+```
+
+It runs `CCC_HARNESS_PHASE=quick bash scripts/validate-harness.sh` — the same
+static-phase code path CI runs, with shellcheck and the interpreter-call-site
+scan limited to files changed since the base ref (`--base REF`, default the
+merge-base with `origin/main`) and only four measured-slow inline suites
+skipped (`QUICK_SKIP_SUITES`); every other check — node-name ratchet, skill
+registry, skill pre-validation, architecture/side-effect contracts, tree guards
+such as the doctor cron-marker registry, … — still runs, plus the changelog-fragment
+check and `ruff` on changed `*.py` when ruff is installed. These are the
+deterministic checks behind most red CI runs: in 2026-10-26..31, 7 of 11 failed
+`harness-ci` runs were a node-name ratchet drift or a stale skill registry.
+It does **not** replace CI (hook-test shards, bridge tests, mypy, full
+shellcheck stay CI-only).
+
+To run it automatically on `git push` in a **development** clone, opt in to the
+pre-push hook (`git push --no-verify` bypasses it once):
+
+```bash
+bash scripts/quick-check.sh --install-pre-push
+bash scripts/quick-check.sh --uninstall-pre-push
+```
+
+Installation refuses in a node's managed checkout (the one carrying
+`managed-checkout-guard`, see above), over a pre-push hook it did not write,
+and under a custom `core.hooksPath` — wire `scripts/quick-check.sh` into that
+setup yourself.
+
+Full local checks:
 
 ```bash
 bash scripts/validate-harness.sh
@@ -125,7 +158,7 @@ the static phase plus four shards in parallel; see
 [`docs/ci-governance.md`](docs/ci-governance.md)):
 
 ```bash
-CCC_HARNESS_PHASE=static bash scripts/validate-harness.sh    # fast, no suites
+CCC_HARNESS_PHASE=static bash scripts/validate-harness.sh    # no hook suites; ~2.5 min, mostly shellcheck
 CCC_HARNESS_PHASE=hook-tests CCC_HARNESS_SHARD=1/4 bash scripts/validate-harness.sh
 ```
 

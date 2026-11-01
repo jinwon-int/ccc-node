@@ -265,9 +265,56 @@ if command -v shellcheck >/dev/null 2>&1; then
   sc_untracked_out="$(sc_probe "$SCFIX")"
   ok "an untracked script is not linted (index, not tree)" \
     'grep -Fxq "FAIL=0" <<<"$sc_untracked_out" && ! grep -Fq "untracked.sh" <<<"$sc_untracked_out"'
+
+  # --- #2611: quick phase lints only what changed since the base ref --------
+  # A warning committed INTO the base is out of quick scope (the full phase
+  # still reports it); a warning added after the base is caught; with no
+  # resolvable base the quick phase falls back to the full scope.
+  rm -f "$SCFIX/untracked.sh"
+  printf '#!/usr/bin/env bash\nold_unused=1\n' > "$SCFIX/old-warn.sh"
+  git -C "$SCFIX" add -A 2>/dev/null
+  git -C "$SCFIX" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm base 2>/dev/null
+  sc_base="$(git -C "$SCFIX" rev-parse HEAD)"
+  printf '#!/usr/bin/env bash\nnew_unused=1\n' > "$SCFIX/new-warn.sh"
+  git -C "$SCFIX" add -A 2>/dev/null
+  # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+  sc_full_out="$(sc_probe "$SCFIX")"
+  ok "full phase: both the old and the new warning fail" \
+    'grep -Fxq "ERR: shellcheck: old-warn.sh" <<<"$sc_full_out" && grep -Fxq "ERR: shellcheck: new-warn.sh" <<<"$sc_full_out"'
+  # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+  sc_quick_out="$(phase_quick=1 CCC_HARNESS_QUICK_BASE="$sc_base" sc_probe "$SCFIX")"
+  ok "quick phase: the warning added after the base fails" \
+    'grep -Fxq "FAIL=1" <<<"$sc_quick_out" && grep -Fxq "ERR: shellcheck: new-warn.sh" <<<"$sc_quick_out"'
+  ok "quick phase: files unchanged since the base are not linted" \
+    '! grep -Fq "old-warn.sh" <<<"$sc_quick_out" && ! grep -Fq "SAY:   ok clean.sh" <<<"$sc_quick_out"'
+  ok "quick phase: the scope line names the changed count" \
+    'grep -Fq "SAY:   ok warning-level scope (quick): 1 changed script(s) of " <<<"$sc_quick_out"'
+  # shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+  sc_nobase_out="$(phase_quick=1 CCC_HARNESS_QUICK_BASE=no-such-ref sc_probe "$SCFIX")"
+  ok "quick phase: an unresolvable base falls back to the full scope" \
+    'grep -Fq "no base ref resolved" <<<"$sc_nobase_out" && grep -Fxq "ERR: shellcheck: old-warn.sh" <<<"$sc_nobase_out"'
 else
   echo "SKIP: shellcheck absent — fail-on-new-warning fixture not exercised (CI installs shellcheck)"
 fi
+
+# --- #2611: the quick phase skips only an explicit, live list of slow suites ---
+QS_SRC="$(sed -n '/^QUICK_SKIP_SUITES=(/,/^)/p' "$VALIDATE")"
+mapfile -t qs_entries < <(sed -n 's/^  \(scripts\/[^ ]*\.py\)$/\1/p' <<<"$QS_SRC")
+ok "QUICK_SKIP_SUITES is present and non-empty" '[ "${#qs_entries[@]}" -gt 0 ]'
+qs_stale=""
+for e in "${qs_entries[@]}"; do
+  grep -qF "quick_skips $e" "$VALIDATE" && grep -qE "python3 $e( |\$)" "$VALIDATE" || qs_stale="$qs_stale $e"
+done
+ok "every QUICK_SKIP_SUITES entry is a live, quick_skips-guarded invocation (no stale entry)" '[ -z "$qs_stale" ]'
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+qs_unlisted="$(grep -oE "quick_skips scripts/[^ ;]+" "$VALIDATE" | awk '{print $2}' | sort -u | while read -r s; do printf '%s\n' "${qs_entries[@]}" | grep -qxF "$s" || echo "$s"; done)"
+ok "every quick_skips call names a listed suite" '[ -z "$qs_unlisted" ]'
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+bogus_phase_out="$(CCC_HARNESS_PHASE=bogus bash "$VALIDATE" 2>&1)"
+# shellcheck disable=SC2034  # referenced inside eval'd ok() assertions
+bogus_phase_rc=$?
+ok "an unknown CCC_HARNESS_PHASE names quick among the valid phases" \
+  '[ "$bogus_phase_rc" = 2 ] && grep -qF "static|quick|hook-tests|all" <<<"$bogus_phase_out"'
 
 # --- suite summary-line contract ------------------------------------------
 # The harness echoes each suite's own `PASS=<n> FAIL=<n>` tally. A suite that
