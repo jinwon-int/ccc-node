@@ -1095,7 +1095,7 @@ class HandeTransport:
         if not isinstance(room, str) or not ROOM_PATTERN.fullmatch(room) or room not in self.rooms:
             return None, "room-not-allowed"
         device = str(frame.get("sender") or "")[1:].split(":", 1)[0]
-        job = {
+        job: dict[str, Any] = {
             "event_id": turn_id,
             "room_id": room,
             "sender": sender,
