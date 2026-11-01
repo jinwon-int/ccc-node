@@ -15,6 +15,13 @@ renaming it into the bridge's private staging directory, and only then verifies
 it. Whatever happens after the rename, the bridge owns the file and deletes it,
 so the bot never races the bridge on one path. A file the bridge never renamed
 (oversize, knob off, frame refused) stays the bot's to delete.
+
+Ownership (#2606 follow-up): on Termux the bot and the bridge are one uid and
+the file is 0600. On a Linux node the bot runs as its own service user and the
+bridge as root or as a member of the bot's group, so a file owned by the
+**spool directory's owner** (the bot) is accepted too, with mode 0600 or 0640
+(group-readable for a non-root bridge). The spool directory itself must not be
+writable by "other" — then only the bot and its group can plant files there.
 """
 
 from __future__ import annotations
@@ -131,7 +138,12 @@ def _open_directory(path: str) -> int:
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
-def _verify(directory_fd: int, name: str, attachment: Mapping[str, Any]) -> None:
+ALLOWED_FILE_MODES = frozenset({0o600, 0o640})
+
+
+def _verify(
+    directory_fd: int, name: str, attachment: Mapping[str, Any], trusted_uids: frozenset[int]
+) -> None:
     """The staged file is the bot's: a private regular file of the promised bytes."""
 
     try:
@@ -145,9 +157,9 @@ def _verify(directory_fd: int, name: str, attachment: Mapping[str, Any]) -> None
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise AttachmentError("invalid")
-        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        if hasattr(os, "getuid") and metadata.st_uid not in trusted_uids:
             raise AttachmentError("invalid")
-        if stat.S_IMODE(metadata.st_mode) != 0o600:
+        if stat.S_IMODE(metadata.st_mode) not in ALLOWED_FILE_MODES:
             raise AttachmentError("invalid")
         if metadata.st_size != attachment["size"]:
             raise AttachmentError("integrity")
@@ -188,6 +200,11 @@ def adopt(
     except OSError:
         raise AttachmentError("missing") from None
     try:
+        spool_meta = os.fstat(spool_fd)
+        if spool_meta.st_mode & stat.S_IWOTH:
+            # Anyone could plant a file there: nothing in it is the bot's for sure.
+            raise AttachmentError("invalid")
+        trusted_uids = frozenset({os.getuid(), spool_meta.st_uid}) if hasattr(os, "getuid") else frozenset()
         try:
             staging_fd = core_media.open_private_document_directory(staging_dir)
         except Exception:  # noqa: BLE001 - unsafe/unwritable staging dir is a storage refusal
@@ -203,7 +220,7 @@ def adopt(
                     "storage" if error.errno in (errno.EXDEV, errno.EACCES, errno.EPERM) else "invalid"
                 ) from None
             try:
-                _verify(staging_fd, target, attachment)
+                _verify(staging_fd, target, attachment, trusted_uids)
             except BaseException:
                 try:
                     os.unlink(target, dir_fd=staging_fd)
