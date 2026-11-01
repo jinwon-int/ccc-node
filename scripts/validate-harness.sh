@@ -916,33 +916,33 @@ hook_run_label() { # <run> -> "<suite>" or "<suite> (umask 0002)"
 }
 
 # Per-run weight in seconds, used only to split the list into shards. Only
-# suites measured at >= 20 s are listed; the other ~172 runs averaged ~3 s.
-# Re-measured 2026-10-31 on harness-ci run 41161296547 (per-suite gaps between
-# consecutive `ok` lines in the four shard logs; both umask variants of a suite
-# share one weight). The #1482 table (main run 33930573500) had drifted: the
-# shards ran 656 / 253 / 337 / 600 s against an estimate of ~267 s each, because
-# ccc-skill-autosave (347 s then; ~130 s once its danso fixture pinned the
-# settle window) and ccc-self-update were weighted as 3 s suites.
-# Re-measure when a shard drifts well past the others.
+# suites measured at >= 20 s are listed; the other ~161 runs averaged ~3 s.
+# Re-measured 2026-11-01 (#2610) as the MEDIAN over 10 successful harness-ci
+# runs (41251369667 .. 41260394525): per-suite gaps between consecutive `ok`
+# lines in the shard logs; both umask variants of a suite share one weight.
+# A single-run table drifts — 2026-10-31's (run 41161296547) already had
+# ccc-doctor at 95 s against a 115 s median. History: the #1482 table (main
+# run 33930573500) ran its shards 656 / 253 / 337 / 600 s against ~267 s
+# estimates, because ccc-skill-autosave and ccc-self-update were weighted as
+# 3 s suites. Re-measure (median over several runs) when a shard drifts well
+# past the others.
 hook_run_weight() { # <suite> -> seconds
   case "$1" in
-    scripts/setup.test.sh) echo 175 ;;
-    scripts/ccc-skill-autosave.test.sh) echo 130 ;;
-    scripts/ccc-doctor.test.sh) echo 95 ;;
-    scripts/ccc-self-update.test.sh) echo 90 ;;
-    scripts/install-nunchi.test.sh) echo 75 ;;
-    claude/hooks/skill-review/autoinstall.test.sh) echo 55 ;;
-    scripts/termux-restart-frontends.test.sh) echo 55 ;;
-    scripts/ccc-memory.test.sh) echo 35 ;;
+    scripts/setup.test.sh) echo 172 ;;
+    scripts/ccc-skill-autosave.test.sh) echo 121 ;;
+    scripts/ccc-doctor.test.sh) echo 115 ;;
+    scripts/ccc-self-update.test.sh) echo 86 ;;
+    scripts/install-nunchi.test.sh) echo 70 ;;
+    scripts/termux-restart-frontends.test.sh) echo 53 ;;
+    claude/hooks/skill-review/autoinstall.test.sh) echo 51 ;;
+    scripts/ccc-memory.test.sh) echo 33 ;;
     scripts/ccc-skill-promotion.test.sh) echo 30 ;;
-    bridge/start-lib.test.sh) echo 25 ;;
-    claude/hooks/skill-review/curator.test.sh) echo 23 ;;
+    scripts/quick-check.test.sh) echo 28 ;;
+    scripts/fleet-bridge-watch.test.sh) echo 26 ;;
+    claude/hooks/skill-review/curator.test.sh) echo 26 ;;
+    bridge/start-lib.test.sh) echo 26 ;;
+    claude/hooks/nunchi/nunchi.test.sh) echo 23 ;;
     claude/hooks/nunchi/bench.test.sh) echo 23 ;;
-    scripts/fleet-bridge-watch.test.sh) echo 22 ;;
-    claude/hooks/nunchi/nunchi.test.sh) echo 20 ;;
-    # #2611: two real-tree quick runs; 28 s on harness-ci run 41255974255
-    # (unweighted it pushed its shard to 489 s against 311-431 s).
-    scripts/quick-check.test.sh) echo 30 ;;
     *) echo 3 ;;
   esac
 }
