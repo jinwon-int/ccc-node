@@ -392,5 +392,30 @@ out="$(FAKE_REUSE_FAIL_REASON=reuse_lock_subset_sha256_mismatch run2 --target "$
 ok "a build without reuse is never retried (mismatch reason irrelevant)" '[ "$rc" = 0 ] && [ "$(grep -c "$PREP2/main-${P_NATIVE:0:7}" "$FAKE_CALLS")" = 1 ]'
 git -C "$REPO" checkout -q "$K"
 
+# 14) #2621: a ready generation built without the Matrix extra must not be reused on a Matrix node
+export CCC_TERMUX_MATRIX_FRONTEND=1
+printf '#!/usr/bin/env python3\n# parser.add_argument("--extra", action="append")\n' > "$REPO/bridge/termux_prepare.py"
+date +%s%N > "$REPO/n2621.txt"; git -C "$REPO" add -A && git -C "$REPO" commit -qm J2621
+J="$(git -C "$REPO" rev-parse HEAD)"
+ptr_before="$(readlink "$CN/bridge-current")"
+out="$(FAKE_MATRIX_OK=0 run)"; rc=$?   # the extra did not land inside the build: receipt ready, gate refuses
+STALE="$(ls -d "$PREP"/main-"${J:0:7}"-* | head -1)"
+ok "extra-less build for J is refused (exit 4) and kept on disk" '[ "$rc" = 4 ] && [ -d "$STALE" ] && [ "$(readlink "$CN/bridge-current")" = "$ptr_before" ]'
+# pin the stale generation's runtime to "no extra" whatever FAKE_MATRIX_OK says later
+printf '#!/usr/bin/env bash\ncase "$*" in *aiohttp*) exit 1 ;; *) exit 0 ;; esac\n' > "$STALE/job/runtime/bin/python"; chmod +x "$STALE/job/runtime/bin/python"
+calls_before="$(grep -c "$PREP/main-${J:0:7}" "$FAKE_CALLS")"
+out="$(FAKE_MATRIX_OK=1 run)"; rc=$?
+ok "rerun skips the stale extra-less generation, builds a fresh one with the extra and promotes it" \
+  '[ "$rc" = 0 ] && grep -q "not reusing it" <<<"$out" && [ "$(grep -c "$PREP/main-${J:0:7}" "$FAKE_CALLS")" = "$((calls_before + 1))" ] && [ "$(basename "$(readlink -e "$CN/bridge-current")")" != "$(basename "$STALE")" ] && [ "$(git -C "$(readlink -e "$CN/bridge-current")/source" rev-parse HEAD)" = "$J" ]'
+ok "the stale extra-less generation stays for diagnosis" '[ -d "$STALE" ]'
+
+# 15) #2621: when the --extra probe cannot read the tool (git show fails) nothing is built
+git -C "$REPO" rm -q bridge/termux_prepare.py && git -C "$REPO" commit -qm K2
+ptr_before="$(readlink "$CN/bridge-current")"; calls_before="$(wc -l < "$FAKE_CALLS")"
+out="$(run)"; rc=$?
+ok "unreadable termux_prepare.py at the target: exit 3, no build attempted, pointer unchanged" \
+  '[ "$rc" = 3 ] && grep -q "git show failed twice" <<<"$out" && [ "$(wc -l < "$FAKE_CALLS")" = "$calls_before" ] && [ "$(readlink "$CN/bridge-current")" = "$ptr_before" ]'
+unset CCC_TERMUX_MATRIX_FRONTEND
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
