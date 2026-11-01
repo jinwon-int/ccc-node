@@ -685,7 +685,7 @@ class PolicyTest(_Base):
         # #2628: owner-personal information notices (lotto buy/result) reach both rooms now
         # without paging — immediate like action, no digest hold, no 15-min re-notify, no ok/hold.
         t0 = _kst(2026, 10, 31, 22, 0)
-        tn, _ = outbox.enqueue(self.queue, "lotto result", node="daegyo", tier="notice")
+        tn, _ = outbox.enqueue(self.queue, "lotto result", node="node-a", tier="notice")
         aid = outbox.alert_id_of(self.queue, tn)
         self.assertEqual(outbox.lookup(self.queue, aid)["tier"], "notice")
         self.assertNotIn(tn, [row[0] for row in policy.held_info_rows(self.queue)])
