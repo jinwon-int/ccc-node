@@ -35,6 +35,7 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `turn.room` (when the bot sends it, family-messenger#423) | room id; absent → the config's first room. Sessions are keyed `(user, room)` |
 | `turn.session_id` (always `null` today) | ignored — the session manager is the resume authority, exactly as on Matrix |
 | `turn.prompt` starting with `/` | the Matrix command set (`new model effort usage stop continue history resume revert waits cancelwait distill skills memory_promote restart task_*`); owner-only ones refuse non-owners. Numbered menus (`/resume`, `/revert`) are plain `result` text answered by a bare-number turn |
+| `turn.attachment` (#2606; family-messenger `docs/FLEET-WORKER.md` "첨부 turn") | only with **`attachment_frames: true`**. The bot has already decrypted the file-v2/v1 attachment (the file key never leaves it) and left the plaintext in `attachment_spool_dir`; the frame names it (`{v:1, path, kind, mime, name?, size, sha256, caption}`). A malformed object → `rejected invalid-attachment`; an unknown `v` or the knob off → the turn runs on `prompt` (the bot's "attachment received but cannot be opened" fallback). `HandeBot._run_attachment` renames the file into `BOT_DATA_DIR/matrix-media` (taking it over), checks regular file · same uid · 0600 · `size` · `sha256` · the Matrix size limits, then runs the Telegram/Matrix image or document prompt with channel `Hande` and deletes the file when the turn ends. A failed check answers once with the Matrix attachment wording and runs no model |
 | `TurnSink.approval` | `approval{approval_id, action, description=<redacted snapshot>, arguments={}}` → `approve`/`deny` → `approval-resolved`; `approval_timeout_s` (default 120) → denied. Audit ledger as on Matrix |
 | `TurnSink.typing` | no-op (the port has no typing indicator) |
 | `TurnSink.status` (the `⏳ Working — 10s \| Bash: …` heartbeat Matrix edits in place) | no-op by default (no editable bubble). **`status_frames: true`** (status-v1, family-messenger#560 / `archive/native-mls/STATUS-V1.md`) forwards every heartbeat as an `interim` frame tagged `kind:"status"` at the Matrix cadence: a status-v1 bot posts it under a `status-<uuid>` client_id, the relay sends no push for it, and the apps show the newest one per sender as one transient bubble (dropped when the reply lands) — turn it on only after the node's bot is status-v1 (an older bot posts it as a plain interim). Otherwise `status_interims: true` forwards it as `interim` frames — a new room message each — throttled: the first line as soon as the heartbeat starts, then one line per `status_interim_interval_s` (default 60, 10..3600) — a changing tool label does not reopen the window (on Matrix it carries the Bash command and changes with every quick call); `None` has no frame, answer previews are never forwarded; needs `interim_frames` (off → counted in `notices_dropped`). A real in-place status bubble needs an app-layer `status` message kind (family-messenger, tracked with the live-preview gap) |
@@ -84,9 +85,23 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   "status_interim_interval_s": 60,
   "tool_timeout_s": 90,
   "steward_tools": true,
-  "steward_tools_approve_all": false
+  "steward_tools_approve_all": false,
+  "attachment_frames": false,
+  "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
 }
 ```
+
+- `attachment_frames` (default off, #2606) accepts `turn.attachment` (see the mapping table).
+  `attachment_spool_dir` is required with it: the **same absolute path** the bot writes
+  decrypted attachments to — a frame `path` is accepted only as a direct child
+  `<32 hex>.bin` of exactly this directory. The bot and this bridge must run as the
+  same uid on the same filesystem (the take-over is a `rename`; `EXDEV` is refused,
+  never copied). Size limits are the Matrix ones (`CCC_MAX_DOCUMENT_SIZE_MB`, or
+  `CCC_TELEGRAM_MAX_IMAGE_BYTES` for images under the image context guard). Rollout
+  order is the reverse of the frames above, because the bot is the sender here:
+  this knob (config edit + `ccc-hande-bridge` restart) **first**, then the bot's own
+  attachment switch. `health_signals()` reports `attachment_frames` and
+  `attachments_ignored`.
 
 - `status_frames` (default off, status-v1) forwards the `⏳ Working — Ns | <tool>` heartbeat as
   `kind:"status"` interim frames at the Matrix cadence for a status-v1 bot/app pair (see the
@@ -213,6 +228,6 @@ leaving it enrolled but stopped), delete the CF token.
 | Push spool on the hande bridge | a second spool consumer makes records vanish at random; the node's Matrix bridge keeps it | #2380 |
 | Multi-room per node | the bot serves one agent room and sends no `room` | family-messenger#423 (bridge already keys by `(user, room)` when `room` is present) |
 | Live preview (edited bubble) | the port has no edit frame; progress lines are `interim` (`interim_frames`) | family-messenger#423 |
-| Attachments, voice | the bot drops `file-v1-*` messages before the responder | family-messenger#354 follow-up |
+| Attachments: the bot side, voice | the bridge accepts `turn.attachment` (#2606, `attachment_frames`); the bot still drops `file-v1-*`/`file-v2-*` messages before the responder until its sender lands. Voice notes are not part of the contract | family-messenger#636 |
 | Termux self-update restart-cmd (`~/.claude/self-update.restart-cmd`) | the repo script follows `bridge-current` for `ccc-hande-bridge` since #2526; a node whose restart-cmd is still a pre-#2526 wrapper restarts Matrix only — check with `termux-restart-frontends.sh --dry-run` (`hande_running=` must appear) | #2526 (closed), per-node check |
 | doctor bridge-status probe for the hande unit | doctor reads `.ccc-hande` session/journal paths (PR-3) but has no hande-specific health verdict yet | #2380 follow-up |
