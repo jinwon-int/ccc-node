@@ -37,8 +37,13 @@ jobs:
   # 33930573500) and was the sole critical path — 14m33s of it the sequential
   # hook-test loop. It is now split three ways:
   #   validate-harness-static   the non-test phases, once (CCC_HARNESS_PHASE=static)
-  #   validate-harness-shard    the hook-test runs, bin-packed across a 4-way
-  #                             matrix (CCC_HARNESS_SHARD=<i>/<n>; est. ~3.6 min each)
+  #   validate-harness-shard    the hook-test runs, bin-packed across a 6-way
+  #                             matrix (CCC_HARNESS_SHARD=<i>/<n>; est. ~4.7 min each)
+  #                             #2610: was 4-way; at ~1,690 s of hook work the
+  #                             4 legs ran 416-445 s (p50, 10 runs) and were the
+  #                             whole critical path. 6 legs put them level with
+  #                             bridge-tests (~280-300 s). More legs buy nothing
+  #                             until bridge-tests shrinks.
   #   validate-harness          pure aggregator: fails unless BOTH legs succeeded
   # The aggregator exists so the required-check context `validate-harness`
   # (.github/required-checks.json, tests/test_ci_required_contexts.py) keeps
@@ -89,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Shard assignment (which suites this leg runs)
