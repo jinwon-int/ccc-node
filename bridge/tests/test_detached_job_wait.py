@@ -272,3 +272,189 @@ def test_cli_registers_a_detached_job(tmp_path: Path, monkeypatch: pytest.Monkey
     rc = external_wait_cli.main(["register", "--source", "detached-job", "--unit", "x", "--log", "relative.log"])
     assert rc == 2
     assert json.loads(capsys.readouterr().out.strip())["code"] == "validation"
+
+
+# --- #2636: wait budget → notify-only --------------------------------------------------
+
+
+def _notify_monitor(registry, recorder, clock, tmp_path: Path, *, unit_active: bool) -> ExternalWaitMonitor:
+    monitor = _monitor(registry, recorder, clock, unit_active=unit_active)
+    monitor._notice_spool_dir = str(tmp_path / "spool")
+    return monitor
+
+
+def _spool_records(tmp_path: Path) -> list[dict]:
+    spool = tmp_path / "spool"
+    if not spool.exists():
+        return []
+    return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(spool.glob("*.json"))]
+
+
+@pytest.mark.anyio
+async def test_deadline_with_a_live_unit_downgrades_to_notify_only_instead_of_expiring(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    log = tmp_path / "job.log"
+    log.write_text("sleeping until morning...\n")
+    wait_id = _register(registry, log, timeout_seconds=7200)
+    recorder = _Recorder()
+    monitor = _notify_monitor(registry, recorder, clock, tmp_path, unit_active=True)
+
+    clock.now = NOW + 7200 + 1  # deadline reached, unit still alive
+    await monitor._tick()
+    rec = registry.get(wait_id)
+    assert rec["state"] == STATE_MONITORING, "a live job is not over at its deadline"
+    assert rec["notify_only"] is True and rec["notify_only_since"] == clock.now
+    assert rec["expires_epoch"] == clock.now + 48 * 3600
+    assert rec["poll_interval_seconds"] == 600.0
+    assert recorder.notifications == [] and recorder.resumes == [], "no wake, no 'expired' message"
+    assert recorder.synced == [(7, 70)], "the route's status line is refreshed so the ⏳ line goes away"
+    assert render_wait_status(registry.records(), clock.now) is None
+    assert "notify-only" in render_waits(registry.records())
+    assert _spool_records(tmp_path) == [], "the downgrade itself is silent"
+
+    # Hours later the unit writes its marker: owner notice, no wake.
+    log.write_text("sleeping until morning...\nall six nodes ok\nEXIT=0\n")
+    clock.now += 5 * 3600
+    await monitor._tick()
+    rec = registry.get(wait_id)
+    assert rec["terminal_status"] == TERMINAL_SUCCESS and rec["terminal_detail"] == {"exit_code": 0}
+    assert rec["wake"]["state"] == "skipped"
+    assert recorder.notifications == [] and recorder.resumes == []
+    notices = _spool_records(tmp_path)
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice["event"] == "DetachedJob" and notice["dedup"] == "DetachedJob:nightly-compare:0"
+    assert notice["text"].startswith("✅ Detached job finished — nightly-compare (exit 0)")
+    assert "Next: read the compare log and report" in notice["text"] and str(log) in notice["text"]
+    assert set(notice) == {"ts", "event", "node", "text", "dedup"}
+    assert render_wait_status(registry.records(), clock.now) is None, "finished notify-only stays off the line"
+
+
+@pytest.mark.anyio
+async def test_deadline_with_a_vanished_unit_is_still_lost_with_a_wake(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    stale = tmp_path / "stale.log"
+    stale.write_text("partial\n")
+    os.utime(stale, (time.time() - 3600, time.time() - 3600))
+    wait_id = _register(registry, stale, timeout_seconds=7200)
+    recorder = _Recorder()
+    clock.now = NOW + 7200 + 1
+    await _notify_monitor(registry, recorder, clock, tmp_path, unit_active=False)._tick()
+    rec = registry.get(wait_id)
+    assert rec["terminal_status"] == TERMINAL_LOST and not rec.get("notify_only")
+    assert recorder.notifications[0][1].startswith("ℹ️ Detached job lost")
+    assert _spool_records(tmp_path) == []
+
+
+@pytest.mark.anyio
+async def test_marker_exactly_at_the_deadline_still_wakes(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    log = tmp_path / "job.log"
+    log.write_text("done\nEXIT=0\n")
+    wait_id = _register(registry, log, timeout_seconds=7200)
+    recorder = _Recorder()
+    clock.now = NOW + 7200 + 5
+    await _notify_monitor(registry, recorder, clock, tmp_path, unit_active=False)._tick()
+    assert registry.get(wait_id)["terminal_status"] == TERMINAL_SUCCESS
+    assert len(recorder.resumes) == 1 and _spool_records(tmp_path) == []
+
+
+@pytest.mark.anyio
+async def test_notify_only_watch_that_exhausts_its_extension_expires_quietly_with_a_notice(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    log = tmp_path / "job.log"
+    log.write_text("still going\n")
+    wait_id = _register(registry, log, timeout_seconds=3600)
+    recorder = _Recorder()
+    monitor = _notify_monitor(registry, recorder, clock, tmp_path, unit_active=True)
+    clock.now = NOW + 3601
+    await monitor._tick()
+    assert registry.get(wait_id)["notify_only"] is True
+    clock.now += 48 * 3600 + 1
+    await monitor._tick()
+    rec = registry.get(wait_id)
+    assert rec["terminal_status"] == "expired" and rec["wake"]["state"] == "skipped"
+    assert recorder.notifications == [] and recorder.resumes == []
+    (notice,) = _spool_records(tmp_path)
+    assert notice["text"].startswith("⏰ Detached job watch expired — nightly-compare")
+    assert notice["dedup"] == "DetachedJob:nightly-compare:expired"
+
+
+@pytest.mark.anyio
+async def test_failure_exit_in_notify_only_mode_is_a_notice_not_a_wake(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    log = tmp_path / "job.log"
+    log.write_text("working\n")
+    wait_id = _register(registry, log, timeout_seconds=3600, notify_only=True)
+    assert registry.get(wait_id)["notify_only"] is True, "registered notify-only from the start"
+    assert render_wait_status(registry.records(), NOW + 1) is None
+    recorder = _Recorder()
+    monitor = _notify_monitor(registry, recorder, clock, tmp_path, unit_active=True)
+    await monitor._tick()
+    assert registry.get(wait_id)["poll_interval_seconds"] <= 600
+    log.write_text("working\nEXIT=3\n")
+    clock.now += 700
+    await monitor._tick()
+    rec = registry.get(wait_id)
+    assert rec["terminal_status"] == TERMINAL_FAILURE and rec["wake"]["state"] == "skipped"
+    assert recorder.notifications == [] and recorder.resumes == []
+    (notice,) = _spool_records(tmp_path)
+    assert notice["text"].startswith("❌ Detached job failed — nightly-compare (exit 3)")
+    assert notice["dedup"] == "DetachedJob:nightly-compare:3"
+
+
+def test_downgrade_is_idempotent_and_only_for_monitoring_records(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    wait_id = _register(registry, tmp_path / "job.log")
+    assert registry.downgrade_to_notify_only(wait_id, now=NOW + 10, extend_seconds=100, poll_interval_seconds=60)
+    assert not registry.downgrade_to_notify_only(wait_id, now=NOW + 20, extend_seconds=100, poll_interval_seconds=60)
+    assert registry.get(wait_id)["expires_epoch"] == NOW + 110
+    registry.finish(wait_id, TERMINAL_SUCCESS, now=NOW + 30, wake=False)
+    assert not registry.downgrade_to_notify_only(wait_id, now=NOW + 40, extend_seconds=100, poll_interval_seconds=60)
+    assert not registry.downgrade_to_notify_only("missing", now=NOW, extend_seconds=100, poll_interval_seconds=60)
+
+
+def test_notice_spool_write_is_owner_only_and_fail_open(tmp_path: Path) -> None:
+    from telegram_bot.core.external_wait_monitor import write_detached_job_notice
+
+    record = {"wait_id": "w", "unit": "job/with:odd chars", "summary": "s" * 500, "log_path": "/tmp/x.log"}
+    path = write_detached_job_notice(str(tmp_path / "spool"), record, TERMINAL_SUCCESS, {"exit_code": 0})
+    assert path and os.path.basename(path).startswith(time.strftime("%Y-%m-%dT", time.gmtime()))
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert "s" * 200 in data["text"] and "s" * 201 not in data["text"]
+    assert write_detached_job_notice("", record, TERMINAL_SUCCESS, {"exit_code": 0}) == ""
+    blocked = tmp_path / "file-not-dir"
+    blocked.write_text("x")
+    assert write_detached_job_notice(str(blocked), record, TERMINAL_SUCCESS, {"exit_code": 0}) == ""
+
+
+def test_cli_timeout_above_the_budget_registers_notify_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    monkeypatch.setenv("CCC_EXTERNAL_WAIT_HOME", str(tmp_path))
+    publish_active_turn(tmp_path, user_id=7, chat_id=70, session_id="sess-1")
+    log = tmp_path / "state" / "job.log"
+    rc = external_wait_cli.main([
+        "register", "--source", "detached-job", "--unit", "overnight", "--log", str(log),
+        "--summary", "verify tomorrow", "--timeout-seconds", str(20 * 3600),
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] and payload["notify_only"] is True and "notify-only" in payload["message"]
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+    rec = registry.get(payload["wait_id"])
+    assert rec["notify_only"] is True and rec["expires_epoch"] - rec["created_epoch"] == 20 * 3600
+    assert render_wait_status(registry.records(), rec["created_epoch"] + 1) is None
+
+    rc = external_wait_cli.main([
+        "register", "--source", "detached-job", "--unit", "short", "--log", str(log), "--timeout-seconds", "7200",
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["notify_only"] is False
+    assert not registry.get(payload["wait_id"]).get("notify_only")

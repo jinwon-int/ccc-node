@@ -372,8 +372,13 @@ class ExternalWaitRegistry:
         task_id: Any = None,
         unit: Any = None,
         log_path: Any = None,
+        notify_only: bool = False,
     ) -> str:
         """Register one wait; returns its id (idempotent per natural key).
+
+        ``notify_only`` (#2636, detached jobs) records a watch that never
+        wakes the conversation and never shows on the ⏳ status line: its
+        outcome is delivered to the owner as one notice instead.
 
         An Actions-run wait (#2590) is keyed by ``run_id`` instead of a PR:
         ``pr_number`` is stored as ``None`` and ``head_sha`` is optional
@@ -402,6 +407,8 @@ class ExternalWaitRegistry:
             unit = validate_unit_name(unit)
             log_path = validate_log_path(log_path)
             extra = {"unit": unit, "log_path": log_path}
+            if notify_only:
+                extra["notify_only"] = True
             natural = (source, unit, log_path, int(user_id), int(chat_id))
         elif source == SOURCE_GITHUB_ACTIONS_RUN:
             repo = validate_repo(repo)
@@ -504,6 +511,37 @@ class ExternalWaitRegistry:
             rec["updated_at"] = _utc_now_iso()
 
         self._mutate(_do)
+
+    def downgrade_to_notify_only(
+        self,
+        wait_id: str,
+        *,
+        now: Optional[float] = None,
+        extend_seconds: float,
+        poll_interval_seconds: float,
+    ) -> bool:
+        """Deadline reached while the detached unit is still alive (#2636).
+
+        The watch is not over, it was under-estimated: keep polling (slowly,
+        for ``extend_seconds`` more) but drop the conversation-facing side —
+        no ⏳ line, and the eventual outcome is a notice, not a wake. Returns
+        True on the monitoring → notify-only transition; idempotent.
+        """
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None or rec.get("state") != STATE_MONITORING or rec.get("notify_only"):
+                return False
+            now_value = self._clock() if now is None else float(now)
+            rec["notify_only"] = True
+            rec["notify_only_since"] = now_value
+            rec["expires_epoch"] = now_value + max(60.0, float(extend_seconds))
+            rec["poll_interval_seconds"] = max(5.0, float(poll_interval_seconds))
+            rec["next_poll_epoch"] = now_value + rec["poll_interval_seconds"]
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return bool(self._mutate(_do))
 
     def correct_head_sha(self, wait_id: str, full_sha: str) -> bool:
         """Heal a legacy short-SHA registration to the full 40-char head.
@@ -867,6 +905,7 @@ def render_waits(records: List[Dict[str, Any]]) -> str:
             lines.append(
                 f"{marker} `{rec.get('wait_id')}` — detached job {rec.get('unit')}"
                 f" · {state}{f' (exit {code})' if code is not None else ''}"
+                f"{' · notify-only' if rec.get('notify_only') else ''}"
             )
         elif rec.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
             label = str(rec.get("run_label") or "").strip() or "workflow"
