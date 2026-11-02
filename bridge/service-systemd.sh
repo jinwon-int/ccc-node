@@ -41,8 +41,12 @@
 # reconcile never touches it. Hosts without systemd (Termux) never reach this
 # script's unit paths.
 #   CCC_BRIDGE_MEMORY_GUARD=0  install: skip the drop-in
-#   CCC_BRIDGE_MEMORY_HIGH     MemoryHigh= value (default 50%)
-#   CCC_BRIDGE_MEMORY_MAX      MemoryMax= value (default 75%)
+#   CCC_BRIDGE_MEMORY_HIGH     MemoryHigh= value (default: the existing
+#                              ccc-generated drop-in's value, else 50%)
+#   CCC_BRIDGE_MEMORY_MAX      MemoryMax= value (default: the existing
+#                              ccc-generated drop-in's value, else 75%)
+#   Unset values are kept from that drop-in on install and memory-guard reruns
+#   (#2633), so per-node limits survive; pass 50%/75% explicitly to reset.
 #   Values: 1%..100%, bytes with optional K/M/G/T suffix, or infinity.
 #   The 50%/75% defaults suit large hosts; on a ~3 GB node 50% (~1.5 GB) can
 #   throttle normal sessions, so set explicit per-node values there first.
@@ -386,10 +390,51 @@ memory_limit_runtime_value() {
     esac
 }
 
+memory_guard_existing_value() {
+    # Prints the MemoryHigh=/MemoryMax= value ($1) of the ccc-generated drop-in
+    # already on disk, or returns 1 when there is none to keep (#2633). Needs
+    # systemd_paths first. A hand-written, symlinked or marker-less file is not
+    # ours to read; an unparseable value is reported and not carried over.
+    local key="$1" dropin value
+    [ -n "${SYSTEMD_UNIT_FILE:-}" ] || return 1
+    dropin="$SYSTEMD_UNIT_FILE.d/$MEMORY_GUARD_DROPIN_NAME"
+    [ -f "$dropin" ] && [ ! -L "$dropin" ] || return 1
+    [ "$(head -n 1 "$dropin" 2>/dev/null)" = "$MEMORY_GUARD_MARKER" ] || return 1
+    value="$(sed -n "s/^${key}=//p" "$dropin" | tail -n 1)"
+    [ -n "$value" ] || return 1
+    if ! memory_limit_kind "$value" >/dev/null; then
+        echo "⚠️  ignoring invalid $key=$value in $dropin; using the default" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
 resolve_memory_guard() {
     # Sets MEMORY_GUARD_HIGH / MEMORY_GUARD_MAX or exits 1 before any write.
-    MEMORY_GUARD_HIGH="${CCC_BRIDGE_MEMORY_HIGH:-$MEMORY_GUARD_DEFAULT_HIGH}"
-    MEMORY_GUARD_MAX="${CCC_BRIDGE_MEMORY_MAX:-$MEMORY_GUARD_DEFAULT_MAX}"
+    # Precedence per value (#2633): CCC_BRIDGE_MEMORY_HIGH/MAX, then the value
+    # in an existing ccc-generated drop-in, then the 50%/75% default. Per-node
+    # limits live only in that drop-in, so a plain `install` or `memory-guard`
+    # rerun without the env must not silently reset them to the default.
+    local kept="" prev
+    MEMORY_GUARD_HIGH="${CCC_BRIDGE_MEMORY_HIGH:-}"
+    if [ -z "$MEMORY_GUARD_HIGH" ]; then
+        if prev="$(memory_guard_existing_value MemoryHigh)"; then
+            MEMORY_GUARD_HIGH="$prev"; kept="$kept MemoryHigh=$prev"
+        else
+            MEMORY_GUARD_HIGH="$MEMORY_GUARD_DEFAULT_HIGH"
+        fi
+    fi
+    MEMORY_GUARD_MAX="${CCC_BRIDGE_MEMORY_MAX:-}"
+    if [ -z "$MEMORY_GUARD_MAX" ]; then
+        if prev="$(memory_guard_existing_value MemoryMax)"; then
+            MEMORY_GUARD_MAX="$prev"; kept="$kept MemoryMax=$prev"
+        else
+            MEMORY_GUARD_MAX="$MEMORY_GUARD_DEFAULT_MAX"
+        fi
+    fi
+    if [ -n "$kept" ]; then
+        echo "↩️  keeping the existing memory guard value(s):$kept (set CCC_BRIDGE_MEMORY_HIGH/MAX to change)"
+    fi
     local high_kind max_kind
     high_kind="$(memory_limit_kind "$MEMORY_GUARD_HIGH")" || {
         echo "❌ Error: CCC_BRIDGE_MEMORY_HIGH must be 1%..100%, bytes[K|M|G|T], or infinity" >&2
@@ -550,8 +595,8 @@ do_memory_guard_remove_systemd() {
 }
 
 do_memory_guard_systemd() {
-    [ "$REMOVE" = "1" ] || resolve_memory_guard
     systemd_paths
+    [ "$REMOVE" = "1" ] || resolve_memory_guard
     if [ -z "${CCC_SYSTEMD_DIR:-}" ] && ! command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1; then
         echo "⚪ systemctl not found — no systemd on this host; memory guard not applicable"
         exit 0
@@ -632,9 +677,10 @@ do_install_systemd() {
     validate_render_home
     local memory_guard=1
     [ "${CCC_BRIDGE_MEMORY_GUARD:-1}" = "0" ] && memory_guard=0
-    # Validate the guard values before writing anything.
-    [ "$memory_guard" = "1" ] && resolve_memory_guard
     systemd_paths
+    # Validate the guard values before writing anything. After systemd_paths
+    # so an existing drop-in's per-node values are kept (#2633).
+    [ "$memory_guard" = "1" ] && resolve_memory_guard
 
     echo "📝 Generating systemd unit: $SYSTEMD_UNIT_FILE"
     mkdir -p "$SYSTEMD_UNIT_DIR"

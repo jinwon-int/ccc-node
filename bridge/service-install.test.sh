@@ -379,6 +379,12 @@ run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" \
 okc "$RC" 0 "install with memory overrides exits 0"
 ok "memory overrides land in the drop-in" \
    'grep -Fxq "MemoryHigh=8G" "$GG" && grep -Fxq "MemoryMax=12G" "$GG" && grep -Fxq "OOMPolicy=continue" "$GG"'
+# Reinstall without the env keeps the per-node values (#2633).
+run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" \
+    bash "$SSD" install --project-root "$PROJECT"
+okc "$RC" 0 "reinstall without memory env exits 0 (#2633)"
+ok "reinstall without memory env keeps the per-node drop-in values (#2633)" \
+   'grep -Fxq "MemoryHigh=8G" "$GG" && grep -Fxq "MemoryMax=12G" "$GG" && grep -q "keeping the existing memory guard value(s): MemoryHigh=8G MemoryMax=12G" "$OUT"'
 
 rm -rf "$SDG"
 run env HOME="$FH" CCC_SYSTEMD_DIR="$SDG" CCC_SYSTEMCTL="$SC_STUB" CCC_BRIDGE_MEMORY_GUARD=0 \
@@ -517,17 +523,69 @@ mg_run env CCC_BRIDGE_MEMORY_HIGH=1G CCC_BRIDGE_MEMORY_MAX=1536M bash "$SSD" mem
 okc "$RC" 0 "memory-guard with byte overrides exits 0"
 ok "byte overrides reach set-property as bytes" \
    'grep -qx "set-property --runtime ccc-telegram-bridge.service MemoryHigh=1073741824 MemoryMax=1610612736" "$MG_CALLS"'
-# Unreadable MemTotal: refuse before writing anything.
+# Unreadable MemTotal: refuse before writing anything. The byte drop-in above
+# would now be kept (#2633), so start from no drop-in to hit the 50% default.
+rm -f "$GG"
 mg_reset active
 mg_run env CCC_MEMINFO_FILE="$TMP/no-meminfo" bash "$SSD" memory-guard
 okc "$RC" 1 "percent limit without a readable MemTotal exits 1"
 ok "unresolvable limit calls no systemctl" \
    '[ ! -s "$MG_CALLS" ] && grep -q "MemTotal unreadable" "$OUT"'
 # User scope drives `systemctl --user set-property --runtime`.
+rm -f "$GG"
 mg_reset active
 mg_run env CCC_SYSTEMD_SCOPE=user bash "$SSD" memory-guard
 ok "user-scope memory-guard uses systemctl --user set-property --runtime" \
    'grep -qx -- "--user $SETPROP_DEFAULT" "$MG_CALLS"'
+
+# Per-node limits survive reruns without the env (#2633): they live only in
+# the generated drop-in, so install/memory-guard keep each unset value from it
+# instead of resetting to 50%/75%; an explicit env value still wins.
+rm -f "$GG"
+mg_reset active
+mg_run env CCC_BRIDGE_MEMORY_HIGH=60% CCC_BRIDGE_MEMORY_MAX=80% bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard with per-node percent values exits 0"
+mg_reset active
+mg_run bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard rerun without env exits 0 (#2633)"
+ok "memory-guard rerun without env keeps the per-node drop-in values (#2633)" \
+   'grep -Fxq "MemoryHigh=60%" "$GG" && grep -Fxq "MemoryMax=80%" "$GG" && grep -q "already current" "$OUT"'
+ok "memory-guard rerun without env says which values it kept (#2633)" \
+   'grep -q "keeping the existing memory guard value(s): MemoryHigh=60% MemoryMax=80%" "$OUT"'
+ok "kept percent values reach set-property as bytes (#2633)" \
+   'grep -qx "set-property --runtime ccc-telegram-bridge.service MemoryHigh=2457600000 MemoryMax=3276800000" "$MG_CALLS"'
+mg_reset active
+mg_run env CCC_BRIDGE_MEMORY_MAX=90% bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard with only MAX set exits 0 (#2633)"
+ok "an explicit env value wins while the unset one is kept (#2633)" \
+   'grep -Fxq "MemoryHigh=60%" "$GG" && grep -Fxq "MemoryMax=90%" "$GG"'
+mg_reset active
+mg_run env CCC_BRIDGE_MEMORY_HIGH=50% CCC_BRIDGE_MEMORY_MAX=75% bash "$SSD" memory-guard
+ok "explicit 50%/75% resets a per-node drop-in (#2633)" \
+   'grep -Fxq "MemoryHigh=50%" "$GG" && grep -Fxq "MemoryMax=75%" "$GG" && ! grep -q "keeping the existing" "$OUT"'
+mg_reset active
+mg_run env CCC_BRIDGE_MEMORY_HIGH=90% bash "$SSD" memory-guard
+okc "$RC" 1 "explicit HIGH above the kept MAX is refused (#2633)"
+ok "refused mixed explicit/kept values leave the drop-in unchanged (#2633)" \
+   'grep -Fxq "MemoryHigh=50%" "$GG" && grep -Fxq "MemoryMax=75%" "$GG"'
+# A marker drop-in with an unparseable value is not carried over.
+printf '%s\n' "$(head -n 1 "$GG")" "[Service]" "MemoryHigh=lots" "MemoryMax=80%" "OOMPolicy=continue" > "$GG"
+mg_reset active
+mg_run bash "$SSD" memory-guard
+okc "$RC" 0 "memory-guard over an invalid kept value exits 0 (#2633)"
+ok "an invalid kept value falls back to the default with a warning (#2633)" \
+   'grep -Fxq "MemoryHigh=50%" "$GG" && grep -Fxq "MemoryMax=80%" "$GG" && grep -q "ignoring invalid MemoryHigh=lots" "$OUT"'
+# A hand-written (marker-less) file is never read as a source of values.
+printf '%s\n' "[Service]" "MemoryHigh=10%" "MemoryMax=20%" > "$GG"
+mg_reset active
+mg_run bash "$SSD" memory-guard --dry-run
+ok "a marker-less drop-in is not a source of kept values (#2633)" \
+   'grep -q "MemoryHigh=50%" "$OUT" && ! grep -q "keeping the existing" "$OUT"'
+# Leave the default drop-in in place for the --remove cases below.
+rm -f "$GG"
+mg_reset active
+mg_run bash "$SSD" memory-guard
+okc "$RC" 0 "default drop-in restored for the rollback cases"
 
 # Rollback mirror (--remove): drop-in removed, daemon-reload, runtime limits
 # cleared with infinity on an active unit; nothing at runtime when inactive.
