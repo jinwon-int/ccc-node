@@ -89,8 +89,14 @@ the caller.
    the evidence:
    ```bash
    python3 ~/.claude/hooks/lib/detached_jobs.py register \
-     --unit self-restart-<job> --log "$OUT" --summary "self-restart <own-service> for <reason>"
+     --unit self-restart-<job> --log "$OUT" --summary "self-restart <own-service> for <reason>" \
+     --expect 15m
    ```
+   `--expect` is the restart+verify window, not the idle-gate wait: it sizes
+   the bridge `⏳` wait (`bridge-safe-detached-run` Step 2, #2636). If the
+   idle gate may hold the restart for hours, give the whole span (`--expect 2h`)
+   or, past the 6 h budget, let the unit announce itself with
+   `detached_jobs.py notify` instead of a wait.
 
 4. **End the turn / do not attempt to verify inline.** The current session is
    about to die when the restart fires; there is nothing to poll from inside
