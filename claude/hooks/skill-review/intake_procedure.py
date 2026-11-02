@@ -3,7 +3,7 @@
 `prescreen.py` feeds the reviewer the "Worker procedure" section of
 a2a-nexus `docs/skills-intake-review.md`. Until now that text was read only
 from a local a2a-nexus checkout, so a node without one reported
-`procedure-unavailable` and never screened a draft (bangtong, gongmyoung
+`procedure-unavailable` and never screened a draft (two of six fleet nodes on
 2026-11-01). This module carries a verbatim snapshot of that section as the
 fallback; a checkout, when present, still wins so the canonical document can
 move ahead of the bundle.
