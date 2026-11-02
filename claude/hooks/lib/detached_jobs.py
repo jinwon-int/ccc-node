@@ -47,9 +47,36 @@ Classification
     agent must investigate by hand. Separating it from ``done`` is the whole
     point: ``status=stopped`` conflated them.
 
+Wait budget (#2636)
+-------------------
+``register`` also arms a bridge ``detached-job`` wait (#2605 layer 3): the
+``⏳ Running detached`` status line plus a wake when ``EXIT=`` appears. That
+wait has a budget (``WAIT_BUDGET_SECONDS``, the bridge default of 6 h), and a
+job expected to outlive it must not be armed: the line would sit on the
+owner's screen for the whole budget, end ``expired`` with no result, and the
+real exit the next morning would reach nobody. So registration takes the
+expectation -- ``--expect 90m`` / ``--until "05:30"`` -- and decides:
+
+* within budget: arm, with the wait sized to the expectation (+ margin, capped
+  at the budget) so "up to …" on the status line is honest;
+* over budget: **no wait**; the row carries ``notify_on_exit`` and stdout says
+  what to use instead (``schedule``, or a hand-written unit that calls
+  ``notify`` on exit);
+* no expectation given: arm as before (compatibility) with a one-line hint.
+
+``schedule`` is the paved path for "start later, tell me when done": a
+``systemd-run --on-calendar`` transient timer whose wrapper appends the
+``EXIT=`` marker and emits one body-free spool notice through ``notify``
+instead of a wake. ``notify`` writes that spool record on its own too, for
+hand-written units.
+
 Usage::
 
     detached_jobs.py register --unit U --log P [--summary S] [--workdir W]
+                              [--expect 90m | --until "YYYY-MM-DD HH:MM"] [--no-wait]
+    detached_jobs.py schedule --unit U --at "<systemd calendar>" --log P
+                              [--summary S] [--workdir W] [--print] -- <cmd…>
+    detached_jobs.py notify   --unit U --exit N [--summary S] [--log P]
     detached_jobs.py sweep [<registry path>] [--max-bytes N]
     detached_jobs.py ack --unit U [--all]
     detached_jobs.py list [--json]
@@ -62,9 +89,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 # Same reasoning as pending_promises: this block sits high in the memory
@@ -89,6 +119,127 @@ MAX_AGE_SECONDS = 7 * 24 * 3600
 STATE_DONE = "done"
 STATE_RUNNING = "running"
 STATE_LOST = "lost"
+
+# The bridge's default wait timeout (``external_wait_monitor.DEFAULT_TIMEOUT_SECONDS``).
+# A detached-job wait longer than this is not a wait the conversation can
+# resume on; it is an all-day status line that ends ``expired``.
+DEFAULT_WAIT_BUDGET_SECONDS = 6 * 3600
+# Headroom added to an expectation when sizing the wait: a job that says "90m"
+# and takes 100 must still be caught by the wait, not expire just before.
+WAIT_MARGIN_SECONDS = 30 * 60
+# Spool event name for completion notices (read by the bridge PushNotifier).
+NOTIFY_EVENT = "DetachedJob"
+
+# Longest alternatives first: ``m`` must not swallow the start of ``min``.
+_DURATION_RE = re.compile(r"(\d+)\s*(hours|hour|hrs|hr|days|day|secs|sec|min|d|h|m|s)?", re.IGNORECASE)
+_UNIT_SECONDS = {
+    "": 1, "s": 1, "sec": 1, "secs": 1,
+    "m": 60, "min": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
+
+
+def wait_budget_seconds() -> int:
+    raw = os.environ.get("CCC_DETACHED_WAIT_BUDGET_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(60, int(float(raw)))
+        except ValueError:
+            pass
+    return DEFAULT_WAIT_BUDGET_SECONDS
+
+
+def parse_duration(text: str) -> Optional[int]:
+    """``3600`` / ``45m`` / ``2h`` / ``1h30m`` / ``1d`` → seconds, else None."""
+    text = (text or "").strip().lower()
+    if not text:
+        return None
+    pos = 0
+    total = 0
+    for match in _DURATION_RE.finditer(text):
+        if match.start() != pos:
+            return None
+        unit = (match.group(2) or "").lower()
+        total += int(match.group(1)) * _UNIT_SECONDS[unit]
+        pos = match.end()
+    if pos != len(text) or total <= 0:
+        return None
+    return total
+
+
+def parse_until(text: str, *, now: Optional[float] = None) -> Optional[int]:
+    """Seconds from now until a wall-clock instant, else None.
+
+    Accepts ``HH:MM`` (next occurrence: today if still ahead, else tomorrow),
+    ``YYYY-MM-DD HH:MM[:SS]`` and ISO-8601 (``T`` separator, optional offset or
+    ``Z``). Naive values are the node's local clock, which is what the
+    operator reads off the status line.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    base = datetime.fromtimestamp(time.time() if now is None else now).astimezone()
+    target: Optional[datetime] = None
+    if re.fullmatch(r"\d{1,2}:\d{2}", text):
+        hh, mm = (int(part) for part in text.split(":"))
+        if hh > 23 or mm > 59:
+            return None
+        target = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= base:
+            target += timedelta(days=1)
+    else:
+        candidate = text.replace("Z", "+00:00")
+        if " " in candidate and "T" not in candidate:
+            candidate = candidate.replace(" ", "T", 1)
+        try:
+            target = datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=base.tzinfo)
+    seconds = int((target - base).total_seconds())
+    return seconds if seconds > 0 else None
+
+
+def wait_plan(expect_seconds: Optional[int], *, budget: Optional[int] = None) -> Dict[str, Any]:
+    """Decide whether a ⏳ wait is honest for this expectation.
+
+    Returns ``{"arm": bool, "timeout_seconds": int|None, "reason": str}``.
+    ``timeout_seconds`` is None when the bridge default should stand (no
+    expectation given: compatibility path).
+    """
+    cap = wait_budget_seconds() if budget is None else int(budget)
+    if expect_seconds is None:
+        return {
+            "arm": True,
+            "timeout_seconds": None,
+            "reason": "no --expect/--until given; wait armed with the bridge default — "
+                      "pass --expect <duration> so the status line is honest (#2636)",
+        }
+    if expect_seconds > cap:
+        return {
+            "arm": False,
+            "timeout_seconds": None,
+            "reason": f"expected {_fmt_duration(expect_seconds)} exceeds the wait budget "
+                      f"{_fmt_duration(cap)}: no ⏳ wait armed; completion is reported by "
+                      "`detached_jobs.py notify` (use `schedule`, or call notify from the unit) (#2636)",
+        }
+    timeout = min(cap, expect_seconds + WAIT_MARGIN_SECONDS)
+    return {
+        "arm": True,
+        "timeout_seconds": int(timeout),
+        "reason": f"expected {_fmt_duration(expect_seconds)}; wait sized to {_fmt_duration(timeout)}",
+    }
+
+
+def _fmt_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)}m"
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h" if minutes == 0 else f"{hours}h{minutes:02d}m"
 
 
 def registry_path(explicit: str = "") -> str:
@@ -182,15 +333,16 @@ def _log_age(log_path: str) -> Optional[float]:
         return None
 
 
-def unit_is_active(unit: str) -> bool:
+def unit_is_active(unit: str, *, suffix: str = ".service") -> bool:
     """Best-effort systemd liveness. Absent systemctl means 'cannot tell'.
 
     Returns False rather than raising on non-systemd nodes (Termux), where the
-    mtime signal carries the classification on its own.
+    mtime signal carries the classification on its own. ``suffix=".timer"``
+    asks about a ``schedule``d job that has not fired yet.
     """
     if not unit:
         return False
-    name = unit if unit.endswith(".service") else unit + ".service"
+    name = unit if unit.endswith(suffix) else unit + suffix
     try:
         proc = subprocess.run(
             ["systemctl", "is-active", name],
@@ -213,7 +365,13 @@ def classify_one(rec: Dict[str, Any], *, now: Optional[float] = None) -> Tuple[s
     if age is None:
         # No log at all. If the unit is up the job simply has not written yet;
         # otherwise there is no evidence anywhere and it must be investigated.
-        return (STATE_RUNNING, None) if unit_is_active(str(rec.get("unit") or "")) else (STATE_LOST, None)
+        # A scheduled job (#2636) is "running" while its timer is still armed.
+        unit = str(rec.get("unit") or "")
+        if unit_is_active(unit):
+            return STATE_RUNNING, None
+        if rec.get("scheduled_at") and unit_is_active(unit, suffix=".timer"):
+            return STATE_RUNNING, None
+        return STATE_LOST, None
     if age < STALE_SECONDS:
         return STATE_RUNNING, None
     if unit_is_active(str(rec.get("unit") or "")):
@@ -260,6 +418,9 @@ def _row(rec: Dict[str, Any]) -> str:
     code = rec.get("_exit")
     if code is not None:
         row += f"  (**EXIT={code}**)"
+    at = " ".join(str(rec.get("scheduled_at") or "").split())[:40]
+    if at and code is None:
+        row += f"  ⏰ {at}"
     log_path = str(rec.get("log") or "").strip()
     if log_path:
         row += f"  로그: `{log_path}`"
@@ -351,11 +512,36 @@ def _max_bytes(argv: List[str]) -> int:
         return DEFAULT_MAX_BYTES
 
 
+_REGISTER_USAGE = (
+    "usage: detached_jobs.py register --unit U --log PATH [--summary S] [--workdir W]"
+    " [--expect <duration> | --until <time>] [--no-wait]\n"
+)
+
+
+def _expectation(argv: List[str]) -> Tuple[Optional[int], Optional[str]]:
+    """``(seconds, error)`` from ``--expect`` / ``--until``; ``(None, None)`` when absent."""
+    expect = _opt(argv, "expect").strip()
+    until = _opt(argv, "until").strip()
+    if expect and until:
+        return None, "--expect and --until are mutually exclusive"
+    if expect:
+        seconds = parse_duration(expect)
+        return (seconds, None) if seconds else (None, f"cannot parse --expect {expect!r} (try 45m, 2h, 1d)")
+    if until:
+        seconds = parse_until(until)
+        return (seconds, None) if seconds else (None, f"cannot parse --until {until!r} or it is not in the future")
+    return None, None
+
+
 def cmd_register(argv: List[str]) -> int:
     unit = _opt(argv, "unit").strip()
     log_path = _opt(argv, "log").strip()
     if not unit or not log_path:
-        sys.stderr.write("usage: detached_jobs.py register --unit U --log PATH [--summary S] [--workdir W]\n")
+        sys.stderr.write(_REGISTER_USAGE)
+        return 2
+    expect_seconds, err = _expectation(argv)
+    if err:
+        sys.stderr.write(f"detached_jobs: {err}\n{_REGISTER_USAGE}")
         return 2
     rec: Dict[str, Any] = {
         "unit": unit,
@@ -370,9 +556,181 @@ def cmd_register(argv: List[str]) -> int:
     workdir = _opt(argv, "workdir").strip()
     if workdir:
         rec["workdir"] = workdir
+    plan = wait_plan(expect_seconds)
+    if expect_seconds is not None:
+        rec["expect_seconds"] = int(expect_seconds)
+    if not plan["arm"]:
+        # Over budget: the job's own completion must announce itself (#2636).
+        rec["notify_on_exit"] = True
     rc = _append(registry_path(_opt(argv, "registry")), rec)
-    if rc == 0 and not _opt(argv, "registry") and "--no-wait" not in argv:
-        _arm_bridge_wait(unit, rec["log"], summary)
+    if rc != 0:
+        return rc
+    if _opt(argv, "registry") or "--no-wait" in argv:
+        return 0
+    if not plan["arm"]:
+        sys.stdout.write(f"bridge wait not armed: {plan['reason']}\n")
+        return 0
+    if plan["timeout_seconds"] is None:
+        sys.stdout.write(f"hint: {plan['reason']}\n")
+    _arm_bridge_wait(unit, rec["log"], summary, timeout_seconds=plan["timeout_seconds"])
+    return rc
+
+
+def _spool_dir() -> str:
+    explicit = os.environ.get("CCC_PUSH_SPOOL", "").strip()
+    if explicit:
+        return explicit
+    state = os.environ.get("CCC_STATE_DIR", "").strip()
+    if not state:
+        state = os.path.join(os.environ.get("HOME", "/root"), ".claude", "state")
+    return os.path.join(state, "telegram-spool")
+
+
+def write_notice(unit: str, exit_code: int, *, summary: str = "", log_path: str = "", spool: str = "") -> str:
+    """Queue one body-free completion notice for the bridge PushNotifier (#2636).
+
+    Same record shape as ``claude/hooks/notify.sh`` (``ts/event/node/text/dedup``);
+    the notifier dedups on ``dedup`` and never reads anything else. Returns the
+    spool file path, or '' when the spool is unwritable (never raises).
+    """
+    spool = spool or _spool_dir()
+    mark = "✅" if exit_code == 0 else "❌"
+    text = f"{mark} 분리 작업 `{unit}` 종료 EXIT={exit_code}"
+    summary = " ".join((summary or "").split())[:200]
+    if summary:
+        text += f" — {summary}"
+    if log_path:
+        text += f" · 로그 {log_path}"
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    node = os.environ.get("CCC_NODE", "").strip() or (os.uname().nodename.split(".")[0] if hasattr(os, "uname") else "node")
+    record = {"ts": ts, "event": NOTIFY_EVENT, "node": node, "text": text, "dedup": f"{NOTIFY_EVENT}:{unit}:{exit_code}"}
+    safe_unit = re.sub(r"[^A-Za-z0-9_.-]", "_", unit)[:80]
+    # Exit code and pid keep two notices for one unit in the same second apart
+    # (a retry after failure); the notifier dedups on ``dedup``, not the name.
+    final = os.path.join(spool, f"{ts.replace(':', '-')}-{NOTIFY_EVENT}-{safe_unit}-{exit_code}-{os.getpid()}.json")
+    tmp = final + f".{os.getpid()}.tmp"
+    try:
+        os.makedirs(spool, mode=0o700, exist_ok=True)
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(tmp, final)
+    except OSError as exc:
+        sys.stderr.write(f"detached_jobs: cannot queue notice: {exc}\n")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return ""
+    return final
+
+
+def cmd_notify(argv: List[str]) -> int:
+    unit = _opt(argv, "unit").strip()
+    raw_exit = _opt(argv, "exit").strip()
+    if not unit or not raw_exit:
+        sys.stderr.write("usage: detached_jobs.py notify --unit U --exit N [--summary S] [--log P]\n")
+        return 2
+    try:
+        exit_code = int(raw_exit)
+    except ValueError:
+        sys.stderr.write("detached_jobs: --exit must be an integer\n")
+        return 2
+    path = write_notice(unit, exit_code, summary=_opt(argv, "summary"), log_path=_opt(argv, "log").strip())
+    if path:
+        sys.stdout.write(f"notice queued: {path}\n")
+    return 0 if path else 1
+
+
+_SCHEDULE_USAGE = (
+    "usage: detached_jobs.py schedule --unit U --at \"<systemd calendar>\" --log PATH"
+    " [--summary S] [--workdir W] [--print] -- <command…>\n"
+)
+
+
+def build_schedule_command(
+    *, unit: str, at: str, log_path: str, command: List[str], summary: str = "", workdir: str = "", module: str = "",
+) -> List[str]:
+    """The exact ``systemd-run`` argv for a scheduled, self-announcing job.
+
+    The wrapper is the ``bridge-safe-detached-run`` Step 1 recipe plus the
+    notice: command output appended to the log, ``EXIT=<rc>`` as the last
+    line, then ``notify`` with the same unit/exit so the owner hears the
+    result without a ⏳ wait. HOME/PATH are injected because transient units
+    inherit neither.
+    """
+    module = module or os.path.abspath(__file__)
+    home = os.environ.get("HOME", "/root")
+    path_env = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    notify = [sys.executable or "python3", module, "notify", "--unit", unit, "--log", log_path]
+    if summary:
+        notify += ["--summary", summary]
+    script = (
+        f"{shlex.join(command)} >> {shlex.quote(log_path)} 2>&1; rc=$?; "
+        f"echo \"EXIT=$rc\" >> {shlex.quote(log_path)}; "
+        f"{shlex.join(notify)} --exit \"$rc\" >/dev/null 2>&1 || true; exit \"$rc\""
+    )
+    argv = [
+        "systemd-run", "--unit", unit, "--collect",
+        "--on-calendar", at, "--timer-property=AccuracySec=1min",
+        f"--property=Environment=HOME={home}",
+        f"--property=Environment=PATH={path_env}",
+    ]
+    if workdir:
+        argv.append(f"--property=WorkingDirectory={workdir}")
+    argv += ["/bin/bash", "-c", script]
+    return argv
+
+
+def cmd_schedule(argv: List[str]) -> int:
+    if "--" not in argv:
+        sys.stderr.write(_SCHEDULE_USAGE)
+        return 2
+    split = argv.index("--")
+    opts, command = argv[:split], argv[split + 1:]
+    unit = _opt(opts, "unit").strip()
+    at = _opt(opts, "at").strip()
+    log_path = _opt(opts, "log").strip()
+    if not unit or not at or not log_path or not command:
+        sys.stderr.write(_SCHEDULE_USAGE)
+        return 2
+    if not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,200}", unit):
+        sys.stderr.write("detached_jobs: --unit must be a plain systemd unit name\n")
+        return 2
+    log_path = os.path.abspath(os.path.expanduser(log_path))
+    summary = " ".join(_opt(opts, "summary").split())[:200]
+    workdir = _opt(opts, "workdir").strip()
+    cmd = build_schedule_command(
+        unit=unit, at=at, log_path=log_path, command=command, summary=summary, workdir=workdir,
+    )
+    if "--print" in opts or "--dry-run" in opts:
+        sys.stdout.write(shlex.join(cmd) + "\n")
+        return 0
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+    except FileNotFoundError:
+        sys.stderr.write("detached_jobs: systemd-run not available on this node (Termux? use setsid + notify)\n")
+        return 3
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write(f"detached_jobs: systemd-run failed: {exc}\n")
+        return 3
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "ignore").strip().splitlines()
+        sys.stderr.write(f"detached_jobs: systemd-run rc={proc.returncode}: {tail[-1] if tail else ''}\n")
+        return 3
+    rec: Dict[str, Any] = {
+        "unit": unit,
+        "log": log_path,
+        "started_at": int(time.time()),
+        "scheduled_at": at[:80],
+        "notify_on_exit": True,
+    }
+    if summary:
+        rec["summary"] = summary
+    if workdir:
+        rec["workdir"] = workdir
+    rc = _append(registry_path(_opt(opts, "registry")), rec)
+    if rc == 0:
+        sys.stdout.write(f"scheduled: unit={unit} at={at!r} (no ⏳ wait; completion arrives as a spool notice)\n")
     return rc
 
 
@@ -387,7 +745,7 @@ def _bridge_python() -> str:
     return ""
 
 
-def _arm_bridge_wait(unit: str, log_path: str, summary: str) -> None:
+def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds: Optional[int] = None) -> None:
     """Best-effort: register the job as a bridge ``detached-job`` wait (ccc-node #2605).
 
     Inside a bridge turn this puts ``⏳ Running detached · <unit>`` on the
@@ -396,6 +754,8 @@ def _arm_bridge_wait(unit: str, log_path: str, summary: str) -> None:
     restart. Outside a turn (no active route), on a node without the bridge,
     or when ``CCC_DETACHED_JOBS_NO_WAIT=1`` / ``--no-wait`` / ``--registry``
     is given, it does nothing; the job registry above is never affected.
+    ``timeout_seconds`` (#2636) sizes the wait to the caller's expectation;
+    None keeps the bridge default.
     """
     if os.environ.get("CCC_DETACHED_JOBS_NO_WAIT", "").strip() in {"1", "true", "yes", "on"}:
         return
@@ -408,6 +768,8 @@ def _arm_bridge_wait(unit: str, log_path: str, summary: str) -> None:
     ]
     if summary:
         cmd += ["--summary", summary]
+    if timeout_seconds is not None:
+        cmd += ["--timeout-seconds", str(int(timeout_seconds))]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
@@ -472,6 +834,10 @@ def main(argv: List[str]) -> int:
     cmd, rest = argv[0], argv[1:]
     if cmd == "register":
         return cmd_register(rest)
+    if cmd == "schedule":
+        return cmd_schedule(rest)
+    if cmd == "notify":
+        return cmd_notify(rest)
     if cmd == "ack":
         return cmd_ack(rest)
     if cmd == "list":

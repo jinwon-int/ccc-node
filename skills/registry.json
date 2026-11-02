@@ -120,18 +120,18 @@
       "name": "bridge-detached-self-restart",
       "source": "skills/bridge-detached-self-restart",
       "status": "active",
-      "tree_sha256": "e265080c2f0e1037c6a4a3461864a6970043fffe490ae4d9cd595ac5cb79778f"
+      "tree_sha256": "0e04d37d92588ee98bee3a34d5609d1b4d4f3abb8566a0f751cf2bd727238802"
     },
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Use when a command or wait may outlive the session, a bridge restart, or a bridge turn limit (installs, builds, long tests, fleet polling), a job died on restart, a turn-timeout/stall notice appeared, or a done job looks failed as its watcher died. Logged systemd unit + EXIT marker + job registry.",
+      "description": "Use when a command or wait may outlive the session, a bridge restart, or a turn limit (installs, builds, long tests, fleet polling), a job died on restart, a done job looks failed as its watcher died, or work must start later and just announce its result. systemd unit + EXIT marker + registry.",
       "files": 1,
       "managed": false,
       "name": "bridge-safe-detached-run",
       "source": "skills/bridge-safe-detached-run",
       "status": "active",
-      "tree_sha256": "53220b7d69aabfa34c137bb751b435d7f72bf8bda3b9b5d026b018a28918e84f"
+      "tree_sha256": "c7aa70e89cb2b14a327fcd764c21f5441043648f5909a9a9961fa93abd5d881c"
     },
     {
       "audience": "claude",

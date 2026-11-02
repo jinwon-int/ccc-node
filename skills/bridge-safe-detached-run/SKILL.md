@@ -1,6 +1,6 @@
 ---
 name: bridge-safe-detached-run
-description: Use when a command or wait may outlive the session, a bridge restart, or a bridge turn limit (installs, builds, long tests, fleet polling), a job died on restart, a turn-timeout/stall notice appeared, or a done job looks failed as its watcher died. Logged systemd unit + EXIT marker + job registry.
+description: Use when a command or wait may outlive the session, a bridge restart, or a turn limit (installs, builds, long tests, fleet polling), a job died on restart, a done job looks failed as its watcher died, or work must start later and just announce its result. systemd unit + EXIT marker + registry.
 ---
 
 # bridge-safe-detached-run
@@ -25,6 +25,9 @@ the process watching it did not.
   or stall notice and the late final answer never arrived (Step 2c)
 - `systemd-run` output mysteriously fails because `HOME` is missing (see the
   `HOME`/`PATH` injection rule in Step 1)
+- The work should start later (after a nightly self-update, a deploy window)
+  or will run longer than the bridge wait budget (6 h) — `schedule` it; never
+  park a sleeping watcher behind a `⏳ Running detached` line (Step 2d, #2636)
 
 ## Step 1 — Launch as a transient unit
 
@@ -72,8 +75,27 @@ Register the log path immediately after launching, in the same turn:
 
 ```bash
 python3 ~/.claude/hooks/lib/detached_jobs.py register \
-  --unit <job> --log "$LOG" --summary "<one line, body-free>"
+  --unit <job> --log "$LOG" --summary "<one line, body-free>" \
+  --expect 90m            # or --until "05:30" — how long the job should take
 ```
+
+Inside a bridge turn `register` also arms a `detached-job` wait (#2605 layer
+3): `⏳ Running detached · <job>` on the conversation's status line and a wake
+when `EXIT=` appears. **That wait has a budget** — the bridge default of 6 h —
+and `--expect`/`--until` is how `register` decides whether a wait is honest
+(#2636):
+
+| expectation | what `register` does |
+|---|---|
+| ≤ budget (e.g. `--expect 90m`) | arms the wait, sized to expectation + 30 min (capped at the budget), so "up to …" on the status line is true |
+| > budget (e.g. `--expect 20h`, `--until` tomorrow) | **no ⏳ wait**; the row is flagged `notify_on_exit` and stdout tells you to make the unit announce itself (`notify`, or `schedule` in Step 2d) |
+| none given | arms with the bridge default and prints a hint — always pass the expectation |
+
+Rule: a ⏳ line is for work **this conversation must resume on, inside the
+budget**. A unit that sleeps until a future time, or polls for most of a day,
+is not that — it is a scheduled job (Step 2d). Registering it as a wait leaves
+an all-day status line that ends `expired` with no result (fleet incident,
+2026-11-02).
 
 Now the completion evidence is durable and **stateless to read**: every
 SessionStart sweeps the registry and reports each job as `done` (with its real
@@ -138,6 +160,33 @@ live values before a long wait; never quote a remembered number.
    explicitly in the next report, and never restart or interrupt the bridge to
    clear a stuck turn — that is approval-gated and session-killing
    (`bridge-detached-self-restart`).
+
+## Step 2d — Start later / run long: `schedule`, not a sleeping wait
+
+For "run this at 05:00 after the self-update and tell me how it went", or any
+job expected to outlive the wait budget, do not launch a unit that sleeps and
+register it. Schedule it:
+
+```bash
+python3 ~/.claude/hooks/lib/detached_jobs.py schedule \
+  --unit <job> --at "2026-11-03 05:00:00 Asia/Seoul" \
+  --log "$HOME/.claude/state/<job>.log" --summary "<one line>" \
+  -- bash /path/to/check.sh
+python3 ~/.claude/hooks/lib/detached_jobs.py schedule ... --print -- <cmd>   # show the systemd-run line only
+```
+
+`schedule` builds the Step 1 recipe as a `systemd-run --on-calendar` transient
+timer (HOME/PATH injected, output appended to the log, `EXIT=<rc>` last), then
+has the wrapper call `detached_jobs.py notify --unit <job> --exit <rc>`: one
+body-free spool record the bridge delivers to the owner as `🔔 ccc-node
+[DetachedJob]` — **no ⏳ line, no wake**. The registry row carries
+`scheduled_at`/`notify_on_exit`; until the timer fires the SessionStart sweep
+lists the job as running with its ⏰ time (timer active, no log yet), not lost.
+`--at` takes any systemd calendar spec (`systemd-analyze calendar "<spec>"` to
+check it). Hand-written units get the same announcement by appending
+`python3 ~/.claude/hooks/lib/detached_jobs.py notify --unit <job> --exit "$rc"`
+after their `EXIT=` line. Non-systemd nodes (Termux): `schedule` exits 3 —
+use the `setsid`/`nohup` fallback with a sleep-until and the same `notify`.
 
 ## Receiving `<task-notification status=stopped>` — classify first
 
@@ -208,3 +257,8 @@ systemctl stop <job>.service                               # abort a running job
   restarting or re-running anything
 - A long wait was handed to a unit and the turn ended before the bridge's turn
   ceiling; the result was reported in a later turn from the log's `EXIT=` line
+- `register --expect 20h` printed `bridge wait not armed … exceeds the wait
+  budget` and no `⏳ Running detached` line appeared; `register --expect 90m`
+  showed `⏳ … (up to 2h)`
+- A `schedule`d job appeared as `🔔 ccc-node [DetachedJob] … EXIT=0` when it
+  finished, without a ⏳ line beforehand
