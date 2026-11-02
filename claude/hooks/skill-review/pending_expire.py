@@ -63,7 +63,7 @@ _ARCHIVE_DIR_RE = re.compile(r"^(pending-90d|prescreen-reject)-\d{8}$")
 # staging hook turned away at draft time. They never entered the queue, so the
 # `status` archived count (which uses _ARCHIVE_DIR_RE) deliberately excludes
 # them; only `restore` may pull one back for a human second look.
-_RESTORE_DIR_RE = re.compile(r"^(pending-90d|prescreen-reject)-\d{8}$|^draft-rejected$")
+_RESTORE_DIR_RE = re.compile(r"^(pending-90d|prescreen-reject|autoinstall-(revise|reject))-\d{8}$|^draft-rejected$")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
@@ -323,6 +323,59 @@ def restore(state: Path, name: str, *, now: float | None = None, node: str = "")
     return result
 
 
+def archive(
+    state: Path,
+    name: str,
+    *,
+    prefix: str,
+    reason: str,
+    lifecycle: str,
+    now: float | None = None,
+    node: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Move one undecided draft out of the queue into `<prefix><YYYYMMDD>/` (#2631).
+
+    The autoinstall layer uses this for drafts the prescreen reviewer judged
+    `revise`/`reject` once auto mode installs `approve` only: same archive
+    root, same manifest shape, same `restore` path as the 90-day expiry and
+    the prescreen blocker archive. Nothing is deleted.
+    """
+    now = time.time() if now is None else now
+    result: dict[str, Any] = {"ts": _now_iso(now), "node": node, "name": name, "prefix": prefix}
+    if not _SAFE_NAME_RE.match(name):
+        result["status"] = "unsafe-name"
+        return result
+    if not _RESTORE_DIR_RE.match(prefix + "20000101"):
+        result["status"] = "prefix-not-restorable"
+        return result
+    entry = state / "pending-skills" / name
+    if classify(entry) is not None:
+        result["status"] = "not-an-undecided-draft"
+        return result
+    try:
+        archive_dir = prepare_archive(state, now, prefix=prefix)
+    except OSError as error:
+        result["status"] = f"archive-unavailable:{error}"
+        return result
+    dest = archive_dir / name
+    if dest.exists() or dest.is_symlink():
+        result["status"] = "archive-name-taken"
+        return result
+    try:
+        os.rename(entry, dest)
+    except OSError as error:
+        result["status"] = f"rename-failed:{error.errno}"
+        return result
+    row = {"ts": _now_iso(now), "node": node, "from": str(state / "pending-skills"), "name": name,
+           "reason": reason, "lifecycle": lifecycle}
+    if extra:
+        row.update({k: v for k, v in extra.items() if k not in row})
+    _append_manifest(archive_dir, row)
+    result.update({"status": "archived", "to": str(archive_dir)})
+    return result
+
+
 def status(state: Path, *, now: float | None = None) -> dict[str, Any]:
     """Read-only backlog view used by doctor/status: age buckets of undecided drafts."""
     now = time.time() if now is None else now
@@ -366,6 +419,13 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--now", type=float, default=None, help="epoch override for tests")
     res_p = sub.add_parser("restore", help="move one archived draft back into the queue")
     res_p.add_argument("name")
+    arc_p = sub.add_parser("archive", help="move one undecided draft into a restorable archive dir (#2631)")
+    arc_p.add_argument("name")
+    arc_p.add_argument("--prefix", required=True, help="archive dir prefix, e.g. autoinstall-revise-")
+    arc_p.add_argument("--reason", required=True)
+    arc_p.add_argument("--lifecycle", required=True)
+    arc_p.add_argument("--verdict", default="")
+    arc_p.add_argument("--now", type=float, default=None)
     sub.add_parser("status", help="age buckets of the undecided queue (read-only)")
     args = parser.parse_args(argv)
     state = _state_dir()
@@ -376,6 +436,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "restore":
         out = restore(state, args.name, node=node)
         rc = 0 if out["status"] == "restored" else 1
+    elif args.cmd == "archive":
+        out = archive(state, args.name, prefix=args.prefix, reason=args.reason, lifecycle=args.lifecycle,
+                      now=args.now, node=node, extra={"verdict": args.verdict} if args.verdict else None)
+        rc = 0 if out["status"] == "archived" else 1
     else:
         out = status(state)
         rc = 0

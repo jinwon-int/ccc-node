@@ -28,6 +28,8 @@ trap 'rm -rf "$TMP"' EXIT
 # an unset anchor fell through to the operator's home.
 export HOME="$TMP/home"
 export CCC_CLAUDE_DIR="$TMP/home/.claude"
+# #2631: these cases pin the deterministic gates; the prescreen-verdict gate has its own section.
+export CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0
 mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 

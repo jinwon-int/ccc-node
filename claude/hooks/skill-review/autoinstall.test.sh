@@ -21,6 +21,8 @@ trap 'rm -rf "$TMP"' EXIT
 # an unset anchor fell through to the operator's home.
 export HOME="$TMP/home"
 export CCC_CLAUDE_DIR="$TMP/home/.claude"
+# #2631: these cases pin the deterministic gates; the prescreen-verdict gate has its own section.
+export CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0
 mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 
@@ -748,6 +750,31 @@ out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_YAML" CLAUDE_SKILLS_DIR="$SKILLS_YAML"
   CCC_NODE=testnode CCC_SKILL_AUTOSAVE_TRIGGER=yaml bash "$TMP/no-fm/hooks/skill-review/autoinstall.sh" run)"
 ok "#2032 missing renderer blocks the draft (fail closed)" \
   '[ ! -e "$SKILLS_YAML/yaml-nofm-skill" ] && jq -e ".blocked[] | select(.id == \"20260928-000003-yaml-nofm\" and .reason == \"lint description-yaml-unsafe\")" >/dev/null <<<"$out"'
+
+# --- #2631: auto mode consumes prescreen verdicts (approve installs; revise/reject archive; unscreened waits)
+rm -f "$SPOOL"/*.json
+make_draft 20260301-000001-ps-unscreened ps-unscreened "Use when capturing the recurring prescreen unscreened verification procedure."
+make_draft 20260301-000002-ps-approved ps-approved "Use when capturing the recurring prescreen approved rollout procedure."
+make_draft 20260301-000003-ps-revise ps-revise "Use when capturing the recurring prescreen revise cleanup procedure."
+make_draft 20260301-000004-ps-reject ps-reject "Use when capturing the recurring prescreen reject triage procedure."
+make_draft 20260301-000005-ps-error ps-error "Use when capturing the recurring prescreen error recovery procedure."
+printf '{"status":"ok","verdict":"approve"}\n' > "$PENDING/20260301-000002-ps-approved/prescreen.json"
+printf '{"status":"ok","verdict":"revise"}\n' > "$PENDING/20260301-000003-ps-revise/prescreen.json"
+printf '{"status":"ok","verdict":"reject"}\n' > "$PENDING/20260301-000004-ps-reject/prescreen.json"
+printf '{"status":"error","error":"handler-timeout"}\n' > "$PENDING/20260301-000005-ps-error/prescreen.json"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=1 CCC_SKILL_AUTOSAVE_DAILY_CAP=99 CCC_SKILL_AUTOSAVE_TRIGGER=test bash "$AUTO" run)"
+ok "#2631: an approve-screened draft installs" '[ -f "$SKILLS/ps-approved/SKILL.md" ]'
+ok "#2631: unscreened and reviewer-error drafts stay pending and are counted" '[ -d "$PENDING/20260301-000001-ps-unscreened" ] && [ -d "$PENDING/20260301-000005-ps-error" ] && jq -e ".unscreened >= 2 and .require_prescreen == true" >/dev/null <<<"$out"'
+ok "#2631: revise/reject drafts leave the queue into restorable archive dirs" '[ ! -e "$PENDING/20260301-000003-ps-revise" ] && [ ! -e "$PENDING/20260301-000004-ps-reject" ] && ls -d "$STATE/skill-autosave-archive/autoinstall-revise-"*/20260301-000003-ps-revise >/dev/null 2>&1 && ls -d "$STATE/skill-autosave-archive/autoinstall-reject-"*/20260301-000004-ps-reject >/dev/null 2>&1'
+ok "#2631: the archive manifest carries lifecycle and verdict" 'cat "$STATE"/skill-autosave-archive/autoinstall-revise-*/manifest.jsonl | jq -e "select(.name==\"20260301-000003-ps-revise\") | .lifecycle == \"archived:prescreen-revise\" and .verdict == \"revise\"" >/dev/null'
+ok "#2631: the summary lists the archived drafts and nothing from them installed" 'jq -e "(.prescreen_archived | map(.id) | sort) == [\"20260301-000003-ps-revise\",\"20260301-000004-ps-reject\"]" >/dev/null <<<"$out" && [ ! -e "$SKILLS/ps-revise" ] && [ ! -e "$SKILLS/ps-reject" ]'
+ok "#2631: the post-hoc notice reports archives and never asks for approval" 'txt="$(cat "$SPOOL"/*SkillAutoInstall*.json | jq -r .text)"; grep -q "프리스크린 판정으로 archive 2건(revise 1·reject 1" <<<"$txt" && grep -Eq "미심사 [0-9]+건" <<<"$txt" && ! grep -q "승인 대기" <<<"$txt"'
+# shellcheck disable=SC2034  # restore_out is read via eval inside ok()
+restore_out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE" CCC_CLAUDE_DIR="$CCC_CLAUDE_DIR" python3 "$(dirname "$AUTO")/pending_expire.py" restore 20260301-000003-ps-revise)"
+ok "#2631: an archived revise draft is restorable" 'jq -e ".status == \"restored\"" >/dev/null <<<"$restore_out" && [ -d "$PENDING/20260301-000003-ps-revise" ]'
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0 CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
+ok "#2631: REQUIRE_PRESCREEN=0 keeps the pre-#2631 behaviour (unscreened clean draft installs)" '[ -f "$SKILLS/ps-unscreened/SKILL.md" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

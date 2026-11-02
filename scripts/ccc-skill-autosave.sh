@@ -961,10 +961,33 @@ if [ -f "$REVIEW" ] && [ ! -f "$STATE_DIR/skill-review.disabled" ]; then
     || log "reindex failed (non-fatal) $(printf '%s' "$summary" | head -c 200)"
 fi
 
+# --- 2a'') pre-screen undecided drafts (#2183; before autoinstall since #2631) -----
+# The same independent reviewer the fleet-skills intake uses (rubric A-H)
+# reads each undecided draft before a human does: reject+blocker is archived
+# under skill-autosave-archive/prescreen-reject-<date>/ (manifest row,
+# restorable), everything else stays with its verdict in prescreen.json for
+# /skillsuggest. Runs the handler locally — no broker, no edge secret. A
+# reviewer failure never moves a draft (fail-open toward the human gate), and
+# three consecutive failures stop the run. Bounded per run; nothing installs
+# here — but in auto mode the installer below only takes `approve` verdicts
+# (#2631), so this stage runs first in the sweep.
+if [ -f "$PRESCREEN" ] && command -v python3 >/dev/null 2>&1; then
+  prescreen_args="run"
+  [ "$AUTONOMY_STATE" = "dry-run" ] && prescreen_args="run --dry-run"
+  # shellcheck disable=SC2086  # prescreen_args is a fixed word list built above
+  summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_NODE="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}" python3 "$PRESCREEN" $prescreen_args 2>>"$LOG")" \
+    && log "prescreen $(printf '%s' "$summary" | head -c 600)" \
+    || log "prescreen failed (non-fatal) $(printf '%s' "$summary" | head -c 300)"
+else
+  log "prescreen skipped reason=missing-runtime"
+fi
+
 # --- 2b) auto mode (#355): machine-gate + install passing drafts -------------
 # autoinstall.sh no-ops unless mode=auto; it owns the gates, the daily cap, the
-# installed-by=autosave ledger and the post-hoc Telegram notice for installs
-# and blocks, so the sweep just invokes it and records the summary.
+# installed-by=autosave ledger and the post-hoc Telegram notice for installs,
+# blocks and (#2631) prescreen archives, so the sweep just invokes it and
+# records the summary. It installs only drafts the prescreen stage above
+# marked `approve`; revise/reject leave the queue into a restorable archive.
 EFFECTIVE_MODE="$(resolve_mode)"
 if [ "$EFFECTIVE_MODE" = "auto" ]; then
   log "mode-advisory mode=auto source=$(mode_source) recommended=review (#2011) migrate='ccc-skill-autosave.sh set-mode review'"
@@ -1037,25 +1060,6 @@ if [ -f "$PENDING_EXPIRE" ] && command -v python3 >/dev/null 2>&1; then
     || log "pending-expire failed (non-fatal) $(printf '%s' "$summary" | head -c 300)"
 else
   log "pending-expire skipped reason=missing-runtime"
-fi
-
-# --- 2c3) pre-screen undecided drafts (#2183) ----------------------------------
-# The same independent reviewer the fleet-skills intake uses (rubric A-H)
-# reads each undecided draft before a human does: reject+blocker is archived
-# under skill-autosave-archive/prescreen-reject-<date>/ (manifest row,
-# restorable), everything else stays with its verdict in prescreen.json for
-# /skillsuggest. Runs the handler locally — no broker, no edge secret. A
-# reviewer failure never moves a draft (fail-open toward the human gate), and
-# three consecutive failures stop the run. Bounded per run; nothing installs.
-if [ -f "$PRESCREEN" ] && command -v python3 >/dev/null 2>&1; then
-  prescreen_args="run"
-  [ "$AUTONOMY_STATE" = "dry-run" ] && prescreen_args="run --dry-run"
-  # shellcheck disable=SC2086  # prescreen_args is a fixed word list built above
-  summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_NODE="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}" python3 "$PRESCREEN" $prescreen_args 2>>"$LOG")" \
-    && log "prescreen $(printf '%s' "$summary" | head -c 600)" \
-    || log "prescreen failed (non-fatal) $(printf '%s' "$summary" | head -c 300)"
-else
-  log "prescreen skipped reason=missing-runtime"
 fi
 
 # --- 2d) private skill intake (explicit opt-in) ------------------------------
