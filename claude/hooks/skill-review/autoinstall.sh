@@ -57,6 +57,12 @@ DAILY_CAP="${CCC_SKILL_AUTOSAVE_DAILY_CAP:-3}"
 NOTIFY="${CCC_SKILL_AUTOSAVE_NOTIFY:-1}"
 TRIGGER="${CCC_SKILL_AUTOSAVE_TRIGGER:-manual}"
 case "$DAILY_CAP" in ''|*[!0-9]*) DAILY_CAP=3 ;; esac
+# #2631: auto mode installs only drafts the prescreen reviewer (#2183, rubric
+# A-H) judged `approve`; `revise`/`reject` drafts move to a restorable archive
+# without a human ever seeing them, unscreened drafts wait for the next
+# prescreen run. 0 restores the pre-#2631 behaviour (deterministic gates only).
+REQUIRE_PRESCREEN="${CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN:-1}"
+case "$REQUIRE_PRESCREEN" in 0|false|no|off) REQUIRE_PRESCREEN=0 ;; *) REQUIRE_PRESCREEN=1 ;; esac
 
 KEBAB='^[a-z0-9]+(-[a-z0-9]+)*$'
 DESC_MIN=20
@@ -484,6 +490,30 @@ claim_urls() { # <skill.md> — every citable URL, deduped, scheme-normalized
 # run — gate + install
 # ---------------------------------------------------------------------------
 
+# Prescreen verdict of one draft (#2631): approve | revise | reject | error | none.
+# Only a reviewer result with status=ok counts; anything else is "not screened".
+prescreen_verdict() { # <draft-dir>
+  local f="$1/prescreen.json" v st
+  [ -f "$f" ] || { printf 'none'; return 0; }
+  st="$(jq -r '.status // empty' "$f" 2>/dev/null)"
+  v="$(jq -r '.verdict // empty' "$f" 2>/dev/null | tr 'A-Z' 'a-z')"
+  if [ "$st" != "ok" ]; then printf 'error'; return 0; fi
+  case "$v" in approve|revise|reject) printf '%s' "$v" ;; *) printf 'none' ;; esac
+}
+
+# Move a revise/reject draft into skill-autosave-archive/autoinstall-<verdict>-<date>/
+# (manifest row, `pending_expire.py restore <id>` brings it back). Prints the
+# archive status; a failure leaves the draft pending (fail-open toward the queue).
+archive_prescreened() { # <draft-id> <verdict>
+  local out tool="$AUTOINSTALL_LIB_DIR/pending_expire.py"
+  [ -f "$tool" ] && command -v python3 >/dev/null 2>&1 || { printf 'tool-missing'; return 1; }
+  out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" python3 "$tool" archive "$1" \
+    --prefix "autoinstall-$2-" --verdict "$2" --lifecycle "archived:prescreen-$2" \
+    --reason "prescreen verdict $2 — auto mode installs approve only (#2631)" 2>/dev/null)" || { printf 'archive-failed'; return 1; }
+  printf '%s' "$(jq -r '.status // "unknown"' <<<"$out" 2>/dev/null)"
+  [ "$(jq -r '.status // empty' <<<"$out" 2>/dev/null)" = "archived" ]
+}
+
 mark_blocked() { # <draft-dir> <reason> ; echoes "new" when first seen with this reason
   local reason="$2" marker="$1/autosave-block.json" prev=""
   [ -f "$marker" ] && prev="$(jq -r '.reason // empty' "$marker" 2>/dev/null)"
@@ -567,8 +597,8 @@ do_run() {
   local work dir id f name desc verdict rec sha sid dest proposal_file action apply_json apply_rc validation_json
   local base_provider="$SKILL_PROVIDER" base_skills_dir="$SKILLS_DIR"
   local -a draft_providers=()
-  local -a installed=() blocked=() newly_blocked=() would_install=()
-  local deferred=0 failed=0 today_used legacy_used incremental_used incremental_cap
+  local -a installed=() blocked=() newly_blocked=() would_install=() ps_archived=()
+  local deferred=0 failed=0 unscreened=0 today_used legacy_used incremental_used incremental_cap ps_verdict ps_status
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
   mkdir -p "$work" 2>/dev/null
   trap 'rm -rf "$work" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null' RETURN
@@ -641,6 +671,28 @@ do_run() {
     esac
     proposal_file="$dir/proposal.json"
     f="$dir/SKILL.md"
+    # #2631 reviewer gate (SKILL.md drafts; incremental proposals keep their
+    # own validator): approve proceeds to the machine gates below, revise/reject
+    # leave the queue into a restorable archive, not-yet-screened waits.
+    if [ "$REQUIRE_PRESCREEN" = 1 ] && [ ! -f "$proposal_file" ]; then
+      ps_verdict="$(prescreen_verdict "$dir")"
+      case "$ps_verdict" in
+        approve) ;;
+        revise|reject)
+          if ps_status="$(archive_prescreened "$id" "$ps_verdict")"; then
+            ps_archived+=("$(jq -nc --arg id "$id" --arg verdict "$ps_verdict" '{id:$id, verdict:$verdict}')")
+            log "archived id=$id reason=prescreen-$ps_verdict trigger=$TRIGGER"
+          else
+            failed=$((failed + 1))
+            log "archive-failed id=$id verdict=$ps_verdict status=$ps_status trigger=$TRIGGER"
+          fi
+          continue ;;
+        *)
+          unscreened=$((unscreened + 1))
+          log "deferred id=$id reason=unscreened prescreen=$ps_verdict trigger=$TRIGGER"
+          continue ;;
+      esac
+    fi
     if [ -f "$proposal_file" ]; then
       if [ -e "$f" ]; then
         record_block "$dir" "$id" "proposal mixed-payload"; continue
@@ -835,12 +887,16 @@ do_run() {
     --argjson failed "$failed" \
     --argjson pending "$(pending_count)" \
     --arg autonomy "$AUTONOMY_STATE" \
+    --argjson unscreened "$unscreened" \
+    --argjson require_prescreen "$REQUIRE_PRESCREEN" \
+    --argjson prescreen_archived "$(printf '%s\n' "${ps_archived[@]:-}" | jq -sc 'map(select(type=="object"))' 2>/dev/null || printf '[]')" \
     --argjson providers "$(printf '%s\n' "${draft_providers[@]:-}" | jq -R . | jq -sc 'map(select(length>0)) | unique')" \
     '{mode:"auto", autonomy:$autonomy, providers:$providers,
       provider:(if ($providers | length) == 1 then $providers[0] else null end),
       installed:$installed, blocked:$blocked,
       newly_blocked:$newly_blocked, would_install:$would_install,
-      dry_run:($autonomy=="dry-run"), deferred:$deferred, failed:$failed, pending:$pending}')"
+      dry_run:($autonomy=="dry-run"), deferred:$deferred, failed:$failed, pending:$pending,
+      require_prescreen:($require_prescreen==1), unscreened:$unscreened, prescreen_archived:$prescreen_archived}')"
   printf '%s\n' "$summary"
   log "run done $summary"
   notify_summary "$summary"
@@ -850,15 +906,23 @@ do_run() {
 # After-the-fact owner notification — same spool contract as the sweep/notify.sh:
 # short redaction-safe text; the bridge PushNotifier (opt-in) delivers it.
 notify_summary() { # <summary-json>
-  local summary="$1" n_inst n_new_blk n_def text parts dedup now fname node
+  local summary="$1" n_inst n_new_blk n_def n_arc n_rev n_rej n_unscreened text parts dedup now fname node
   [ "$NOTIFY" = "1" ] || return 0
   n_inst="$(jq -r '.installed | length' <<<"$summary" 2>/dev/null || printf 0)"
   n_new_blk="$(jq -r '.newly_blocked | length' <<<"$summary" 2>/dev/null || printf 0)"
   n_def="$(jq -r '.deferred' <<<"$summary" 2>/dev/null || printf 0)"
-  [ "$n_inst" -gt 0 ] 2>/dev/null || [ "$n_new_blk" -gt 0 ] 2>/dev/null || return 0
+  n_arc="$(jq -r '.prescreen_archived | length' <<<"$summary" 2>/dev/null || printf 0)"
+  n_rev="$(jq -r '[.prescreen_archived[]? | select(.verdict=="revise")] | length' <<<"$summary" 2>/dev/null || printf 0)"
+  n_rej="$(jq -r '[.prescreen_archived[]? | select(.verdict=="reject")] | length' <<<"$summary" 2>/dev/null || printf 0)"
+  n_unscreened="$(jq -r '.unscreened // 0' <<<"$summary" 2>/dev/null || printf 0)"
+  [ "$n_inst" -gt 0 ] 2>/dev/null || [ "$n_new_blk" -gt 0 ] 2>/dev/null || [ "$n_arc" -gt 0 ] 2>/dev/null || return 0
   parts=""
   if [ "$n_inst" -gt 0 ]; then
     parts="스킬 자동 설치 ${n_inst}건: $(jq -r '.installed | join(", ")' <<<"$summary")"
+  fi
+  if [ "$n_arc" -gt 0 ] 2>/dev/null; then
+    [ -n "$parts" ] && parts="$parts · "
+    parts="${parts}프리스크린 판정으로 archive ${n_arc}건(revise ${n_rev}·reject ${n_rej}, 복원 가능)"
   fi
   if [ "$n_new_blk" -gt 0 ]; then
     [ -n "$parts" ] && parts="$parts · "
@@ -869,11 +933,14 @@ notify_summary() { # <summary-json>
   if [ "$n_def" -gt 0 ] 2>/dev/null; then
     parts="$parts · 일일 상한(${DAILY_CAP}건) 도달로 ${n_def}건 보류"
   fi
-  text="$parts — '/skillsuggest'로 사후 검토/롤백하세요."
+  if [ "$n_unscreened" -gt 0 ] 2>/dev/null; then
+    parts="$parts · 미심사 ${n_unscreened}건은 다음 프리스크린 뒤 처리"
+  fi
+  text="$parts — 사후 확인/롤백: '/skillsuggest'."
   mkdir -p "$SPOOL" 2>/dev/null || return 0
   node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
   now="$(ts)"
-  dedup="SkillAutoInstall:$(jq -r '.installed | join(",")' <<<"$summary"):$(jq -r '.newly_blocked | join(",")' <<<"$summary")"
+  dedup="SkillAutoInstall:$(jq -r '.installed | join(",")' <<<"$summary"):$(jq -r '.newly_blocked | join(",")' <<<"$summary"):$(jq -r '[.prescreen_archived[]?.id] | join(",")' <<<"$summary")"
   dedup="$(printf '%s' "$dedup" | cut -c1-120)"
   fname="$SPOOL/$(printf '%s' "$now" | tr ':' '-')-SkillAutoInstall-$$.json"
   if jq -nc --arg ts "$now" --arg node "$node" --arg text "$text" --arg dedup "$dedup" \

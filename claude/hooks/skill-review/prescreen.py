@@ -137,15 +137,54 @@ def resolve_handler() -> Path | None:
         Path("/usr/local/sbin/skills-intake-review-handler.sh"),
         _claude_dir() / "hooks" / "skills-intake-review-handler.sh",
         Path(__file__).resolve().parents[3] / "scripts" / "skills-intake-review-handler.sh",
+        *_repo_handler_candidates(),
     ):
         if cand.is_file() and os.access(cand, os.X_OK):
             return cand
     return None
 
 
+def _repo_handler_candidates() -> list[Path]:
+    """The ccc-node checkouts an installed node has (#2631).
+
+    The repo-relative candidate above only resolves inside a checkout; on an
+    installed node this file lives under ~/.claude/hooks and `parents[3]` is
+    the home directory. Probe the checkout self-update maintains instead:
+    the operator's `~/.claude/self-update.repo` override, then the two
+    conventional roots (`/opt/ccc-node`, `~/ccc-node` on Termux).
+    """
+    roots: list[Path] = []
+    override = _claude_dir() / "self-update.repo"
+    try:
+        for line in override.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                roots.append(Path(os.path.expanduser(line)))
+                break
+    except OSError:
+        pass
+    roots += [Path("/opt/ccc-node"), Path(os.path.expanduser("~")) / "ccc-node"]
+    return [root / "scripts" / "skills-intake-review-handler.sh" for root in roots]
+
+
+#: Where the reviewer procedure came from in the last `load_procedure` call:
+#: the checkout path, "bundled" (intake_procedure.py), or "" when none.
+PROCEDURE_SOURCE = ""
+
+
 def load_procedure() -> str | None:
+    """The reviewer procedure: a local a2a-nexus checkout first, else the bundle.
+
+    An explicit CCC_SKILL_PRESCREEN_NEXUS_DIR is authoritative when it holds
+    the document; the conventional checkout roots come next; a node with no
+    checkout at all falls back to the verbatim snapshot in
+    `intake_procedure.py` (#2631) instead of reporting procedure-unavailable.
+    Set CCC_SKILL_PRESCREEN_NEXUS_DIR=off to disable the bundle too.
+    """
+    global PROCEDURE_SOURCE
+    PROCEDURE_SOURCE = ""
     explicit = os.environ.get("CCC_SKILL_PRESCREEN_NEXUS_DIR")
-    roots = [Path(explicit).expanduser()] if explicit else []
+    roots = [Path(explicit).expanduser()] if explicit and explicit != "off" else []
     home = Path(os.environ.get("HOME", "/root"))
     roots += [home / "work" / "a2a" / "a2a-nexus", home / "a2a-nexus", Path("/opt/a2a-nexus")]
     for root in roots:
@@ -159,7 +198,18 @@ def load_procedure() -> str | None:
             continue
         procedure = text[start:end].strip()
         if len(procedure) >= 256:
+            PROCEDURE_SOURCE = str(doc)
             return procedure
+    if explicit == "off":
+        return None
+    try:
+        import intake_procedure  # bundled snapshot beside this module
+    except ImportError:
+        return None
+    procedure = str(getattr(intake_procedure, "PROCEDURE", "") or "").strip()
+    if len(procedure) >= 256:
+        PROCEDURE_SOURCE = "bundled"
+        return procedure
     return None
 
 
@@ -451,6 +501,7 @@ def run(state: Path, *, dry_run: bool, now: float | None = None, node: str = "")
     handler = resolve_handler()
     procedure = load_procedure()
     summary["handler"] = str(handler) if handler else None
+    summary["procedure_source"] = PROCEDURE_SOURCE or None
     if handler is None or procedure is None:
         summary["status"] = "handler-unavailable" if handler is None else "procedure-unavailable"
         _write_last(state, summary)

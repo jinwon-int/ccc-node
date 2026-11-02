@@ -94,7 +94,9 @@ ok "max-per-run=0 is off and calls nothing" 'printf "%s" "$out" | jq -e ".status
 # --- 3) missing handler / procedure: fail-open, nothing moves --------------------------
 out="$(CCC_SKILL_PRESCREEN_HANDLER="$TMP/nope.sh" run_ps run --now "$NOW")"
 ok "missing handler reported, nothing moved" 'printf "%s" "$out" | jq -e ".status == \"handler-unavailable\"" >/dev/null && [ -d "$PENDING/20260902-000000-bbbb-bad" ]'
-out="$(CCC_SKILL_PRESCREEN_NEXUS_DIR="$TMP/nonexus" run_ps run --now "$NOW")"
+# #2631: a missing checkout alone no longer stops the run (the bundled procedure
+# answers); `off` is the explicit way to have no procedure at all.
+out="$(CCC_SKILL_PRESCREEN_NEXUS_DIR=off run_ps run --now "$NOW")"
 ok "missing procedure reported, nothing moved" 'printf "%s" "$out" | jq -e ".status == \"procedure-unavailable\"" >/dev/null && [ -d "$PENDING/20260902-000000-bbbb-bad" ]'
 
 # --- 4) live run with cap=3: oldest three reviewed, rest deferred ---------------------------
@@ -166,6 +168,25 @@ ok "dry-run leaves oversize drafts out of would_review (#1460)" \
 # --- 8) status is read-only and summarises the queue --------------------------------------
 out="$(run_ps status)"
 ok "status reports last run and verdict counts" 'printf "%s" "$out" | jq -e ".last.status == \"reviewed\" and .queue.approve == 1 and .queue.revise == 2 and .queue.reject == 2 and .queue.error == 1" >/dev/null'
+
+# --- #2631: handler through the ccc-node checkout; bundled procedure fallback -------
+REPO_FAKE="$TMP/ccc-node-checkout"; mkdir -p "$REPO_FAKE/scripts"; cp "$HANDLER" "$REPO_FAKE/scripts/skills-intake-review-handler.sh"
+printf '# operator override\n%s\n' "$REPO_FAKE" > "$CCC_CLAUDE_DIR/self-update.repo"
+out="$(cd "$HERE" && python3 -c 'import prescreen; print("\n".join(str(p) for p in prescreen._repo_handler_candidates()))')"
+ok "#2631: the ccc-node checkout named in ~/.claude/self-update.repo is probed first, then /opt/ccc-node and ~/ccc-node" \
+  '[ "$(sed -n 1p <<<"$out")" = "$REPO_FAKE/scripts/skills-intake-review-handler.sh" ] && grep -q "^/opt/ccc-node/scripts/skills-intake-review-handler.sh$" <<<"$out" && grep -q "^$HOME/ccc-node/scripts/skills-intake-review-handler.sh$" <<<"$out"'
+out="$(cd "$HERE" && python3 -c 'import os,prescreen; os.environ.pop("CCC_SKILL_PRESCREEN_HANDLER", None); h=prescreen.resolve_handler(); print(h or "")')"
+ok "#2631: resolve_handler returns an executable handler on a node without the hand-copied /usr/local/sbin file" '[ -n "$out" ] && [ -x "$out" ]'
+rm -f "$CCC_CLAUDE_DIR/self-update.repo"
+unset CCC_SKILL_PRESCREEN_NEXUS_DIR
+draft 20260301-000002-bundled bundled-skill 2026-03-01T00:00:00Z
+out="$(python3 "$PS" run)"
+ok "#2631: without an a2a-nexus checkout the bundled procedure is used and drafts are screened" 'printf "%s" "$out" | jq -e ".procedure_source == \"bundled\" and .status != \"procedure-unavailable\" and .reviewed >= 1" >/dev/null'
+ok "#2631: the bundled text reaches the handler packet" 'grep -q "bundled-skill intent=skills-intake-review proc=[1-9][0-9][0-9][0-9]" "$CALLS"'
+draft 20260301-000003-nobundle nobundle-skill 2026-03-01T00:00:00Z
+out="$(CCC_SKILL_PRESCREEN_NEXUS_DIR=off python3 "$PS" run)"
+ok "#2631: CCC_SKILL_PRESCREEN_NEXUS_DIR=off disables the bundle too" 'printf "%s" "$out" | jq -e ".status == \"procedure-unavailable\"" >/dev/null'
+export CCC_SKILL_PRESCREEN_NEXUS_DIR="$NEXUS"
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

@@ -721,6 +721,12 @@ run atomic_install "$SRC/scripts/ccc-piri" "$CLAUDE_DIR/hooks/ccc-piri"
 # existing standalone secure-fs copy instead of forking provider logic.
 run atomic_install "$SRC/bridge/memory/local_memory_transaction.py" "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
 run chmod 644 "$CLAUDE_DIR/hooks/ccc_local_memory_transaction.py"
+# Fleet intake reviewer handler (#2631): skill-review/prescreen.py runs it
+# locally over pending drafts. Installing it beside the hooks removes the
+# dependency on a hand-copied /usr/local/sbin/ (the A2A worker deployment via
+# scripts/install-a2a-review-handler.sh is unchanged and still preferred there).
+run atomic_install "$SRC/scripts/skills-intake-review-handler.sh" "$CLAUDE_DIR/hooks/skills-intake-review-handler.sh"
+run chmod 755 "$CLAUDE_DIR/hooks/skills-intake-review-handler.sh"
 # Memory helper tools used by load-memory.sh / refresh-memory.sh in standalone installs.
 run atomic_install "$SRC/scripts/ccc-memory-index.sh" "$CLAUDE_DIR/hooks/ccc-memory-index.sh"
 run atomic_install "$SRC/scripts/ccc_memory_index.py" "$CLAUDE_DIR/hooks/ccc_memory_index.py"
