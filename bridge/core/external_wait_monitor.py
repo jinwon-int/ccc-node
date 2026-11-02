@@ -74,6 +74,17 @@ DETACHED_JOB_MAX_POLL_INTERVAL_SECONDS = 60.0
 #: Without an ``EXIT=`` marker a log this quiet, whose unit is gone, counts
 #: as lost — the same threshold the hooks-side ``detached_jobs.py`` uses.
 DETACHED_JOB_STALE_SECONDS = 900.0
+#: A detached-job wait that reaches its deadline while the unit is still alive
+#: is not over, it was under-estimated (#2636). Instead of ending ``expired``
+#: (a wake with no result, and the real EXIT the next morning reaching nobody)
+#: the watch is downgraded to *notify-only*: off the ⏳ status line, polled at
+#: this ceiling for this much longer, and its outcome goes to the owner as one
+#: spool notice instead of a conversation wake.
+DETACHED_JOB_NOTIFY_ONLY_POLL_INTERVAL_SECONDS = 600.0
+DETACHED_JOB_NOTIFY_ONLY_EXTENSION_SECONDS = 48 * 60 * 60
+#: Spool event name shared with ``claude/hooks/lib/detached_jobs.py notify`` so
+#: the PushNotifier dedups a result announced from both sides.
+DETACHED_JOB_NOTICE_EVENT = "DetachedJob"
 #: Only the tail of a (possibly huge) log is read; the marker is appended last.
 _DETACHED_LOG_TAIL_BYTES = 8192
 #: Live run statuses (#2590). ``waiting`` is an environment approval gate
@@ -510,6 +521,78 @@ def detached_job_terminal(
     return None
 
 
+def default_notice_spool_dir() -> str:
+    """The PushNotifier spool (``CCC_PUSH_SPOOL``, else ``~/.claude/state/telegram-spool``)."""
+    explicit = os.environ.get("CCC_PUSH_SPOOL", "").strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    return os.path.join(os.path.expanduser("~"), ".claude", "state", "telegram-spool")
+
+
+def detached_job_notice_text(record: Dict[str, Any], status: str, detail: Dict[str, Any]) -> str:
+    """Bounded, body-free owner notice for a notify-only detached outcome (#2636)."""
+    unit = str(record.get("unit") or "?")
+    code = detail.get("exit_code") if isinstance(detail, dict) else None
+    if status == TERMINAL_SUCCESS:
+        head = f"✅ Detached job finished — {unit} (exit {code})"
+    elif status == TERMINAL_FAILURE:
+        head = f"❌ Detached job failed — {unit} (exit {code})"
+    elif status == TERMINAL_LOST:
+        head = f"ℹ️ Detached job lost — {unit} (no EXIT marker; read the log before re-running)"
+    elif status == TERMINAL_EXPIRED:
+        head = f"⏰ Detached job watch expired — {unit} (still no EXIT marker after the extended watch)"
+    else:
+        head = f"⚠️ Detached job watch ended ({status}) — {unit}"
+    summary = " ".join(str(record.get("summary") or "").split())[:200]
+    if summary:
+        head += f"\nNext: {summary}"
+    log_path = str(record.get("log_path") or "").strip()
+    if log_path:
+        head += f"\nLog: {log_path}"
+    return head
+
+
+def write_detached_job_notice(spool_dir: str, record: Dict[str, Any], status: str, detail: Dict[str, Any]) -> str:
+    """Queue one spool record for the PushNotifier; '' when unwritable (never raises).
+
+    Same shape and dedup key as ``claude/hooks/lib/detached_jobs.py notify``
+    (``DetachedJob:<unit>:<exit>``), so a unit that announces itself from its
+    wrapper *and* is watched here reaches the owner once.
+    """
+    if not spool_dir:
+        return ""
+    unit = str(record.get("unit") or "?")
+    code = detail.get("exit_code") if isinstance(detail, dict) else None
+    dedup = f"{DETACHED_JOB_NOTICE_EVENT}:{unit}:{code if code is not None else status}"
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    node = os.environ.get("CCC_NODE", "").strip() or os.uname().nodename.split(".")[0]
+    payload = {
+        "ts": ts,
+        "event": DETACHED_JOB_NOTICE_EVENT,
+        "node": node,
+        "text": detached_job_notice_text(record, status, detail),
+        "dedup": dedup,
+    }
+    safe_unit = "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in unit)[:80]
+    final = os.path.join(
+        spool_dir, f"{ts.replace(':', '-')}-{DETACHED_JOB_NOTICE_EVENT}-{safe_unit}-{status}-{os.getpid()}.json"
+    )
+    tmp = final + ".tmp"
+    try:
+        os.makedirs(spool_dir, mode=0o700, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(tmp, final)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return ""
+    return final
+
+
 _WAKE_HEADLINE = {
     TERMINAL_SUCCESS: "✅ CI green",
     TERMINAL_FAILURE: "❌ CI failed",
@@ -676,6 +759,7 @@ class ExternalWaitMonitor:
         resume_daily_cap: int = DEFAULT_RESUME_DAILY_CAP,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         clock: Callable[[], float] = time.time,
+        notice_spool_dir: Optional[str] = None,
     ) -> None:
         self._registry = registry
         self._transport = transport
@@ -683,6 +767,9 @@ class ExternalWaitMonitor:
         self._resumer = resumer
         self._session_lookup = session_lookup
         self._status_syncer = status_syncer
+        # Where notify-only detached outcomes are queued for the PushNotifier
+        # (#2636): the same spool the hooks write into (``CCC_PUSH_SPOOL``).
+        self._notice_spool_dir = notice_spool_dir or default_notice_spool_dir()
         self._resume_enabled = resume_enabled
         self._resume_daily_cap = max(0, int(resume_daily_cap))
         self._tick_seconds = max(1.0, float(tick_seconds))
@@ -766,6 +853,11 @@ class ExternalWaitMonitor:
                     poll_interval_seconds=float(record.get("poll_interval_seconds") or 5.0),
                 )
             return
+        if record.get("source") == SOURCE_DETACHED_JOB:
+            # Owns its own deadline handling (#2636): a live unit at the
+            # deadline is downgraded, not expired.
+            await self._poll_detached_job(record, now)
+            return
         if now >= float(record.get("expires_epoch") or 0):
             self._registry.finish(wait_id, TERMINAL_EXPIRED, now=now)
             return
@@ -774,9 +866,6 @@ class ExternalWaitMonitor:
             return
         if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
             await self._poll_actions_run(record, now)
-            return
-        if record.get("source") == SOURCE_DETACHED_JOB:
-            await self._poll_detached_job(record, now)
             return
         try:
             state = await self._transport.fetch_pr_state(record["repo"], int(record["pr_number"]))
@@ -922,20 +1011,70 @@ class ExternalWaitMonitor:
         conversation for a detached unit, unlike a local task.
         """
         wait_id = record["wait_id"]
+        notify_only = bool(record.get("notify_only"))
+        expired = now >= float(record.get("expires_epoch") or 0)
         try:
             state = await asyncio.to_thread(
                 self._inspect_detached_job, str(record.get("log_path") or ""), str(record.get("unit") or "")
             )
         except Exception:
+            if notify_only and self._transport_errors.get(wait_id, 0) + 1 >= MAX_TRANSPORT_ERRORS:
+                # No conversation to wake for a notify-only watch: say so once.
+                self._registry.finish(wait_id, TERMINAL_MONITOR_ERROR, now=now, wake=False)
+                self._emit_detached_notice(record, TERMINAL_MONITOR_ERROR, {"reason": "probe-failed"})
+                return
             self._transport_failed(record, TransportError("detached-probe-failed"), now)
             return
         self._transport_errors.pop(wait_id, None)
         outcome = detached_job_terminal(state)
         if outcome is not None:
             status, detail = outcome
+            if notify_only:
+                # #2636: outcome goes to the owner as a notice, never a wake.
+                self._registry.finish(wait_id, status, now=now, detail=detail, wake=False)
+                self._emit_detached_notice(record, status, detail)
+                return
             self._registry.finish(wait_id, status, now=now, detail=detail)
             return
-        self._reschedule(record, ceiling=DETACHED_JOB_MAX_POLL_INTERVAL_SECONDS)
+        if expired:
+            if notify_only:
+                # The extension is used up too: stop watching, tell the owner once.
+                self._registry.finish(
+                    wait_id, TERMINAL_EXPIRED, now=now, detail={"reason": "watch-expired"}, wake=False
+                )
+                self._emit_detached_notice(record, TERMINAL_EXPIRED, {"reason": "watch-expired"})
+                return
+            # Deadline reached, unit still alive (#2636): the wait was
+            # under-estimated, not failed. Downgrade instead of expiring —
+            # off the ⏳ line now, notice on exit later.
+            if self._registry.downgrade_to_notify_only(
+                wait_id,
+                now=now,
+                extend_seconds=DETACHED_JOB_NOTIFY_ONLY_EXTENSION_SECONDS,
+                poll_interval_seconds=DETACHED_JOB_NOTIFY_ONLY_POLL_INTERVAL_SECONDS,
+            ):
+                logger.info(
+                    "External-wait detached job %s outlived its budget; downgraded to notify-only: wait=%s",
+                    record.get("unit"),
+                    wait_id,
+                )
+                await self._sync_status(record)
+            return
+        ceiling = (
+            DETACHED_JOB_NOTIFY_ONLY_POLL_INTERVAL_SECONDS if notify_only else DETACHED_JOB_MAX_POLL_INTERVAL_SECONDS
+        )
+        self._reschedule(record, ceiling=ceiling)
+
+    def _emit_detached_notice(self, record: Dict[str, Any], status: str, detail: Dict[str, Any]) -> None:
+        path = write_detached_job_notice(self._notice_spool_dir, record, status, detail)
+        if path:
+            logger.info("External-wait notify-only outcome queued: wait=%s status=%s", record.get("wait_id"), status)
+        else:
+            logger.warning(
+                "External-wait notify-only outcome could not be queued: wait=%s status=%s",
+                record.get("wait_id"),
+                status,
+            )
 
     #: Seam for tests: swap the filesystem/systemd probe.
     _inspect_detached_job = staticmethod(inspect_detached_job)

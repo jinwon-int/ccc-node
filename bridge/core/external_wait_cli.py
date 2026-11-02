@@ -60,7 +60,13 @@ the job's log for its ``EXIT=<n>`` marker (local file read; no GitHub) and
 wakes the conversation like a CI wait — ``success`` for ``EXIT=0``,
 ``failure`` otherwise (exit code in the event), ``lost`` when the unit is gone
 without a marker. ``detached_jobs.py register`` arms this automatically when
-the bridge is present; the explicit form is for other launchers.
+the bridge is present; the explicit form is for other launchers. The wait has
+a budget (``--timeout-seconds``, default 6 h): a job still alive at the
+deadline is not ended ``expired`` but downgraded to *notify-only* (#2636) —
+off the status line, polled slowly for up to 48 h more, its result delivered
+as one owner notice instead of a wake. A ``--timeout-seconds`` above the
+default registers notify-only from the start: no ⏳ line, no wake, notice on
+exit.
 
 A new registration for the same PR at a different head supersedes this
 conversation's older pending waits for that PR (#1110): a stale head must
@@ -313,6 +319,9 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
         _emit({"ok": False, "code": "validation", "message": "invalid numeric field"})
         return RC_USAGE
 
+    # Longer than the budget is not a wait the conversation can resume on
+    # (#2636): watch it notify-only from the start — no ⏳ line, no wake.
+    notify_only = timeout > DEFAULT_TIMEOUT_SECONDS
     registry = ExternalWaitRegistry(default_registry_path(home))
     wait_id = registry.register(
         repo="",
@@ -327,10 +336,21 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
         source=SOURCE_DETACHED_JOB,
         unit=unit,
         log_path=log_path,
+        notify_only=notify_only,
     )
     if not wait_id:
         _emit({"ok": False, "code": "registry-error"})
         return RC_REGISTRY_ERROR
+    if notify_only:
+        message = (
+            f"timeout exceeds the wait budget ({int(DEFAULT_TIMEOUT_SECONDS)}s): watching notify-only — "
+            f"no status line, no wake; the owner gets one notice when EXIT appears (wait_id={wait_id})"
+        )
+    else:
+        message = (
+            "watching the detached job's EXIT marker; conversation resumes when "
+            f"it ends (wait_id={wait_id})"
+        )
     _emit(
         {
             "ok": True,
@@ -339,11 +359,9 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
             "log_path": log_path,
             "timeout_seconds": int(timeout),
             "source": SOURCE_DETACHED_JOB,
+            "notify_only": notify_only,
             "superseded": [],
-            "message": (
-                "watching the detached job's EXIT marker; conversation resumes when "
-                f"it ends (wait_id={wait_id})"
-            ),
+            "message": message,
         }
     )
     return RC_OK

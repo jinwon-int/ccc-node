@@ -404,6 +404,10 @@ def render_wait_status(
     """
     lines: List[str] = []
     for rec in _chronological(records):
+        if rec.get("notify_only"):
+            # #2636: a notify-only detached watch is announced to the owner on
+            # exit; it never has a conversation-facing line, waiting or done.
+            continue
         if rec.get("state") == STATE_MONITORING:
             lines.append(_monitoring_line(rec))
         elif _is_recent_terminal(rec, float(now_epoch), float(recent_terminal_seconds)):
@@ -448,7 +452,9 @@ def plan_status_update(
     text = render_wait_status(
         route_records, now_epoch, recent_terminal_seconds=recent_terminal_seconds
     )
-    monitoring = any(rec.get("state") == STATE_MONITORING for rec in route_records)
+    monitoring = any(
+        rec.get("state") == STATE_MONITORING and not rec.get("notify_only") for rec in route_records
+    )
     if not stored:
         if text is not None and monitoring:
             return "send", text
