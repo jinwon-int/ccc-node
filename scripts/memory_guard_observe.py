@@ -11,7 +11,7 @@ that is NOT "since the current process started":
   remains running after unit stopped`` and, on the next start, ``Found
   left-over process N in control group while starting unit``) the cgroup is
   NOT recreated, so the kernel counters keep counting across restarts. That
-  is why sogyo/hande reported the same ``1.9G memory peak, 257.4M memory
+  is why one hande bridge reported the same ``1.9G memory peak, 257.4M memory
   swap peak`` on four consecutive stops (2026-11-01).
 
 For each bridge unit this prints:

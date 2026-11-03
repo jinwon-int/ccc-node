@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for memory_guard_observe (#2633 a).
 
-The motivating observation: sogyo/hande reported the same ``1.9G memory
+The motivating observation: one hande bridge reported the same ``1.9G memory
 peak, 257.4M memory swap peak`` on four consecutive self-update stops
 (2026-11-01) because each stop left unit processes behind, the next start
 reused the cgroup, and the kernel counters never reset. These tests pin the
@@ -33,20 +33,20 @@ SECRET_COMM = "SENSITIVE_COMM_MARKER"
 HIGH = 2463432704
 MAX = 3284578304
 
-# Shaped after the sogyo journal (short-unix), with a leftover-reusing restart.
-SOGYO_JOURNAL = f"""\
-1761916674.0 sogyo systemd[1]: Stopping {UNIT} - ccc-node hande frontend...
-1761916678.0 sogyo systemd[1]: {UNIT}: Failed to kill control group /system.slice/{UNIT}, ignoring: Invalid argument
-1761916678.0 sogyo systemd[1]: Stopped {UNIT} - ccc-node hande frontend.
-1761916678.0 sogyo systemd[1]: {UNIT}: Consumed 1h 36min 11.312s CPU time, 1.9G memory peak, 257.4M memory swap peak.
-1761916678.0 sogyo systemd[1]: Started {UNIT} - ccc-node hande frontend.
-1761928000.0 sogyo systemd[1]: {UNIT}: Killing process 22478 ({SECRET_COMM}) with signal SIGKILL.
-1761928000.0 sogyo systemd[1]: {UNIT}: Unit process 22364 ({SECRET_COMM}) remains running after unit stopped.
-1761928000.0 sogyo systemd[1]: {UNIT}: Unit process 22445 ({SECRET_COMM}) remains running after unit stopped.
-1761928000.0 sogyo systemd[1]: {UNIT}: Consumed 1min 45.083s CPU time, 730.1M memory peak, 0B memory swap peak.
-1761928000.0 sogyo systemd[1]: {UNIT}: Found left-over process 22364 ({SECRET_COMM}) in control group while starting unit. Ignoring.
-1761928000.0 sogyo systemd[1]: Started {UNIT} - ccc-node hande frontend.
-1761929000.0 sogyo systemd[1]: {UNIT}: Consumed 3min 53.630s CPU time.
+# Shaped after a real hande journal (short-unix), with a leftover-reusing restart.
+LEFTOVER_JOURNAL = f"""\
+1761916674.0 node-a systemd[1]: Stopping {UNIT} - ccc-node hande frontend...
+1761916678.0 node-a systemd[1]: {UNIT}: Failed to kill control group /system.slice/{UNIT}, ignoring: Invalid argument
+1761916678.0 node-a systemd[1]: Stopped {UNIT} - ccc-node hande frontend.
+1761916678.0 node-a systemd[1]: {UNIT}: Consumed 1h 36min 11.312s CPU time, 1.9G memory peak, 257.4M memory swap peak.
+1761916678.0 node-a systemd[1]: Started {UNIT} - ccc-node hande frontend.
+1761928000.0 node-a systemd[1]: {UNIT}: Killing process 22478 ({SECRET_COMM}) with signal SIGKILL.
+1761928000.0 node-a systemd[1]: {UNIT}: Unit process 22364 ({SECRET_COMM}) remains running after unit stopped.
+1761928000.0 node-a systemd[1]: {UNIT}: Unit process 22445 ({SECRET_COMM}) remains running after unit stopped.
+1761928000.0 node-a systemd[1]: {UNIT}: Consumed 1min 45.083s CPU time, 730.1M memory peak, 0B memory swap peak.
+1761928000.0 node-a systemd[1]: {UNIT}: Found left-over process 22364 ({SECRET_COMM}) in control group while starting unit. Ignoring.
+1761928000.0 node-a systemd[1]: Started {UNIT} - ccc-node hande frontend.
+1761929000.0 node-a systemd[1]: {UNIT}: Consumed 3min 53.630s CPU time.
 """
 
 
@@ -120,7 +120,7 @@ class Harness:
 
 class JournalParsing(unittest.TestCase):
     def test_cycles_peaks_survivors_and_reused_start(self) -> None:
-        lines = [(float(ts), msg) for ts, msg in (row.split(" ", 1) for row in SOGYO_JOURNAL.splitlines())]
+        lines = [(float(ts), msg) for ts, msg in (row.split(" ", 1) for row in LEFTOVER_JOURNAL.splitlines())]
         parsed = mgo.parse_journal(lines)
         peaks = [c["memory_peak"] for c in parsed["cycles"]]
         self.assertEqual(peaks, [int(1.9 * (1 << 30)), int(730.1 * (1 << 20)), None])
@@ -194,12 +194,12 @@ class Verdicts(unittest.TestCase):
         self.assertEqual((rc, r["verdict"]), (2, "FAIL"))
 
     def test_journal_oom_kill_fails(self) -> None:
-        self.h.journal.write_text(f"1762000000.0 sogyo systemd[1]: {UNIT}: Failed with result 'oom-kill'.\n")
+        self.h.journal.write_text(f"1762000000.0 node-a systemd[1]: {UNIT}: Failed with result 'oom-kill'.\n")
         rc, r = self.h.run_json()
         self.assertEqual((rc, r["verdict"], r["journal_oom_kills"]), (2, "FAIL", 1))
 
     def test_cycle_peak_over_threshold_and_reused_cgroup(self) -> None:
-        self.h.journal.write_text(SOGYO_JOURNAL)
+        self.h.journal.write_text(LEFTOVER_JOURNAL)
         rc, r = self.h.run_json()
         self.assertEqual((rc, r["verdict"]), (1, "WARN"))
         self.assertTrue(r["reused_cgroup"])
@@ -231,7 +231,7 @@ class Verdicts(unittest.TestCase):
         self.assertEqual((rc, r["verdict"]), (3, "UNVERIFIED"))
 
     def test_discovery_and_text_output_never_echo_journal_text(self) -> None:
-        self.h.journal.write_text(SOGYO_JOURNAL)
+        self.h.journal.write_text(LEFTOVER_JOURNAL)
         for args in ((), ("--json",)):
             rc, out, _ = self.h.run(*args)
             self.assertIn(UNIT, out)
