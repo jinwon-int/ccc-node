@@ -93,7 +93,7 @@ MAX_SKILL_BYTES = 128 * 1024
 
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9+#.]*")
-_APPROVAL_RE = re.compile(r"^\s*(\d+[.)]?\s*)+(승인|approve|ok|okay|yes|네|응|좋아|진행)?\s*$", re.IGNORECASE)
+_APPROVAL_WORDS = frozenset({"승인", "approve", "approved", "ok", "okay", "yes", "네", "응", "좋아", "진행", "go"})
 _STOPWORDS = frozenset(
     """
     a an the and or but if then than that this these those it its is are was were be been being
@@ -444,9 +444,26 @@ def _skip_reason(prompt: str) -> Optional[str]:
         return "short"
     if text.startswith("/"):
         return "slash-command"
-    if _APPROVAL_RE.match(text):
+    if _is_approval(text):
         return "approval"
     return None
+
+
+def _is_approval(text: str) -> bool:
+    """``1`` / ``2637 승인`` / ``1. 2. 승인`` / ``ok`` — numbers with optional
+    trailing ``.``/``)`` and at most one closing approval word. Plain token
+    scan, no regex: a nested-quantifier pattern here was flagged for
+    exponential backtracking (CodeQL, #2645)."""
+    words = text.lower().split()
+    if not words or len(words) > 8:
+        return False
+    if words[-1] in _APPROVAL_WORDS:
+        words = words[:-1]
+    for word in words:
+        core = word.rstrip(".)")
+        if not core or not core.isdigit() or len(core) > 12:
+            return False
+    return True
 
 
 def _excerpt(text: str, limit: int) -> str:

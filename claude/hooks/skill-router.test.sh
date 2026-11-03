@@ -90,7 +90,7 @@ ok "a non-core skill comparable to the core winner is still suggested" 'grep -q 
 ok "the core skill itself is never suggested" '! grep -q core-pr-flow <<<"$(names)"'
 
 # ---- hook: silence ------------------------------------------------------------------
-for p in "1" "2637 승인" "1. 승인" "ok" "/skillsuggest" "고마워 잘했다" "응 그렇게 해"; do
+for p in "1" "2637 승인" "1. 승인" "1 2 3" "2637 2638 approve" "ok" "000000000000000000000000000000!" "/skillsuggest" "고마워 잘했다" "응 그렇게 해"; do
   run_hook "$p" sess-5
   ok "no suggestion for '$p' (short / approval / slash / no signal)" '[ "$rc" = 0 ] && [ -z "$out" ]'
 done
