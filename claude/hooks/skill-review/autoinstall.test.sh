@@ -23,6 +23,8 @@ export HOME="$TMP/home"
 export CCC_CLAUDE_DIR="$TMP/home/.claude"
 # #2631: these cases pin the deterministic gates; the prescreen-verdict gate has its own section.
 export CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0
+# #2645: the routability gate needs a real installed-roots index; legacy suites run with it off.
+export CCC_SKILL_GATE_ROUTABLE=0
 mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 
@@ -108,7 +110,7 @@ mkdir -p "$TMP/fail-bin"
 REAL_PY3="$(command -v python3)"
 cat > "$TMP/fail-bin/python3" <<STUB
 #!/bin/sh
-case "\$1" in */description_trigger.py|*skill_frontmatter.py) exec "$REAL_PY3" "\$@" ;; esac
+case "\$1" in */description_trigger.py|*skill_frontmatter.py|*skill_router.py) exec "$REAL_PY3" "\$@" ;; esac
 printf '%s\n' '{"ok": false, "code": "stubbed_unsafe_skills_root"}'
 exit 2
 STUB
@@ -775,6 +777,29 @@ restore_out="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE" CCC_CLAUDE_DIR="$CCC_CLAUDE_D
 ok "#2631: an archived revise draft is restorable" 'jq -e ".status == \"restored\"" >/dev/null <<<"$restore_out" && [ -d "$PENDING/20260301-000003-ps-revise" ]'
 run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0 CCC_SKILL_AUTOSAVE_DAILY_CAP=99 bash "$AUTO" run >/dev/null
 ok "#2631: REQUIRE_PRESCREEN=0 keeps the pre-#2631 behaviour (unscreened clean draft installs)" '[ -f "$SKILLS/ps-unscreened/SKILL.md" ]'
+
+
+# ---- #2645: routability gate (self-retrieval against the installed roots) ------
+# An installed skill with a distinctive description; a draft that copies it
+# must not install (it would shadow the installed one and never be chosen),
+# a draft with its own distinctive description must. The gate is off in the
+# rest of this file (CCC_SKILL_GATE_ROUTABLE=0 above); here it is on.
+ROUTE_SKILLS="$CCC_CLAUDE_DIR/skills"; mkdir -p "$ROUTE_SKILLS/wiki-operating-log"
+printf -- '---\nname: wiki-operating-log\ndescription: Use when a durable operating log entry, decision or runbook must be recorded in the family wiki through the PR-first write-path flow.\n---\n\n# wiki-operating-log\n\nbody\n' > "$ROUTE_SKILLS/wiki-operating-log/SKILL.md"
+make_draft 20260401-000001-route-copy route-copy "Use when a durable operating log entry, decision or runbook must be recorded in the family wiki through the PR-first write-path flow."
+make_draft 20260401-000002-route-fresh route-fresh "Use when a Matrix room must move between alert and agent modes and the sender bots need a coordinated restart afterwards with health verification."
+make_draft 20260401-000003-route-thin route-thin "Use when deploying things."
+# shellcheck disable=SC2034  # route_out is read via eval inside ok()
+route_out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_GATE_ROUTABLE=1 CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0 CCC_SKILL_AUTOSAVE_DAILY_CAP=99 CCC_SKILL_AUTOSAVE_TRIGGER=test bash "$AUTO" run)"
+ok "#2645: a draft whose description copies an installed skill is blocked as description-not-routable" \
+  'jq -e ".reason == \"lint description-not-routable\"" "$PENDING/20260401-000001-route-copy/autosave-block.json" >/dev/null && [ ! -e "$SKILLS/route-copy/SKILL.md" ]'
+ok "#2645: a draft with a distinctive description installs" '[ -f "$SKILLS/route-fresh/SKILL.md" ] && jq -e ".installed | index(\"route-fresh\") != null" <<<"$route_out" >/dev/null'
+ok "#2645: a description with too little content is blocked by the same gate" \
+  'jq -e ".reason == \"lint description-not-routable\" or .reason == \"lint description-too-short\"" "$PENDING/20260401-000003-route-thin/autosave-block.json" >/dev/null'
+make_draft 20260401-000004-route-unverif route-unverif "Use when a second distinctive matrix bridge description must prove the unverifiable branch of the routability gate works."
+run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_GATE_ROUTABLE=1 CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0 CCC_SKILL_AUTOSAVE_DAILY_CAP=99 CCC_CLAUDE_DIR="$CCC_CLAUDE_DIR" PATH="$TMP/fail-bin:$PATH" bash "$AUTO" run >/dev/null 2>&1 || true
+ok "#2645: without a working python3 the gate reports unverifiable and the draft stays pending" \
+  '[ -d "$PENDING/20260401-000004-route-unverif" ] && [ ! -e "$SKILLS/route-unverif/SKILL.md" ]'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

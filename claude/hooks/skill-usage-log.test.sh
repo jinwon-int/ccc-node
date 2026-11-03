@@ -97,5 +97,25 @@ rc=0
 CCC_CLAUDE_DIR="$TMP/never-created-$$" bash "$HOOK" '{"tool_name":"Read","tool_input":{"file_path":"/a/.claude/skills/x/SKILL.md"}}' </dev/null || rc=$?
 ok "unwritable state root still fails open" '[ "$rc" = 0 ]'
 
+
+# ---- #2645: routing measurement tag --------------------------------------------
+# With a router suggestion recorded for the session, a use says whether it
+# followed one; without a suggestion file the row keeps the pre-#2645 shape.
+ROUTER_STATE="$CCC_CLAUDE_DIR/state/skill-router"; mkdir -p "$ROUTER_STATE"
+printf '{"ts":"2026-01-01T00:00:00Z","candidates":["gh-pr-flow","wiki-record"]}\n' > "$ROUTER_STATE/last-sess-r1.json"
+: > "$LEDGER"
+run_hook '{"session_id":"sess-r1","tool_name":"Skill","tool_input":{"skill":"gh-pr-flow"}}'
+ok "#2645: a use that follows a suggestion is tagged suggested:true" \
+  'jq -e "select(.skill == \"gh-pr-flow\" and .suggested == true)" "$LEDGER" >/dev/null'
+run_hook '{"session_id":"sess-r1","tool_name":"Skill","tool_input":{"skill":"self-update"}}'
+ok "#2645: a use outside the suggestions is tagged suggested:false" \
+  'jq -e "select(.skill == \"self-update\" and .suggested == false)" "$LEDGER" >/dev/null'
+run_hook '{"session_id":"sess-none","tool_name":"Skill","tool_input":{"skill":"gh-pr-flow"}}'
+ok "#2645: without a suggestion file the row has no suggested field" \
+  'jq -e "select(.skill == \"gh-pr-flow\" and (has(\"suggested\") | not))" "$LEDGER" >/dev/null'
+run_hook '{"session_id":"../../etc","tool_name":"Skill","tool_input":{"skill":"gh-pr-flow"}}'
+ok "#2645: a hostile session id is sanitised, the hook still exits 0 and logs the use" \
+  '[ "$(jq -r "select(.skill == \"gh-pr-flow\") | .skill" "$LEDGER" | wc -l)" = 3 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
