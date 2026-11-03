@@ -120,7 +120,7 @@ class Harness:
 
 class JournalParsing(unittest.TestCase):
     def test_cycles_peaks_survivors_and_reused_start(self) -> None:
-        lines = [(float(l.split(" ", 1)[0]), l.split(" ", 1)[1]) for l in SOGYO_JOURNAL.splitlines()]
+        lines = [(float(ts), msg) for ts, msg in (row.split(" ", 1) for row in SOGYO_JOURNAL.splitlines())]
         parsed = mgo.parse_journal(lines)
         peaks = [c["memory_peak"] for c in parsed["cycles"]]
         self.assertEqual(peaks, [int(1.9 * (1 << 30)), int(730.1 * (1 << 20)), None])
