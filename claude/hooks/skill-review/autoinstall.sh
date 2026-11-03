@@ -249,6 +249,30 @@ gate_description_trigger() { # <description>
   return 1
 }
 
+# Routability (#2645). The runtime routes from the description; a draft whose
+# description retrieves an already-installed skill ahead of itself (or says
+# too little to retrieve anything) would install and then never be chosen —
+# or worse, shadow the skill it copies. Self-retrieval against the installed
+# roots via the same ranker the prompt-time router uses. Fails closed like the
+# trigger gate; CCC_SKILL_GATE_ROUTABLE=0 turns it off.
+ROUTER_TOOL="$AUTOINSTALL_LIB_DIR/../lib/skill_router.py"
+gate_description_routable() { # <name> <description>
+  local rc
+  case "${CCC_SKILL_GATE_ROUTABLE:-1}" in 0|false|no|off) return 0 ;; esac
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -r "$ROUTER_TOOL" ]; then
+    printf 'lint description-routable-unverifiable'; return 1
+  fi
+  CCC_CLAUDE_DIR="${CCC_CLAUDE_DIR:-$HOME/.claude}" python3 "$ROUTER_TOOL" check-description \
+    --name "$1" --description "$2" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) printf 'lint description-not-routable' ;;
+    *) printf 'lint description-routable-unverifiable' ;;
+  esac
+  return 1
+}
+
 gate_lint() { # <skill.md>
   local f="$1" close name desc body_lines
   [ -f "$f" ] || { printf 'lint missing-skill-md'; return 1; }
@@ -264,6 +288,7 @@ gate_lint() { # <skill.md>
   [ "${#desc}" -ge "$DESC_MIN" ] || { printf 'lint description-too-short'; return 1; }
   [ "${#desc}" -le "$DESC_MAX" ] || { printf 'lint description-too-long'; return 1; }
   gate_description_trigger "$desc" || return 1
+  gate_description_routable "$name" "$desc" || return 1
   compat="$(fm_field "$f" compatibility)"
   [ "${#compat}" -le 500 ] || { printf 'lint compatibility-too-long'; return 1; }
   body_lines="$(awk -v s="$close" 'NR>s && NF' "$f" 2>/dev/null | wc -l | tr -d '[:space:]')"

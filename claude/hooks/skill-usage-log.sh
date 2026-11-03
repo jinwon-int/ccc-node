@@ -63,10 +63,26 @@ mkdir -p "$state" 2>/dev/null || exit 0
 chmod 700 "$state" 2>/dev/null || true
 ledger="$state/usage.jsonl"
 lock="$state/.usage.lock"
+# Routing measurement (#2645): when the skill router suggested candidates for
+# this session's latest prompt, say whether this use followed one of them.
+# Absent suggestion file → no field (the pre-#2645 row shape), so the report
+# can tell "no suggestion" from "suggestion ignored".
+suggested=""
+sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null | tr -cd 'A-Za-z0-9_.-' | cut -c1-128)"
+if [ -n "$sid" ]; then
+  last="${CCC_STATE_DIR:-${CCC_CLAUDE_DIR:-$HOME/.claude}/state}/skill-router/last-$sid.json"
+  if [ -f "$last" ] && [ ! -L "$last" ]; then
+    if jq -e --arg s "$skill" '.candidates | index($s) != null' "$last" >/dev/null 2>&1; then
+      suggested=',"suggested":true'
+    else
+      suggested=',"suggested":false'
+    fi
+  fi
+fi
 {
   flock -x 9
-  printf '{"ts":"%s","skill":"%s","tool":"%s","runtime":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skill" "$tool" "$runtime" >>"$ledger" 2>/dev/null || true
+  printf '{"ts":"%s","skill":"%s","tool":"%s","runtime":"%s"%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skill" "$tool" "$runtime" "$suggested" >>"$ledger" 2>/dev/null || true
   chmod 600 "$ledger" 2>/dev/null || true
 } 9>>"$lock" 2>/dev/null || true
 exit 0

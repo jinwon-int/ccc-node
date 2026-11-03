@@ -25,6 +25,8 @@ export HOME="$TMP/home"
 export CCC_CLAUDE_DIR="$TMP/home/.claude"
 # #2631: these cases pin the deterministic gates; the prescreen-verdict gate has its own section.
 export CCC_SKILL_AUTOINSTALL_REQUIRE_PRESCREEN=0
+# #2645: the routability gate needs a real installed-roots index; legacy suites run with it off.
+export CCC_SKILL_GATE_ROUTABLE=0
 mkdir -p "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 chmod 700 "$CCC_CLAUDE_DIR/state" "$CCC_CLAUDE_DIR/skills"
 
