@@ -2,7 +2,7 @@
 
 `scripts/ccc-skill-lineage-report.py` is a read-only report over the
 skill-promotion ledger (`~/.claude/state/skill-promotion/ledger.jsonl` on the
-curator node, seoseo). It replaces the verdict-level "revise ratio" that the
+curator node). It replaces the verdict-level "revise ratio" that the
 #2239 programme tracked with lineage-level outcome metrics. It never writes
 anything and prints counters, PR numbers, node names and timestamps only.
 
@@ -64,18 +64,18 @@ the window, `status=consumed` denominator) so both numbers sit side by side.
 ## Usage
 
 ```bash
-# on seoseo (ledger owner), text summary of the last 14 days
+# on the curator node (ledger owner), text summary of the last 14 days
 scripts/ccc-skill-lineage-report.py
 
 # explicit cohort, every lineage listed
 scripts/ccc-skill-lineage-report.py --since 2026-10-19T13:45:00Z --until 2026-11-02T13:45:00Z --lineages
 
 # from another node without copying the ledger: stream it over ssh, read stdin
-ssh seoseo cat ~/.claude/state/skill-promotion/ledger.jsonl | scripts/ccc-skill-lineage-report.py - --json
+ssh <curator-node> cat ~/.claude/state/skill-promotion/ledger.jsonl | scripts/ccc-skill-lineage-report.py - --json
 ```
 
 `CCC_SKILL_PROMOTION_LEDGER` overrides the default path. Exit codes: 0 report
 printed, 64 bad arguments, 66 ledger not found.
 
 Tests: `scripts/ccc-skill-lineage-report.test.sh` (hermetic; synthetic ledger
-rows shaped like the 2026-11-03 seoseo sample).
+rows shaped like the 2026-11-03 curator-node sample).

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Lineage report (#2641): the verdict-level revise share counts rounds, the
 lineage view counts outcomes. These cases pin the regrouping on the ledger row
-shapes seoseo actually writes (sampled 2026-11-03):
+shapes the curator node actually writes (sampled 2026-11-03; node slugs here are
+placeholders — the repo-wide node-name ratchet keeps fleet names out of fixtures):
 
     a2a-verdict            task_id skills_intake_review-pr<N>-<node>-<stamp>,
                            verdict approve|revise|reject, status consumed|malformed|infra_failed
@@ -100,36 +101,36 @@ def arbitration(pr: int, trigger: str, days_ago: float) -> dict:
 
 def ledger_rows() -> list[dict]:
     return [
-        # A: gwakga, revise -> republished -> approve  (approved, 2 rounds, first=revise)
-        verdict(10, "gwakga", 10.0, "revise"),
-        republished(10, 11, "gwakga", 9.9),
+        # A: node-a, revise -> republished -> approve  (approved, 2 rounds, first=revise)
+        verdict(10, "node-a", 10.0, "revise"),
+        republished(10, 11, "node-a", 9.9),
         superseded(10, 11, 9.9),
-        verdict(11, "gwakga", 9.5, "approve"),
-        # B: yukson, approve first time  (approved, 1 round)
-        verdict(20, "yukson", 8.0, "approve"),
-        # C: dungae, revise -> invalid(secret)  (dropped, 1 round)
-        verdict(30, "dungae", 7.0, "revise"),
+        verdict(11, "node-a", 9.5, "approve"),
+        # B: node-b, approve first time  (approved, 1 round)
+        verdict(20, "node-b", 8.0, "approve"),
+        # C: node-c, revise -> invalid(secret)  (dropped, 1 round)
+        verdict(30, "node-c", 7.0, "revise"),
         revise_result(30, "invalid", 6.9, "secret_possible-token"),
-        # D: jingun, revise -> republished -> revise -> failed (retryable) + arbitration  (in_progress, 2 rounds)
-        verdict(40, "jingun", 6.0, "revise"),
-        republished(40, 41, "jingun", 5.9),
-        verdict(41, "jingun", 5.0, "revise"),
+        # D: node-d, revise -> republished -> revise -> failed (retryable) + arbitration  (in_progress, 2 rounds)
+        verdict(40, "node-d", 6.0, "revise"),
+        republished(40, 41, "node-d", 5.9),
+        verdict(41, "node-d", 5.0, "revise"),
         revise_result(41, "failed", 4.9),
         arbitration(41, "revise_failed", 4.8),
-        # E: seoseo, reject  (rejected, 1 round)
-        verdict(50, "seoseo", 4.0, "reject"),
+        # E: node-e, reject  (rejected, 1 round)
+        verdict(50, "node-e", 4.0, "reject"),
         # malformed-only PR: never a lineage in the cohort
-        verdict(60, "gwakga", 3.0, None, status="malformed"),
+        verdict(60, "node-a", 3.0, None, status="malformed"),
         # F: lineage whose first verdict predates the window; its approve lands inside it
-        verdict(70, "gongmyoung", 20.0, "revise"),
+        verdict(70, "node-f", 20.0, "revise"),
         superseded(70, 71, 19.0),
-        verdict(71, "gongmyoung", 2.0, "approve"),
+        verdict(71, "node-f", 2.0, "approve"),
         # G: link known ONLY via a2a-intake-superseded (no revise-result row), approve on the successor
-        verdict(80, "yukson", 2.5, "revise"),
+        verdict(80, "node-b", 2.5, "revise"),
         superseded(80, 81, 2.4),
-        verdict(81, "yukson", 1.0, "approve"),
+        verdict(81, "node-b", 1.0, "approve"),
         # infra_failed row on A's final PR must not count as a round
-        verdict(11, "gwakga", 9.6, None, status="infra_failed"),
+        verdict(11, "node-a", 9.6, None, status="infra_failed"),
         # noise the parser must ignore
         {"kind": "a2a-dispatch-skipped", "ts": ts(1.0), "reason": "dispatch_ci_not_green"},
         {"kind": "a2a-verdict", "status": "consumed", "verdict": "approve", "task_id": "not-a-review-task", "ts": ts(1.0)},
@@ -168,7 +169,7 @@ class LineageGrouping(unittest.TestCase):
 
     def test_first_and_final_verdict_and_node_attribution(self) -> None:
         a = self.by_root[10]
-        self.assertEqual((a["node"], a["first_verdict"], a["final_verdict"], a["final_pr"]), ("gwakga", "revise", "approve", 11))
+        self.assertEqual((a["node"], a["first_verdict"], a["final_verdict"], a["final_pr"]), ("node-a", "revise", "approve", 11))
         self.assertTrue(self.by_root[40]["arbitrated"])
         self.assertEqual(self.by_root[40]["arbitration_triggers"], ["revise_failed"])
         self.assertFalse(self.by_root[10]["arbitrated"])
@@ -198,12 +199,12 @@ class LineageGrouping(unittest.TestCase):
 
     def test_by_node(self) -> None:
         by_node = self.summary["by_node"]
-        self.assertEqual(sorted(by_node), ["dungae", "gwakga", "jingun", "seoseo", "yukson"])
-        self.assertEqual(by_node["yukson"]["lineages"], 2)
-        self.assertEqual(by_node["yukson"]["outcomes"]["approved"], 2)
-        self.assertAlmostEqual(by_node["yukson"]["first_review_approve_rate"], 0.5)
-        self.assertEqual(by_node["dungae"]["outcomes"]["dropped"], 1)
-        self.assertIsNone(by_node["jingun"]["final_approve_rate_decided"], "no decided lineage -> n/a, not 0")
+        self.assertEqual(sorted(by_node), ["node-a", "node-b", "node-c", "node-d", "node-e"])
+        self.assertEqual(by_node["node-b"]["lineages"], 2)
+        self.assertEqual(by_node["node-b"]["outcomes"]["approved"], 2)
+        self.assertAlmostEqual(by_node["node-b"]["first_review_approve_rate"], 0.5)
+        self.assertEqual(by_node["node-c"]["outcomes"]["dropped"], 1)
+        self.assertIsNone(by_node["node-d"]["final_approve_rate_decided"], "no decided lineage -> n/a, not 0")
 
 class LegacyWindowCounts(unittest.TestCase):
     """The old #2239 definition, reproduced on the same rows for side-by-side comparison."""
@@ -222,7 +223,7 @@ class LegacyWindowCounts(unittest.TestCase):
 class HeadlineContrast(unittest.TestCase):
     def test_every_lineage_approved_after_one_revise_round(self) -> None:
         rows = []
-        for i, node in enumerate(("gwakga", "yukson", "dungae", "jingun"), start=1):
+        for i, node in enumerate(("node-a", "node-b", "node-c", "node-d"), start=1):
             pr, new = 100 + 2 * i, 101 + 2 * i
             rows += [
                 verdict(pr, node, 5.0 - i * 0.1, "revise"),
@@ -239,24 +240,24 @@ class HeadlineContrast(unittest.TestCase):
 class OutcomeEdgeCases(unittest.TestCase):
     def test_terminal_result_before_the_latest_verdict_does_not_drop(self) -> None:
         rows = [
-            verdict(10, "gwakga", 6.0, "revise"),
+            verdict(10, "node-a", 6.0, "revise"),
             revise_result(10, "invalid", 5.9, "envelope_path_invalid"),
             # operator fixed it by hand, republished, reviewed again -> still open
-            republished(10, 11, "gwakga", 5.0),
-            verdict(11, "gwakga", 4.0, "revise"),
+            republished(10, 11, "node-a", 5.0),
+            verdict(11, "node-a", 4.0, "revise"),
         ]
         e = mod.summarize(mod.build_lineages(rows), SINCE, NOW)["lineages"][0]
         self.assertEqual(e["outcome"], "in_progress")
 
     def test_drop_recommended_and_publish_failed_are_terminal(self) -> None:
         for status in ("drop-recommended", "publish-failed"):
-            rows = [verdict(10, "gwakga", 6.0, "revise"), revise_result(10, status, 5.9)]
+            rows = [verdict(10, "node-a", 6.0, "revise"), revise_result(10, status, 5.9)]
             e = mod.summarize(mod.build_lineages(rows), SINCE, NOW)["lineages"][0]
             self.assertEqual(e["outcome"], "dropped", status)
 
     def test_approve_then_later_revise_is_judged_by_the_latest(self) -> None:
         # intake #26 shape from the lineage_state tests: approve 08-30, revise 09-03
-        rows = [verdict(26, "gwakga", 6.0, "approve"), verdict(26, "gwakga", 3.0, "revise")]
+        rows = [verdict(26, "node-a", 6.0, "approve"), verdict(26, "node-a", 3.0, "revise")]
         e = mod.summarize(mod.build_lineages(rows), SINCE, NOW)["lineages"][0]
         self.assertEqual((e["first_verdict"], e["final_verdict"], e["outcome"], e["rounds"]), ("approve", "revise", "in_progress", 2))
 
@@ -269,15 +270,15 @@ class OutcomeEdgeCases(unittest.TestCase):
 
     def test_review_task_id_formats(self) -> None:
         cases = {
-            "skills_intake_review-pr729-yukson-20261102T173212Z": (729, "yukson"),
-            "skills_intake_review-pr69-soonwook-20260830T022314Z04": (69, "soonwook"),
-            "skills_intake_review-pr34-ccc-node-20260831T011835Z01-t2r2": (34, "ccc-node"),
+            "skills_intake_review-pr729-node-b-20261102T173212Z": (729, "node-b"),
+            "skills_intake_review-pr69-node-g-20260830T022314Z04": (69, "node-g"),
+            "skills_intake_review-pr34-ops-bot-20260831T011835Z01-t2r2": (34, "ops-bot"),
         }
         for task_id, expected in cases.items():
             match = mod.REVIEW_TASK_RE.match(task_id)
             self.assertIsNotNone(match, task_id)
             self.assertEqual((int(match.group(1)), match.group(2)), expected, task_id)
-        for bad in ("skills_intake_revise-pr728-yukson-20261102T171506Z", "not-a-review-task", "skills_intake_review-prX-yukson-20261102T173212Z"):
+        for bad in ("skills_intake_revise-pr728-node-b-20261102T171506Z", "not-a-review-task", "skills_intake_review-prX-node-b-20261102T173212Z"):
             self.assertIsNone(mod.REVIEW_TASK_RE.match(bad), bad)
 
     def test_read_rows_skips_garbage(self) -> None:
@@ -314,7 +315,7 @@ class Cli(unittest.TestCase):
             self.assertIn("final approve rate  decided 60.0%  all 50.0%   first-review approve 16.7%", text)
             self.assertIn("revise ratio 50.0%", text)
             self.assertIn("10,11", text)
-            self.assertIn("gwakga", text)
+            self.assertIn("node-a", text)
 
     def test_stdin_and_env_default(self) -> None:
         text = ledger_text(ledger_rows())
@@ -345,4 +346,9 @@ class Cli(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # validate-harness requires a `PASS=<n> FAIL=<n>` summary line.
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    failed = len(result.failures) + len(result.errors)
+    print(f"PASS={result.testsRun - failed} FAIL={failed}")
+    raise SystemExit(0 if result.wasSuccessful() else 1)
