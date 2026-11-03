@@ -878,6 +878,13 @@ def main() -> None:
     except Exception as exc:
         logger.error("Fatal error: %s", exc, exc_info=True)
         raise SystemExit(1) from exc
+    finally:
+        # Leave nothing for systemd's per-PID KillMode=mixed sweep, which aborts
+        # on EINVAL and lets the next start reuse a populated cgroup (#2646).
+        # No-op unless this process is a ccc-*bridge*.service main process.
+        from telegram_bot.utils.unit_cgroup_sweep import sweep_own_unit_cgroup
+
+        sweep_own_unit_cgroup()
 
 
 if __name__ == "__main__":
