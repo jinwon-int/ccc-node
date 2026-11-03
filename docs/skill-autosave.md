@@ -220,6 +220,30 @@ Drafting LLM on danso nodes: set `CCC_SKILL_REVIEW_LLM_CMD` to the
 `CCC_SKILL_REVIEW_LLM_CMD="danso-review-agent.sh --model glm-5.3-flash"` with
 `DANSO_GLM_*`/`DANSO_OPENAI_*`/`DANSO_CHATGPT_*` credentials in the worker env.
 
+## One draft per transcript — hook and sweep share the regrowth ledger (#2642)
+
+The sweep records every transcript it processed in
+`~/.claude/state/skill-autosave.seen` (`<session>\t<ts>\t<size>`) and drafts it
+again only after it grew by `CCC_SKILL_AUTOSAVE_REGROWTH_BYTES` (16 KiB). Until
+#2642 the SessionEnd hook neither read nor wrote that file, so one interactive
+session produced two drafts: the hook's at session end and the sweep's that
+night (or, for a session the sweep caught mid-flight, the sweep's first and the
+hook's at the end). On 2026-11-03 that was 17 of 68 weekly pending drafts
+across six nodes (25%).
+
+`skill-review.sh` now treats hook triggers (`sessionend`) like a sweep pass:
+
+| moment | behaviour |
+|---|---|
+| after a hook-triggered review finishes (any staged count; not after an extraction failure) | writes the session's row with the transcript size it drafted from — the sweep's existing check then skips it |
+| before a hook-triggered review starts (after the cooldown check) | skips when the ledger holds the session and the transcript grew less than 16 KiB since; log line `skip reason=already-drafted session=… ledger_size=… size=…` |
+| `manual` trigger | exempt both ways: the sweep keeps its own row bookkeeping, and an operator's manual call always runs and leaves no row |
+
+`CCC_SKILL_REVIEW_LEDGER_DEDUPE=off` (in the hook's environment) restores the
+independent paths. The sweep's loop is unchanged; the Codex / Piri / Danso
+branches keep their separate `skill-autosave.<provider>-seen` ledgers because
+no hook drafts those transcripts.
+
 ## Enable the daily sweep
 
 ```bash

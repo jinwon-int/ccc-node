@@ -30,7 +30,9 @@
 #     counter, #1824); CCC_SKILL_AUTOSAVE_TOTAL_MAX_SESSIONS caps the sum
 #     across branches (default 3 since #1647; explicit 0 = no cap). A ledger
 #     prevents re-drafting a transcript that has not grown since it was last
-#     processed.
+#     processed. The SessionEnd hook writes and reads the same ledger
+#     (skill-autosave.seen, #2642), so a session drafted at session end is not
+#     drafted again here, and vice versa.
 set -uo pipefail
 
 CLAUDE_DIR="${CCC_CLAUDE_DIR:-${HOME:-/root}/.claude}"

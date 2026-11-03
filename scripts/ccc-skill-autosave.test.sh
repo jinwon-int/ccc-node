@@ -259,6 +259,29 @@ after_spool="$(ls "$SPOOL" 2>/dev/null | wc -l | tr -d '[:space:]')"
 ok "unchanged transcript not re-drafted" '[ "$after_drafts" = "$before_drafts" ]'
 ok "no duplicate notification for same pending count" '[ "$after_spool" = "$before_spool" ]'
 
+# --- 2a) #2642: a session the SessionEnd hook drafted is not drafted again ---
+# The hook writes the same `<sid>\t<ts>\t<size>` row this sweep reads, so a
+# transcript reviewed at session end is skipped here unless it regrows 16 KiB.
+HOOK_TRANS="$PROJECTS/-root--work/hook-sess-2.jsonl"
+make_transcript "$HOOK_TRANS" 6
+jq -nc --arg sid hook-sess-2 --arg tp "$HOOK_TRANS" '{session_id:$sid, transcript_path:$tp, cwd:"/root/work"}' \
+  | CCC_SKILL_REVIEW_STATE_DIR="$STATE" CLAUDE_SKILLS_DIR="$TMP/skills" CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 \
+    bash "$REVIEW" sessionend >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  grep -q "ledger recorded session=hook-sess-2" "$STATE/skill-review.log" 2>/dev/null && break
+  sleep 0.1
+done
+ok "#2642 hook run left a ledger row the sweep reads" \
+  'awk -F"\t" "\$1==\"hook-sess-2\" && \$3+0>0 {f=1} END {exit !f}" "$STATE/skill-autosave.seen"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+hook_drafts_before="$(find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | wc -l | tr -d '[:space:]')"
+run_autosave
+sleep 1
+# shellcheck disable=SC2034  # read via eval inside ok()
+hook_drafts_after="$(find "$STATE/pending-skills" -name SKILL.md 2>/dev/null | wc -l | tr -d '[:space:]')"
+ok "#2642 sweep does not re-draft the hook-drafted session" \
+  '! grep -q "review ok session=hook-sess-2" "$STATE/skill-autosave.log" && [ "$hook_drafts_after" = "$hook_drafts_before" ]'
+
 # --- 3) off-switch skips everything ------------------------------------------
 touch "$STATE/skill-autosave.disabled"
 rm -f "$TMP/scan.touched"
