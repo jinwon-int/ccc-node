@@ -197,6 +197,14 @@ reviewed `scripts/ccc-self-update.sh` path. See
 > ~3 GB-RAM node `MemoryHigh=50%` (~1.5 GB) can throttle ordinary sessions, so measure the bridge
 > peak there first and pass explicit `CCC_BRIDGE_MEMORY_HIGH=` / `CCC_BRIDGE_MEMORY_MAX=` values
 > to `memory-guard` (bytes with `K/M/G/T` or a percentage; `HIGH` must not exceed `MAX`).
+>
+> **Observing pressure across restarts (#2633).** `memory.peak` / `memory.events` count from the
+> cgroup's creation, not the current process, and a stop that leaves unit processes behind
+> (`Found left-over process … while starting unit`) reuses the cgroup, so a one-shot read can show
+> an old cycle's peak. `python3 scripts/memory_guard_observe.py [--unit U] [--state-file PATH]
+> [--json]` prints per-stop peaks from the journal `Consumed … memory peak` lines, whether the
+> current start reused the cgroup, `memory.events` growth since the previous run (keyed by cgroup
+> id), and PSI `memory.pressure` avg300, and exits 0 PASS / 1 WARN / 2 FAIL / 3 UNVERIFIED.
 
 > **Restart ownership.** Run `--restart` from a shell outside the serving
 > bridge process tree. An agent turn that tries to restart its own bridge is
