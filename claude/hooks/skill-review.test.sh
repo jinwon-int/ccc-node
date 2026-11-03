@@ -467,5 +467,82 @@ done
 ok "#2239 SessionEnd path: trigger-less draft rejected through the hook spawn" \
   '[ "$(pending_count_of "$STATE_G6")" = 0 ] && [ -n "$(rejected_dir "$STATE_G6" no-trigger-skill)" ] && grep -q "candidate rejected reason=description-trigger name=no-trigger-skill" "$STATE_G6/skill-review.log"'
 
+# --- #2642: hook and sweep share the regrowth ledger (skill-autosave.seen) ----
+# 2026-11-03 six-node measurement: 17 of 68 weekly drafts were one session
+# drafted by both the SessionEnd hook and the nightly sweep. These cases pin
+# the fix in both directions, the `manual` exemption and the opt-out.
+STATE_LED="$TMP/state-ledger"; mkdir -p "$STATE_LED"; chmod 700 "$STATE_LED"
+# shellcheck disable=SC2034  # read via eval inside ok()
+LEDGER_LED="$STATE_LED/skill-autosave.seen"
+TRANS_SIZE="$(wc -c < "$TRANS" | tr -d '[:space:]')"
+# (a) hook run records the session + transcript size the sweep's check reads
+payload sess-led "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_LED" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  grep -q "ledger recorded session=sess-led" "$STATE_LED/skill-review.log" 2>/dev/null && break
+  sleep 0.1
+done
+ok "#2642 hook run records the session in skill-autosave.seen" \
+  '[ -f "$LEDGER_LED" ] && awk -F"\t" -v s=sess-led -v z="$TRANS_SIZE" "\$1==s && \$3==z {f=1} END {exit !f}" "$LEDGER_LED"'
+ok "#2642 ledger row uses the sweep format: three tab-separated fields" \
+  '[ "$(awk -F"\t" "\$1==\"sess-led\" {print NF}" "$LEDGER_LED")" = 3 ]'
+ok "#2642 ledger record is logged after done" \
+  'grep -q "done staged=1" "$STATE_LED/skill-review.log" && grep -q "ledger recorded session=sess-led size=$TRANS_SIZE trigger=sessionend" "$STATE_LED/skill-review.log"'
+# (b) the next hook run for the same, unchanged transcript is skipped
+: > "$STATE_LED/skill-review.log"
+# shellcheck disable=SC2034  # read via eval inside ok()
+last_stamp_before="$(cat "$STATE_LED/skill-review.last" 2>/dev/null)"
+sleep 1.1
+payload sess-led "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_LED" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend >/dev/null 2>&1
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
+ok "#2642 already-drafted hook run exits 0" '[ "$rc" = 0 ]'
+ok "#2642 already-drafted hook run is skipped with the ledger sizes logged" \
+  'grep -q "skip reason=already-drafted session=sess-led ledger_size=$TRANS_SIZE size=$TRANS_SIZE regrowth_bytes=16384 trigger=sessionend" "$STATE_LED/skill-review.log" && ! grep -q "start trigger=" "$STATE_LED/skill-review.log"'
+ok "#2642 skipped run does not re-stamp the cooldown" \
+  '[ "$(cat "$STATE_LED/skill-review.last" 2>/dev/null)" = "$last_stamp_before" ]'
+# (c) enough regrowth (>= 16 KiB) makes the session eligible again
+TRANS_GROWN="$TMP/projects/-root--work/sess-led.jsonl"
+cp "$TRANS" "$TRANS_GROWN"
+for i in $(seq 1 120); do
+  printf '{"type":"user","message":{"content":"%s %s"}}\n' "$(printf 'x%.0s' $(seq 1 150))" "$i" >> "$TRANS_GROWN"
+done
+: > "$STATE_LED/skill-review.log"
+payload sess-led "$TRANS_GROWN" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_LED" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend >/dev/null 2>&1
+ok "#2642 grown transcript (>=16 KiB) is reviewed again" \
+  '[ "$(( $(wc -c < "$TRANS_GROWN") - TRANS_SIZE ))" -ge 16384 ] && grep -q "start trigger=sessionend session=sess-led" "$STATE_LED/skill-review.log" && ! grep -q "already-drafted" "$STATE_LED/skill-review.log"'
+# (d) sweep direction: a row the sweep wrote silences the hook for that session
+STATE_SWP="$TMP/state-ledger-sweep"; mkdir -p "$STATE_SWP"; chmod 700 "$STATE_SWP"
+printf 'sess-swept\t2026-11-03T00:00:00Z\t%s\n' "$TRANS_SIZE" > "$STATE_SWP/skill-autosave.seen"
+payload sess-swept "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_SWP" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 bash "$REVIEW" sessionend >/dev/null 2>&1
+ok "#2642 session the sweep already drafted is skipped by the hook" \
+  'grep -q "skip reason=already-drafted session=sess-swept" "$STATE_SWP/skill-review.log" && ! grep -q "start trigger=" "$STATE_SWP/skill-review.log"'
+# (e) `manual` is exempt in both directions: it runs, and it writes no row
+: > "$STATE_SWP/skill-review.log"
+payload sess-swept "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_SWP" CLAUDE_SKILLS_DIR="$SKILLS" \
+  bash "$REVIEW" manual >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  grep -q "done staged=" "$STATE_SWP/skill-review.log" 2>/dev/null && break
+  sleep 0.1
+done
+ok "#2642 manual trigger ignores the ledger and runs" \
+  'grep -q "start trigger=manual session=sess-swept" "$STATE_SWP/skill-review.log"'
+ok "#2642 manual trigger leaves the ledger to the sweep (no row written, no record log)" \
+  '! grep -q "ledger recorded" "$STATE_SWP/skill-review.log" && [ "$(wc -l < "$STATE_SWP/skill-autosave.seen" | tr -d "[:space:]")" = 1 ]'
+# (f) opt-out restores the independent paths
+STATE_OFF="$TMP/state-ledger-off"; mkdir -p "$STATE_OFF"; chmod 700 "$STATE_OFF"
+printf 'sess-off\t2026-11-03T00:00:00Z\t%s\n' "$TRANS_SIZE" > "$STATE_OFF/skill-autosave.seen"
+payload sess-off "$TRANS" "/root/work" | CCC_SKILL_REVIEW_STATE_DIR="$STATE_OFF" CLAUDE_SKILLS_DIR="$SKILLS" \
+  CCC_SKILL_REVIEW_COOLDOWN_SECONDS=0 CCC_SKILL_REVIEW_LEDGER_DEDUPE=off bash "$REVIEW" sessionend >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  grep -q "done staged=" "$STATE_OFF/skill-review.log" 2>/dev/null && break
+  sleep 0.1
+done
+ok "#2642 CCC_SKILL_REVIEW_LEDGER_DEDUPE=off runs despite the ledger row and writes none" \
+  'grep -q "start trigger=sessionend session=sess-off" "$STATE_OFF/skill-review.log" && ! grep -q "ledger recorded" "$STATE_OFF/skill-review.log" && [ "$(wc -l < "$STATE_OFF/skill-autosave.seen" | tr -d "[:space:]")" = 1 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

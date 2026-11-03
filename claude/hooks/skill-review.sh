@@ -16,6 +16,14 @@
 #   - Redaction happens in skill-review/extract.sh before model input.
 #   - Off-switch: touch ~/.claude/state/skill-review.disabled
 #   - Cooldown: CCC_SKILL_REVIEW_COOLDOWN_SECONDS (default 3600) for hook triggers.
+#   - One draft per transcript across hook and sweep (#2642): hook triggers
+#     share the sweep's regrowth ledger (skill-autosave.seen). A hook run
+#     records the transcript size it drafted from, so the nightly sweep skips
+#     the session unless it grew by CCC_SKILL_AUTOSAVE_REGROWTH_BYTES (16 KiB);
+#     and a hook run skips a session the sweep already drafted at (about) this
+#     size. The `manual` trigger is exempt — the sweep keeps its own ledger
+#     bookkeeping and an operator's manual call must always run.
+#     CCC_SKILL_REVIEW_LEDGER_DEDUPE=off restores the old independent paths.
 set -uo pipefail
 
 # Node-global anchor, NOT CCC_STATE_DIR. This hook fires from SessionEnd, so
@@ -33,6 +41,42 @@ TRIGGER="${1:-manual}"
 SKILL_REVIEW_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || SKILL_REVIEW_LIB_DIR="${HOME:-/root}/.claude/hooks"
 # shellcheck source=claude/hooks/lib/hook-common.sh
 . "$SKILL_REVIEW_LIB_DIR/lib/hook-common.sh" || exit 0
+
+# --- shared regrowth ledger with the autosave sweep (#2642) -------------------
+# scripts/ccc-skill-autosave.sh keeps `<session>\t<ts>\t<size>` rows in
+# $STATE_DIR/skill-autosave.seen and re-drafts a transcript only after it grew
+# by CCC_SKILL_AUTOSAVE_REGROWTH_BYTES. Hook triggers never touched that file,
+# so the same session was drafted twice: by the hook at session end and by the
+# sweep that night (or the other way round for a session the sweep caught
+# mid-flight). 25% of weekly pending drafts on 2026-11-03. These helpers let the
+# hook path read and write the same rows; the sweep's own loop is unchanged.
+SKILL_REVIEW_LEDGER="$STATE_DIR/skill-autosave.seen"
+SKILL_REVIEW_REGROWTH_BYTES="${CCC_SKILL_AUTOSAVE_REGROWTH_BYTES:-16384}"
+case "$SKILL_REVIEW_REGROWTH_BYTES" in ''|*[!0-9]*) SKILL_REVIEW_REGROWTH_BYTES=16384 ;; esac
+skill_review_dedupe_active() { # <trigger> -> 0 when the shared ledger applies
+  is_disabled "${CCC_SKILL_REVIEW_LEDGER_DEDUPE:-on}" && return 1
+  [ "${1:-manual}" != "manual" ]
+}
+skill_review_ledger_last_size() { # <session> -> last recorded size (0 = none)
+  local sz
+  sz="$(awk -F'\t' -v s="$1" '$1==s {sz=$3} END {print sz+0}' "$SKILL_REVIEW_LEDGER" 2>/dev/null)"
+  case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  printf '%s' "$sz"
+}
+skill_review_ledger_record() { # <session> <size> — same atomic rewrite as the sweep
+  local tmp="$SKILL_REVIEW_LEDGER.tmp.$$"
+  touch "$SKILL_REVIEW_LEDGER" 2>/dev/null
+  { awk -F'\t' -v s="$1" '$1!=s' "$SKILL_REVIEW_LEDGER" 2>/dev/null;
+    printf '%s\t%s\t%s\n' "$1" "$(ts)" "$2"; } > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$SKILL_REVIEW_LEDGER" 2>/dev/null \
+    || { rm -f "$tmp" 2>/dev/null; log "ledger record failed session=$1 ledger=$SKILL_REVIEW_LEDGER"; }
+}
+skill_review_transcript_size() { # <path> -> byte size (0 when unreadable)
+  local sz
+  sz="$(wc -c < "$1" 2>/dev/null | tr -d '[:space:]')"
+  case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  printf '%s' "$sz"
+}
 
 # --- reindex (#2283): rebuild pending-skills/index.jsonl from the queue -------
 # The index is the one cross-draft ledger, but the per-draft append never ran
@@ -237,6 +281,7 @@ run_skill_review_bg() {
   case "$count" in ''|*[!0-9]*) count=0 ;; esac
   if [ "$count" -eq 0 ]; then
     log "done staged=0 trigger=$TRIGGER pid=$PIPE_PID"
+    skill_review_ledger_note_processed
     return 0
   fi
 
@@ -353,7 +398,23 @@ run_skill_review_bg() {
     rm -f "$STASH.tmp" 2>/dev/null
   fi
   log "done staged=$staged rejected_trigger=$rej_trigger rejected_duplicate=$rej_duplicate rejected_session_cap=$rej_cap gates=$([ "$GATES" = 1 ] && printf on || printf off) trigger=$TRIGGER pid=$PIPE_PID"
+  skill_review_ledger_note_processed
   return 0
+}
+
+# #2642: called from inside run_skill_review_bg after a completed review (any
+# staged count — the sweep records a processed transcript the same way), never
+# after an extraction failure, so a failed run stays eligible. Hook triggers
+# only: the sweep writes its own row for `manual` and an operator's manual call
+# must never leave a mark that silences the next hook.
+skill_review_ledger_note_processed() {
+  skill_review_dedupe_active "$TRIGGER" || return 0
+  [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ] || return 0
+  local size
+  size="$(skill_review_transcript_size "$TRANSCRIPT_PATH")"
+  [ "$size" -gt 0 ] || return 0
+  skill_review_ledger_record "$SESSION_ID" "$size"
+  log "ledger recorded session=$SESSION_ID size=$size trigger=$TRIGGER pid=$PIPE_PID"
 }
 
 # --- draft-time gate helpers (#2239) -----------------------------------------
@@ -521,6 +582,21 @@ if [ "$TRIGGER" != "manual" ] && [ "$COOLDOWN" -gt 0 ] && [ -f "$LAST_FILE" ]; t
   if [ "$age" -lt "$COOLDOWN" ]; then
     log "skip reason=cooldown age_s=$age cooldown_s=$COOLDOWN trigger=$TRIGGER pid=$$"
     exit 0
+  fi
+fi
+
+# #2642: the sweep already drafted this session and the transcript has not
+# grown enough since — the same skip rule the sweep applies to hook-drafted
+# sessions. After the cooldown so cooldown behaviour is unchanged; before the
+# cooldown stamp so a skipped run does not push the next hook back.
+if skill_review_dedupe_active "$TRIGGER"; then
+  LEDGER_SIZE="$(skill_review_ledger_last_size "$SESSION_ID")"
+  if [ "$LEDGER_SIZE" -gt 0 ]; then
+    SIZE_NOW="$(skill_review_transcript_size "$TRANSCRIPT_PATH")"
+    if [ $((SIZE_NOW - LEDGER_SIZE)) -lt "$SKILL_REVIEW_REGROWTH_BYTES" ]; then
+      log "skip reason=already-drafted session=$SESSION_ID ledger_size=$LEDGER_SIZE size=$SIZE_NOW regrowth_bytes=$SKILL_REVIEW_REGROWTH_BYTES trigger=$TRIGGER pid=$$"
+      exit 0
+    fi
   fi
 fi
 
