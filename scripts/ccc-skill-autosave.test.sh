@@ -1180,5 +1180,50 @@ status19b="$(CCC_STATE_DIR="$STATE19" CCC_SKILL_CURATOR_ENV_FILE="$CENV19" bash 
 ok "#2239: status reports a 0644 curator env file as unsafe" \
   'printf "%s" "$status19b" | grep -q "^curator env file: unsafe"'
 
+# ---- #2650: skill-autosave.env — per-node sweep throughput knobs -------------
+AENV="$TMP/skill-autosave52.env"
+PS_STUB52="$TMP/prescreen-stub52.py"
+cat > "$PS_STUB52" <<'PY52'
+import json, os
+print(json.dumps({"stub": True,
+                  "max_per_run": os.environ.get("CCC_SKILL_PRESCREEN_MAX_PER_RUN", "unset"),
+                  "daily_cap": os.environ.get("CCC_SKILL_AUTOSAVE_DAILY_CAP", "unset"),
+                  "expire_days": os.environ.get("CCC_SKILL_PENDING_EXPIRE_DAYS", "unset"),
+                  "mode": os.environ.get("CCC_SKILL_AUTOSAVE_MODE", "unset")}))
+PY52
+cat > "$AENV" <<EOF52
+# operator: drain the prescreen backlog faster for a while
+CCC_SKILL_PRESCREEN_MAX_PER_RUN=40
+export CCC_SKILL_PENDING_EXPIRE_DAYS=60
+CCC_SKILL_AUTOSAVE_DAILY_CAP=5x
+CCC_SKILL_AUTOSAVE_MODE=auto
+FOO52=leak
+CCC_SKILL_PRESCREEN_MAX_PER_RUN2=\$(touch $TMP/injected52)
+EOF52
+chmod 600 "$AENV"
+ps52() { CCC_STATE_DIR="$STATE19" CCC_SKILL_AUTOSAVE_ENV_FILE="$AENV" CCC_SKILL_PRESCREEN_CMD="$PS_STUB52" "$@" bash "$AUTOSAVE" prescreen 2>&1 | tail -1; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+out52="$(ps52 env)"
+ok "#2650: allow-listed digit values from the file reach the sweep's helpers" \
+  'jq -e ".max_per_run == \"40\" and .expire_days == \"60\"" <<<"$out52" >/dev/null'
+ok "#2650: non-digit values and non-allow-listed keys are ignored; the file is parsed, never executed" \
+  'jq -e ".daily_cap == \"unset\" and .mode == \"unset\"" <<<"$out52" >/dev/null && [ ! -e "$TMP/injected52" ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+out52b="$(ps52 env CCC_SKILL_PRESCREEN_MAX_PER_RUN=7)"
+ok "#2650: a value already in the environment wins over the file" \
+  'jq -e ".max_per_run == \"7\" and .expire_days == \"60\"" <<<"$out52b" >/dev/null'
+# shellcheck disable=SC2034  # read via eval inside ok()
+st52="$(CCC_STATE_DIR="$STATE19" CCC_SKILL_AUTOSAVE_ENV_FILE="$AENV" bash "$AUTOSAVE" status 2>&1)"
+ok "#2650: status shows the autosave env file and the keys it applied (names only)" \
+  'printf "%s" "$st52" | grep -q "^autosave env file: present .*applied=PRESCREEN_MAX_PER_RUN,PENDING_EXPIRE_DAYS$"'
+chmod 644 "$AENV"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out52c="$(ps52 env)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+st52c="$(CCC_STATE_DIR="$STATE19" CCC_SKILL_AUTOSAVE_ENV_FILE="$AENV" bash "$AUTOSAVE" status 2>&1)"
+ok "#2650: a group/other-readable autosave env file is ignored and reported unsafe" \
+  'jq -e ".max_per_run == \"unset\"" <<<"$out52c" >/dev/null && printf "%s" "$st52c" | grep -q "^autosave env file: unsafe .*applied=none"'
+
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

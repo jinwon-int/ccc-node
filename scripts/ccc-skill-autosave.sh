@@ -119,6 +119,43 @@ load_curator_env() {
 }
 load_curator_env
 
+# Sweep throughput knobs (#2650): a node-local file for the few numeric limits
+# an operator tunes per node — how many drafts the pre-screen reviews per night,
+# the auto-mode daily install cap, the pending-expiry age. Same file-safety rule
+# and precedence as the curator file (owner-only regular file; a value already
+# in the environment wins); only these full key names, digits only. Parsed,
+# never executed. The consumers (prescreen.py, autoinstall.sh, pending_expire)
+# still bound every value themselves.
+AUTOSAVE_ENV="${CCC_SKILL_AUTOSAVE_ENV_FILE:-${HOME:-/root}/.config/ccc-node/skill-autosave.env}"
+AUTOSAVE_ENV_KEYS="CCC_SKILL_PRESCREEN_MAX_PER_RUN CCC_SKILL_AUTOSAVE_DAILY_CAP CCC_SKILL_PENDING_EXPIRE_DAYS"
+AUTOSAVE_ENV_APPLIED=""
+autosave_env_file_ok() {
+  [ -f "$AUTOSAVE_ENV" ] && [ ! -L "$AUTOSAVE_ENV" ] && [ -O "$AUTOSAVE_ENV" ] || return 1
+  case "$(stat -c %a "$AUTOSAVE_ENV" 2>/dev/null)" in [0-7]00) return 0 ;; esac
+  return 1
+}
+autosave_env_file_state() { # present | absent | unsafe (presence only)
+  if autosave_env_file_ok; then echo present
+  elif [ -e "$AUTOSAVE_ENV" ] || [ -L "$AUTOSAVE_ENV" ]; then echo unsafe
+  else echo absent; fi
+}
+load_autosave_env() {
+  autosave_env_file_ok || return 0
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    line="${line#export }"
+    key="${line%%=*}"; value="${line#*=}"
+    [ "$key" != "$line" ] || continue
+    case " $AUTOSAVE_ENV_KEYS " in *" $key "*) ;; *) continue ;; esac
+    [[ "$value" =~ ^[0-9]{1,3}$ ]] || continue
+    [ -z "${!key+x}" ] || continue
+    export "$key=$value"
+    AUTOSAVE_ENV_APPLIED="${AUTOSAVE_ENV_APPLIED:+$AUTOSAVE_ENV_APPLIED,}${key#CCC_SKILL_}"
+  done < "$AUTOSAVE_ENV"
+}
+load_autosave_env
+
 # Fleet-wide autonomy guard (#386): a single kill-switch/dry-run above every
 # no-approval write. The installed layout keeps the lib under the claude tree;
 # the repo checkout keeps it beside this script's ../claude. Sourced fail-open —
@@ -456,6 +493,7 @@ if [ "$MODE" = "status" ]; then
   # #2239: same presence-only rule. `unsafe` = exists but is not a regular
   # owner-only file we own, so neither the sweep nor the promoter reads it.
   echo "promotion env file: $(promotion_env_file_state) ($PROMOTION_ENV — CCC_SKILL_PROMOTION_* knobs for the 2d collect and the results cron; process env wins; python3 \"$PROMOTER\" status shows config_file/effective)"
+  echo "autosave env file: $(autosave_env_file_state) ($AUTOSAVE_ENV — CCC_SKILL_PRESCREEN_MAX_PER_RUN / CCC_SKILL_AUTOSAVE_DAILY_CAP / CCC_SKILL_PENDING_EXPIRE_DAYS, digits only; process env wins; #2650) applied=${AUTOSAVE_ENV_APPLIED:-none}"
   echo "curator env file: $(curator_env_file_state) ($CURATOR_ENV — allow-listed CCC_SKILL_CURATOR_* keys; process env wins) applied=${CURATOR_ENV_APPLIED:-none} archive_after_days=${CCC_SKILL_CURATOR_ARCHIVE_AFTER_DAYS:-90(default)}"
   echo "candidates report: $(ls -la "$STATE_DIR/skill-candidates.md" 2>/dev/null || echo none)"
   echo "-- ledger (last 5) --";      tail -5 "$LEDGER" 2>/dev/null
