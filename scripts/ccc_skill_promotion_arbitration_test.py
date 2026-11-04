@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import types
 import unittest
@@ -108,6 +109,33 @@ class ArbitrationState(unittest.TestCase):
         self.assertEqual(state(base + [revise_result("v1", "failed")])[0], "revise_failed")
         self.assertEqual(state(base + [revise_result("v1", "invalid")])[0], "revise_failed")
         self.assertEqual(state(base + [revise_result("v1", "republished")])[0], None)
+        # #2657: a revised tree that could not be republished, or came back
+        # identical, leaves nothing to run — arbitration owns the head.
+        self.assertEqual(state(base + [revise_result("v1", "publish-failed")])[0], "revise_failed")
+        self.assertEqual(state(base + [revise_result("v1", "unchanged")])[0], "revise_failed")
+
+    def test_publish_failed_revise_field_case_is_unsettled(self) -> None:
+        # fleet-skills#654: review → revise verdict (6 days old) → revise round
+        # succeeded on the broker → republish refused (description_trigger_missing).
+        # Before #2657 this returned (None, False) forever: `revise_stuck` needs
+        # *no* revise dispatch, and `publish-failed` was not a terminal outcome.
+        rows = [review("t1", "r1"), verdict("t1", "revise", age=6 * 86400), revise("v1", NODE),
+                {**revise_result("v1", "publish-failed"), "code": "description_trigger_missing"}]
+        self.assertEqual(state(rows), ("revise_failed", False))
+
+    def test_every_written_revise_status_is_classified(self) -> None:
+        # A status the publisher can write but `_arbitration_state` does not
+        # classify is a silent dead end (#2657). Read every `a2a-revise-result`
+        # record literal from the source and require it be handled.
+        source = Path(promotion.__file__).read_text(encoding="utf-8")
+        written = set()
+        for literal in re.findall(r'\{[^{}]*"kind":\s*"a2a-revise-result"[^{}]*\}', source):
+            match = re.search(r'"status":\s*"([a-z_-]+)"', literal)
+            self.assertIsNotNone(match, f"revise-result written with a non-literal status: {literal[:120]}")
+            written.add(match.group(1))
+        self.assertIn("publish-failed", written)
+        handled = set(promotion._ARBITRATION_TERMINAL_REVISE) | {"republished", "infra_failed"}
+        self.assertEqual(sorted(written - handled), [])
 
     def test_failed_review_and_settled_states(self) -> None:
         self.assertEqual(state([review("t1", "r1"), verdict("t1", None, status="malformed")])[0], "review_failed")
