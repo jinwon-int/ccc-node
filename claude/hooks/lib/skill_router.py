@@ -18,6 +18,13 @@ trimmed description — as ``additionalContext``. Nothing is executed or
 auto-invoked; the model still chooses. Core-listing skills are excluded
 because their descriptions are already in the listing.
 
+The index spans every runtime's skill root, but ``suggest`` only offers the
+skills the *calling* runtime can invoke (#2658): a Codex-only name suggested
+to Claude is a name the Skill tool cannot resolve. The hook is registered in
+Claude Code's hooks only, so the runtime defaults to ``claude``;
+``CCC_SKILL_ROUTER_RUNTIME`` selects another root, and an unknown value makes
+the hook silent rather than wrong.
+
 Two more commands reuse the same index:
 
 * ``check-description`` — a draft's description must retrieve the draft ahead
@@ -107,6 +114,12 @@ _STOPWORDS = frozenset(
     ccc node nodes fleet
     """.split()
 )
+
+#: Runtime the ``suggest`` hook feeds when CCC_SKILL_ROUTER_RUNTIME is unset:
+#: the hook is registered only in Claude Code's hooks (#2658).
+DEFAULT_SUGGEST_RUNTIME = "claude"
+#: Root labels offered to every runtime: the operator listed them explicitly.
+SHARED_RUNTIMES = frozenset({"extra"})
 
 STATE_SUBDIR = "skill-router"
 SUGGESTIONS_FILE = "suggestions.jsonl"
@@ -267,39 +280,82 @@ def _root_signature(root: str) -> str:
     return f"{mtime}:{len(entries)}:{digest}"
 
 
+def _read_skill(root: str, name: str) -> Optional[Dict[str, str]]:
+    """Frontmatter of ``<root>/<name>/SKILL.md`` when it is an active, well-formed skill."""
+    path = os.path.join(root, name, "SKILL.md")
+    try:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_SKILL_BYTES:
+            return None
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            text = handle.read(16384)
+    except OSError:
+        return None
+    fm = _frontmatter(text)
+    if fm is None or fm.get("name") != name:
+        return None
+    if fm.get("status", "active") != "active":
+        return None
+    return fm
+
+
 def scan_roots(roots: Iterable[Tuple[str, str]]) -> List[Dict[str, Any]]:
-    """One document per installed skill: name, runtime, description, tokens."""
+    """One document per installed skill: name, runtime, runtimes, description, tokens.
+
+    ``runtime`` is the first root that holds the name (scoring uses that copy);
+    ``runtimes`` lists every root that holds it, so ``suggest`` can offer a
+    skill to exactly the runtimes able to invoke it (#2658)."""
     docs: List[Dict[str, Any]] = []
-    seen: set = set()
+    by_name: Dict[str, Dict[str, Any]] = {}
     for runtime, root in roots:
         try:
             names = sorted(os.listdir(root))
         except OSError:
             continue
         for name in names:
-            if not _NAME_RE.fullmatch(name) or name in seen:
+            if not _NAME_RE.fullmatch(name):
                 continue
-            path = os.path.join(root, name, "SKILL.md")
-            try:
-                if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_SKILL_BYTES:
-                    continue
-                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-                    text = handle.read(16384)
-            except OSError:
+            seen = by_name.get(name)
+            if seen is not None and runtime in seen["runtimes"]:
                 continue
-            fm = _frontmatter(text)
-            if fm is None or fm.get("name") != name:
+            fm = _read_skill(root, name)
+            if fm is None:
                 continue
-            if fm.get("status", "active") != "active":
+            if seen is not None:
+                seen["runtimes"].append(runtime)
                 continue
             tokens = tokenize(name) * NAME_TOKEN_WEIGHT + tokenize(fm["description"])
             if not tokens:
                 continue
-            seen.add(name)
-            docs.append(
-                {"name": name, "runtime": runtime, "description": " ".join(fm["description"].split())[:400], "tokens": tokens}
-            )
+            doc = {
+                "name": name, "runtime": runtime, "runtimes": [runtime],
+                "description": " ".join(fm["description"].split())[:400], "tokens": tokens,
+            }
+            by_name[name] = doc
+            docs.append(doc)
     return docs
+
+
+def suggest_runtime(env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Runtime whose skills ``suggest`` may offer, or None when it is not a known root."""
+    env = os.environ if env is None else env
+    runtime = (env.get("CCC_SKILL_ROUTER_RUNTIME") or "").strip().lower() or DEFAULT_SUGGEST_RUNTIME
+    known = {label for label, _ in skill_roots(env)} - SHARED_RUNTIMES
+    return runtime if runtime in known else None
+
+
+def runtime_docs(index: Dict[str, Any], runtime: str) -> List[Dict[str, Any]]:
+    """Index documents ``runtime`` can invoke: its own root plus the shared (extra) roots.
+
+    Indexes cached before #2658 carry only ``runtime``; that single label is used then."""
+    allowed = {runtime} | SHARED_RUNTIMES
+    out = []
+    for doc in index.get("docs") or []:
+        labels = doc.get("runtimes")
+        if not isinstance(labels, list) or not labels:
+            labels = [doc.get("runtime")]
+        if allowed.intersection(labels):
+            out.append(doc)
+    return out
 
 
 def load_index(env: Optional[Dict[str, str]] = None, *, rebuild: bool = False) -> Dict[str, Any]:
@@ -413,17 +469,30 @@ class Ranker:
         return rows
 
 
-def candidates_for(prompt: str, index: Dict[str, Any], *, exclude: Iterable[str] = (), synonyms: Optional[List[Tuple[str, List[str]]]] = None) -> List[Dict[str, Any]]:
-    """Top candidates above the thresholds, or []."""
+def candidates_for(
+    prompt: str,
+    index: Dict[str, Any],
+    *,
+    exclude: Iterable[str] = (),
+    synonyms: Optional[List[Tuple[str, List[str]]]] = None,
+    allowed: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Top candidates above the thresholds, or [].
+
+    ``allowed`` (names the calling runtime can invoke, #2658) drops the other
+    runtimes' skills *after* ranking: scores keep using the whole index so the
+    thresholds stay calibrated (IDF over a one-skill root is near zero)."""
     synonyms = load_synonyms() if synonyms is None else synonyms
     tokens = expand_prompt(prompt, synonyms)
     if not tokens:
         return []
     ranker = Ranker(index.get("docs") or [])
     skip = set(exclude)
+    keep = None if allowed is None else set(allowed)
     ranked = [
         row for row in ranker.rank(tokens)
-        if row["score"] >= MIN_SCORE and row["shared"] >= MIN_SHARED_TOKENS and row["coverage"] >= MIN_COVERAGE
+        if (keep is None or row["name"] in keep)
+        and row["score"] >= MIN_SCORE and row["shared"] >= MIN_SHARED_TOKENS and row["coverage"] >= MIN_COVERAGE
     ]
     if not ranked:
         return []
@@ -551,10 +620,14 @@ def cmd_suggest(argv: List[str]) -> int:
         return 0
     if _skip_reason(prompt):
         return 0
+    runtime = suggest_runtime(env)
+    if runtime is None:
+        return 0
     session = str(payload.get("session_id") or "")[:128]
     session = re.sub(r"[^A-Za-z0-9_.-]", "", session)
     index = load_index(env)
-    rows = candidates_for(prompt, index, exclude=core_names(env))
+    allowed = [doc["name"] for doc in runtime_docs(index, runtime)]
+    rows = candidates_for(prompt, index, exclude=core_names(env), allowed=allowed)
     if not rows:
         return 0
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
