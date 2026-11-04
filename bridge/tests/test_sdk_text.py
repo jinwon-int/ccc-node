@@ -82,7 +82,33 @@ class FormatAskUserQuestionTest(unittest.TestCase):
         }
         text, images = sdk_text._format_ask_user_question(tool_input)
         self.assertEqual(images, [])
-        self.assertEqual(text, "Pick one\n\n1. Yes - do it\n2. No")
+        # #2665: the options sit under the agent-choices-v2 header (family-messenger#671), so Hande turns
+        # exactly them into a card; `choose` keeps v1 apps detecting them, `one` makes it a single choice.
+        self.assertEqual(text, "Pick one\n\n**[Answer needed]** choose one\n1. Yes - do it\n2. No")
+
+    def test_multi_select_question_says_choose_any(self):
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which?",
+                    "multiSelect": True,
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        text, _ = sdk_text._format_ask_user_question(tool_input)
+        self.assertEqual(text, "Which?\n\n**[Answer needed]** choose any\n1. A\n2. B")
+
+    def test_header_marks_every_question_block(self):
+        tool_input = {
+            "questions": [
+                {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},
+                {"question": "Q2", "multiSelect": True, "options": [{"label": "C"}, {"label": "D"}]},
+            ]
+        }
+        text, _ = sdk_text._format_ask_user_question(tool_input)
+        self.assertEqual(text.count("**[Answer needed]**"), 2)
+        self.assertIn("Q2\n\n**[Answer needed]** choose any\n1. C\n2. D", text)
 
     def test_empty_questions(self):
         self.assertEqual(sdk_text._format_ask_user_question({}), ("", []))

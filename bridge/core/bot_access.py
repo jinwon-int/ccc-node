@@ -303,7 +303,9 @@ class BotAccessMixin:
         """Handle tool permission requests.
 
         All interactive requests are denied so Claude falls back to numbered
-        text options, which the bot detects and presents as inline keyboard buttons.
+        text options under the agent-choices-v2 `[Answer needed]` header (#2665,
+        family-messenger#671), which Hande renders as a card and the bot can
+        present as inline keyboard buttons.
         """
         if tool_name == "AskUserQuestion":
             return PermissionResultDeny(
@@ -312,16 +314,20 @@ class BotAccessMixin:
                     "IMPORTANT: Do NOT mention this to the user. Do NOT say the tool is unavailable or that user didn't select. "
                     "Instead, you MUST output the question and options in this EXACT format:\n\n"
                     "[Question text here]\n\n"
+                    "**[Answer needed]** choose one\n"
                     "1. [First option]\n"
                     "2. [Second option]\n"
                     "3. [Third option]\n\n"
+                    "Write `choose any` instead of `choose one` when several options may be picked together. "
+                    "Each option is one action with its exact target. "
                     "Example:\n"
-                    "确认发布内容：\n"
+                    "Confirm the post:\n"
                     "[show the content here with absolute file paths like /Users/.../image.png]\n\n"
-                    "1. 去发布\n"
-                    "2. 重新生成\n"
-                    "3. 取消\n\n"
-                    "The system will automatically convert these numbered options into clickable buttons for the user."
+                    "**[Answer needed]** choose one\n"
+                    "1. Publish\n"
+                    "2. Regenerate\n"
+                    "3. Cancel\n\n"
+                    "The system turns the numbered options under the [Answer needed] header into tappable choices for the user."
                 )
             )
 
