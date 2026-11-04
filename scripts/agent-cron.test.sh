@@ -1044,10 +1044,15 @@ TIER_STORE="$TMP/tier-store/tasks.json"
 TIER_SPOOL="$TMP/tier-spool"
 mkdir -p "$(dirname "$TIER_STORE")"
 cat > "$TIER_STORE" <<'JSON'
-{"version":1,"tasks":[{"id":"tier-info-fail","schedule":"* * * * *","prompt":"Edge Fail","enabled":true,"notify":"owner-on-failure","failureTier":"info","failureAlertAfter":0,"lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-info-ok","schedule":"* * * * *","prompt":"Edge quiet","enabled":true,"notify":"owner","failureTier":"info","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-explicit-action","schedule":"* * * * *","prompt":"Loud Fail","enabled":true,"notify":"owner-on-failure","failureTier":"action","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
+{"version":1,"tasks":[{"id":"tier-info-fail","schedule":"* * * * *","prompt":"Edge Fail","enabled":true,"notify":"owner-on-failure","failureTier":"info","failureAlertAfter":0,"lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-info-ok","schedule":"* * * * *","prompt":"Edge quiet","enabled":true,"notify":"owner","failureTier":"info","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-explicit-action","schedule":"* * * * *","prompt":"Loud Fail","enabled":true,"notify":"owner-on-failure","failureTier":"action","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-notice-fail","schedule":"* * * * *","prompt":"Edge Fail","enabled":true,"notify":"owner-on-failure","failureTier":"notice","failureAlertAfter":0,"lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60},{"id":"tier-notice-ok","schedule":"* * * * *","prompt":"Edge quiet","enabled":true,"notify":"owner","failureTier":"notice","lastRunAt":"2026-01-01T00:00:00Z","lockTimeoutSec":60}]}
 JSON
 out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" bash "$CMD" validate --json)"; rc=$?
-ok "#2559 validate accepts failureTier action|info" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null'
+ok "#2559/#2654 validate accepts failureTier action|info|notice" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null'
+# #2654 failureTier=notice: the event reaches the owner at once (fleet-alerts `notice`: no digest, no re-notify).
+out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-notice-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2654 failureTier=notice: failed run is spooled as tier=notice" '[ "$rc" = 1 ] && jq -e ".status == \"failed\" and .notification.delivery == \"spooled\"" <<<"$out" >/dev/null && f="$(find "$TIER_SPOOL" -maxdepth 1 -type f -name "*tier-notice-fail*.json" | head -1)" && jq -e ".event == \"AgentCronRun\" and .status == \"failed\" and .tier == \"notice\" and .recipient == \"owner\"" "$f" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-notice-ok --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
+ok "#2654 failureTier=notice does not touch a success notice (stays info)" '[ "$rc" = 0 ] && f="$(find "$TIER_SPOOL" -maxdepth 1 -type f -name "*tier-notice-ok*.json" | head -1)" && jq -e ".status == \"success\" and .tier == \"info\"" "$f" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-info-fail --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
 ok "#2559 failureTier=info: failed run is still spooled but as tier=info" '[ "$rc" = 1 ] && jq -e ".status == \"failed\" and .notification.delivery == \"spooled\"" <<<"$out" >/dev/null && f="$(find "$TIER_SPOOL" -maxdepth 1 -type f -name "*tier-info-fail*.json" | head -1)" && jq -e ".event == \"AgentCronRun\" and .status == \"failed\" and .tier == \"info\" and .recipient == \"owner\"" "$f" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$TIER_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" CCC_PUSH_SPOOL="$TIER_SPOOL" bash "$CMD" run tier-info-ok --json --at 2026-01-01T00:01:00Z 2>&1)"; rc=$?
@@ -1060,8 +1065,10 @@ out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" add edge-watch --schedule "
 ok "#2559 add --failure-tier info persists the field" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"info\"" "$TIER_CRUD" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" edit edge-watch --failure-tier action --json 2>&1)"; rc=$?
 ok "#2559 edit --failure-tier action flips it back" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"action\"" "$TIER_CRUD" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" edit edge-watch --failure-tier notice --json 2>&1)"; rc=$?
+ok "#2654 edit --failure-tier notice persists the field" '[ "$rc" = 0 ] && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"notice\"" "$TIER_CRUD" >/dev/null'
 out="$(CCC_AGENT_CRON_STORE="$TIER_CRUD" bash "$CMD" edit edge-watch --failure-tier loud --json 2>&1)"; rc=$?
-ok "#2559 --failure-tier rejects values outside action|info without writing" '[ "$rc" != 0 ] && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"action\"" "$TIER_CRUD" >/dev/null'
+ok "#2559 --failure-tier rejects values outside action|info|notice without writing" '[ "$rc" != 0 ] && jq -e ".tasks[] | select(.id == \"edge-watch\") | .failureTier == \"notice\"" "$TIER_CRUD" >/dev/null'
 
 BAD_SPOOL="$TMP/not-a-dir-spool"
 printf 'not a directory' > "$BAD_SPOOL"

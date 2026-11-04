@@ -123,7 +123,8 @@ never labelled `retry-exhausted` — its failures stay plain `failed`.
 > `--failure-alert-after 0` to such a task, because each nonzero exit already
 > pages — and, when the event is informational rather than something a person
 > must act on, `--failure-tier info` so it lands in the daily digest instead of
-> re-notifying (see "Notify modes").
+> re-notifying, or `--failure-tier notice` when the person should see it at
+> once but still has nothing to decide (see "Notify modes").
 
 ## Notify modes
 
@@ -145,7 +146,18 @@ while it fires (so a watch that is itself broken still pages unless it also set
 `--failure-alert-after 0`) — only its all-`recovered` "cleared" notice is `info`
 (#2565: nothing to decide, so it joins the digest instead of re-notifying) — and
 `*-on-failure` still decides *whether* a run
-is spooled. Default `action`; any other value fails validation.
+is spooled.
+
+`failureTier: notice` (`--failure-tier notice`, #2654) is the third setting for
+the same edge-triggered watches: the event is delivered **at once** to both
+rooms like `action`, but like `info` it is never re-notified and is not an
+`ok/hold` target (fleet-alerts `notice`, #2628). Use it when the owner wants to
+know *when* the transition happened (the `laptop ONLINE` notice arriving the
+next morning in the digest was too late, 2026-11-04) but has nothing to decide.
+Everything else is as for `info`: success notices stay `info`, the
+consecutive-failure alarm is unchanged.
+
+Default `action`; any other value fails validation.
 
 
 - `none` (default) — no spool writes.
