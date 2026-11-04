@@ -705,6 +705,12 @@ else
   err "skill-promotion dispatch-skip ledger + redispatch selection tests failed"
   tail -10 "$TMP/skill-promotion-redispatch-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_ci_red_test.py >"$TMP/skill-promotion-ci-red-test.out" 2>&1; then
+  say "  ok skill-promotion CI-red intake skip-once / last-in-line / stale-close tests (#2656)"
+else
+  err "skill-promotion CI-red intake tests failed (a red intake head would again be retried forever and never closed, #2656)"
+  tail -10 "$TMP/skill-promotion-ci-red-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_identity_generalize_test.py >"$TMP/skill-promotion-identity-generalize-test.out" 2>&1; then
   say "  ok skill-promotion fleet-identity generalization tests (#2435 S4)"
 else

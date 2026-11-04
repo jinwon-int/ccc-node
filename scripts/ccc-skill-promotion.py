@@ -293,6 +293,9 @@ class Config:
     approve_ssh_target: str = ""
     # Owner push spool (bridge PushNotifier); None = post-hoc notify disabled.
     push_spool: Path | None = None
+    # #2656: close an open intake PR whose `skills` check has been red this
+    # many days (first `ci=failure` skip row); 0 turns the close sweep off.
+    ci_red_close_days: int = 3
 
 
 @dataclass(frozen=True)
@@ -887,6 +890,7 @@ def _config(environment: dict[str, str] | None = None) -> Config:
             env.get("CCC_SKILL_PROMOTION_A2A_NEXUS_DIR", str(home / "work" / "a2a" / "a2a-nexus"))
         ).absolute(),
         dispatch_ci_wait_sec=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC", 600, 60, 3600),
+        ci_red_close_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_CI_RED_CLOSE_DAYS", 3, 0, 90),
         autorepair_enabled=autorepair_enabled,
         require_usage=require_usage,
         min_skill_uses=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MIN_SKILL_USES", 1, 0, 100),
@@ -3075,6 +3079,29 @@ def _wait_for_skills_check(config: Config, head: str, timeout_sec: int) -> bool:
         time.sleep(15)
 
 
+def _skills_check_state(config: Config, head: str) -> str:
+    """One read of the `skills` check on this exact head (#2656):
+    `success`, `failure` (completed with any other conclusion — a red head
+    that will not turn green by waiting) or `pending` (queued, running,
+    missing, or unreadable). Only `failure` may age an intake PR toward the
+    stale close; a pending timeout or a transient `gh` error never does."""
+    try:
+        completed = _run(
+            [
+                "gh", "api", f"repos/{config.repo}/commits/{head}/check-runs",
+                "--jq", '[.check_runs[] | select(.name == "skills")][0] | "\\(.status)/\\(.conclusion // "")"',
+            ]
+        )
+        state = completed.stdout.decode("utf-8").strip()
+    except PromotionError:
+        return "pending"
+    if state == "completed/success":
+        return "success"
+    if state.startswith("completed/") and state != "completed/":
+        return "failure"
+    return "pending"
+
+
 def _build_dispatch_manifest(  # noqa: C901
     config: Config,
     candidate: Candidate,
@@ -3284,29 +3311,80 @@ def _dispatch_intake_review(
     # `dispatch_secret_missing` already writes its own durable row (#1766, inside
     # the attempt) — do not record it twice.
     if result.get("outcome") == "dispatch-skipped" and result.get("code") != "dispatch_secret_missing":
+        record: dict[str, object] = {
+            "ts": _utc_now(),
+            "kind": _DISPATCH_SKIPPED_KIND,
+            "transport_id": transport_id,
+            "code": str(result.get("code", "")),
+            "detail": str(result.get("detail", ""))[:160],
+            "pr_url": str(outcome.get("url", "")),
+            "branch": str(outcome.get("branch", "")),
+            "node": candidate.node,
+            "provider": candidate.provider,
+            "name": candidate.name,
+            "tree_sha256": candidate.tree_sha256,
+        }
+        head = result.get("head_sha")
+        ci_red = result.get("code") == _CI_NOT_GREEN_CODE and isinstance(head, str) and bool(head)
+        if ci_red:
+            # #2656: a CI-red head is retried every 15-minute cycle; record it
+            # once per (pr, head, ci state) instead of once per retry (1,098
+            # identical rows for three PRs in nine days, 2026-11-04).
+            record["pr"] = _pr_number_from_url(str(outcome.get("url", ""))) or ""
+            record["head_sha"] = head
+            record["ci"] = str(result.get("ci") or "pending")
+        if ci_red and _ci_skip_recorded(config, record):
+            return result
         try:
-            _append_ledger(
-                config,
-                {
-                    "ts": _utc_now(),
-                    "kind": _DISPATCH_SKIPPED_KIND,
-                    "transport_id": transport_id,
-                    "code": str(result.get("code", "")),
-                    "detail": str(result.get("detail", ""))[:160],
-                    "pr_url": str(outcome.get("url", "")),
-                    "branch": str(outcome.get("branch", "")),
-                    "node": candidate.node,
-                    "provider": candidate.provider,
-                    "name": candidate.name,
-                    "tree_sha256": candidate.tree_sha256,
-                },
-            )
+            _append_ledger(config, record)
         except PromotionError:
-            pass
+            return result
+        if ci_red and record["ci"] == "failure":
+            _notify_ci_red(config, record)
     return result
 
 
 _DISPATCH_SKIPPED_KIND = "a2a-dispatch-skipped"
+_CI_NOT_GREEN_CODE = "dispatch_ci_not_green"
+_CI_RED_CLOSED_KIND = "a2a-intake-ci-red-closed"
+
+
+def _ci_skip_key(row: dict[str, object]) -> tuple[str, str, str] | None:
+    """(pr, head, ci) of a #2656 CI skip row; None for any other row (and for
+    pre-#2656 rows, which name neither the PR number nor the head)."""
+    if row.get("kind") != _DISPATCH_SKIPPED_KIND or row.get("code") != _CI_NOT_GREEN_CODE:
+        return None
+    pr, head, ci = row.get("pr"), row.get("head_sha"), row.get("ci")
+    if not isinstance(head, str) or not head or not isinstance(ci, str):
+        return None
+    return (str(pr or ""), head, ci)
+
+
+def _ci_skip_recorded(config: Config, record: dict[str, object]) -> bool:
+    key = _ci_skip_key(record)
+    if key is None:
+        return False
+    try:
+        rows = _ledger_rows(config)
+    except PromotionError:
+        return False
+    return any(_ci_skip_key(row) == key for row in rows)
+
+
+def _notify_ci_red(config: Config, record: dict[str, object]) -> None:
+    """One owner notice per red intake head (#2656): numbers and names only."""
+    pr = str(record.get("pr") or "?")
+    days = int(getattr(config, "ci_red_close_days", 0) or 0)
+    tail = (
+        f"{days}일 동안 계속 실패하면 PR을 자동 종료합니다."
+        if days > 0 else "자동 종료는 꺼져 있습니다(CCC_SKILL_PROMOTION_CI_RED_CLOSE_DAYS=0)."
+    )
+    text = (
+        f"🧪 fleet-skills intake PR #{pr} — CI `skills` 실패로 리뷰 배정을 보류합니다 "
+        f"({record.get('node')}/{record.get('name')}). 고친 후보는 새 intake PR로 다시 올라옵니다. {tail}"
+    )
+    head = str(record.get("head_sha") or "")
+    _push_notify(config, event="SkillIntakeCiRed", text=text, dedup=f"SkillIntakeCiRed:{pr}:{head[:12]}")
 
 
 def _dispatch_intake_review_attempt(  # noqa: C901
@@ -3379,7 +3457,12 @@ def _dispatch_intake_review_attempt(  # noqa: C901
         pass
     try:
         if not _wait_for_skills_check(config, head, config.dispatch_ci_wait_sec):
-            return {"outcome": "dispatch-skipped", "code": "dispatch_ci_not_green"}
+            # #2656: name the head and whether it is red or merely not done yet,
+            # so the skip row can be deduplicated and a red head aged/closed.
+            return {
+                "outcome": "dispatch-skipped", "code": "dispatch_ci_not_green",
+                "head_sha": head, "ci": _skills_check_state(config, head),
+            }
         procedure = _worker_procedure_from_docs(
             config.a2a_nexus_dir,
             doc_name="skills-intake-review.md",
@@ -8667,7 +8750,11 @@ def _missing_dispatch_prs(
         if now - float(created) < min_age_sec:
             continue
         owed.append(pr)
-    owed.sort(key=lambda item: float(item["created_at"]))
+    # #2656: a head whose `skills` check is known red goes last. It stays
+    # eligible (a re-run CI can turn it green), but oldest-first alone let
+    # three red PRs hold every slot of every cycle and starve newer intakes.
+    red_heads = {key[1] for key in map(_ci_skip_key, rows) if key is not None and key[2] == "failure"}
+    owed.sort(key=lambda item: (item["head"] in red_heads, float(item["created_at"])))
     return owed[:limit]
 
 
@@ -9339,6 +9426,110 @@ def _sweep_replay_plans(config: Config, *, dry_run: bool) -> list[dict[str, obje
     return out
 
 
+def _ci_red_close(
+    config: Config,
+    rows: list[dict[str, object]],
+    *,
+    pr: str,
+    head: str,
+    node: str,
+    name: str,
+    days: int,
+    since: str,
+) -> dict[str, object]:
+    """Close one stale CI-red intake PR (#2656). Same shape as
+    `_arbitration_close`: one terminal row + the CLOSED state row, nothing
+    written when the close itself fails."""
+    body = (
+        f"이 intake PR은 CI `skills` 검사가 {days}일 넘게 실패한 상태라 리뷰를 배정하지 못했습니다. "
+        "자동으로 종료합니다 (#2656).\n\n"
+        f"- 첫 실패 기록: `{since}` · head `{head[:12]}`\n"
+        f"- 계보: `{node}` / `{name}`\n"
+        "- 검증 실패(예: `secret_possible-token`)는 자동으로 무시하거나 우회하지 않습니다. "
+        "후보를 고치면 새 tree로 새 intake PR이 열립니다.\n"
+        "- 이 종료는 삭제가 아닙니다. 오너가 PR을 다시 열면 같은 head를 다시 닫지 않습니다.\n"
+    )
+    try:
+        _run(["gh", "pr", "close", pr, "--repo", config.repo, "--comment", body])
+    except PromotionError as error:
+        return {"outcome": "ci-red-close-failed", "pr": pr, "code": error.code}
+    record = {"ts": _utc_now(), "kind": _CI_RED_CLOSED_KIND, "pr": pr, "head_sha": head, "node": node,
+              "name": name, "reason": "ci-not-green-stale", "since": since, "lifecycle": "archived:ci-not-green"}
+    _append_ledger(config, record)
+    rows.append(record)
+    state = {"ts": _utc_now(), "kind": _INTAKE_STATE_KIND, "pr": pr, "state": "CLOSED"}
+    _append_ledger(config, state)
+    rows.append(state)
+    return {"outcome": "ci-red-closed", "pr": pr}
+
+
+def _sweep_ci_red_intakes(
+    config: Config, *, dry_run: bool, now: float | None = None
+) -> list[dict[str, object]]:
+    """Close open intake PRs whose head has been CI-red for `ci_red_close_days` (#2656).
+
+    Before #2656 nothing owned such a PR: `_sweep_missing_dispatch` retried it
+    forever (the head is never reviewed), arbitration skips never-reviewed
+    heads, and no close sweep reached it. Age counts from the first skip row
+    that saw the check *completed and failed* (`ci=failure`) — never from a
+    pending timeout — and the check is re-read once more right before the
+    close. A head that got a review round, or that this sweep already closed
+    once (the owner may reopen it), is left alone. `ci_red_close_days=0`
+    turns the sweep off.
+    """
+    days = int(getattr(config, "ci_red_close_days", 0) or 0)
+    if not getattr(config, "dispatch_enabled", False) or days <= 0:
+        return []
+    rows = _ledger_rows(config)
+    first_red: dict[tuple[str, str], tuple[float, str]] = {}
+    reviewed: set[str] = set()
+    closed: set[tuple[str, str]] = set()
+    for row in rows:
+        kind = row.get("kind")
+        if kind == "a2a-dispatch" and isinstance(row.get("head_sha"), str):
+            reviewed.add(str(row["head_sha"]))
+        elif kind == _CI_RED_CLOSED_KIND:
+            closed.add((str(row.get("pr") or ""), str(row.get("head_sha") or "")))
+        key = _ci_skip_key(row)
+        if key is None or key[2] != "failure":
+            continue
+        at = _iso_epoch(row.get("ts"))
+        if at is None:
+            continue
+        seen = first_red.get(key[:2])
+        if seen is None or at < seen[0]:
+            first_red[key[:2]] = (at, str(row.get("ts")))
+    if not first_red:
+        return []
+    try:
+        open_prs = _open_intake_prs(config)
+    except PromotionError as error:
+        return [{"outcome": "ci-red-skipped", "code": error.code}]
+    current = time.time() if now is None else now
+    out: list[dict[str, object]] = []
+    for pr in open_prs:
+        number, head = str(pr.get("number") or ""), str(pr.get("head") or "")
+        red = first_red.get((number, head))
+        if red is None or head in reviewed or (number, head) in closed:
+            continue
+        if current - red[0] < days * 86400:
+            continue
+        parts = _intake_branch_parts(str(pr.get("branch") or "")) or {}
+        item: dict[str, object] = {"pr": number, "head": head, "since": red[1]}
+        state = _skills_check_state(config, head)
+        if state != "failure":
+            out.append({**item, "outcome": "ci-red-recheck", "ci": state})
+            continue
+        if dry_run:
+            out.append({**item, "outcome": "would-close-ci-red"})
+            continue
+        out.append(_ci_red_close(
+            config, rows, pr=number, head=head, node=parts.get("node", ""), name=parts.get("name", ""),
+            days=days, since=red[1],
+        ))
+    return out
+
+
 def _sweep_missing_dispatch(
     config: Config, *, dry_run: bool, now: float | None = None
 ) -> list[dict[str, object]]:
@@ -9393,7 +9584,10 @@ def _sweep_missing_dispatch(
 
 
 def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
-    """Redispatch / intake-state / autoclose / supersede / arbitration / auto-promote / auto-merge."""
+    """CI-red close / redispatch / intake-state / autoclose / supersede / arbitration / auto-promote / auto-merge."""
+    # #2656: close stale CI-red intakes first so the redispatch sweep does not
+    # spend a slot on a PR this cycle is about to close.
+    ci_red_closed = _sweep_ci_red_intakes(config, dry_run=dry_run)
     redispatched = _sweep_missing_dispatch(config, dry_run=dry_run)
     intake_states = _sweep_intake_states(config, dry_run=dry_run)
     promoted_intakes = _sweep_promoted_intakes(config, dry_run=dry_run)
@@ -9405,6 +9599,7 @@ def _collect_drain(config: Config, *, dry_run: bool) -> dict[str, object]:
     if getattr(config, "auto_promote_enabled", False):
         auto_promote = _promote(config, dry_run=dry_run, limit=8)
     return {
+        "ci_red_closed": ci_red_closed,
         "redispatched": redispatched,
         "intake_states": intake_states,
         "promoted_intakes": promoted_intakes,

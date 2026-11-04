@@ -958,6 +958,37 @@ ssh_target_set, blocker}` — presence only, never the target or path.
 - **Revoke:** delete the flag file (or write `off`); the next sweep is back to
   the pre-L3 flow. No restart.
 
+#### CI-red intake PRs: one skip row, last in line, closed when stale (#2656)
+
+A review round is dispatched only on a green `skills` check. Before #2656 a
+red head belonged to no sweep: `_sweep_missing_dispatch` retried it every
+15-minute cycle (one `a2a-dispatch-skipped` row each time — 1,098 rows for
+three PRs in nine days), it held the oldest-first redispatch slots, nobody
+was told, and arbitration skips never-reviewed heads.
+
+- **Classify:** a `dispatch_ci_not_green` skip now names `pr`, `head_sha` and
+  `ci` — `failure` (the check completed with any non-success conclusion) or
+  `pending` (queued, running, missing, unreadable).
+- **Record once:** the same `(pr, head_sha, ci)` is written once; other skip
+  codes are still recorded on every attempt.
+- **Tell once:** the first `ci=failure` row sends one push-spool line
+  `SkillIntakeCiRed` (PR number, node/name; `CCC_SKILL_AUTOSAVE_NOTIFY=0`
+  silences it).
+- **Last in line:** `_missing_dispatch_prs` sorts known-red heads after every
+  other owed PR; they stay eligible, so a re-run that turns green dispatches.
+- **Close when stale:** `_sweep_ci_red_intakes` (first in `_collect_drain`)
+  closes an open intake PR whose head has a `ci=failure` row older than
+  `CCC_SKILL_PROMOTION_CI_RED_CLOSE_DAYS` (default `3`, `0` = off, max 90),
+  after re-reading the check once more. It writes
+  `a2a-intake-ci-red-closed` (`lifecycle=archived:ci-not-green`) plus the
+  `a2a-intake-state` CLOSED row. Age counts from the first `failure` row,
+  never from a pending timeout; rows written before #2656 (no `head_sha`) do
+  not count. A reviewed head, a changed head, or a head this sweep already
+  closed once (the owner may reopen it) is left alone.
+- Validation failures such as `secret_possible-token` are never ignored or
+  bypassed — the close only ends the wait; a fixed candidate gets a new tree
+  and a new intake PR.
+
 #### A2A arbitration of unsettled intake lineages (#2435 S2, default OFF)
 
 Owner decision 2026-10-21: the intake loop's "human judgment" end states are
