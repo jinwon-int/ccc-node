@@ -444,9 +444,45 @@ def _skip_reason(prompt: str) -> Optional[str]:
         return "short"
     if text.startswith("/"):
         return "slash-command"
-    if _is_approval(text):
+    if _is_approval(_strip_tail(text)):
         return "approval"
+    if _is_choice_echo(text):
+        return "choice-echo"
     return None
+
+
+#: Separators after which an approval reply carries only the copied option
+#: explanation ("2651 승인 — 두 PR 모두 …", "1 (권장)").
+_TAIL_SEPARATORS = (" — ", " – ", " - ", " -- ", " : ")
+
+
+def _strip_tail(text: str) -> str:
+    """Drop a copied explanation tail: anything after an em/en dash or colon
+    separator, then trailing parenthesised notes ("(권장)", "(recommended)").
+    Plain string operations (no regex; see _is_approval)."""
+    for sep in _TAIL_SEPARATORS:
+        cut = text.find(sep)
+        if cut > 0:
+            text = text[:cut]
+    text = text.strip()
+    while text.endswith(")") and "(" in text:
+        text = text[: text.rfind("(")].rstrip()
+    return text
+
+
+def _is_choice_echo(text: str) -> bool:
+    """A reply that starts with an option marker — ``1.`` / ``2)`` / ``3 .`` —
+    is the operator picking (and usually pasting) one of the assistant's
+    numbered options. Its words are the assistant's own wording, so routing on
+    them only echoes the previous turn back as noise (#2652)."""
+    head = text.lstrip()[:5]
+    digits = 0
+    while digits < len(head) and head[digits].isdigit():
+        digits += 1
+    if digits == 0 or digits > 2:
+        return False
+    rest = head[digits:].lstrip(" ")
+    return rest[:1] in (".", ")") and (len(rest) == 1 or rest[1:2] in (" ", "\t", ""))
 
 
 def _is_approval(text: str) -> bool:

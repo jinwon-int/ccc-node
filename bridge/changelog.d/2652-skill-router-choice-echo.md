@@ -1,0 +1,1 @@
+- Skill router: copied option replies no longer get candidate injections — approval replies with an explanation tail ("1. 2651 승인 (권장)", "… 승인 — 설명") are recognised as approvals, and replies starting with an option marker ("1.", "2)") are skipped as choice echoes; numbers that are not option markers still route (#2652).
