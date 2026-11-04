@@ -94,6 +94,16 @@ for p in "1" "2637 승인" "1. 승인" "1 2 3" "2637 2638 approve" "ok" "0000000
   run_hook "$p" sess-5
   ok "no suggestion for '$p' (short / approval / slash / no signal)" '[ "$rc" = 0 ] && [ -z "$out" ]'
 done
+# #2652: copied option replies — approvals with an explanation tail, and any
+# reply that starts with an option marker — never get candidates (the words
+# are the assistant's own option text, routing on them is an echo).
+for p in "1. 2651 승인 (권장)" "2637 2638 승인 — 두 PR 모두 리뷰" "2651 승인 (recommended option)" \
+         "1. 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 — 권장안" "2) 브리지 재시작 전에 분리 유닛으로 돌려서 검증" "3 . 지금 상태로 브리지 재시작 분리 유닛 검증"; do
+  run_hook "$p" sess-5
+  ok "#2652: no suggestion for copied option reply '$p'" '[ "$rc" = 0 ] && [ -z "$out" ]'
+done
+run_hook "2026 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-9
+ok "#2652: a request that merely starts with a number still routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
 ok "silent prompts leave no last-session file" '[ ! -e "$CCC_STATE_DIR/skill-router/last-sess-5.json" ]'
 run_hook "tell me about zebra quokka probing in the codex runtime roots" sess-6
 ok "codex-root skills are routable" '[ "$(names | head -1)" = codex-only-probe ]'
