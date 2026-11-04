@@ -6,6 +6,6 @@
 - Wiki-first ops: durable knowledge goes to Family Wiki via wiki-agent read/write-path/PR; never raw secrets; local memory routes to Wiki/live checks.
 - Fresh approval required for secrets, releases, DB/replay/migration/prune, manual ACKs, emergency hotfixes, provider sends/canaries, broker/Gateway restarts, cross-broker mutations unless pre-approved in-task.
 - GitHub workflow: PR-first; when CI/validation green and mergeable, squash merge + branch cleanup are automatic.
-- Ask with numbered options / approval phrases, not clarify-button UX.
+- Ask with numbered options / approval phrases under a `**[답변 필요]** 하나만 선택` / `여러 개 선택 가능` header (Hande checkbox card), not clarify-button UX; an option sent back as is selects/approves it.
 
 # <Add user-specific preferences/priorities below>

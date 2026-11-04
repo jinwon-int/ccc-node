@@ -109,7 +109,9 @@ so the account name is not an identity.
    merely to bypass branch protection.
 
    - Old approvals, memory, environment state, or approval for another PR do
-     not count. If approval is absent or ambiguous, stop and ask.
+     not count. If approval is absent or ambiguous, stop and ask. An option
+     the owner sends back as is counts as the phrase it carries (see
+     "Reading the owner's reply" under Conditional bundled approval, #2665).
    - **Pushing to someone else's PR can delete the only remaining approver.**
      `jinwon-int/ccc-node` `main` sets `require_last_push_approval: true`, so
      the account that pushed last cannot approve that PR. Push a review fix to
@@ -687,11 +689,20 @@ An `ABORT_BUSY`-style no-change result (idle gate never opened, nothing
 modified) is not a failure: retry that node within the bundle, and report it.
 
 **4. Reading the owner's reply.** The phrase must come from the owner in the
-current conversation. The owner often answers by pasting one option back from
-a numbered list: a message that repeats **exactly one** proposed option
-selects it. A message that pastes several mutually exclusive options, or only
-a conditional sentence ("보였다면 … 승인을 주세요") without answering it, is
-**not** an approval — ask once more, with the recommended option first.
+current conversation. The owner answers by sending proposed options back as
+is — Hande's agent-choices card (check → 보내기), a paste, or the number
+(owner 2026-11-04, #2665). An option sent back verbatim selects it, and
+approves its target when the option carries the approval phrase
+(`#<n> relay 머지`, `<n> 묶음 승인`, …). Several **independent** options sent
+together are each selected. Propose them under the agent-choices-v2 header —
+`**[답변 필요]** 하나만 선택` for mutually exclusive options,
+`**[답변 필요]** 여러 개 선택 가능` for independent ones — one action and its
+exact target (PR, head, version) per option. It is **not** an approval —
+ask once more, with the recommended option first — when the message sends
+several options of a 「하나만」 block, repeats a question or a conditional
+sentence ("보였다면 … 승인을 주세요") without answering it, or names a PR whose
+head (or a version) moved since the proposal. External PRs still need an
+option carrying `<n> 외부 승인`.
 
 **5. Evidence.** Post each step's evidence (step, result, IDs, SHAs, PIDs,
 timestamps) to the PR as it completes, and cite the bundle approval message in

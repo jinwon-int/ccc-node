@@ -165,6 +165,8 @@ class PermissionCallbackTests(unittest.TestCase):
         result = asyncio.run(bot._permission_callback(10, 1, "AskUserQuestion", {}))
         self.assertIsInstance(result, PermissionResultDeny)
         self.assertIn("numbered options", result.message.lower().replace("-", " "))
+        # #2665: the format the agent is told to write carries the agent-choices-v2 header Hande renders.
+        self.assertIn("**[Answer needed]** choose one\n1. ", result.message)
 
     def test_bash_auto_approve_allows(self):
         bot = self._harness(bash_policy="auto-approve")

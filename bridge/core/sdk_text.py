@@ -195,6 +195,11 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
     return text_bucket in _RETRYABLE_TEXT_BUCKETS
 
 
+# agent-choices-v2 header (family-messenger#671 §5): options under it are the answer the user owes.
+ANSWER_NEEDED_ONE = "**[Answer needed]** choose one"
+ANSWER_NEEDED_MANY = "**[Answer needed]** choose any"
+
+
 def _format_ask_user_question(tool_input: dict):
     """Degrade AskUserQuestion to plain text for bot delivery.
 
@@ -216,6 +221,10 @@ def _format_ask_user_question(tool_input: dict):
 
         if options:
             lines.append("")
+            # #2665 / family-messenger#671 (agent-choices-v2): the header marks exactly these options as the
+            # answer the user owes, so Hande renders them as a card; `choose` keeps v1 apps detecting them and
+            # `one` makes the card single-choice.
+            lines.append(ANSWER_NEEDED_MANY if q.get("multiSelect") else ANSWER_NEEDED_ONE)
         for i, opt in enumerate(options, 1):
             label = opt.get("label", "")
             desc = opt.get("description", "")
