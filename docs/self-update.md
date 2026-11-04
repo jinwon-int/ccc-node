@@ -231,6 +231,40 @@ the bridge is serving a request:
 - fail-open (missing / unreadable / stale `health.json` → proceed) and
   `--force` bypasses the gate entirely.
 
+### Pre-restart recheck (#2667)
+
+The gate above runs once, before fetch. A changed tick then spends seconds
+(setup, installer re-apply) to minutes (Termux `prepare-cmd`) before the first
+restart, and a turn admitted in that window used to be killed by the restart.
+Observed on a fleet node 2026-11-04 during a fleet rolling update: gate ok at
+17:51:44 KST, an owner's 「한데」 message admitted at 17:51:50, `ccc-hande-bridge`
+stopped at 17:51:57 — the owner saw `worker_gone`.
+
+So the same gate (bridge frontends and A2A workers) runs **again right before
+the first restart**:
+
+- bridges publish their workload every 10 s, so when a gated health file
+  exists the recheck first waits one reporting interval
+  (`CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS`, default `11`, `0` = off). A
+  turn admitted shortly before the restart is then visible, or already done;
+- busy → nothing is restarted and the previous generation keeps serving. The
+  code and harness are already installed, so the run records the activation as
+  `restart-deferred-busy` (audit `activation-deferred`, `deferred_stage:
+  "pre-restart"`), keeps the pre-update recovery snapshot with that record, and
+  exits `8` (quiet, like any busy deferral);
+- the next tick sees HEAD equal to the installed marker. Instead of reporting
+  up-to-date (or only reporting the pending activation, which never restarts on
+  its own, #1527) it logs `pending-activation resume reason=restart-deferred-busy`
+  and resumes like an install drift: re-deploy, the recheck, the restart. The
+  completion notice ends with `(보류됐던 재시작 완료)`;
+- the deferral cap counts from the record's `started_at` (first install of that
+  target), so a frontend that is busy at every recheck still gets restarted once
+  `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` has passed; `--force` and a first gate that
+  already proceeded on the cap skip the recheck.
+
+This narrows the window to the bridge's reporting lag; it does not close it.
+An admission handshake before stop is #1608.
+
 ## Worktree gate (#1961)
 
 On a fleet node (2026-09-24) four Claude Code `Agent(isolation: worktree)` trees,
@@ -372,6 +406,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
+| `CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS` | `11` | wait before the pre-restart idle recheck when a gated health file exists, so a just-admitted turn reaches `health.json` (integer 0..60; `0` = recheck immediately, #2667) |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_A2A_HANDLERS` | `1` | set to `0` to skip refreshing drifted installed A2A handler copies (#2357) |
 | `CCC_A2A_HANDLER_SYSTEM_DEST` | `/usr/local/sbin` | system destination of the installed A2A handlers checked by the refresh step and by `ccc-doctor` (tests point it at a temp dir); the home destination is always `$HOME/a2a-broker-worker` |
