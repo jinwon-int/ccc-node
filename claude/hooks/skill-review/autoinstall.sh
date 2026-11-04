@@ -950,10 +950,24 @@ notify_summary() { # <summary-json>
     parts="${parts}프리스크린 판정으로 archive ${n_arc}건(revise ${n_rev}·reject ${n_rej}, 복원 가능)"
   fi
   if [ "$n_new_blk" -gt 0 ]; then
+    # #2650: a gate-blocked draft is not waiting for anyone's approval in auto
+    # mode — it stays pending until its cause is fixed, and the sweep's pending
+    # expiry archives it (restorable) once it is old enough. Say exactly that.
+    local expire_days="${CCC_SKILL_PENDING_EXPIRE_DAYS:-90}" blocked_tail
+    case "$expire_days" in ''|*[!0-9]*) expire_days=90 ;; esac
+    if [ "$(resolve_mode)" = auto ]; then
+      if [ "$expire_days" -gt 0 ]; then
+        blocked_tail="사유 해결 전까지 보류, ${expire_days}일 지나면 자동 archive(복원 가능)"
+      else
+        blocked_tail="사유 해결 전까지 보류(자동 정리 꺼짐)"
+      fi
+    else
+      blocked_tail="승인 대기 유지"
+    fi
     [ -n "$parts" ] && parts="$parts · "
     parts="${parts}자동 설치 차단 ${n_new_blk}건($(jq -r \
       '.newly_blocked as $ni | [.blocked[] | select(.id as $i | $ni | index($i))
-       | (.reason | split(" ")[0])] | unique | join(",")' <<<"$summary" 2>/dev/null)) — 승인 대기 유지"
+       | (.reason | split(" ")[0])] | unique | join(",")' <<<"$summary" 2>/dev/null)) — ${blocked_tail}"
   fi
   if [ "$n_def" -gt 0 ] 2>/dev/null; then
     parts="$parts · 일일 상한(${DAILY_CAP}건) 도달로 ${n_def}건 보류"

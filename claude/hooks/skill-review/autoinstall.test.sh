@@ -151,6 +151,8 @@ ok "block marker names pattern class only" 'jq -e ".reason == \"secret gh-token\
 ok "block marker never quotes the secret" '! grep -q ghp_ "$PENDING/20260101-000002-c-leaky/autosave-block.json"'
 ok "summary counts newly blocked" 'jq -e ".newly_blocked | length == 1" >/dev/null <<<"$out"'
 ok "block notification queued" 'jq -r ".text" "$SPOOL"/*SkillAutoInstall*.json | grep -q "차단 1건"'
+ok "#2650: in auto mode the blocked-draft notice says what happens instead of asking for approval" \
+  'txt="$(jq -r ".text" "$SPOOL"/*SkillAutoInstall*.json)"; grep -q "차단 1건(secret) — 사유 해결 전까지 보류, 90일 지나면 자동 archive(복원 가능)" <<<"$txt" && ! grep -q "승인 대기" <<<"$txt"'
 
 # second run: same block is not "new" — no duplicate notification
 # shellcheck disable=SC2034  # spool_before is read via eval inside ok()
