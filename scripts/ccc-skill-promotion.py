@@ -8818,7 +8818,17 @@ _ARBITRATION_STUCK_SEC = 24 * 3600
 # reviewer online, broker down) closes the lineage as arbiter-unavailable.
 _ARBITRATION_GRACE_SEC = 48 * 3600
 _ARBITRATION_LIMIT = 4  # per collect; each dispatch may wait on the skills check
-_ARBITRATION_TERMINAL_REVISE = frozenset({"failed", "invalid", "drop-recommended", "broker-mismatch"})
+# Revise outcomes that leave the head with nothing left to run. #2657: a round
+# whose revised tree could not be republished (`publish-failed`, e.g. the
+# revised description failing `description_trigger_missing`) or came back
+# identical (`unchanged`) used to fall through to `None` — `revise_stuck`
+# only fires when no revise was dispatched — so the intake PR stayed open
+# with no owner (fleet-skills#654, 2026-10-29 → 2026-11-04). Every status a
+# `a2a-revise-result` row can carry must be terminal here, `republished`
+# (superseded), or `infra_failed` (retried) — pinned by the arbitration test.
+_ARBITRATION_TERMINAL_REVISE = frozenset(
+    {"failed", "invalid", "drop-recommended", "broker-mismatch", "publish-failed", "unchanged"}
+)
 
 
 def _iso_epoch(value: object) -> float | None:

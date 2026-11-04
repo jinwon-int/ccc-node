@@ -1009,7 +1009,9 @@ chmod 600 ~/.claude/state/skill-promotion.arbitration
   review or revise round for the head is still running):
   `reject` (latest verdict) · `round_limit` (the revise round-limit handoff
   comment) · `drop_recommended` · `revise_failed` (revise result
-  failed/invalid/broker-mismatch) · `review_failed` (malformed verdict after
+  failed/invalid/broker-mismatch, and since #2657 publish-failed — the revised
+  tree was refused on republish, e.g. `description_trigger_missing` — or
+  unchanged) · `review_failed` (malformed verdict after
   the #2435 S1 infrastructure retry) · `revise_stuck` (a revise verdict whose
   revision went nowhere for 24 h).
 - **Arbitration round:** a normal skills-intake review dispatch to a reviewer
