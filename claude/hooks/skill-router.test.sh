@@ -105,8 +105,28 @@ done
 run_hook "2026 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-9
 ok "#2652: a request that merely starts with a number still routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
 ok "silent prompts leave no last-session file" '[ ! -e "$CCC_STATE_DIR/skill-router/last-sess-5.json" ]'
+# #2658: the hook only offers skills the calling runtime can invoke. It is
+# registered in Claude Code's hooks, so the default runtime is claude.
 run_hook "tell me about zebra quokka probing in the codex runtime roots" sess-6
-ok "codex-root skills are routable" '[ "$(names | head -1)" = codex-only-probe ]'
+ok "#2658: a codex-only skill is never offered to the claude runtime (default)" '[ "$rc" = 0 ] && [ -z "$out" ]'
+CCC_SKILL_ROUTER_RUNTIME=codex run_hook "tell me about zebra quokka probing in the codex runtime roots" sess-6
+ok "#2658: CCC_SKILL_ROUTER_RUNTIME=codex routes to codex-root skills" '[ "$(names | head -1)" = codex-only-probe ]'
+CCC_SKILL_ROUTER_RUNTIME=codex run_hook "브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-6
+ok "#2658: a claude-only skill is never offered to the codex runtime" '! grep -q bridge-restart-detached <<<"$(names)"'
+CCC_SKILL_ROUTER_RUNTIME=piri run_hook "브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-6
+ok "#2658: an unknown runtime is silent rather than wrong" '[ "$rc" = 0 ] && [ -z "$out" ]'
+skill "$CODEX_HOME/skills" hwpx-report-build "Use when producing a Korean hwpx report document that must inherit an institutional form template without Hangul Office installed."
+sleep 1; touch "$CODEX_HOME/skills"
+out="$(python3 "$MOD" index --json)"
+ok "#2658: a name in both roots stays one index document listing both runtimes" \
+  'jq -e ".skills == 8 and .by_runtime.claude == 7 and .by_runtime.codex == 1" <<<"$out" >/dev/null && jq -e "[.docs[] | select(.name == \"hwpx-report-build\") | .runtimes] == [[\"claude\",\"codex\"]]" "$CCC_STATE_DIR/skill-router/index.json" >/dev/null'
+run_hook "hwpx 한글 보고서를 기관 양식 그대로 만들어줘" sess-6
+ok "#2658: a skill in both roots routes for claude" '[ "$(names | head -1)" = hwpx-report-build ]'
+CCC_SKILL_ROUTER_RUNTIME=codex run_hook "hwpx 한글 보고서를 기관 양식 그대로 만들어줘" sess-6
+ok "#2658: … and for codex" '[ "$(names | head -1)" = hwpx-report-build ]'
+EXTRA="$TMP/extra-skills"; skill "$EXTRA" osprey-ledger-audit "Use when auditing the osprey ledger rollups for drift between nightly snapshots and the live heron counters."
+CCC_SKILL_ROUTER_EXTRA_ROOTS="$EXTRA" run_hook "audit the osprey ledger rollups for drift against the heron counters" sess-6
+ok "#2658: operator extra roots are offered to the claude runtime" '[ "$(names | head -1)" = osprey-ledger-audit ]'
 
 CCC_SKILL_ROUTER=0 run_hook "브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-7
 ok "CCC_SKILL_ROUTER=0 silences the hook" '[ "$rc" = 0 ] && [ -z "$out" ]'
