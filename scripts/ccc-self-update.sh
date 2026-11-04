@@ -106,6 +106,20 @@
 #      It also defers while an allowlisted A2A worker unit (a2a-*worker*) runs
 #      a task — its cgroup holds a handler child besides the worker (#2138);
 #      CCC_SELF_UPDATE_CGROUP_ROOT (/sys/fs/cgroup). Same caps and --force.
+#      Pre-restart recheck (#2667): the gate above runs once, before fetch, and
+#      a changed tick then spends seconds to minutes in setup/reapply/prepare. A
+#      turn admitted in that window was SIGTERM-killed by the restart (a fleet node
+#      2026-11-04: gate ok 17:51:44, hande turn 17:51:50, restart 17:51:57 →
+#      worker_gone). So the same gate runs again right before the first
+#      restart. Bridges publish workload every 10 s, so when a gated health
+#      file exists the recheck first waits one reporting interval,
+#      CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS (11; 0..60, 0 = off). Busy →
+#      nothing is restarted (the previous generation keeps serving), the
+#      activation record gets outcome `restart-deferred-busy` and the run exits
+#      8. The next tick sees HEAD == installed marker but that record, and
+#      resumes like an install drift (re-deploy + restart) instead of reporting
+#      up-to-date. The deferral cap counts from the record's started_at, so a
+#      frontend that is busy at every recheck cannot starve the activation.
 # Exit: 0 = up-to-date or updated cleanly; 7 = a restart (allowlisted service
 #      or external restart-cmd) or a recovery attempt failed; 8 = deferred
 #      (bridge busy, or — #1961, uncapped and not bypassed by --force — a
@@ -469,6 +483,7 @@ notify_activation_incomplete() { # <target-sha> <text> <dedup-suffix>
 load_pending_activation() {
   local rec rc
   PENDING_TARGET_SHA=""; PENDING_OUTCOME=""; PENDING_SERVICES='[]'
+  PENDING_PREVIOUS_SHA=""; PENDING_SNAPSHOT=""; PENDING_STARTED_EPOCH=""
   rec="$(activation_state load "${NEW_SHA:-}")"; rc=$?
   if [ "$rc" != 0 ]; then
     [ "$rc" = 1 ] || log "pending-activation unsafe reason=unsafe-or-interrupted"
@@ -477,6 +492,18 @@ load_pending_activation() {
   PENDING_TARGET_SHA="$(printf '%s' "$rec" | jq -r .target_sha)"
   PENDING_OUTCOME="$(printf '%s' "$rec" | jq -r .outcome)"
   PENDING_SERVICES="$(printf '%s' "$rec" | jq -c .services)"
+  PENDING_PREVIOUS_SHA="$(printf '%s' "$rec" | jq -r .previous_sha)"
+  PENDING_SNAPSHOT="$(printf '%s' "$rec" | jq -r .snapshot)"
+  # started_at survives every rewrite for the same target (helper `write`), so
+  # it is the moment this generation was first installed (#2667 defer cap).
+  PENDING_STARTED_EPOCH="$(printf '%s' "$rec" | python3 -c '
+import json, sys
+from datetime import datetime
+try:
+    print(int(datetime.fromisoformat(json.load(sys.stdin)["started_at"].replace("Z", "+00:00")).timestamp()))
+except Exception:
+    pass
+' 2>/dev/null)"
 }
 detect_interrupted_pending_write() { activation_state residue; }
 resolve_serving_generation() {
@@ -1037,6 +1064,14 @@ FRESH_SECONDS="${CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS:-90}"
 BUSY_MAX_SECONDS="${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}"
 MAX_DEFER_SECONDS="${CCC_SELF_UPDATE_MAX_DEFER_SECONDS:-3600}"
 DEFER_MARK="$STATE_DIR/self-update.deferred-since"
+PRE_RESTART_SETTLE_SECONDS="${CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS:-11}"
+if [[ ! "$PRE_RESTART_SETTLE_SECONDS" =~ ^(0|[1-9][0-9]?)$ ]] || [ "$PRE_RESTART_SETTLE_SECONDS" -gt 60 ]; then
+  say "self-update: CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS must be an integer in 0..60" >&2
+  exit 2
+fi
+# Set when the first gate let a busy run through because the total deferral cap
+# was exceeded; the pre-restart recheck then honours the same decision.
+IDLE_GATE_CAP_PROCEEDED=0
 
 # Echo a reason and return 0 when the bridge is busy; return 1 (fail-open) when
 # idle, unknown, stale, or over the per-task cap.
@@ -1196,6 +1231,7 @@ if [ -n "$busy_kind" ]; then
   fi
   log "proceed reason=defer-cap-exceeded waited=${waited}s $busy_reason"
   say "self-update: $busy_label busy but deferred ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
+  IDLE_GATE_CAP_PROCEEDED=1
 fi
 # Not busy (or forced, or cap exceeded) → clear any deferral marker and continue.
 rm -f "$DEFER_MARK" 2>/dev/null
@@ -1696,6 +1732,24 @@ elif [ "$CHANGED" = "false" ] && [ -z "$INSTALLED_SHA" ] && [ "$FORCE" != "1" ];
   printf '%s\n' "$NEW_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || log "warn installed-sha marker write failed path=$INSTALLED_SHA_FILE"
 fi
 
+# Resume a restart the pre-restart recheck deferred (#2667). The previous run
+# installed NEW_SHA and then found a frontend busy, so it restarted nothing:
+# HEAD and the installed marker already match and the unchanged-tick path
+# below would only REPORT the pending activation (it never restarts on its
+# own, #1527). `restart-deferred-busy` is the one outcome where no restart was
+# ever attempted, so finishing it is the original action, not a retry; it
+# resumes exactly like an install drift. The first gate above has already
+# confirmed idle (or the cap), and the recheck before the restart runs again.
+RESUME_DEFERRED_RESTART=0
+if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ] && load_pending_activation \
+   && [ "$PENDING_OUTCOME" = "restart-deferred-busy" ] \
+   && [ "$PENDING_TARGET_SHA" = "$NEW_SHA" ] && [ "$INSTALLED_SHA" = "$NEW_SHA" ]; then
+  RESUME_DEFERRED_RESTART=1
+  RESUME_SNAPSHOT="$PENDING_SNAPSHOT"
+  log "pending-activation resume reason=restart-deferred-busy target=$NEW_SHA previous=$PENDING_PREVIOUS_SHA"
+  CHANGED=true
+fi
+
 # --- installed A2A handler refresh (#2357, #1460) -----------------------------
 # scripts/install-a2a-review-handler.sh COPIES the skills-intake dispatcher and
 # handlers to /usr/local/sbin (Termux / non-root: ~/a2a-broker-worker). setup.sh
@@ -2173,6 +2227,62 @@ service_failure_reason() { # <unit> <system|user> <since-epoch>
   printf '%s' "$reason"
 }
 
+# --- pre-restart idle recheck (#2667) ------------------------------------------
+# The first gate ran before fetch; everything since (setup, reapply, prepare)
+# took time in which a new turn may have been admitted. Look again right before
+# the first restart. See the header "Pre-restart recheck" paragraph.
+gated_health_file_present() {
+  [ -f "$HEALTH_FILE" ] && return 0
+  service_allowlisted ccc-matrix-bridge && [ -f "$MATRIX_HEALTH_FILE" ] && return 0
+  service_allowlisted ccc-hande-bridge && [ -f "$HANDE_HEALTH_FILE" ] && return 0
+  return 1
+}
+pre_restart_idle_recheck() {
+  local kind="" reason label now since waited
+  [ "$FORCE" = "1" ] && return 0
+  [ "$IDLE_GATE_CAP_PROCEEDED" = "1" ] && return 0
+  if [ "$PRE_RESTART_SETTLE_SECONDS" -gt 0 ] && gated_health_file_present; then
+    # One bridge reporting interval, so a turn admitted just before this point
+    # has reached health.json (or already finished).
+    sleep "$PRE_RESTART_SETTLE_SECONDS"
+  fi
+  if reason="$(bridge_is_busy)"; then
+    kind=bridge
+  elif reason="$(worker_is_busy)"; then
+    kind=worker
+  fi
+  [ -n "$kind" ] || return 0
+  label="bridge"; [ "$kind" = worker ] && label="a2a worker"
+  now="$(date +%s)"
+  since=""
+  load_pending_activation && since="$PENDING_STARTED_EPOCH"
+  case "$since" in ''|*[!0-9]*) since="$now" ;; esac
+  waited=$(( now - since ))
+  if [ "$waited" -ge "$MAX_DEFER_SECONDS" ]; then
+    log "proceed reason=defer-cap-exceeded stage=pre-restart waited=${waited}s $reason"
+    say "self-update: $label busy before restart but activation waited ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
+    return 0
+  fi
+  # Code and harness are installed; only the restart is postponed. Keep the
+  # recovery snapshot with the record so the resumed tick can still roll back.
+  KEEP_INSTALL_SNAPSHOT=1
+  write_pending_activation "restart-deferred-busy" "$PREPARE_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
+  # The record keeps the FIRST attempt's snapshot for a target (helper
+  # `write`). A resumed run's own snapshot (taken of already-new artifacts) is
+  # then referenced by nothing; let the EXIT trap remove it instead of leaking
+  # one directory per repeated deferral.
+  if load_pending_activation && [ -n "$PENDING_SNAPSHOT" ] \
+     && [ "$PENDING_SNAPSHOT" != "$INSTALL_SNAPSHOT_DIR" ]; then
+    KEEP_INSTALL_SNAPSHOT=0
+  fi
+  log "deferred reason=${kind}-busy stage=pre-restart $reason waited=${waited}s target=$NEW_SHA"
+  audit "activation-deferred" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$PREPARE_JSON" \
+    "$(jq -nc --arg k "$kind" '{deferred_stage:"pre-restart", busy_kind:$k}')"
+  say "self-update: $label busy ($reason) right before restart — restart deferred; ${NEW_SHA:0:7} is installed and the next tick restarts into it"
+  exit 8
+}
+pre_restart_idle_recheck
+
 # --- restart allowlisted services ----------------------------------------------
 SERVICES_JSON="$PREPARE_JSON"
 FAILED_NAMES=""
@@ -2330,10 +2440,25 @@ if ! rm -rf -- "$INSTALL_SNAPSHOT_DIR"; then
   exit 10
 fi
 INSTALL_SNAPSHOT_DIR=""
+# A resumed deferred restart (#2667) also owns the snapshot the deferring run
+# kept (taken before that run's setup, i.e. the real pre-update artifacts).
+# Activation is verified, so it is no longer needed. Only a private rollback
+# directory of this state dir is ever removed.
+RESUME_NOTE=""
+if [ "$RESUME_DEFERRED_RESTART" = "1" ]; then
+  RESUME_NOTE=" (보류됐던 재시작 완료)"
+  case "$RESUME_SNAPSHOT" in
+    "$STATE_DIR"/self-update-install-rollback.*)
+      if [ -d "$RESUME_SNAPSHOT" ] && [ ! -L "$RESUME_SNAPSHOT" ]; then
+        rm -rf -- "$RESUME_SNAPSHOT" || log "warn deferred-restart snapshot cleanup failed path=$RESUME_SNAPSHOT"
+      fi
+      ;;
+  esac
+fi
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then
-  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}${A2A_HANDLER_NOTE}." "ok-$NEW_SHA"
+  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}${A2A_HANDLER_NOTE}${RESUME_NOTE}." "ok-$NEW_SHA"
 fi
-say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED${REAPPLY_NOTE}${A2A_HANDLER_NOTE})"
+say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED${REAPPLY_NOTE}${A2A_HANDLER_NOTE}${RESUME_NOTE:+, deferred restart resumed})"
 exit 0

@@ -50,6 +50,10 @@ export CCC_SELF_UPDATE_PROVENANCE_MODE=off
 # Same for the Matrix frontend's health file (never the node's real ~/.ccc-matrix).
 export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
 export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
+# The pre-restart recheck (#2667) waits one bridge reporting interval when a
+# gated health file exists. Sections that leave a fixture health file in place
+# would otherwise spend 11 s per changed tick; the #2667 section opts back in.
+export CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS=0
 # And for the A2A worker gate (#2138): never read the node's real unit cgroups,
 # or a fixture run on a worker node mid-task would defer.
 export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
@@ -1920,6 +1924,102 @@ out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=9999 run_selfup run 2>&1)
 ok "prepare budget above 7200s is refused by run" '[ "$rc" = 2 ] && grep -q "1..7200" <<<"$out" && [ "$(git -C "$REPO" rev-parse HEAD)" = "$budget_head" ]'
 rm -f "$CLAUDE/self-update.prepare-cmd" "$CLAUDE/self-update.restart-cmd" "$STATE/self-update.pending-activation.json"
 rm -rf "$STATE"/self-update-install-rollback.*
+
+# --- #2667: the idle gate runs again right before the first restart ----------
+# A fleet node, 2026-11-04: the gate passed at 17:51:44, a hande turn was admitted at
+# 17:51:50 and the restart at 17:51:57 killed it (worker_gone). The prepare
+# command below plays that turn: it runs after the first gate and setup, and
+# marks the hande frontend busy just before the restart section.
+HH2667="$TMP/hande-health-2667.json"
+export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$HH2667"
+PENDING_2667="$STATE/self-update.pending-activation.json"
+rm -f "$PENDING_2667" "$STATE/self-update.deferred-since" "$STATE/self-update.activation-notified"
+rm -rf "$STATE"/self-update-install-rollback.*
+printf '%s\n' 'system:ccc-hande-bridge.service' > "$CLAUDE/self-update.services"
+cat > "$TMP/mkbusy-2667.sh" <<SH
+#!/usr/bin/env bash
+printf '{"updated_at":"%s","workload":{"active_requests":1,"oldest_request_age_seconds":5}}' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HH2667"
+SH
+busy_prepare_2667() { printf 'bash %s\n' "$TMP/mkbusy-2667.sh" > "$CLAUDE/self-update.prepare-cmd"; }
+mk_idle_2667() { printf '{"updated_at":"%s","workload":{"active_requests":0,"oldest_request_age_seconds":0}}' "$(now_iso)" > "$HH2667"; }
+hande_restarts_2667() { grep -c "^restart ccc-hande-bridge.service" "$TMP/systemctl.calls" 2>/dev/null; }
+
+# (a) idle at the first gate, busy right before the restart → defer, no restart.
+busy_prepare_2667; mk_idle_2667
+bump2142 recheck-2667
+# shellcheck disable=SC2034  # read via eval inside ok()
+target_2667="$(git -C "$TMP/seed" rev-parse HEAD)"
+: > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#2667 turn admitted after the first gate defers before restart (exit 8)" \
+  '[ "$rc" = 8 ] && grep -q "right before restart" <<<"$out"'
+ok "#2667 deferred run restarts nothing" '[ "$(hande_restarts_2667)" = 0 ]'
+ok "#2667 defer is logged with its stage and frontend" \
+  'grep -q "deferred reason=bridge-busy stage=pre-restart hande active=1" "$STATE/self-update.log"'
+ok "#2667 code is installed and the record says restart-deferred-busy with its snapshot" \
+  '[ "$(cat "$STATE/self-update.installed-sha")" = "$target_2667" ] && jq -e ".outcome == \"restart-deferred-busy\" and .target_sha == \"$target_2667\" and (.snapshot | length) > 0" "$PENDING_2667" >/dev/null && [ -d "$(jq -r .snapshot "$PENDING_2667")" ]'
+ok "#2667 defer is audited as activation-deferred at stage pre-restart" \
+  'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"activation-deferred\" and .deferred_stage == \"pre-restart\" and .busy_kind == \"bridge\"" >/dev/null'
+ok "#2667 a busy deferral stays quiet (self-heals next tick)" '! ls "$TMP/spool"/*.json >/dev/null 2>&1'
+# shellcheck disable=SC2034  # read via eval inside ok()
+started_2667="$(jq -r .started_at "$PENDING_2667")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+snap_2667="$(jq -r .snapshot "$PENDING_2667")"
+
+# (b) next tick (HEAD unchanged): resumes, finds the turn still running, defers
+# again — same record start, no extra snapshot left behind.
+mk_idle_2667; : > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#2667 unchanged tick resumes the deferred restart instead of reporting up-to-date" \
+  'grep -q "pending-activation resume reason=restart-deferred-busy target=$target_2667" "$STATE/self-update.log" && ! grep -q "already up to date" <<<"$out"'
+ok "#2667 resumed tick still busy defers again without restarting" \
+  '[ "$rc" = 8 ] && [ "$(hande_restarts_2667)" = 0 ]'
+ok "#2667 repeated deferral keeps the first start time and snapshot (cap accumulates)" \
+  '[ "$(jq -r .started_at "$PENDING_2667")" = "$started_2667" ] && [ "$(jq -r .snapshot "$PENDING_2667")" = "$snap_2667" ] && [ "$(compgen -G "$STATE/self-update-install-rollback.*" | wc -l)" = 1 ]'
+
+# (c) next tick idle: the resumed run restarts into the installed generation.
+rm -f "$CLAUDE/self-update.prepare-cmd"
+mk_idle_2667; : > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "#2667 idle resumed tick restarts the deferred generation" \
+  '[ "$rc" = 0 ] && [ "$(hande_restarts_2667)" = 1 ] && grep -q "deferred restart resumed" <<<"$out"'
+ok "#2667 activation verified and every rollback snapshot removed" \
+  '[ "$(jq -r .outcome "$PENDING_2667")" = activated ] && ! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "#2667 completion notice says the deferred restart finished" \
+  'jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | grep -q "보류됐던 재시작 완료"'
+ok "#2667 the tick after that is a plain up-to-date" \
+  ': > "$TMP/systemctl.calls"; o="$(run_selfup run 2>&1)"; [ "$?" = 0 ] && grep -q "already up to date" <<<"$o" && [ "$(hande_restarts_2667)" = 0 ]'
+
+# (d) busy at the recheck but the activation already waited past the cap → proceed.
+busy_prepare_2667; mk_idle_2667; bump2142 recheck-cap-2667
+: > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
+out="$(CCC_SELF_UPDATE_MAX_DEFER_SECONDS=0 run_selfup run 2>&1)"; rc=$?
+ok "#2667 deferral cap reached at the recheck proceeds with the restart" \
+  '[ "$rc" = 0 ] && [ "$(hande_restarts_2667)" = 1 ] && grep -q "proceed reason=defer-cap-exceeded stage=pre-restart" "$STATE/self-update.log"'
+
+# (e) --force bypasses the recheck like the first gate.
+mk_idle_2667; bump2142 recheck-force-2667
+: > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "#2667 --force bypasses the pre-restart recheck" \
+  '[ "$rc" = 0 ] && [ "$(hande_restarts_2667)" = 1 ] && ! grep -q "stage=pre-restart" "$STATE/self-update.log"'
+
+# (f) the settle wait runs only when a gated health file exists; bad values refused.
+mk_idle_2667; bump2142 recheck-settle-2667
+: > "$TMP/systemctl.calls"
+settle_t0=$SECONDS
+out="$(CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS=2 run_selfup run 2>&1)"; rc=$?
+# shellcheck disable=SC2034  # settle_elapsed is read via eval inside ok()
+settle_elapsed=$((SECONDS - settle_t0))
+ok "#2667 settle wait precedes the recheck when the hande health file exists" \
+  '[ "$rc" = 8 ] && [ "$settle_elapsed" -ge 2 ] && [ "$(hande_restarts_2667)" = 0 ]'
+rm -f "$CLAUDE/self-update.prepare-cmd"; mk_idle_2667
+run_selfup run >/dev/null 2>&1
+out="$(CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS=61 run_selfup run 2>&1)"; rc=$?
+ok "#2667 settle above 60s is refused" '[ "$rc" = 2 ] && grep -q "PRE_RESTART_SETTLE_SECONDS must be an integer in 0..60" <<<"$out"'
+rm -f "$HH2667" "$CLAUDE/self-update.services" "$PENDING_2667" "$STATE/self-update.deferred-since"
+rm -rf "$STATE"/self-update-install-rollback.*
+export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
 
 # --- #2487: one operator-owned per-node prepare timeout file for both scripts --
 # The prepare-cmd is the real termux-prepare-generation.sh (--status, read-only,
