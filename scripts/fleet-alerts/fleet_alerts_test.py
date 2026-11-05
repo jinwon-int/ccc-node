@@ -653,33 +653,156 @@ class PolicyTest(_Base):
         self.assertIsNone(policy.tick(self.queue, _kst(2026, 10, 27, 15, 0))["digest"])  # waits for tomorrow
         self.assertIsNotNone(policy.tick(self.queue, _kst(2026, 10, 28, 9, 0))["digest"])
 
-    def test_renotify_once_after_15_minutes_unless_replied(self) -> None:
+    def _delivered_at(self, t0: float, *txns: str) -> None:
+        for t in txns:
+            outbox.delivered(self.queue, t, "$" + t)
+        with outbox.database(self.queue) as conn:
+            for t in txns:
+                conn.execute("UPDATE alerts SET delivered=? WHERE txn=?", (t0, t))
+
+    def _bodies(self, made: list[str]) -> list[tuple[str, str]]:
+        out = []
+        for m in made:
+            with outbox.database(self.queue) as conn:
+                out.append(conn.execute("SELECT body, tier FROM alerts WHERE txn=?", (m,)).fetchone())
+        return out
+
+    def test_renotify_at_15m_1h_4h_then_stops_unless_replied(self) -> None:
+        # #2674 owner decision: up to 3 re-notifies at 15 min, 1 h and 4 h; ok/hold stops the chain.
         t0 = _kst(2026, 10, 27, 10, 0)
         ta, _ = outbox.enqueue(self.queue, "act", node="node-a", tier="action")
         tc, _ = outbox.enqueue(self.queue, "crit", node="node-b", tier="critical")
         tr, _ = outbox.enqueue(self.queue, "replied", node="node-c", tier="action")
-        for t in (ta, tc, tr):
-            outbox.delivered(self.queue, t, "$" + t)
-        with outbox.database(self.queue) as conn:
-            conn.execute("UPDATE alerts SET delivered=? WHERE txn IN (?,?,?)", (t0, ta, tc, tr))
+        self._delivered_at(t0, ta, tc, tr)
         outbox.receipt(self.queue, tr, "reply", "reply", "ok")
         self.assertEqual(policy.make_renotify(self.queue, t0 + 14 * 60), [])
         made = policy.make_renotify(self.queue, t0 + 16 * 60)
         self.assertEqual(len(made), 2)
-        bodies = []
-        for m in made:
-            with outbox.database(self.queue) as conn:
-                bodies.append(conn.execute("SELECT body, tier FROM alerts WHERE txn=?", (m,)).fetchone())
+        bodies = self._bodies(made)
         self.assertTrue(all(tier == "renotify" for _, tier in bodies))
         aid_a, aid_c = outbox.alert_id_of(self.queue, ta), outbox.alert_id_of(self.queue, tc)
-        self.assertTrue(any(f"⏰ 재통지 #{aid_a} (action, 16분 전" in b for b, _ in bodies))
-        self.assertTrue(any(f"🚨 재통지 #{aid_c} (critical" in b for b, _ in bodies))
-        self.assertTrue(any(f"`ok {aid_a}` 또는 `hold {aid_a}`" in b for b, _ in bodies))
-        self.assertEqual(policy.make_renotify(self.queue, t0 + 60 * 60), [])  # only once
-        self.assertEqual([r["kind"] for r in outbox.lookup(self.queue, ta)["receipts"]], ["matrix-event", "renotify"])
-        self.assertEqual([r["kind"] for r in outbox.lookup(self.queue, tr)["receipts"]], ["matrix-event", "reply"])
+        self.assertTrue(any(f"⏰ 재통지 1/3 #{aid_a} (action, 16분 전" in b for b, _ in bodies))
+        self.assertTrue(any(f"🚨 재통지 1/3 #{aid_c} (critical" in b for b, _ in bodies))
+        self.assertTrue(any(f"`ok {aid_a}` 또는 `hold {aid_a}`로 답하면 멈춥니다(남은 재통지 2회)" in b for b, _ in bodies))
         # derived rows leave at once and are strong-receipted like any other row
         self.assertEqual(policy.pending_deliverable(self.queue)[0], made[0])
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 59 * 60), [])   # 2nd not before 1 h
+        second = policy.make_renotify(self.queue, t0 + 60 * 60)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(any(f"재통지 2/3 #{aid_a} (action, 60분 전" in b for b, _ in self._bodies(second)))
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 3 * 3600 + 59 * 60), [])
+        third = policy.make_renotify(self.queue, t0 + 4 * 3600)
+        self.assertTrue(any(f"재통지 3/3 #{aid_a} (action, 4시간 0분 전" in b and "마지막 재통지" in b
+                            for b, _ in self._bodies(third)))
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 48 * 3600), [])  # schedule used up
+        self.assertEqual(sorted((r["channel"], r["kind"]) for r in outbox.lookup(self.queue, ta)["receipts"]),
+                         [("matrix", "matrix-event"), ("renotify", "renotify"),
+                          ("renotify-2", "renotify"), ("renotify-3", "renotify")])
+        self.assertEqual([r["kind"] for r in outbox.lookup(self.queue, tr)["receipts"]], ["matrix-event", "reply"])
+        view = outbox.receipt_view(outbox.lookup(self.queue, ta))
+        self.assertEqual((view["renotified"], view["renotify_count"], view["resolved"]), (True, 3, False))
+
+    def test_reply_after_the_first_renotify_stops_the_rest(self) -> None:
+        t0 = _kst(2026, 10, 27, 10, 0)
+        ta, _ = outbox.enqueue(self.queue, "act", node="node-a", tier="action")
+        self._delivered_at(t0, ta)
+        self.assertEqual(len(policy.make_renotify(self.queue, t0 + 15 * 60)), 1)
+        outbox.receipt(self.queue, ta, "reply", "reply", "hold")
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 60 * 60), [])
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 4 * 3600), [])
+
+    def test_renotify_2_and_3_wait_out_the_night(self) -> None:
+        # #2674: a 2nd/3rd re-notify due 00:00–07:00 KST waits for 07:00; the 3rd keeps its gap after the 2nd.
+        t0 = _kst(2026, 11, 5, 23, 30)
+        ta, _ = outbox.enqueue(self.queue, "night", node="node-a", tier="action")
+        self._delivered_at(t0, ta)
+        self.assertEqual(len(policy.make_renotify(self.queue, _kst(2026, 11, 5, 23, 45))), 1)  # 1st never deferred
+        self.assertEqual(policy.make_renotify(self.queue, _kst(2026, 11, 6, 0, 30)), [])        # 2nd would be 00:30
+        self.assertEqual(policy.make_renotify(self.queue, _kst(2026, 11, 6, 6, 59)), [])
+        self.assertEqual(len(policy.make_renotify(self.queue, _kst(2026, 11, 6, 7, 0))), 1)     # 2nd at 07:00
+        # the 3rd was due 03:30 → deferred, and must also be ≥3 h after the 2nd (07:00) → 10:00
+        self.assertEqual(policy.make_renotify(self.queue, _kst(2026, 11, 6, 9, 59)), [])
+        self.assertEqual(len(policy.make_renotify(self.queue, _kst(2026, 11, 6, 10, 0))), 1)
+        self.assertEqual(policy.make_renotify(self.queue, _kst(2026, 11, 7, 12, 0)), [])
+
+    def test_renotify_due_at_rules(self) -> None:
+        d = _kst(2026, 11, 5, 10, 0)
+        self.assertEqual(policy.renotify_due_at(d, 0), d + 15 * 60)
+        self.assertEqual(policy.renotify_due_at(d, 1), d + 3600)
+        self.assertEqual(policy.renotify_due_at(d, 2), d + 4 * 3600)
+        self.assertIsNone(policy.renotify_due_at(d, 3))
+        late = _kst(2026, 11, 5, 23, 50)  # 1st 00:05 is not deferred; 2nd 00:50 → 07:00; 3rd 03:50 → ≥10:00
+        self.assertEqual(policy.renotify_due_at(late, 0), _kst(2026, 11, 6, 0, 5))
+        self.assertEqual(policy.renotify_due_at(late, 1), _kst(2026, 11, 6, 7, 0))
+        self.assertEqual(policy.renotify_due_at(late, 2), _kst(2026, 11, 6, 10, 0))
+        early = _kst(2026, 11, 6, 4, 0)    # 1st 04:15 at once; 2nd 05:00 → 07:00; 3rd 08:00 → 10:00 (gap after 07:00)
+        self.assertEqual(policy.renotify_due_at(early, 0), _kst(2026, 11, 6, 4, 15))
+        self.assertEqual(policy.renotify_due_at(early, 1), _kst(2026, 11, 6, 7, 0))
+        self.assertEqual(policy.renotify_due_at(early, 2), _kst(2026, 11, 6, 10, 0))
+        self.assertEqual(policy.defer_quiet(_kst(2026, 11, 6, 7, 0)), _kst(2026, 11, 6, 7, 0))
+
+    def test_queue_from_the_single_renotify_continues_with_the_second(self) -> None:
+        # A row re-notified by the #2413 code has one receipt on channel `renotify`: it counts as the 1st.
+        t0 = _kst(2026, 10, 27, 10, 0)
+        ta, _ = outbox.enqueue(self.queue, "old", node="node-a", tier="action")
+        self._delivered_at(t0, ta)
+        outbox.receipt(self.queue, ta, "renotify", "renotify", "zz9999")
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE receipts SET at=? WHERE txn=? AND channel='renotify'", (t0 + 15 * 60, ta))
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 30 * 60), [])
+        made = policy.make_renotify(self.queue, t0 + 60 * 60)
+        self.assertTrue(any("재통지 2/3" in b for b, _ in self._bodies(made)))
+
+    def test_resolves_marker_stops_the_chain_and_is_not_renotified_itself(self) -> None:
+        key = "fw:node-a:hande:20261105T083652Z"
+        new = _payload(text=f"NEW UNREACHABLE node-a channel=hande since=2026-11-05T08:36:52Z\n@fleet-alert opens={key}",
+                       tier="action", record="r-new.json")
+        tn, _ = rx.queue_payload(self.queue, new)
+        with outbox.database(self.queue) as conn:
+            body = conn.execute("SELECT body FROM alerts WHERE txn=?", (tn,)).fetchone()[0]
+        self.assertNotIn("@fleet-alert", body)            # the owner never sees the marker
+        self.assertIn("NEW UNREACHABLE node-a", body)
+        t0 = _kst(2026, 11, 5, 17, 52)
+        self._delivered_at(t0, tn)
+        self.assertEqual(len(policy.make_renotify(self.queue, t0 + 15 * 60)), 1)
+        rec = _payload(text=f"RECOVERED node-a channel=hande was=UNREACHABLE\n@fleet-alert resolves={key}",
+                       tier="action", record="r-rec.json")
+        tv, _ = rx.queue_payload(self.queue, rec)
+        self._delivered_at(t0 + 30 * 60, tv)
+        view = outbox.receipt_view(outbox.lookup(self.queue, tn))
+        self.assertTrue(view["resolved"])
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 60 * 60), [])      # NEW chain stopped
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 30 * 60 + 16 * 60), [])  # RECOVERED never re-notified
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 8 * 3600), [])
+
+    def test_resolves_is_node_scoped_and_key_exact(self) -> None:
+        key = "fw:node-a:hande:20261105T083652Z"
+        ta, _ = rx.queue_payload(self.queue, _payload(text=f"NEW a\n@fleet-alert opens={key}", tier="action", record="a.json"))
+        other = _payload("node-b", text=f"RECOVERED b\n@fleet-alert resolves={key}", tier="action", record="b.json")
+        rx.queue_payload(self.queue, other)                                  # another node cannot close it
+        rx.queue_payload(self.queue, _payload(text="RECOVERED a\n@fleet-alert resolves=fw:node-a:hande:20261105T090000Z",
+                                              tier="action", record="c.json"))  # a different outage key
+        self.assertFalse(outbox.receipt_view(outbox.lookup(self.queue, ta))["resolved"])
+        t0 = _kst(2026, 11, 5, 12, 0)
+        self._delivered_at(t0, ta)
+        self.assertEqual(len([m for m in policy.make_renotify(self.queue, t0 + 16 * 60)]), 1)
+        # a mixed alert (opens one, resolves another) still re-notifies — it reports a live problem
+        tm, _ = rx.queue_payload(self.queue, _payload(
+            text="NEW x\n@fleet-alert opens=fw:node-a:matrix:20261105T120000Z\n@fleet-alert resolves=fw:node-a:x:1",
+            tier="action", record="m.json"))
+        self._delivered_at(t0, tm)
+        self.assertIn(tm, [r[0] for r in policy.due_renotify(self.queue, t0 + 16 * 60)])
+
+    def test_extract_conditions(self) -> None:
+        text = "head\n@fleet-alert opens=fw:a:b:1\n  @fleet-alert resolves=fw:a:b:0  \n@fleet-alert opens=fw:a:b:1\n" \
+               "@fleet-alert opens=bad key\n@fleet-alert other=x\ntail"
+        shown, opens, resolves = outbox.extract_conditions(text)
+        self.assertEqual(shown, "head\n@fleet-alert opens=bad key\n@fleet-alert other=x\ntail")
+        self.assertEqual((opens, resolves), (["fw:a:b:1"], ["fw:a:b:0"]))
+        only = "@fleet-alert opens=fw:a:b:1"
+        self.assertEqual(outbox.extract_conditions(only), (only, ["fw:a:b:1"], []))   # never queued empty
+        many = "\n".join(f"@fleet-alert opens=k{i}" for i in range(40))
+        self.assertEqual(len(outbox.extract_conditions(many)[1]), outbox.MAX_CONDITIONS)
 
     def test_notice_leaves_at_once_is_never_renotified_and_not_an_ok_target(self) -> None:
         # #2628: owner-personal information notices (lotto buy/result) reach both rooms now

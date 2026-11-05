@@ -353,6 +353,25 @@ def describe(kind, row, entry, prev, now, cfg):
 
 
 REPORT_ORDER = ('NEW', 'STILL', 'RECOVERED', 'PENDING', 'KNOWN', 'RECOVERING')
+CHANGE_KINDS = ('NEW', 'STILL', 'RECOVERED')
+
+# #2674: machine lines for the fleet alert relay. A NEW/STILL row *opens* the
+# condition `fw:<node>:<channel>:<abnormalSince>` and the RECOVERED row for the
+# same outage *resolves* it, so the relay stops re-notifying the open alert.
+# The key is the outage's own start time, so a later outage of the same pair
+# gets a new key and an old recovery can never close it. `:` keeps every
+# segment short (the owner spool masks 24+ char runs of [A-Za-z0-9_./+=-]).
+_MARKER_PART = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$')
+
+
+def condition_marker(kind, node, channel, since):
+    """`@fleet-alert opens=…` / `resolves=…` for a change row, or None when a part is not key-safe."""
+    if kind not in CHANGE_KINDS or since is None:
+        return None
+    if not (_MARKER_PART.match(str(node or '')) and _MARKER_PART.match(str(channel or ''))):
+        return None
+    role = 'resolves' if kind == 'RECOVERED' else 'opens'
+    return f'@fleet-alert {role}=fw:{node}:{channel}:{since.strftime("%Y%m%dT%H%M%SZ")}'
 
 
 def evaluate(entries, rows, now, cfg):
@@ -363,10 +382,11 @@ def evaluate(entries, rows, now, cfg):
     """
     updated = dict(entries)
     report = {kind: [] for kind in REPORT_ORDER}
+    report['MARKERS'] = []
     quiet = {verdict: 0 for verdict in NORMAL}
     for key, row in rows.items():
         prev = entries.get(key)
-        verdict, _node, _channel, detail = row
+        verdict, node, channel, detail = row
         if verdict in NORMAL:
             entry, kind = observe_normal(prev, verdict, detail, now, cfg)
         else:
@@ -375,6 +395,10 @@ def evaluate(entries, rows, now, cfg):
             quiet[verdict] += 1
         else:
             report[kind].append(describe(kind, row, entry, prev or {}, now, cfg))
+            source = (prev or {}) if kind == 'RECOVERED' else entry
+            marker = condition_marker(kind, node, channel, parse_ts(source.get('abnormalSince')))
+            if marker:
+                report['MARKERS'].append(marker)
         if kind == 'RECOVERED':
             _close_alert(entry)
         updated[key] = entry
@@ -386,7 +410,11 @@ def should_page(report, cfg):
 
 
 def render(report, quiet, checked, page):
-    lines = [line for kind in REPORT_ORDER for line in report[kind]]
+    # Change rows, then their relay markers (#2674) while still near the top of
+    # the output (agent-cron keeps only the head of a long stream), then context.
+    lines = [line for kind in CHANGE_KINDS for line in report[kind]]
+    lines += report.get('MARKERS', [])
+    lines += [line for kind in REPORT_ORDER if kind not in CHANGE_KINDS for line in report[kind]]
     counts = ' '.join(f'{kind.lower()}={len(report[kind])}' for kind in REPORT_ORDER)
     # `retired=` appears only when there is something to count, so a fleet
     # without retired pairs keeps the SUMMARY shape it always had.

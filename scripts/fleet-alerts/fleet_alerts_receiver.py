@@ -187,13 +187,14 @@ class NodeLabels:
 
 def queue_payload(queue_dir: Path, payload: dict, labels: Optional[NodeLabels] = None) -> tuple[str, bool]:
     node = str(payload.get("node") or "")
-    text = payload["text"]
+    # #2674: `@fleet-alert opens=/resolves=` lines are for the queue, not the owner.
+    text, opens, resolves = outbox.extract_conditions(payload["text"])
     label = labels.label(node) if labels is not None else node
     # First line: "[sender] #<id> …" — the owner quotes the id back (ok/hold <id>, #2413).
     prefix = f"[{label}] " if label else ""
     key = str(payload.get("record") or payload.get("dedup") or "")
     fp = outbox.fingerprint(node, key) if key else None
-    return outbox.enqueue(
+    txn, dup = outbox.enqueue(
         queue_dir,
         text,
         node=node,
@@ -202,6 +203,11 @@ def queue_payload(queue_dir: Path, payload: dict, labels: Optional[NodeLabels] =
         tier=normalize_tier(payload.get("tier")),
         body_with_id=lambda alert_id: f"{prefix}#{alert_id} {text}",
     )
+    if not dup and (opens or resolves):
+        closed = outbox.record_conditions(queue_dir, txn, node, opens, resolves)
+        log.info("conditions node=%s txn=%s opens=%d resolves=%d resolved=%d",
+                 node, txn, len(opens), len(resolves), closed)
+    return txn, dup
 
 
 class Receiver:

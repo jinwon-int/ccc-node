@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -134,11 +135,95 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
         txn TEXT NOT NULL, channel TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '',
         at REAL NOT NULL, PRIMARY KEY (txn, channel))"""
     )
+    # #2674: condition keys a sender declared for an alert (``opens``) or as cleared (``resolves``).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS conditions (
+        txn TEXT NOT NULL, node TEXT NOT NULL, key TEXT NOT NULL, role TEXT NOT NULL,
+        PRIMARY KEY (txn, key, role))"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS conditions_node_key ON conditions(node, key, role)")
 
 
 def normalize_tier(value: object) -> str:
     v = str(value or "").strip().lower()
     return v if v in TIERS else DEFAULT_TIER
+
+
+# ---- condition keys (#2674) ---------------------------------------------------
+# A sender names, in its own alert text, the condition an alert *opens* and the
+# conditions a later alert *resolves*:
+#
+#     @fleet-alert opens=fw:<node>:<channel>:<since>
+#     @fleet-alert resolves=fw:<node>:<channel>:<since>
+#
+# The relay strips these lines from the text it shows and stores the keys. A
+# ``resolves`` key closes every still-open alert *from the same sending node*
+# that declared the same key (``resolved`` receipt), which stops its re-notify
+# chain. Nothing is ever inferred from free text: no marker, no link (fail-safe
+# = keep re-notifying). ``:`` separates key segments on purpose — the owner
+# spool masks any 24+ char run of ``[A-Za-z0-9_./+=-]``, and ``:`` keeps each
+# segment of a key well under that.
+CONDITION_LINE_RE = re.compile(r"^@fleet-alert[ \t]+(opens|resolves)=([A-Za-z0-9][A-Za-z0-9._:-]{0,127})[ \t]*$")
+MAX_CONDITIONS = 16
+RESOLVED_RECEIPT_CHANNEL = "resolved"
+
+
+def extract_conditions(text: str) -> tuple[str, list[str], list[str]]:
+    """``(display_text, opens, resolves)`` — marker lines removed, keys deduplicated in order.
+
+    A text made only of marker lines keeps its original form (an alert is never
+    queued empty); the keys still count.
+    """
+    keep: list[str] = []
+    opens: list[str] = []
+    resolves: list[str] = []
+    for line in str(text or "").splitlines():
+        m = CONDITION_LINE_RE.match(line.strip())
+        if not m:
+            keep.append(line)
+            continue
+        bucket = opens if m.group(1) == "opens" else resolves
+        if m.group(2) not in bucket and len(opens) + len(resolves) < MAX_CONDITIONS:
+            bucket.append(m.group(2))
+    shown = "\n".join(keep).strip("\n")
+    return (shown if shown.strip() else str(text or "")), opens, resolves
+
+
+def record_conditions(
+    root: os.PathLike | str, txn: str, node: str, opens: list[str], resolves: list[str],
+    *, now: Optional[float] = None,
+) -> int:
+    """Store ``txn``'s condition keys and resolve matching open alerts of the same node.
+
+    Returns how many earlier alerts were marked ``resolved`` (idempotent: an
+    already-resolved alert is not counted twice). Resolution is node-scoped, so
+    one node can never stop another node's re-notify chain.
+    """
+    now = time.time() if now is None else now
+    node = node[:64]
+    resolved = 0
+    with database(root) as conn:
+        resolver = conn.execute("SELECT alert_id FROM alerts WHERE txn=?", (txn,)).fetchone()
+        ref = (resolver[0] if resolver and resolver[0] else txn)[:256]
+        for role, keys in (("opens", opens), ("resolves", resolves)):
+            for key in keys[:MAX_CONDITIONS]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO conditions(txn,node,key,role) VALUES (?,?,?,?)", (txn, node, key, role)
+                )
+        for key in resolves[:MAX_CONDITIONS]:
+            targets = conn.execute(
+                "SELECT c.txn FROM conditions c JOIN alerts a ON a.txn=c.txn"
+                " WHERE c.node=? AND c.key=? AND c.role='opens' AND c.txn<>? AND a.created<=?"
+                " AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.txn=c.txn AND r.channel=?)",
+                (node, key, txn, now, RESOLVED_RECEIPT_CHANNEL),
+            ).fetchall()
+            for (target,) in targets:
+                conn.execute(
+                    "INSERT OR IGNORE INTO receipts(txn,channel,kind,ref,at) VALUES (?,?,?,?,?)",
+                    (target, RESOLVED_RECEIPT_CHANNEL, "resolved", ref, now),
+                )
+                resolved += 1
+    return resolved
 
 
 def _alert_id(conn: sqlite3.Connection, txn: str) -> str:
@@ -220,15 +305,21 @@ def alert_id_of(root: os.PathLike | str, txn: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def receipt(root: os.PathLike | str, txn: str, channel: str, kind: str, ref: str = "") -> None:
-    """Record one channel's delivery receipt for ``txn`` (one per channel; later writes win)."""
+def receipt(
+    root: os.PathLike | str, txn: str, channel: str, kind: str, ref: str = "", *, at: Optional[float] = None,
+) -> None:
+    """Record one channel's delivery receipt for ``txn`` (one per channel; later writes win).
+
+    ``at`` defaults to now; the policy passes its own clock so a re-notify's time
+    (the base of the next one, #2674) is the time the policy decided on.
+    """
     for v, name in ((channel, "channel"), (kind, "kind")):
         if not isinstance(v, str) or not v or len(v) > 32:
             raise ValueError(f"invalid receipt {name}")
     with database(root) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO receipts(txn,channel,kind,ref,at) VALUES (?,?,?,?,?)",
-            (txn, channel, kind, str(ref or "")[:256], time.time()),
+            (txn, channel, kind, str(ref or "")[:256], time.time() if at is None else at),
         )
 
 
@@ -289,6 +380,8 @@ def receipt_view(info: dict) -> dict:
         "notified_at": min(r["at"] for r in strong) if strong else None,
         "reply": reply,
         "renotified": "renotify" in kinds,
+        "renotify_count": sum(1 for r in receipts if r.get("kind") == "renotify"),
+        "resolved": "resolved" in kinds,
         "digested": "digested" in kinds,
     }
 
@@ -331,9 +424,10 @@ def prune(root: os.PathLike | str, *, keep_seconds: float = 30 * 86400) -> int:
     """Drop delivered rows older than ``keep_seconds``; returns the number removed."""
     with database(root) as conn:
         cutoff = time.time() - keep_seconds
-        conn.execute(
-            "DELETE FROM receipts WHERE txn IN (SELECT txn FROM alerts WHERE delivered IS NOT NULL AND delivered < ?)",
-            (cutoff,),
-        )
+        for table in ("receipts", "conditions"):
+            conn.execute(
+                f"DELETE FROM {table} WHERE txn IN (SELECT txn FROM alerts WHERE delivered IS NOT NULL AND delivered < ?)",
+                (cutoff,),
+            )
         cur = conn.execute("DELETE FROM alerts WHERE delivered IS NOT NULL AND delivered < ?", (cutoff,))
         return int(cur.rowcount or 0)

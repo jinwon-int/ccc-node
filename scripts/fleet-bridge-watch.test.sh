@@ -1144,8 +1144,8 @@ reply alpha /opt/ccc-node no /opt/ccc-node
 run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T00:45:00Z
 run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:00:00Z
 okc "$RC" 1 "state mode: a new issue pages beside a known one"
-ok "state mode: NEW row first, KNOWN after it" \
-  '[ "$(sed -n 1p "$OUT")" = "NEW DOWN alpha channel=telegram since=2026-10-01T00:45:00Z" ] && sed -n 2p "$OUT" | grep -q "^KNOWN DEGRADED beta "'
+ok "state mode: NEW row first, its relay marker (#2674), then KNOWN" \
+  '[ "$(sed -n 1p "$OUT")" = "NEW DOWN alpha channel=telegram since=2026-10-01T00:45:00Z" ] && [ "$(sed -n 2p "$OUT")" = "@fleet-alert opens=fw:alpha:telegram:20261001T004500Z" ] && sed -n 3p "$OUT" | grep -q "^KNOWN DEGRADED beta "'
 reply alpha /opt/ccc-node yes /opt/ccc-node
 run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:15:00Z
 run_state "alpha beta" CCC_FLEET_WATCH_NOW=2026-10-01T01:30:00Z

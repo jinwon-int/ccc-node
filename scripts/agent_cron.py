@@ -96,6 +96,7 @@ from agent_cron_schema import validate_store  # noqa: E402
 from agent_cron_alarm import (  # noqa: E402
     alarm_text,
     classify_failure,
+    condition_marker,
     dead_lock_text,
     dead_lock_transition,
     node_transition,
@@ -104,6 +105,7 @@ from agent_cron_alarm import (  # noqa: E402
     stale_transition,
     task_transition,
     trailing_failures,
+    with_condition_markers,
 )
 from agent_cron_model import normalize, task_by_id  # noqa: E402
 from agent_cron_repository import (  # noqa: E402
@@ -2115,8 +2117,9 @@ def record_dead_lock_skips(data, actions, at):
                 at_dt = parse_dt(at_s, 'at')
             except Exception:
                 at_dt = None
-            spooled = write_failure_alarm_spool(task_id, run_id, dead_lock_text(task_id, event, holder),
-                                                reasons, at_dt)
+            text = with_condition_markers(dead_lock_text(task_id, event, holder),
+                                          [condition_marker('dead', task_id, event)])
+            spooled = write_failure_alarm_spool(task_id, run_id, text, reasons, at_dt)
             out['events'].append({'taskId': task_id, 'reason': event['reason'],
                                   'skippedRuns': event.get('skippedRuns'),
                                   'delivery': spooled.get('delivery')})
@@ -2178,6 +2181,9 @@ def record_failure_alarm(task_id, task, run_id, status, failure_class, at, immed
                          if event)
         text = alarm_text(task_id, task_event, node_event, last_success,
                           stale_event=stale_event, failure_class=failure_class)
+        # #2674: let the fleet alert relay stop re-notifying an alarm once it cleared.
+        text = with_condition_markers(text, [condition_marker('task', task_id, task_event),
+                                             condition_marker('node', 'node', node_event)])
         spooled = write_failure_alarm_spool(task_id, run_id, text, reasons, at)
         state_name = 'alerted' if spooled.get('delivery') == 'spooled' else 'alert-lost'
         return {**result, 'state': state_name, 'reasons': reasons, **spooled}

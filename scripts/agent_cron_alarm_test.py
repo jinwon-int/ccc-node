@@ -29,6 +29,7 @@ from agent_cron_alarm import (  # noqa: E402
     FAILURE_CLASSES,
     alarm_text,
     classify_failure,
+    condition_marker,
     dead_lock_text,
     dead_lock_transition,
     node_transition,
@@ -37,6 +38,7 @@ from agent_cron_alarm import (  # noqa: E402
     stale_transition,
     task_transition,
     trailing_failures,
+    with_condition_markers,
 )
 import agent_cron_schema  # noqa: E402
 
@@ -602,6 +604,75 @@ class Integration(unittest.TestCase):
         self.assertEqual(box.alarm_state()['tasks']['a']['lastSuccessAt'], stamp(5))
         self.assertNotIn('boom', json.dumps(box.alarm_state()))
 
+
+
+class ConditionMarkers(unittest.TestCase):
+    """#2674: an alarm opens `ac:<scope>:<id>:<alertedAt>` and its cleared notice resolves the same key."""
+
+    def _streak(self, start):
+        state, events = None, []
+        for i, failed in enumerate((True, True, True, True, False)):
+            at = f'2026-11-05T0{start + i}:00:00Z'
+            state, event = task_transition(state, failed=failed, failure_class='timeout' if failed else None,
+                                           threshold=3, at=at)
+            events.append(event)
+        return events
+
+    def test_task_threshold_and_recovered_share_one_key(self):
+        events = self._streak(1)
+        fire, cleared = events[2], events[4]
+        self.assertEqual(fire['reason'], 'threshold')
+        self.assertEqual(cleared['reason'], 'recovered')
+        opens = condition_marker('task', 'external-github-watch-15m', fire)
+        resolves = condition_marker('task', 'external-github-watch-15m', cleared)
+        self.assertRegex(opens, r'^@fleet-alert opens=ac:task:[0-9a-f]{8}:20261105T030000Z$')
+        self.assertEqual(resolves, opens.replace(' opens=', ' resolves='))
+
+    def test_class_change_keeps_the_streak_key_and_a_new_streak_gets_a_new_one(self):
+        state = None
+        for i, cls in enumerate(('other', 'other', 'other')):
+            state, fire = task_transition(state, failed=True, failure_class=cls, threshold=3, at=f'2026-11-05T01:0{i}:00Z')
+        self.assertEqual(fire['reason'], 'threshold')
+        state, change = task_transition(state, failed=True, failure_class='auth_failed', threshold=3,
+                                        at='2026-11-06T09:00:00Z')  # past the 24 h class-change cooldown
+        self.assertEqual(change['reason'], 'class-change')
+        self.assertEqual(condition_marker('task', 't', change), condition_marker('task', 't', fire))
+        self.assertNotEqual(condition_marker('task', 't', self._streak(3)[2]), condition_marker('task', 't', fire))
+
+    def test_node_and_dead_lock_scopes(self):
+        state = None
+        for task_id in ('a', 'b', 'c'):
+            state, fire = node_transition(state, task_id=task_id, failed=True, failure_class='other',
+                                          threshold=3, at='2026-11-05T02:00:00Z')
+        self.assertEqual(fire['reason'], 'threshold')
+        _state, cleared = node_transition(state, task_id='a', failed=False, failure_class=None,
+                                          threshold=3, at='2026-11-05T03:00:00Z')
+        self.assertEqual(condition_marker('node', 'node', cleared),
+                         condition_marker('node', 'node', fire).replace(' opens=', ' resolves='))
+        dl = None
+        for n in range(3):
+            dl, ev = dead_lock_transition(dl, dead=True, scheduled_at=f's{n}', holder_run_id='r1',
+                                          threshold=3, at=f'2026-11-05T04:0{n}:00Z')
+        _dl, gone = dead_lock_transition(dl, dead=False, scheduled_at='s9', holder_run_id=None,
+                                         threshold=3, at='2026-11-05T05:00:00Z')
+        self.assertEqual(condition_marker('dead', 'fleet-watch-15m', gone),
+                         condition_marker('dead', 'fleet-watch-15m', ev).replace(' opens=', ' resolves='))
+
+    def test_no_marker_without_a_usable_event(self):
+        self.assertIsNone(condition_marker('task', 't', None))
+        self.assertIsNone(condition_marker('task', 't', {'reason': 'threshold'}))
+        self.assertIsNone(condition_marker('stale', 't', {'reason': 'stale', 'alertedAt': '2026-11-05T01:00:00Z'}))
+        self.assertEqual(with_condition_markers('body', [None, 'm1', 'm1', 'm2']), 'body\nm1\nm2')
+        self.assertEqual(with_condition_markers('body', [None]), 'body')
+
+    def test_marker_survives_owner_spool_redaction(self):
+        import agent_cron
+        line = condition_marker('task', 'a-very-long-task-id-that-is-over-24-chars',
+                                {'reason': 'threshold', 'alertedAt': '2026-11-05T08:36:52Z'})
+        redacted = agent_cron.redact_for_owner(line)
+        if redacted is None:
+            self.skipTest('canonical redaction unavailable in this checkout')
+        self.assertEqual(redacted, line)
 
 
 class DeadLockTransition(unittest.TestCase):

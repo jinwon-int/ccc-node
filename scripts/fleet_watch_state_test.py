@@ -98,8 +98,11 @@ class StateRun(unittest.TestCase):
         rc, out, _ = self.run_watch(DEG_A + chronic, '2026-10-01T00:45:00Z')
         self.assertEqual(rc, 1)
         self.assertTrue(out[0].startswith('NEW DEGRADED node-a channel=telegram'), out)
-        self.assertTrue(out[1].startswith('KNOWN DEGRADED node-b channel=matrix'), out)
+        # #2674: the relay marker for the change row sits right after the change rows.
+        self.assertEqual(out[1], '@fleet-alert opens=fw:node-a:telegram:20261001T003000Z')
+        self.assertTrue(out[2].startswith('KNOWN DEGRADED node-b channel=matrix'), out)
         self.assertNotIn('NEW DEGRADED node-b', '\n'.join(out))
+        self.assertNotIn('node-b:matrix', '\n'.join(out))  # a KNOWN row opens nothing new
 
     def test_realert_is_staged(self):
         self.run_watch(DEG_A, '2026-10-01T00:00:00Z')
@@ -118,6 +121,50 @@ class StateRun(unittest.TestCase):
         rc, out, _ = self.run_watch(DEG_A, '2026-10-02T06:15:00Z')
         self.assertEqual(rc, 1)
         self.assertIn('alerts=3', out[0])
+
+    # --- relay condition markers (#2674) -------------------------------------
+
+    def test_markers_link_new_still_and_recovered_of_one_outage(self):
+        key = 'fw:node-a:telegram:20261001T000000Z'
+        self.run_watch(DEG_A, '2026-10-01T00:00:00Z')
+        rc, out, _ = self.run_watch(DEG_A, '2026-10-01T00:15:00Z')
+        self.assertEqual(rc, 1)
+        self.assertEqual([line for line in out if line.startswith('@fleet-alert')], [f'@fleet-alert opens={key}'])
+        self.run_watch(DEG_A, '2026-10-01T06:00:00Z')
+        rc, out, _ = self.run_watch(DEG_A, '2026-10-01T06:15:00Z')  # STILL re-alert: same outage, same key
+        self.assertTrue(out[0].startswith('STILL '), out)
+        self.assertEqual(out[1], f'@fleet-alert opens={key}')
+        self.run_watch(OK_A, '2026-10-01T06:30:00Z')
+        rc, out, _ = self.run_watch(OK_A, '2026-10-01T06:45:00Z')
+        self.assertTrue(out[0].startswith('RECOVERED node-a channel=telegram'), out)
+        self.assertEqual(out[1], f'@fleet-alert resolves={key}')
+        self.assertTrue(out[-1].startswith('SUMMARY '), out)
+
+    def test_a_later_outage_gets_a_new_key(self):
+        for t in ('00:00', '00:15', '00:30', '00:45'):
+            self.run_watch(DEG_A if t < '00:30' else OK_A, f'2026-10-01T{t}:00Z')
+        self.run_watch(DEG_A, '2026-10-01T02:00:00Z')
+        rc, out, _ = self.run_watch(DEG_A, '2026-10-01T02:15:00Z')
+        self.assertEqual(rc, 1)
+        self.assertIn('@fleet-alert opens=fw:node-a:telegram:20261001T020000Z', out)
+        self.assertNotIn('@fleet-alert opens=fw:node-a:telegram:20261001T000000Z', out)
+
+    def test_no_marker_for_context_rows_or_unsafe_names(self):
+        rc, out, _ = self.run_watch(DEG_A, '2026-10-01T00:00:00Z')  # PENDING only
+        self.assertFalse(any(line.startswith('@fleet-alert') for line in out), out)
+        self.assertIsNone(fws.condition_marker('NEW', 'node a', 'telegram', fws.parse_ts('2026-10-01T00:00:00Z')))
+        self.assertIsNone(fws.condition_marker('NEW', 'node-a', 'x' * 40, fws.parse_ts('2026-10-01T00:00:00Z')))
+        self.assertIsNone(fws.condition_marker('KNOWN', 'node-a', 'matrix', fws.parse_ts('2026-10-01T00:00:00Z')))
+
+    def test_marker_survives_owner_spool_redaction(self):
+        # agent-cron masks 24+ char runs of [A-Za-z0-9_./+=-]; the `:`-split key must come through intact.
+        import agent_cron
+        line = fws.condition_marker('RECOVERED', 'host-1a2b3c4', 'matrix', fws.parse_ts('2026-11-05T08:36:52Z'))
+        self.assertEqual(line, '@fleet-alert resolves=fw:host-1a2b3c4:matrix:20261105T083652Z')
+        redacted = agent_cron.redact_for_owner(line)
+        if redacted is None:
+            self.skipTest('canonical redaction unavailable in this checkout')
+        self.assertEqual(redacted, line)
 
     def test_realert_can_be_disabled(self):
         env = {'CCC_FLEET_WATCH_REALERT': 'off'}

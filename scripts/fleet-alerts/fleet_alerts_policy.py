@@ -13,10 +13,17 @@ Policy (owner decision 2026-10-27, ccc-node#2413):
               event with its content line and key detail lines (within
               ``DIGEST_MAX_BYTES``); the held rows are marked delivered with
               a ``digested`` receipt pointing at the digest id.
-``action``    delivered at once; **re-notified once** ``RENOTIFY_AFTER_S`` (15 min)
-              after its strong Matrix receipt unless a ``reply`` receipt (the
-              responder stage, ``ok/hold <id>``) arrived — a derived row
-              ``tier=renotify`` that quotes the original id.
+``action``    delivered at once; **re-notified up to 3 times** (#2674, owner decision
+              2026-11-05) at ``RENOTIFY_SCHEDULE_S`` = 15 min, 1 h, 4 h after its
+              strong Matrix receipt — each a derived row ``tier=renotify`` that
+              quotes the original id and says ``k/3``. The chain stops at once on a
+              ``reply`` receipt (``ok/hold <id>``) or a ``resolved`` receipt (a later
+              alert from the same node declared ``resolves=<key>`` for a key this
+              one ``opens``; see ``fleet_alerts_outbox.extract_conditions``). An
+              alert that only resolves (no ``opens``) is never re-notified. The 2nd
+              and 3rd re-notify are not sent 00:00–07:00 KST: one due in that window
+              waits until 07:00, and a later one keeps at least its schedule gap
+              after the one before it (the 1st, at 15 min, is never deferred).
 ``critical``  delivered at once, no digest; re-notified like ``action``.
 ``notice``    (#2628) delivered at once, no digest, **never re-notified** and not a
               ``ok/hold`` target — an owner-personal information notice (lotto buy/
@@ -47,7 +54,11 @@ DIGEST_TIER = "digest"
 RENOTIFY_TIER = "renotify"
 DERIVED_TIERS = (DIGEST_TIER, RENOTIFY_TIER)
 IMMEDIATE_TIERS = ("notice", "action", "critical")
-RENOTIFY_AFTER_S = 15 * 60
+#: Seconds after delivery for the 1st, 2nd and 3rd re-notify (#2674). Its length is the cap.
+RENOTIFY_SCHEDULE_S = (15 * 60, 60 * 60, 4 * 60 * 60)
+RENOTIFY_AFTER_S = RENOTIFY_SCHEDULE_S[0]  # kept for callers of the #2413 single re-notify
+#: KST hours [start, end) in which a 2nd/3rd re-notify waits until ``end`` o'clock.
+RENOTIFY_QUIET_HOURS_KST = (0, 7)
 RENOTIFY_LINE_CHARS = 160
 DIGEST_LINE_CHARS = 120     # bytes of an item's head line (``#id label summary``)
 DIGEST_DETAIL_CHARS = 100   # bytes of one detail line under an item
@@ -245,33 +256,90 @@ def make_digest(root: os.PathLike | str, now: Optional[float] = None) -> Optiona
 
 # ---- re-notify -------------------------------------------------------------
 
+def renotify_channel(n: int) -> str:
+    """Receipt channel for the ``n``-th re-notify (0-based). The 1st keeps the #2413 name ``renotify``.
+
+    Receipts are keyed ``(txn, channel)``, so each re-notify needs its own channel;
+    a queue written by the single re-notify keeps working (its one receipt is the 1st).
+    """
+    return "renotify" if n == 0 else f"renotify-{n + 1}"
+
+
+def defer_quiet(at: float) -> float:
+    """``at``, or 07:00 KST of the same day when ``at`` falls in ``RENOTIFY_QUIET_HOURS_KST``."""
+    start, end = RENOTIFY_QUIET_HOURS_KST
+    local = _dt.datetime.fromtimestamp(at, KST)
+    if start <= local.hour < end:
+        return local.replace(hour=end, minute=0, second=0, microsecond=0).timestamp()
+    return at
+
+
+def renotify_due_at(delivered: float, done: int) -> Optional[float]:
+    """When the ``done``-th re-notify (0-based) is due; ``None`` once the schedule is used up.
+
+    Deterministic from the delivery time alone (not from when an earlier one was
+    actually sent): the 1st is ``delivered + 15 min`` and never deferred; a later
+    one is due at its schedule offset but no earlier than its schedule gap after
+    the previous one's due time, and is then moved out of the quiet hours — so a
+    2nd pushed to 07:00 pushes the 3rd to 10:00, and a day-time chain stays at
+    exactly 15 min / 1 h / 4 h.
+    """
+    if done >= len(RENOTIFY_SCHEDULE_S):
+        return None
+    if done == 0:
+        return delivered + RENOTIFY_SCHEDULE_S[0]
+    previous = renotify_due_at(delivered, done - 1)
+    gap = RENOTIFY_SCHEDULE_S[done] - RENOTIFY_SCHEDULE_S[done - 1]
+    return defer_quiet(max(delivered + RENOTIFY_SCHEDULE_S[done], previous + gap))
+
+
 def due_renotify(root: os.PathLike | str, now: float):
-    """Delivered action/critical rows older than RENOTIFY_AFTER_S with no reply and no re-notify yet."""
+    """``(txn, alert_id, node, tier, delivered, done)`` of action/critical rows whose next re-notify is due.
+
+    Excluded: rows without a strong Matrix receipt, replied (``ok``/``hold``) or
+    ``resolved`` rows, rows whose schedule is used up, and resolution-only alerts
+    (they declared ``resolves`` keys and no ``opens`` key).
+    """
     with outbox.database(root) as conn:
-        return conn.execute(
-            "SELECT a.txn, a.alert_id, a.node, a.tier, r.ref, a.delivered FROM alerts a"
-            " JOIN receipts r ON r.txn=a.txn AND r.channel='matrix' AND r.kind='matrix-event'"
+        rows = conn.execute(
+            "SELECT a.txn, a.alert_id, a.node, a.tier, a.delivered,"
+            " (SELECT COUNT(*) FROM receipts x WHERE x.txn=a.txn AND x.kind='renotify')"
+            " FROM alerts a JOIN receipts r ON r.txn=a.txn AND r.channel='matrix' AND r.kind='matrix-event'"
             " WHERE a.tier IN ('action','critical') AND a.delivered IS NOT NULL AND a.delivered <= ?"
-            " AND NOT EXISTS (SELECT 1 FROM receipts x WHERE x.txn=a.txn AND x.kind IN ('reply','renotify'))"
+            " AND NOT EXISTS (SELECT 1 FROM receipts x WHERE x.txn=a.txn AND x.kind IN ('reply','resolved'))"
+            " AND NOT (EXISTS (SELECT 1 FROM conditions c WHERE c.txn=a.txn AND c.role='resolves')"
+            "          AND NOT EXISTS (SELECT 1 FROM conditions c WHERE c.txn=a.txn AND c.role='opens'))"
             " ORDER BY a.delivered",
-            (now - RENOTIFY_AFTER_S,),
+            (now - RENOTIFY_SCHEDULE_S[0],),
         ).fetchall()
+    due = []
+    for txn, alert_id, node, tier, delivered, done in rows:
+        at = renotify_due_at(delivered, int(done or 0))
+        if at is not None and at <= now:
+            due.append((txn, alert_id, node, tier, delivered, int(done or 0)))
+    return due
 
 
 def make_renotify(root: os.PathLike | str, now: Optional[float] = None) -> list[str]:
-    """One derived ``renotify`` row per due alert; marks the original so it happens once."""
+    """One derived ``renotify`` row per due alert, recorded as its ``k``-th re-notify (k ≤ 3)."""
     now = time.time() if now is None else now
     made = []
-    for txn, alert_id, node, tier, _event_ref, delivered in due_renotify(root, now):
+    total = len(RENOTIFY_SCHEDULE_S)
+    for txn, alert_id, node, tier, delivered, done in due_renotify(root, now):
         mins = int((now - delivered) // 60)
+        ago = f"{mins}분" if mins < 120 else f"{mins // 60}시간 {mins % 60}분"
         label = "🚨" if tier == "critical" else "⏰"
-        text = (f"{label} 재통지 #{alert_id} ({tier}, {mins}분 전 알림, 회신 없음) — "
-                f"`ok {alert_id}` 또는 `hold {alert_id}`로 답하면 재통지가 멈춥니다. 상세: fleet_alerts_receipt.py {alert_id}")
+        left = total - done - 1
+        tail = f"남은 재통지 {left}회" if left else "마지막 재통지"
+        text = (f"{label} 재통지 {done + 1}/{total} #{alert_id} ({tier}, {ago} 전 알림, 회신 없음) — "
+                f"`ok {alert_id}` 또는 `hold {alert_id}`로 답하면 멈춥니다({tail}). "
+                f"상세: 릴레이 호스트 fleet_alerts_receipt.py --queue <큐> {alert_id}")
         new_txn, _ = outbox.enqueue(
             root, text, node=node, event="FleetAlertRenotify", tier=RENOTIFY_TIER,
             body_with_id=lambda aid, t=text: f"#{aid} {t}",
         )
-        outbox.receipt(root, txn, "renotify", "renotify", outbox.alert_id_of(root, new_txn) or new_txn)
+        outbox.receipt(root, txn, renotify_channel(done), "renotify",
+                       outbox.alert_id_of(root, new_txn) or new_txn, at=now)
         made.append(new_txn)
     if made:
         logging.info("fleet alert re-notify rows=%d", len(made))
