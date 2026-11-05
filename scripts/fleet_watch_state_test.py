@@ -129,7 +129,7 @@ class StateRun(unittest.TestCase):
         self.run_watch(DEG_A, '2026-10-01T00:00:00Z')
         rc, out, _ = self.run_watch(DEG_A, '2026-10-01T00:15:00Z')
         self.assertEqual(rc, 1)
-        self.assertEqual([l for l in out if l.startswith('@fleet-alert')], [f'@fleet-alert opens={key}'])
+        self.assertEqual([line for line in out if line.startswith('@fleet-alert')], [f'@fleet-alert opens={key}'])
         self.run_watch(DEG_A, '2026-10-01T06:00:00Z')
         rc, out, _ = self.run_watch(DEG_A, '2026-10-01T06:15:00Z')  # STILL re-alert: same outage, same key
         self.assertTrue(out[0].startswith('STILL '), out)
@@ -151,7 +151,7 @@ class StateRun(unittest.TestCase):
 
     def test_no_marker_for_context_rows_or_unsafe_names(self):
         rc, out, _ = self.run_watch(DEG_A, '2026-10-01T00:00:00Z')  # PENDING only
-        self.assertFalse(any(l.startswith('@fleet-alert') for l in out), out)
+        self.assertFalse(any(line.startswith('@fleet-alert') for line in out), out)
         self.assertIsNone(fws.condition_marker('NEW', 'node a', 'telegram', fws.parse_ts('2026-10-01T00:00:00Z')))
         self.assertIsNone(fws.condition_marker('NEW', 'node-a', 'x' * 40, fws.parse_ts('2026-10-01T00:00:00Z')))
         self.assertIsNone(fws.condition_marker('KNOWN', 'node-a', 'matrix', fws.parse_ts('2026-10-01T00:00:00Z')))
