@@ -106,6 +106,31 @@
       }
     },
     {
+      "operation": "agent_cron.dead_lock_alarm",
+      "owner": "agent-cron dead-holder lock skip owner alarm",
+      "registration": {
+        "kind": "python-symbol",
+        "path": "scripts/agent_cron.py",
+        "symbol": "record_dead_lock_skips"
+      },
+      "external": true,
+      "idempotency": "local-ledger",
+      "idempotency_key": "agent-cron-alarm:<task-id>:dead-lock-<holder-run-id>:dead-lock=<reason>",
+      "retry_class": "conditional",
+      "ambiguous_window": "failure-alarm.json deadLocks already marks the alert sent when the spool file is created, so a spool failure loses that one alert instead of repeating it",
+      "reconcile": "receipt",
+      "compensation": "delete",
+      "audit_surface": "body-free spool path plus failure-alarm.json deadLocks counters (skipped-run count, holder run id, timestamps)",
+      "approval_boundary": "owner-only recipient; on by default after 3 skipped due runs, opt out node-wide with CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER=0; never releases the lock",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
+    },
+    {
       "operation": "external_wait.wake_resume",
       "owner": "bridge external-wait monitor",
       "registration": {

@@ -208,14 +208,16 @@ This is an example only. Adding it is an operator decision.
   --prompt "Fleet bridge health every 15 minutes; pages only on NEW/STILL/RECOVERED (#2086)" \
   --schedule '*/15 * * * *' --timezone Asia/Seoul \
   --notify owner-on-failure --catch-up-policy skip \
-  --failure-alert-after 0 --timeout-sec 840 \
+  --failure-alert-after 0 --timeout-sec 840 --lock-timeout-sec 1800 \
   --argv bash --argv /root/ccc-node/scripts/fleet-bridge-watch.sh \
   --argv --light --argv --state-file \
   --argv /root/.claude/state/fleet-watch/state.json
 /root/ccc-node/scripts/agent-cron.sh run fleet-watch-15m --dry-run --json
 ```
 
-`--timeout-sec 840` sits above the light-mode worst case: the Matrix pass is at
+`--lock-timeout-sec 1800` (twice the run timeout) lets a lock left by a killed
+run expire instead of stopping the watch for hours (#2669; see
+`agent-cron.md` → Dead-holder locks). `--timeout-sec 840` sits above the light-mode worst case: the Matrix pass is at
 most about 264s, and the deadline stops new probes at 600s, after which at most
 one in-flight probe (≤ 65s) remains. It also stays below the 15-minute
 interval. A measured all-OK run of 12 nodes × 2 channels took about 53s. The

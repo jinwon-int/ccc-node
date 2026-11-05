@@ -29,6 +29,8 @@ from agent_cron_alarm import (  # noqa: E402
     FAILURE_CLASSES,
     alarm_text,
     classify_failure,
+    dead_lock_text,
+    dead_lock_transition,
     node_transition,
     resolve_stale_days,
     resolve_threshold,
@@ -600,6 +602,63 @@ class Integration(unittest.TestCase):
         self.assertEqual(box.alarm_state()['tasks']['a']['lastSuccessAt'], stamp(5))
         self.assertNotIn('boom', json.dumps(box.alarm_state()))
 
+
+
+class DeadLockTransition(unittest.TestCase):
+    """Dead-holder lock skip counter (#2669)."""
+
+    def tick(self, prev, scheduled, *, dead=True, run='r1', threshold=3, at=None):
+        return dead_lock_transition(prev, dead=dead, scheduled_at=scheduled, holder_run_id=run,
+                                    threshold=threshold, at=at or scheduled or '2026-01-01T00:00:00Z')
+
+    def test_counts_once_per_scheduled_run_and_alerts_once(self) -> None:
+        state, event = self.tick(None, 't1')
+        self.assertIsNone(event)
+        state, event = self.tick(state, 't1', at='t1b')  # a second tick for the same due run
+        self.assertEqual((state['skippedRuns'], event), (1, None))
+        state, _ = self.tick(state, 't2')
+        state, event = self.tick(state, 't3')
+        self.assertEqual(event['reason'], 'threshold')
+        self.assertEqual((event['skippedRuns'], event['holderRunId'], event['firstSkipAt']), (3, 'r1', 't1'))
+        state, event = self.tick(state, 't4')
+        self.assertIsNone(event)
+        self.assertEqual((state['skippedRuns'], state['alerted']), (4, True))
+
+    def test_recovery_after_alert_sends_one_cleared_notice(self) -> None:
+        state = None
+        for t in ('t1', 't2', 't3'):
+            state, _ = self.tick(state, t)
+        state, event = self.tick(state, 't4', dead=False)
+        self.assertEqual((state, event['reason'], event['skippedRuns']), ({}, 'recovered', 3))
+        self.assertEqual(self.tick(state, 't5', dead=False), ({}, None))
+
+    def test_recovery_before_alert_is_silent(self) -> None:
+        state, _ = self.tick(None, 't1')
+        self.assertEqual(self.tick(state, 't2', dead=False), ({}, None))
+
+    def test_new_holder_run_restarts_the_streak(self) -> None:
+        state = None
+        for t in ('t1', 't2'):
+            state, _ = self.tick(state, t)
+        state, event = self.tick(state, 't3', run='r2')
+        self.assertEqual((state['skippedRuns'], state['holderRunId'], event), (1, 'r2', None))
+
+    def test_threshold_zero_opts_out(self) -> None:
+        state = None
+        for t in ('t1', 't2', 't3', 't4'):
+            state, event = self.tick(state, t, threshold=0)
+            self.assertIsNone(event)
+
+    def test_text_names_ids_counts_and_release_command_only(self) -> None:
+        holder = {'runId': 'r1', 'pid': 4242, 'acquiredAt': '2026-11-04T21:20:00Z'}
+        fire = dead_lock_text('fleet-watch-15m', {'reason': 'threshold', 'skippedRuns': 16,
+                                                  'holderRunId': 'r1', 'firstSkipAt': 't0'}, holder)
+        self.assertIn('task fleet-watch-15m skipped 16 consecutive due runs', fire)
+        self.assertIn('agent-cron.sh lock fleet-watch-15m --action release --run-id r1', fire)
+        self.assertIn('pid 4242', fire)
+        cleared = dead_lock_text('fleet-watch-15m', {'reason': 'recovered', 'skippedRuns': 16,
+                                                     'holderRunId': 'r1'}, None)
+        self.assertTrue(cleared.startswith('agent-cron dead-lock alarm cleared: task fleet-watch-15m'))
 
 if __name__ == '__main__':
     unittest.main()

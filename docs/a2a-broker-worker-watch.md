@@ -128,7 +128,7 @@ scripts/agent-cron.sh add a2a-broker-worker-watch \
   --schedule 'every 5m' --timezone Asia/Seoul \
   --prompt 'A2A broker worker staleness watch (#2086)' \
   --notify telegram-owner-on-failure \
-  --catch-up-policy skip --timeout-sec 120 \
+  --catch-up-policy skip --timeout-sec 120 --lock-timeout-sec 600 \
   --argv python3 --argv /root/ccc-node/scripts/a2a-broker-worker-watch.py \
   --argv --broker --argv team2=http://127.0.0.1:8787 \
   --argv --edge-env-file --argv /root/.a2a-broker-edge.env

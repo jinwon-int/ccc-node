@@ -120,6 +120,7 @@ class SideEffectContractTest(unittest.TestCase):
                 "self_update.apply",
                 "agent_cron.spool_notify",
                 "agent_cron.failure_alarm",
+                "agent_cron.dead_lock_alarm",
                 "external_wait.wake_resume",
                 "skill_autosave.sweep",
                 "service_control.restart",
@@ -128,7 +129,7 @@ class SideEffectContractTest(unittest.TestCase):
                 "matrix.external_wait_status",
             ],
         )
-        self.assertEqual(len(observations), 50)
+        self.assertEqual(len(observations), 55)
         by_op = {
             operation.operation: {
                 item.boundary: item for item in observations if item.operation == operation.operation

@@ -96,6 +96,8 @@ from agent_cron_schema import validate_store  # noqa: E402
 from agent_cron_alarm import (  # noqa: E402
     alarm_text,
     classify_failure,
+    dead_lock_text,
+    dead_lock_transition,
     node_transition,
     resolve_stale_days,
     resolve_threshold,
@@ -515,7 +517,7 @@ def due_plan(data):  # noqa: C901 -- #348 baseline hotspot
             'runLimit': run_limit,
             'status': 'run-limit-reached' if run_limit['reached'] else ('disabled' if not configured_enabled else 'idle'),
         }
-        for k in ('holder', 'lockAgeSec', 'lockTimeoutSec'):
+        for k in ('holder', 'lockAgeSec', 'lockTimeoutSec', 'holderAlive'):
             if k in lock:
                 row[k] = lock[k]
         try:
@@ -769,6 +771,9 @@ def scheduler_actions(plan):
             'retryAttempt': row.get('retryAttempt'),
             'lockState': lock_state,
             'lockPath': row.get('lockPath'),
+            # False only for a same-boot holder pid that provably no longer exists (#2669).
+            'holderAlive': row.get('holderAlive'),
+            'holder': row.get('holder'),
         })
     return actions
 
@@ -840,9 +845,12 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
         any_history = any_history or bool(m.get('historyAppend'))
         any_lock = any_lock or bool(m.get('lockAcquire'))
         any_task_write = any_task_write or bool(m.get('taskStoreWrite'))
+    dead_lock = record_dead_lock_skips(data, actions, plan.get('at') or at_value)
+    any_spool = any_spool or bool(dead_lock.get('spooled'))
     return {
         'ok': True,
         'mode': 'scheduler-execute-one-shot',
+        'deadLockAlarm': dead_lock,
         'store': str(store),
         'at': plan.get('at'),
         'plannedActions': len(actions),
@@ -1835,9 +1843,15 @@ def load_failure_alarm_state():
         return _empty_alarm_state()
     tasks = doc.get('tasks') if isinstance(doc.get('tasks'), dict) else {}
     node = doc.get('node') if isinstance(doc.get('node'), dict) else {}
-    return {'version': FAILURE_ALARM_STATE_VERSION,
-            'tasks': {k: v for k, v in tasks.items() if isinstance(k, str) and isinstance(v, dict)},
-            'node': node}
+    out = {'version': FAILURE_ALARM_STATE_VERSION,
+           'tasks': {k: v for k, v in tasks.items() if isinstance(k, str) and isinstance(v, dict)},
+           'node': node}
+    # Dead-holder skip counters (#2669) ride in the same file; an older writer
+    # simply drops the key, which costs at most one repeated alert.
+    dead = doc.get('deadLocks')
+    if isinstance(dead, dict):
+        out['deadLocks'] = {k: v for k, v in dead.items() if isinstance(k, str) and isinstance(v, dict)}
+    return out
 
 
 def _node_eligible(item, env_threshold):
@@ -2027,6 +2041,90 @@ def _advance_failure_alarm(state, task_id, current, tasks, run_id, status, failu
             days=resolve_stale_days(os.environ.get('CCC_AGENT_CRON_PROMPT_STALE_DAYS', '')),
         )
     return task_event, node_event, stale_event, result
+
+
+def _is_dead_lock_skip(action):
+    return (isinstance(action, dict) and action.get('action') == 'skip'
+            and action.get('reason') == 'locked' and action.get('holderAlive') is False)
+
+
+# ccc-side-effect: agent_cron.dead_lock_alarm
+def record_dead_lock_skips(data, actions, at):
+    """Owner alarm when a due task keeps skipping on a dead holder's lock (#2669).
+
+    Runs once per ``scheduler --execute`` tick, after the tick's runs. A same-boot
+    lock is never stolen (a wrong liveness guess must not double-run a task), so
+    this only makes the stuck state visible: after N (default 3) skipped due runs
+    one alarm is spooled regardless of ``notify``, and one "cleared" notice
+    follows when the task stops being dead-locked. N is node-wide
+    ``CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER`` (0 disables) and deliberately NOT the
+    task's ``failureAlertAfter``: the periodic watches set that to 0 because their
+    own non-zero exit is the page, and they are exactly the tasks this catches. Counters live
+    in failure-alarm.json (``deadLocks``), never in the task store. State is saved
+    before the spool write, like record_failure_alarm. Never raises.
+    """
+    try:
+        tasks = data.get('tasks') if isinstance(data, dict) else None
+        tasks = [t for t in tasks if isinstance(t, dict)] if isinstance(tasks, list) else []
+        by_id = {str(t.get('id')): t for t in tasks}
+        by_action = {str(a.get('taskId')): a for a in actions or [] if isinstance(a, dict)}
+        at_s = fmt_dt(at) if not isinstance(at, str) else at
+        at_s = at_s or _secure_fs.utc_now_iso()
+        threshold = resolve_threshold(None, os.environ.get('CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER', ''))
+        events = []
+        with store_lock():
+            state = load_failure_alarm_state()
+            dead_state = dict(state.get('deadLocks') or {})
+            candidates = set(dead_state) | {tid for tid, a in by_action.items() if _is_dead_lock_skip(a)}
+            for task_id in sorted(candidates):
+                task = by_id.get(task_id)
+                if task is None or _VALID_TASK_ID.fullmatch(task_id) is None:
+                    dead_state.pop(task_id, None)
+                    continue
+                action = by_action.get(task_id) or {}
+                holder = action.get('holder') if isinstance(action.get('holder'), dict) else {}
+                new, event = dead_lock_transition(
+                    dead_state.get(task_id), dead=_is_dead_lock_skip(action),
+                    scheduled_at=action.get('scheduledAt'), holder_run_id=holder.get('runId'),
+                    threshold=threshold, at=at_s)
+                if new:
+                    dead_state[task_id] = new
+                else:
+                    dead_state.pop(task_id, None)
+                if event:
+                    events.append((task_id, event, holder))
+            if not candidates:
+                return {'state': 'none'}
+            if dead_state:
+                state['deadLocks'] = dead_state
+            else:
+                state.pop('deadLocks', None)
+            try:
+                _write_failure_alarm_state(state)
+            except Exception as e:
+                print(f'agent-cron: dead-lock alarm state not persisted; '
+                      f'{"alert suppressed" if events else "counters not advanced"}: '
+                      f'{short_text(str(e), 200)}', file=sys.stderr)
+                return {'state': 'state-write-failed', 'alertSuppressed': bool(events)}
+        out = {'state': 'alerted' if events else 'counting',
+               'tasks': sorted(dead_state), 'spooled': 0, 'events': []}
+        for task_id, event, holder in events:
+            reasons = [f'dead-lock={event["reason"]}']
+            run_id = 'dead-lock-' + safe_name(str(event.get('holderRunId') or 'unknown'))
+            try:
+                at_dt = parse_dt(at_s, 'at')
+            except Exception:
+                at_dt = None
+            spooled = write_failure_alarm_spool(task_id, run_id, dead_lock_text(task_id, event, holder),
+                                                reasons, at_dt)
+            out['events'].append({'taskId': task_id, 'reason': event['reason'],
+                                  'skippedRuns': event.get('skippedRuns'),
+                                  'delivery': spooled.get('delivery')})
+            if spooled.get('delivery') == 'spooled':
+                out['spooled'] += 1
+        return out
+    except Exception as e:
+        return {'state': 'error', 'error': short_text(str(e), 300)}
 
 
 # ccc-side-effect: agent_cron.failure_alarm
