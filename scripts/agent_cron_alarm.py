@@ -315,6 +315,67 @@ def node_transition(prev: Any, *, task_id: str, failed: bool, failure_class: str
                    'failureClass': cls, 'taskIds': ids}
 
 
+def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
+                         holder_run_id: str | None, threshold: int, at: str
+                         ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Advance one task's dead-holder skip counter by one scheduler tick (#2669).
+
+    A same-boot lock whose holder pid is gone is never stolen (that is the run
+    lock contract), so the task skips ``locked`` on every tick until someone
+    releases it. Skips are not failures, so the failure counters above never
+    saw the 2026-11-05 incident: fleet-watch-15m skipped 16 runs over 4.5 h
+    after a package upgrade TERMed the scheduler mid-run, and nothing alerted.
+
+    ``dead`` is True when this tick skipped the task for a lock held by a dead
+    same-boot holder. The counter advances once per distinct ``scheduled_at``
+    (ticks run more often than many schedules), resets when the holder run id
+    changes, alerts once per streak at ``threshold`` skipped runs, and sends one
+    "cleared" notice when the task is no longer dead-locked. ``threshold`` 0
+    disables it (node-wide CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER=0).
+    """
+    state = dict(prev) if isinstance(prev, dict) else {}
+    alerted = state.get('alerted') is True
+    if not dead:
+        event = None
+        if alerted:
+            event = {'reason': 'recovered', 'skippedRuns': _nonneg_int(state.get('skippedRuns')) or 0,
+                     'holderRunId': state.get('holderRunId')}
+        return {}, event
+    if state.get('holderRunId') != holder_run_id:
+        state = {'holderRunId': holder_run_id, 'skippedRuns': 0, 'firstSkipAt': at, 'alerted': False}
+        alerted = False
+    skipped = _nonneg_int(state.get('skippedRuns')) or 0
+    if scheduled_at is None or state.get('lastScheduledAt') != scheduled_at:
+        skipped += 1
+        state['lastScheduledAt'] = scheduled_at
+    state.update({'skippedRuns': skipped, 'lastSkipAt': at})
+    state.setdefault('firstSkipAt', at)
+    if alerted or threshold <= 0 or skipped < threshold:
+        return state, None
+    state.update({'alerted': True, 'alertedAt': at})
+    return state, {'reason': 'threshold', 'skippedRuns': skipped, 'holderRunId': holder_run_id,
+                   'firstSkipAt': state.get('firstSkipAt')}
+
+
+def dead_lock_text(task_id: str, event: dict[str, Any], holder: dict[str, Any] | None) -> str:
+    """Owner text for the dead-holder skip alarm — ids, counts and timestamps only."""
+    holder = holder if isinstance(holder, dict) else {}
+    run_id = event.get('holderRunId') or '?'
+    if event['reason'] == 'recovered':
+        return (f"agent-cron dead-lock alarm cleared: task {task_id} is no longer blocked by "
+                f"the dead holder lock {run_id} (it had skipped {event['skippedRuns']} due runs)")
+    return '\n'.join([
+        f"agent-cron dead-lock alarm: task {task_id} skipped {event['skippedRuns']} consecutive "
+        f"due runs (since {event.get('firstSkipAt') or '?'}) because its run lock is held by a "
+        f"process that no longer exists (runId {run_id}, pid {holder.get('pid', '?')}, "
+        f"acquired {holder.get('acquiredAt', '?')})",
+        "the lock is never stolen automatically on the same boot; after confirming no run is "
+        f"active, release it: agent-cron.sh lock {task_id} --action release --run-id {run_id}",
+        'or give the task a lockTimeoutSec; this alarm ignores the task notify and '
+        'failureAlertAfter settings (node-wide off: CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER=0)',
+    ])
+
+
 def _id_list(ids: list[str], limit: int = 5) -> str:
     shown = ', '.join(ids[:limit])
     return shown + (f' (+{len(ids) - limit} more)' if len(ids) > limit else '')

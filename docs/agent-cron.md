@@ -310,6 +310,68 @@ verdict when prompt runs are still being attempted (newest within D days) and
 failing with no prompt success anywhere for more than D days. Disabled and
 one-shot tasks never get a per-task warning, so nothing warns forever.
 
+## Dead-holder locks and the dead-lock alarm (#2669)
+
+A run lock is never stolen on the same boot, even when its holder process is
+gone: a wrong liveness guess must not run a task twice. `lock --action probe`
+reports that case as `lockState=held` with `holderAlive=false`. Until someone
+releases it the task skips `locked` on every tick, and a skip is not a failure,
+so the consecutive-failure alarm above never fires.
+
+Observed 2026-11-05 on one node: `unattended-upgrades` restarted services at
+06:21 KST and TERMed `ccc-agent-cron.service` in the middle of a
+`fleet-watch-15m` run. The dead run left its lock behind and the fleet watch
+skipped 16 due runs over 4.5 hours with no alert of any kind.
+
+`scheduler --execute` now counts, after each tick, every enabled due task it
+skipped for a lock whose same-boot holder is gone (`holderAlive=false`):
+
+- once per distinct `scheduledAt` (ticks run more often than most schedules);
+- after **3** skipped due runs one owner alarm is spooled (`AgentCronFailureAlarm`,
+  reason `dead-lock=threshold`, tier `action`) with the holder run id, pid, and
+  the exact release command; a new holder run id restarts the count;
+- when the task is no longer dead-locked, one `dead-lock=recovered` notice
+  (tier `info`).
+
+The alarm ignores the task's `notify` **and** `failureAlertAfter`: the periodic
+watches set `failureAlertAfter=0` because their own non-zero exit is the page,
+and they are exactly the tasks this catches. Node-wide threshold:
+`CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER` (default 3, `0` disables). Counters live
+in `failure-alarm.json` under `deadLocks`, never in the task store; the dry-run
+modes only expose `holderAlive` and write nothing. Nothing is released
+automatically.
+
+To release after the alarm, confirm no run of the task is active, then:
+
+```sh
+scripts/agent-cron.sh lock <task-id> --action probe --json      # holderAlive=false
+scripts/agent-cron.sh lock <task-id> --action release --run-id <holder runId> --json
+```
+
+### lockTimeoutSec for periodic watches
+
+`lockTimeoutSec` is the opt-in way to let a lock expire. Give the periodic
+watch tasks one so a dead holder costs one timeout, not hours. Rule: **twice
+the task's `--timeout-sec`, at least 600 s** — a live run is always killed at its
+own timeout first, so the lock can never be taken from a run that is still
+going.
+
+| task | `--timeout-sec` | `--lock-timeout-sec` |
+|---|---|---|
+| `fleet-watch-15m` | 840 | 1800 |
+| `a2a-broker-worker-watch` | 120 | 600 |
+| `external-github-watch-15m` | 240 | 600 |
+| `laptop-online-watch` | 120 | 600 |
+
+The install examples in `fleet-watch.md` and `a2a-broker-worker-watch.md` carry
+it. A node that already has the task applies it in place (store edit only, no
+restart):
+
+```sh
+scripts/agent-cron.sh edit fleet-watch-15m --lock-timeout-sec 1800 --json
+scripts/agent-cron.sh edit a2a-broker-worker-watch --lock-timeout-sec 600 --json
+```
+
 ## Safety boundaries
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.

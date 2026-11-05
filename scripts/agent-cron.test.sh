@@ -512,6 +512,47 @@ ok "run failure records state and releases lock" 'jq -e ".tasks[] | select(.id =
 
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-once --json --at 2026-01-01T00:01:00Z)"; rc=$?
 ok "maxRuns disables a successful one-time task" '[ "$rc" = 0 ] && jq -e ".runLimit.reached == true and .runLimit.runCount == 1 and .runLimit.remainingRuns == 0" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"exec-once\" and .enabled == false and .runCount == 1)" "$EXEC_STORE" >/dev/null'
+# ── dead-holder lock skip alarm (#2669) ──
+DL_DIR="$TMP/deadlock-store"; DL_STORE="$DL_DIR/tasks.json"; DL_SPOOL="$TMP/deadlock-spool"
+mkdir -p "$DL_DIR/locks" "$DL_SPOOL"
+cat > "$DL_STORE" <<'JSON'
+{"version":1,"tasks":[{"id":"dl-watch","schedule":"* * * * *","prompt":"Dead lock watch","enabled":true,"notify":"none","failureAlertAfter":0,"lastRunAt":"2026-01-01T00:00:00Z"},{"id":"dl-alive","schedule":"* * * * *","prompt":"Alive holder","enabled":true,"notify":"none","lastRunAt":"2026-01-01T00:00:00Z"}]}
+JSON
+dl_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+sleep 300 & DL_ALIVE_PID=$!
+python3 - "$DL_DIR/locks" "$dl_boot" "$DL_ALIVE_PID" <<'PY'
+import json, sys, os
+d, boot, alive = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def w(name, pid, run):
+    open(os.path.join(d, name + '.lock'), 'w', encoding='utf-8').write(json.dumps({"taskId": name, "runId": run, "pid": pid, "host": "test", "bootId": boot, "acquiredAt": "2026-01-01T00:00:30Z", "scheduledAt": "2026-01-01T00:00:00Z"}) + chr(10))
+w('dl-watch', 999999, 'dl-watch-dead-run')
+w('dl-alive', alive, 'dl-alive-run')
+PY
+dl_tick() { CCC_AGENT_CRON_STORE="$DL_STORE" CCC_PUSH_SPOOL="$DL_SPOOL" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" scheduler --execute --json --at "$1"; }
+dl_alarms() { local n=0 f; for f in "$DL_SPOOL"/*-alarm.json; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+dl_tick 2026-01-01T00:01:10Z >/dev/null; out="$(dl_tick 2026-01-01T00:01:40Z)"
+ok "dead-lock: two ticks in one scheduled minute count once, no alarm yet" 'jq -e ".deadLockAlarm.state == \"counting\"" <<<"$out" >/dev/null && jq -e ".deadLocks[\"dl-watch\"].skippedRuns == 1" "$DL_DIR/failure-alarm.json" >/dev/null && [ "$(dl_alarms)" = 0 ]'
+ok "dead-lock: a live holder is never counted" 'jq -e "(.deadLocks | has(\"dl-alive\")) | not" "$DL_DIR/failure-alarm.json" >/dev/null'
+dl_tick 2026-01-01T00:02:10Z >/dev/null; out="$(dl_tick 2026-01-01T00:03:10Z)"
+ok "dead-lock: third skipped due run spools one owner alarm (notify=none and failureAlertAfter=0 ignored)" 'jq -e ".deadLockAlarm.state == \"alerted\" and .deadLockAlarm.spooled == 1 and .mutations.pushSpoolWrite == true" <<<"$out" >/dev/null && [ "$(dl_alarms)" = 1 ] && grep -h "dead-lock alarm: task dl-watch skipped 3 consecutive" "$DL_SPOOL"/*-alarm.json >/dev/null && grep -h "\"tier\": \"action\"" "$DL_SPOOL"/*-alarm.json >/dev/null && grep -h -- "--action release --run-id dl-watch-dead-run" "$DL_SPOOL"/*-alarm.json >/dev/null'
+dl_tick 2026-01-01T00:04:10Z >/dev/null; dl_tick 2026-01-01T00:05:10Z >/dev/null
+ok "dead-lock: further skips do not re-alert" '[ "$(dl_alarms)" = 1 ] && jq -e ".deadLocks[\"dl-watch\"].skippedRuns == 5 and .deadLocks[\"dl-watch\"].alerted == true" "$DL_DIR/failure-alarm.json" >/dev/null'
+ok "dead-lock: the task store gains no alarm fields" '! grep -q "deadLock\|skippedRuns" "$DL_STORE"'
+rm -f "$DL_DIR/locks/dl-watch.lock"
+out="$(dl_tick 2026-01-01T00:06:10Z)"
+ok "dead-lock: release clears the counter with one info notice" '[ "$(dl_alarms)" = 2 ] && grep -l "dead-lock alarm cleared: task dl-watch" "$DL_SPOOL"/*-alarm.json | xargs grep -h "\"tier\": \"info\"" >/dev/null && jq -e "(.deadLocks // {}) | has(\"dl-watch\") | not" "$DL_DIR/failure-alarm.json" >/dev/null'
+out="$(CCC_AGENT_CRON_STORE="$DL_STORE" CCC_PUSH_SPOOL="$DL_SPOOL" bash "$CMD" scheduler --dry-run --json --at 2026-01-01T00:07:10Z)"
+ok "dead-lock: scheduler --dry-run exposes holderAlive and writes nothing" 'jq -e ".actions[] | select(.taskId == \"dl-alive\" and .holderAlive == true)" <<<"$out" >/dev/null && [ "$(dl_alarms)" = 2 ]'
+kill "$DL_ALIVE_PID" 2>/dev/null || true; wait "$DL_ALIVE_PID" 2>/dev/null || true
+DL_OFF_DIR="$TMP/deadlock-off"; mkdir -p "$DL_OFF_DIR/locks" "$TMP/deadlock-off-spool"
+cp "$DL_STORE" "$DL_OFF_DIR/tasks.json"
+python3 - "$DL_OFF_DIR/locks/dl-watch.lock" "$dl_boot" <<'PY'
+import json, sys
+open(sys.argv[1], 'w', encoding='utf-8').write(json.dumps({"taskId": "dl-watch", "runId": "dl-off-run", "pid": 999999, "host": "test", "bootId": sys.argv[2], "acquiredAt": "2026-01-01T00:00:30Z", "scheduledAt": "2026-01-01T00:00:00Z"}) + chr(10))
+PY
+for t in 01 02 03 04; do CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER=0 CCC_AGENT_CRON_STORE="$DL_OFF_DIR/tasks.json" CCC_PUSH_SPOOL="$TMP/deadlock-off-spool" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" scheduler --execute --json --at "2026-01-01T00:${t}:10Z" >/dev/null; done
+ok "dead-lock: CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER=0 turns the alarm off node-wide" '[ -z "$(ls "$TMP/deadlock-off-spool")" ]'
+
 out="$(CCC_AGENT_CRON_STORE="$EXEC_STORE" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" run exec-once --json --at 2026-01-01T00:02:00Z)"; rc=$?
 ok "disabled one-time task cannot recur" '[ "$rc" = 0 ] && jq -e ".status == \"run-limit-reached\" and .mutations.headlessExecute == false" <<<"$out" >/dev/null'
 
