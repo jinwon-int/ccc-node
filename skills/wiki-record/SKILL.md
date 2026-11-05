@@ -40,6 +40,22 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
      the trailing `-N`.
    - `<seq>` starts at `1` and is `max(seq)+1` among entries for the same KST date and node — counting **both** regions below, which share one id space.
    - Prepend the entry at the **top of `pages/log.md`** — below the digest block (the `> **에이전트 다이제스트**` blockquote under the H1), directly above the newest existing `## [LOG-...]` heading entry. Never insert right under the H1: that pushes the digest down (seoyoon-family-wiki#6481). The `- [LOG-...]` bullet region below the `[LOG-00]` block is the older form: still valid and still auto-merged, but new entries go at the top.
+   - **Find that heading on a line start only.** The digest quotes the heading pattern mid-line (`` `## [LOG-YYYYMMDD-<node>-<seq>]` ``), so the first *substring* match — `str.index('## [LOG-')`, `text.find(...)`, an unanchored `sed`/`grep -m1` position — lands inside the digest and splices the entry into it. That broke the digest twice on 2026-11-05 (seoyoon-family-wiki #9254, then again right after the #9273 repair). Insert with a line-anchored match:
+
+     ```bash
+     python3 - "$W/pages/log.md" "$ENTRY_FILE" <<'PY'
+     import re, sys
+     path, entry_path = sys.argv[1], sys.argv[2]
+     text = open(path, encoding="utf-8").read()
+     entry = open(entry_path, encoding="utf-8").read().rstrip("\n") + "\n\n"
+     m = re.search(r"^## \[LOG-", text, re.M)  # line start only, never str.index
+     if m is None:
+         sys.exit("no level-2 LOG heading found; stop and inspect pages/log.md")
+     open(path, "w", encoding="utf-8").write(text[:m.start()] + entry + text[m.start():])
+     PY
+     ```
+
+     Then check before `wiki-agent pr`: `git -C "$W" diff -U0 pages/log.md` shows **only added lines** (no `-` line), and `sed -n 3,6p "$W/pages/log.md"` still prints the digest's `> - 핵심 …` and `> - stale 주의 …` lines unchanged. An Edit whose `old_string` is the newest heading line itself (the full `## [LOG-<id>] … KST — …` text) is also safe; a bare `## [LOG-` is not.
    - Never edit the `[LOG-00]` rule block itself — it is the merge anchor, and changing it makes a concurrent-edit rebase fail closed. Rule changes belong in their own PR.
    - Never assign a new numeric `LOG-NNNN` ID or renumber an old one. When citing an old numeric entry, include its date and title.
 
