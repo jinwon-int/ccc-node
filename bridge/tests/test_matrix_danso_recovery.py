@@ -162,6 +162,16 @@ async def test_typed_one_without_resume_allowed_starts_evidence_first_new_sessio
 
 
 @pytest.mark.anyio
+async def test_offer_is_a_card_and_its_line_answers_like_the_number(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    """#2676: answer-needed header above `1. 이어서 진행`; the card's `3. 상태만 확인` line answers like `3`."""
+    bot, chat, _manager, transport = await _danso_bot(tmp_path)
+    await _turn(bot, "/task_recover")
+    assert "[Answer needed] choose one\n1. 이어서 진행\n2. 새 작업 시작\n3. 상태만 확인" in transport.notices[0][1]
+    await _turn(bot, "3. 상태만 확인")
+    assert chat.calls == [] and any("중단 상태" in body for _r, body, _h in transport.formatted)
+
+
+@pytest.mark.anyio
 async def test_typed_two_and_three_never_call_the_provider(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
     bot, chat, manager, transport = await _danso_bot(tmp_path)
     await _turn(bot, "/task_recover")

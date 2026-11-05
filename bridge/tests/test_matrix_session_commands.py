@@ -111,6 +111,39 @@ async def test_resume_lists_runtime_threads_and_digit_switches(tmp_path: Path, m
 
 
 @pytest.mark.anyio
+async def test_resume_menu_is_a_card_and_takes_the_card_line(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    """#2676: `[Answer needed] choose one` above item 1; the card's `N. label` line switches like `N`."""
+    bot, chat, manager, key = await _prepared(tmp_path, "codex")
+    chat.runtime_sessions = [
+        SimpleNamespace(id=f"t{n}", title=f"Thread {n}", preview="", model=None, cwd=None) for n in range(1, 13)
+    ]
+    text = (await _turn(bot, "/resume")).text
+    assert text.startswith("📋 Session History\n\n[Answer needed] choose one\n1. Thread 1 [codex]\n")
+    assert len((await manager.get_session(key))["resume_list"]) == 12  # the fake ignores the limit
+    assert (await _turn(bot, "2. Thread 2 [codex]")).text == "✅ Switched to session: Thread 2"
+    assert chat.calls == []
+    await _turn(bot, "/resume")
+    await _turn(bot, "1. Thread 1\nand also this")  # two lines: not a menu answer
+    assert chat.calls[-1]["user_message"] == "1. Thread 1\nand also this"
+    assert "resume_list" not in await manager.get_session(key)
+
+
+@pytest.mark.anyio
+async def test_resume_asks_for_at_most_nine_sessions(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
+    bot, chat, _manager, _key = await _prepared(tmp_path, "claude", bridge_memory_mode="off")
+    seen: list[int] = []
+    original = chat.list_sessions
+
+    def spy(limit: int = 10) -> list[tuple[str, str, float]]:
+        seen.append(limit)
+        return original(limit)
+
+    chat.list_sessions = spy  # type: ignore[method-assign]
+    await _turn(bot, "/resume")
+    assert seen == [9]
+
+
+@pytest.mark.anyio
 async def test_non_digit_reply_clears_the_pending_list_and_runs_normally(tmp_path: Path, matrix_config: dict[str, Any]) -> None:
     bot, chat, manager, key = await _prepared(tmp_path, "codex")
     await _turn(bot, "/resume")
@@ -127,7 +160,9 @@ async def test_claude_resume_is_locked_under_audience_scoped_memory_and_lists_ot
     assert "resume_list" not in await manager.get_session(key)
     bot, chat, manager, key = await _prepared(tmp_path / "open", "claude", bridge_memory_mode="off")
     text = (await _turn(bot, "/resume")).text
-    assert "1. Fix the build now [claude]\n30 seconds ago" in text and "2. Plan trip [claude]\n2 hours ago" in text
+    # #2676: header right above item 1, time lines indented so the list stays one Hande card.
+    assert "📋 Session History\n\n[Answer needed] choose one\n1. Fix the build now [claude]\n   30 seconds ago\n" in text
+    assert "2. Plan trip [claude]\n   2 hours ago" in text
     assert (await _turn(bot, "1")).text == "✅ Switched to session: Fix the build\nnow\n\n📋 last answer"
     assert (await manager.get_session(key))["session_id"] == "s1"
 

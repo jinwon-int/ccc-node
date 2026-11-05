@@ -341,9 +341,12 @@ async def test_pages_keep_absolute_numbers(
     bot, chat, _manager, _path, _clock = _revert_bot(tmp_path, users=users)
 
     first = await _say(bot, "/revert")
-    assert "Page 1/2" in first and "10. 💬" in first and "11. 💬" not in first
+    # #2676: nine per page, so page 1 is one Hande answer-needed card.
+    assert "Page 1/2" in first and "9. 💬" in first and "10. 💬" not in first
+    assert "\n[Answer needed] choose one\n1. 💬" in first
     second = await _say(bot, "/revert page 2")
-    assert "11. 💬" in second and "12. 💬" in second and "msg00" in second
+    assert "10. 💬" in second and "12. 💬" in second and "msg00" in second
+    assert "[Answer needed]" not in second  # numbering starts at 10: not a card
     # 12 = the oldest message, line 0; picked from the stored listing.
     assert (await _say(bot, "12")).startswith("🔄 Selected message:\n\nmsg00")
     await _say(bot, "2")
@@ -402,3 +405,17 @@ def test_shared_executor_rejects_paths_outside_the_conversations_dir(tmp_path: P
     assert revert_ops.revert_conversation(tmp_path / "conv", "missing", 1) is False
     assert revert_ops.revert_conversation(tmp_path / "conv", SESSION, 2) is True
     assert len(_lines(path)) == 2
+
+
+async def test_hande_card_line_answers_both_revert_steps(
+    tmp_path: Path, matrix_config: dict[str, Any], spy: list[tuple[Path, str, int]]
+) -> None:
+    """#2676: the Hande card sends one `N. label` line; it answers like a bare number."""
+
+    bot, chat, _manager, _path, _clock = _revert_bot(tmp_path)
+    await _say(bot, "/revert")
+    modes = await _say(bot, "1. 💬 2 minutes ago hello")
+    assert modes.startswith("🔄 Selected message:")
+    assert "Choose revert mode:\n[Answer needed] choose one\n1. " in modes
+    assert await _say(bot, "5. Cancel") == "❌ Revert cancelled"
+    assert spy == []
