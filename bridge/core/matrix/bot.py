@@ -60,6 +60,7 @@ from telegram_bot.core.approval_contract import (
     build_approval_snapshot,
     opaque_ref,
 )
+from telegram_bot.core.answer_menu import ANSWER_NEEDED_ONE, MAX_CARD_ITEMS, menu_reply_number
 from telegram_bot.core.bot_danso_recovery import (
     OFFER,
     RECOVERY_TEXT_ACTIONS,
@@ -171,7 +172,7 @@ _OWNER_ONLY_COMMANDS = frozenset(
 # #2004: a /revert numbered menu (message pick, then mode pick) stays answerable
 # this long per (room, sender); a digit after that gets a "menu expired" answer.
 _REVERT_CHOICE_TTL_S = 300.0
-_REVERT_PAGE_SIZE = 10
+_REVERT_PAGE_SIZE = 9  # #2676: a full page fits one Hande choice card (max 9 items)
 REVERT_MENU_EXPIRED = "⌛ That /revert menu expired. Send /revert again."
 # #2001: files an answer names are sent after it, at most this many per turn.
 MAX_FILES_PER_TURN = 10
@@ -3161,7 +3162,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
     async def _answer_danso_recovery_choice(self, body: str, *, user_id: int, chat_id: int) -> bool:
         """A typed ``1``/``2``/``3`` from the owner answers a pending offer (Telegram #1718)."""
 
-        action = RECOVERY_TEXT_ACTIONS.get(body.strip())
+        number = menu_reply_number(body)  # bare digits or the Hande card's `N. label` (#2676)
+        action = None if number is None else RECOVERY_TEXT_ACTIONS.get(str(number))
         if action is None or not self._danso_recovery_enabled() or not self._check_user_access(user_id):
             return False
         key = self._conversation_key(user_id, chat_id)
@@ -3267,18 +3269,20 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             return await self._resume_piri(args, key=key, session=session, user_id=user_id, chat_id=chat_id)
         if provider in {"codex", "crush"}:
             return await self._resume_runtime_list(key=key, provider=provider)
-        sessions = await asyncio.to_thread(self._project_chat.list_sessions, limit=10)
+        sessions = await asyncio.to_thread(self._project_chat.list_sessions, limit=MAX_CARD_ITEMS)
         if not sessions:
             return "📭 No session history found."
         await self._session_manager.patch_session(
             key, updates={"resume_list": [[sid, msg, "claude"] for sid, msg, _ in sessions]}
         )
-        lines = ["📋 Session History", ""]
+        # #2676: header right above item 1 and indented time lines keep this one
+        # Hande answer-needed block (a choice card), at most MAX_CARD_ITEMS items.
+        lines = ["📋 Session History", "", ANSWER_NEEDED_ONE]
         for index, (sid, msg, mtime) in enumerate(sessions, 1):
             text = re.sub(r"https?://\S+", "", str(msg).replace("\n", " ")).strip()
             lines.append(f"{index}. {text} [claude]")
-            lines.append(self._relative_time(float(mtime)))
-            lines.append("")
+            lines.append(f"   {self._relative_time(float(mtime))}")
+        lines.append("")
         lines.append("Reply with a number to switch to that session:")
         return "\n".join(lines).strip()
 
@@ -3308,14 +3312,14 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
     async def _resume_runtime_list(self, *, key: Any, provider: str) -> str:
         label = provider.title()
         try:
-            items = await self._project_chat.list_runtime_sessions(limit=10)
+            items = await self._project_chat.list_runtime_sessions(limit=MAX_CARD_ITEMS)
         except Exception:
             logger.warning("%s session browsing failed", label)
             return f"⚠️ {label} session history is unavailable."
         if not items:
             return f"📭 No {label} session history found."
         resume_list: list[list[str]] = []
-        lines = ["📋 Session History", ""]
+        lines = ["📋 Session History", "", ANSWER_NEEDED_ONE]  # #2676
         for index, item in enumerate(items, 1):
             title = item.title or item.preview or item.id
             title = " ".join(re.sub(r"https?://\S+", "", str(title)).split())[:120] or item.id
@@ -3350,11 +3354,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             return None
         if not resume_list:
             return None
-        text = body.strip()
-        if not text.isdigit():
+        number = menu_reply_number(body)  # bare digits or the Hande card's `N. label` (#2676)
+        if number is None:
             await self._session_manager.patch_session(key, remove_fields={"resume_list"})
             return None
-        index = int(text) - 1
+        index = number - 1
         if not 0 <= index < len(resume_list):
             return "❌ Invalid number, please try again."
         entry = resume_list[index]
@@ -3463,6 +3467,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         page = min(max(1, page), pages)
         start = (page - 1) * _REVERT_PAGE_SIZE
         lines = ["🔄 Select a message to revert to:", ""]
+        if start == 0:
+            lines.append(ANSWER_NEEDED_ONE)  # #2676: page 1 numbers from 1, so it is a Hande card
         for number, message in enumerate(messages[start:start + _REVERT_PAGE_SIZE], start + 1):
             content = str(message.get("content") or "")
             preview = (content[:40] + "...") if len(content) > 40 else content
@@ -3478,7 +3484,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
     @staticmethod
     def _render_revert_modes(message: Mapping[str, Any]) -> str:
         preview = str(message.get("content") or "")[:200]
-        lines = [f"🔄 Selected message:\n\n{preview}...\n", "Choose revert mode:"]
+        lines = [f"🔄 Selected message:\n\n{preview}...\n", "Choose revert mode:", ANSWER_NEEDED_ONE]
         lines.extend(f"{number}. {label}" for number, (_mode, label) in enumerate(revert_ops.REVERT_MODES, 1))
         lines.append("")
         lines.append("Reply with a number.")
@@ -3554,8 +3560,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
 
         if (user_id, chat_id) not in self._revert_choices:
             return None
-        text = body.strip()
-        if not self._check_user_access(user_id) or re.fullmatch(r"[0-9]+", text) is None:
+        reply = menu_reply_number(body)  # bare digits or the Hande card's `N. label` (#2676)
+        if not self._check_user_access(user_id) or reply is None:
             self._revert_choices.pop((user_id, chat_id), None)  # #1955 owner-only
             return None
         pending, expired = self._live_revert_choice(user_id, chat_id)
@@ -3565,7 +3571,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         if unavailable is not None:
             self._revert_choices.pop((user_id, chat_id), None)
             return unavailable
-        number = int(text)
+        number = reply
         messages = pending["messages"]
         key = self._conversation_key(user_id, chat_id)
         session = await self._session_manager.get_session(key)
@@ -3581,7 +3587,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 session_id=session_id, messages=messages, selected=number,
             )
             return self._render_revert_modes(messages[number - 1])
-        mode = self._revert_mode(text)
+        mode = self._revert_mode(str(number))
         if mode is None:
             return "❌ Invalid number, please try again."
         return await self._finish_revert(

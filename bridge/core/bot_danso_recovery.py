@@ -8,6 +8,7 @@ import secrets
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from telegram_bot.core.answer_menu import ANSWER_NEEDED_ONE, menu_reply_number
 from telegram_bot.core.danso_worker import TASK_RESUME_CONTROL
 from telegram_bot.core.dead_session_recovery import parse_conversation_route
 from telegram_bot.core.memory_audience import resolve_memory_audience
@@ -28,9 +29,14 @@ def keyboard(token):
 # #1718: recovery 제안의 텍스트 모드 — 동일한 세 선택을 콜백 버튼 대신
 # 번호 입력으로 답한다. 기본 ON. 버튼으로 되돌리려면
 # CCC_TELEGRAM_DANSO_RECOVERY_TEXT=false.
+# #2676: answer-needed header right above item 1 → 한데 draws a single-choice card
+# (its `N. label` reply is accepted below, like a bare number).
 RECOVERY_TEXT_MENU = (
-    '\n\n번호로 답해 주세요: 1) 이어서 진행  2) 새 작업 시작  3) 상태만 확인'
-    '\n(/task_recover 로 이 메뉴를 다시 볼 수 있습니다)'
+    f'\n\n{ANSWER_NEEDED_ONE}'
+    '\n1. 이어서 진행'
+    '\n2. 새 작업 시작'
+    '\n3. 상태만 확인'
+    '\n\n번호로 답해 주세요 (/task_recover 로 이 메뉴를 다시 볼 수 있습니다)'
 )
 RECOVERY_TEXT_ACTIONS = {'1': 'continue', '2': 'new', '3': 'view'}
 
@@ -316,7 +322,8 @@ class DansoRecoveryMixin:
         """
         if not self._danso_recovery_text_mode():
             return False
-        action = RECOVERY_TEXT_ACTIONS.get((text or '').strip())
+        number = menu_reply_number(text or '')  # bare digits or `N. label` (#2676)
+        action = None if number is None else RECOVERY_TEXT_ACTIONS.get(str(number))
         if action is None:
             return False
         chat_id = self._require_chat(update).id
