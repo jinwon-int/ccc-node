@@ -25,6 +25,7 @@ owns the side effects and the state file.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import re
 from typing import Any
 
@@ -225,7 +226,7 @@ def task_transition(prev: Any, *, failed: bool, failure_class: str | None,
         event = None
         if alerted:
             event = {'reason': 'recovered', 'consecutiveFailures': previous_streak or 0,
-                     'failureClass': alerted}
+                     'failureClass': alerted, 'alertedAt': state.get('alertedAt')}
         state.update({'consecutiveFailures': 0, 'failureClass': None, 'alertedClass': None,
                       'alertedAt': None, 'classAlertAt': None, 'lastSuccessAt': at})
         return state, event
@@ -239,12 +240,14 @@ def task_transition(prev: Any, *, failed: bool, failure_class: str | None,
         return state, None
     if alerted is None:
         state.update({'alertedClass': cls, 'alertedAt': at, 'classAlertAt': at})
-        return state, {'reason': 'threshold', 'consecutiveFailures': streak, 'failureClass': cls}
+        return state, {'reason': 'threshold', 'consecutiveFailures': streak, 'failureClass': cls,
+                       'alertedAt': at}
     if (cls != alerted and cls in CLASS_CHANGE_REALERT
             and _cooldown_elapsed(state.get('classAlertAt'), at)):
         state.update({'alertedClass': cls, 'classAlertAt': at})
         return state, {'reason': 'class-change', 'consecutiveFailures': streak,
-                       'failureClass': cls, 'previousClass': alerted}
+                       'failureClass': cls, 'previousClass': alerted,
+                       'alertedAt': state.get('alertedAt')}
     return state, None
 
 
@@ -295,7 +298,8 @@ def node_transition(prev: Any, *, task_id: str, failed: bool, failure_class: str
         event = None
         if alerted:
             event = {'reason': 'recovered', 'consecutiveFailures': previous_streak or 0,
-                     'taskIds': ids, 'failureClass': state.get('failureClass')}
+                     'taskIds': ids, 'failureClass': state.get('failureClass'),
+                     'alertedAt': state.get('alertedAt')}
         state.update(_NODE_RESET)
         return state, event
     if previous_streak is None:
@@ -312,7 +316,7 @@ def node_transition(prev: Any, *, task_id: str, failed: bool, failure_class: str
         return state, None
     state.update({'alerted': True, 'alertedAt': at})
     return state, {'reason': 'threshold', 'consecutiveFailures': streak,
-                   'failureClass': cls, 'taskIds': ids}
+                   'failureClass': cls, 'taskIds': ids, 'alertedAt': at}
 
 
 def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
@@ -339,7 +343,7 @@ def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
         event = None
         if alerted:
             event = {'reason': 'recovered', 'skippedRuns': _nonneg_int(state.get('skippedRuns')) or 0,
-                     'holderRunId': state.get('holderRunId')}
+                     'holderRunId': state.get('holderRunId'), 'alertedAt': state.get('alertedAt')}
         return {}, event
     if state.get('holderRunId') != holder_run_id:
         state = {'holderRunId': holder_run_id, 'skippedRuns': 0, 'firstSkipAt': at, 'alerted': False}
@@ -354,7 +358,33 @@ def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
         return state, None
     state.update({'alerted': True, 'alertedAt': at})
     return state, {'reason': 'threshold', 'skippedRuns': skipped, 'holderRunId': holder_run_id,
-                   'firstSkipAt': state.get('firstSkipAt')}
+                   'firstSkipAt': state.get('firstSkipAt'), 'alertedAt': at}
+
+
+# Relay condition markers (#2674): a firing alarm *opens* `ac:<scope>:<id>:<alertedAt>`,
+# its "cleared" notice *resolves* the same key, so the fleet alert relay stops
+# re-notifying the alarm once it cleared. The id is a short digest of the task
+# id (scope `task`/`dead`) or `node`: a raw task id can be longer than the owner
+# spool's 24-char masking run, and `:` keeps every key segment under it.
+def condition_marker(scope: str, ident: str, event: dict[str, Any] | None) -> str | None:
+    """`@fleet-alert opens=…`/`resolves=…` for one alarm event, or None without an alertedAt."""
+    if not isinstance(event, dict) or scope not in ('task', 'node', 'dead'):
+        return None
+    stamp = re.sub(r'[^0-9TZ]', '', str(event.get('alertedAt') or ''))
+    if not re.fullmatch(r'\d{8}T\d{6}Z', stamp):
+        return None
+    digest = hashlib.sha256(str(ident).encode('utf-8')).hexdigest()[:8]
+    role = 'resolves' if event.get('reason') == 'recovered' else 'opens'
+    return f'@fleet-alert {role}=ac:{scope}:{digest}:{stamp}'
+
+
+def with_condition_markers(text: str, markers: list[str | None]) -> str:
+    """``text`` plus one marker line per non-None marker (order kept, duplicates dropped)."""
+    lines = []
+    for m in markers:
+        if m and m not in lines:
+            lines.append(m)
+    return text + ''.join('\n' + m for m in lines)
 
 
 def dead_lock_text(task_id: str, event: dict[str, Any], holder: dict[str, Any] | None) -> str:

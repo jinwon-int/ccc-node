@@ -37,7 +37,7 @@ retired. See "「한데」 lane" below.
 | `fleet_alerts_sender.py` | Matrix transport (ccc-node `MatrixTransport`) draining the queue into the one configured room with a stable txn id; inbound is read only for exact `ok/hold <id>` replies, nothing is ever executed. Needs the bridge venv's matrix extra. |
 | `fleet_alerts_sender_hande.py` | 「한데」 lane: mirror table + trigger on the queue (`--install-only` / `--uninstall` / `--status`), Unix-socket FLEET-WORKER port for the relay bot (answers `turn` with an empty result, pushes paced `notice` frames). stdlib only. |
 | `fleet_alerts_reply.py` | Stage 3: deterministic `ok/hold <id>` parser, reply receipt + `ack` row; used by the Matrix sender (admitted owner text) and the 「한데」 lane (owner-device `turn` frames). |
-| `fleet_alerts_policy.py` | Tier policy (stage 2): info digest at 09:00 KST, action/critical re-notify once after 15 min; derived `digest`/`renotify` rows, `meta` table for the digest day. Pure queue operations, no network. |
+| `fleet_alerts_policy.py` | Tier policy (stage 2): info digest at 09:00 KST, action/critical re-notify at 15 min / 1 h / 4 h (2nd/3rd not 00–07 KST, #2674) until a reply or a `resolved` receipt; derived `digest`/`renotify` rows, `meta` table for the digest day. Pure queue operations, no network. |
 | `fleet_alerts_receipt.py` | Operator read of one alert's receipts by alert id or txn (local, metadata only, exit 3 when unknown). |
 | `fleet_alerts_outbox.py` | Shared owner-only queue (0700 dir, 0600 files, flock, dedup fingerprint window, bodies wiped on delivery; v2: `alert_id`, `tier`, `receipts` — migrated in place on first open). |
 | `*.service.example` | systemd units for both processes. |
@@ -114,8 +114,27 @@ Matrix sender before every round):**
 |---|---|---|
 | `info` | held; one **digest** row per day at **09:00 KST** (`📋 플릿 알림 다이제스트 <date> — info N건 · K종`; grouped by event as `■ <event> N건 (node counts)`, groups with a problem signal first; each item `• HH:MM #id <label> <first content line>` plus up to 2 `└` detail lines, problem lines first — the ccc-node `🔔` header line and run-id/timestamp/URL bookkeeping are dropped; a group shows its 3 most relevant items then `… 외 N건`; the whole text stays ≤ 7000 bytes (「한데」 cap 8000) by dropping detail lines, then items, then trailing groups); held rows get a `digested` receipt pointing at the digest id | — |
 | `notice` | at once (both rooms — the 「한데」 mirror copies every non-`info` insert) | **never**; not an `ok/hold` target (#2628) |
-| `action` | at once | once, 15 min after the Matrix receipt, unless a `reply` receipt (`ok/hold <id>`, responder stage) exists — a derived `⏰ 재통지 #id …` row |
+| `action` | at once | up to **3 times** (#2674): 15 min, 1 h and 4 h after the Matrix receipt — a derived `⏰ 재통지 k/3 #id …` row each. The chain stops on a `reply` receipt (`ok/hold <id>`) or a `resolved` receipt (below). The 2nd/3rd one never goes out 00:00–07:00 KST: it waits for 07:00, and the 3rd keeps its 3 h gap after the 2nd's due time (15 min / 1 h / 4 h by day; e.g. 23:30 → 23:45, 07:00, 10:00). |
 | `critical` | at once | like `action`, `🚨` |
+
+**Resolving an alert (#2674).** A sender can say, inside its own alert text,
+which condition an alert opens and which earlier condition it clears:
+
+```
+@fleet-alert opens=fw:<node>:<channel>:<since>
+@fleet-alert resolves=fw:<node>:<channel>:<since>
+```
+
+The receiver strips these lines from the text the rooms show and stores the
+keys (`conditions` table). A `resolves` key gives every still-open alert **of
+the same sending node** that `opens` the same key a `resolved` receipt, which
+ends its re-notify chain; an alert that only resolves (no `opens`) is never
+re-notified itself. Nothing is inferred from free text — no marker, no link,
+and the alert keeps re-notifying. Emitters today: `fleet_watch_state.py`
+(fleet-watch NEW/STILL open `fw:<node>:<channel>:<abnormalSince>`, the
+matching RECOVERED resolves it) and agent-cron alarms (`ac:task|node|dead:<id
+digest>:<alertedAt>`, the "cleared" notice resolves it). Keys are split with
+`:` because the owner spool masks any 24+ char run of `[A-Za-z0-9_./+=-]`.
 
 **Replies (stage 3).** The owner answers an alert by writing exactly
 `ok <id>` or `hold <id>` in either room. The Matrix sender reads it through
@@ -124,7 +143,7 @@ pinned device); the 「한데」 lane reads it from the relay bot's `turn` frame
 (`sender` = `@<device>:hande`, MLS-authenticated — devices of the owner actor
 only, peer-bot turns ignored). Parsing is a regular expression, never a
 model, so text inside an alert body cannot pass as a reply, and a reply only
-writes a `reply` receipt (which stops the re-notify) and queues a short
+writes a `reply` receipt (which stops the re-notify chain) and queues a short
 `ack` row (`✅ #id ok 접수 HH:MM — <who> (<channel>)`, `⏸` for hold) that both
 rooms show. Unknown ids and non-actionable rows (info/digest/derived) get an
 `ℹ️`/`❓` ack instead. The first reply stands; later ones are acknowledged as
