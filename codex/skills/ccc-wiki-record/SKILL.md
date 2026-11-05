@@ -26,6 +26,11 @@ description: Record durable operating knowledge in the Seoyoon Family Wiki throu
    older form; both are auto-merged and share one id space, so count either when
    picking the sequence. Never edit the `[LOG-00]` block itself, and never
    allocate or renumber a global numeric `LOG-NNNN`.
+   Locate that heading on a **line start only** (`re.search(r"^## \[LOG-", text, re.M)`).
+   The digest quotes the pattern mid-line, so a first-substring match
+   (`str.index('## [LOG-')`, `find`, unanchored `sed`) splices the entry into
+   the digest — it broke twice on 2026-11-05. Before submitting, the log diff
+   must contain only added lines and the digest lines must be unchanged.
 
 4. Record secret locations and handling rules only. Exclude tokens, cookies,
    private keys, message bodies, credential values, and private endpoints.
