@@ -20,7 +20,19 @@ if [ -z "$NODES" ]; then
 fi
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
 SELF="${CCC_FLEET_SELF:-$(hostname -s 2>/dev/null || echo _none_)}"
-# Same bound as the Matrix watch: 12 nodes × (2 × 10s + 2s) = 264s worst case.
+# Per-attempt limit for the whole remote probe (#2673): connect, key exchange,
+# auth, sending the probe and its answer. 10s was too tight for a far watcher:
+# on 2026-11-06 the T2 watcher (RTT ~340 ms) needed 4.1s for `ssh true` and
+# 7.5-12.2s for this probe while the node was healthy, so the watch flapped
+# UNREACHABLE for 42-45 min four times in two days. Default 20s, cap 30s (the
+# main sweep's per-node budget). Worst case at the default: 12 nodes ×
+# (2 × 20s + 2s) = 504s, plus the Matrix watch's 264s = 768s, inside the
+# 840s fleet-watch-15m task timeout; the main probes then end
+# `inspection=deadline` (UNVERIFIED, never silently OK).
+TIMEOUT="${CCC_FLEET_HANDE_TIMEOUT:-20}"
+case "$TIMEOUT" in ''|*[!0-9]*) TIMEOUT=20 ;; esac
+[ "$TIMEOUT" -ge 1 ] || TIMEOUT=20
+[ "$TIMEOUT" -le 30 ] || TIMEOUT=30
 RETRIES="${CCC_FLEET_HANDE_RETRIES:-1}"
 RETRY_DELAY="${CCC_FLEET_HANDE_RETRY_DELAY:-2}"
 case "$RETRIES" in ''|*[!0-9]*) RETRIES=1 ;; esac
@@ -35,15 +47,27 @@ for node in $NODES; do
     if [ "$node" = "$SELF" ]; then
       out=$(python3 "$PROBE" 2>/dev/null); rc=$?
     else
-      out=$(timeout 10 "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" python3 - < "$PROBE" 2>/dev/null); rc=$?
+      out=$(timeout "$TIMEOUT" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" python3 - < "$PROBE" 2>/dev/null); rc=$?
     fi
     [ -n "$out" ] && break
     attempt=$((attempt + 1))
     [ "$attempt" -gt "$RETRIES" ] && break
     [ "$RETRY_DELAY" -gt 0 ] && sleep "$RETRY_DELAY"
   done
+  # An empty answer is classified by the last attempt's exit (#2673): only an
+  # ssh transport failure (255) means the node was not reached. A timeout (124)
+  # or a probe that died (stderr is discarded) is a failed inspection of a node
+  # that did answer the connection — UNVERIFIED, which fleet_watch_state.py
+  # confirms over more runs than UNREACHABLE because it is weaker evidence.
   if [ -z "$out" ]; then
-    echo "UNREACHABLE $node channel=hande"; fail=1; continue
+    if [ "$node" != "$SELF" ] && [ "$rc" = 255 ]; then
+      echo "UNREACHABLE $node channel=hande"
+    elif [ "$node" != "$SELF" ] && [ "$rc" = 124 ]; then
+      echo "UNVERIFIED $node channel=hande inspection=probe-timeout"
+    else
+      echo "UNVERIFIED $node channel=hande inspection=probe-error rc=$rc"
+    fi
+    fail=1; continue
   fi
   if [ "$rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -1)" != PROBE_COMPLETE=1 ]; then
     echo "UNVERIFIED $node channel=hande inspection=incomplete-probe"; fail=1; continue

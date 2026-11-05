@@ -19,6 +19,10 @@ for arg in "$@"; do
   case "$arg" in alpha|beta|gamma|delta|eps) node=$arg ;; esac
 done
 printf '%s\n' "$node" >> "$CALLS_FILE"
+# <node>.sleep: answer only after N seconds (the caller's timeout expires first).
+[ -f "$REPLY_DIR/$node.sleep" ] && sleep "$(cat "$REPLY_DIR/$node.sleep")"
+# <node>.rc: connected, but the probe died before printing (stderr discarded).
+[ -f "$REPLY_DIR/$node.rc" ] && exit "$(cat "$REPLY_DIR/$node.rc")"
 [ -f "$REPLY_DIR/$node" ] || exit 255
 cat "$REPLY_DIR/$node"
 SH
@@ -51,12 +55,43 @@ set +e; out=$(run 'eps'); rc=$?; set -e
 assert test "$rc" = 1
 assert grep -qx 'UNVERIFIED eps channel=hande inspection=malformed-result' <<< "$out"
 
-# Unreachable: bounded retries (cap 1 even when asked for more).
+# Unreachable = ssh transport failure (255): bounded retries (cap 1 even when asked for more).
 : > "$TMP/calls"
 set +e; out=$(run 'gamma' CCC_FLEET_HANDE_RETRIES=8); rc=$?; set -e
 assert test "$rc" = 1
 assert grep -qx 'UNREACHABLE gamma channel=hande' <<< "$out"
 assert test "$(grep -c '^gamma$' "$TMP/calls")" = 2
+
+# #2673: an empty answer is classified by exit code, not always UNREACHABLE.
+# Timeout (124 from `timeout`): the node accepted the connection but the probe
+# did not finish inside CCC_FLEET_HANDE_TIMEOUT — a failed inspection, retried once.
+printf 'HANDE_STATUS=OK\nHANDE_REASON=available\nPROBE_COMPLETE=1\n' > "$TMP/reply/delta"
+printf '3\n' > "$TMP/reply/delta.sleep"
+: > "$TMP/calls"
+set +e; out=$(run 'delta' CCC_FLEET_HANDE_TIMEOUT=1); rc=$?; set -e
+assert test "$rc" = 1
+assert grep -qx 'UNVERIFIED delta channel=hande inspection=probe-timeout' <<< "$out"
+assert test "$(grep -c '^delta$' "$TMP/calls")" = 2
+# The same slow node inside the limit is judged on its answer.
+set +e; out=$(run 'delta' CCC_FLEET_HANDE_TIMEOUT=5); rc=$?; set -e
+assert test "$rc" = 0
+assert grep -qx 'OK delta channel=hande reason=available' <<< "$out"
+rm -f "$TMP/reply/delta.sleep"
+
+# Probe error: connected, empty stdout, nonzero exit other than 255/124.
+printf '1\n' > "$TMP/reply/eps.rc"
+set +e; out=$(run 'eps'); rc=$?; set -e
+assert test "$rc" = 1
+assert grep -qx 'UNVERIFIED eps channel=hande inspection=probe-error rc=1' <<< "$out"
+rm -f "$TMP/reply/eps.rc"
+
+# A malformed limit falls back to the default instead of breaking `timeout`.
+set +e; out=$(run 'alpha' CCC_FLEET_HANDE_TIMEOUT=abc); rc=$?; set -e
+assert test "$rc" = 0
+assert grep -qx 'OK alpha channel=hande reason=available' <<< "$out"
+set +e; out=$(run 'alpha' CCC_FLEET_HANDE_TIMEOUT=0); rc=$?; set -e
+assert test "$rc" = 0
+assert grep -qx 'OK alpha channel=hande reason=available' <<< "$out"
 
 # No built-in node list: a standalone run without CCC_FLEET_NODES refuses.
 set +e; out=$(env -u CCC_FLEET_NODES bash "$ROOT/scripts/fleet-hande-watch.sh" 2>&1); rc=$?; set -e

@@ -71,6 +71,8 @@
 #                    check. Enabled by default during the channel transition.
 #   CCC_FLEET_HANDE  set to 0 to skip the 「한데」 frontend watch (fleet-hande-watch.sh,
 #                    #2569): bridge process/health, native bot, notice_frames.
+#                    CCC_FLEET_HANDE_TIMEOUT per-attempt probe limit in seconds
+#                    (default 20, 1–30, #2673).
 #   CCC_FLEET_DEGRADED_RECHECK_DELAY seconds before a degraded node is asked
 #                    again (default 75, capped at 300); CCC_FLEET_DEGRADED_RECHECK=0
 #                    pages on the first answer instead
