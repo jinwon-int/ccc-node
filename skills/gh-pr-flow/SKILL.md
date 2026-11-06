@@ -381,13 +381,38 @@ flaky test means re-enqueue the same approved head (and record the flake on
 its issue); a real failure means push the fix, get fresh exact-head approval
 for the new head, then re-enqueue, as with any other push.
 
+**Never call `gh pr merge` on a queued repo — with any flag.** The merge
+strategy message is informational: gh goes on to enqueue, and `--delete-branch`
+then removes the head ref, which closes the PR and drops the queue entry
+(a2a-nexus#2500, 2026-11-06). Land with the GraphQL mutation above only. If it
+has already happened: push the same commit again, `gh pr reopen <n>`, and
+enqueue over GraphQL — the exact-head approval survives the reopen; the checks
+re-run on the re-push, so wait for them before enqueueing.
+
+**The enqueuing identity must be able to start workflows.** An enqueue made
+with the repository `GITHUB_TOKEN` — an `auto-merge.yml` running `gh pr merge
+--auto` under `github.token` — produces a `merge_group` event that starts **no**
+workflow runs (GitHub never triggers runs from `GITHUB_TOKEN`-made events), so
+the required checks stay pending and the queue drops the PR at its timeout:
+a2a-nexus#2500 sat 63 minutes as `AWAITING_CHECKS` with zero group runs
+(a2a-nexus#2501). Diagnose with `gh run list --event merge_group` filtered on
+`pr-<n>`: an entry in `AWAITING_CHECKS` and no run means this cause — re-enqueue
+as a user (local `gh`, relay helper) at once instead of waiting. Rulesets do
+not have to carry the word *queue* in their name (a2a-nexus's is
+`a2a-nexus-main-required-checks`); the merge-strategy message is the signal.
+
 Enqueue needs the head up to date and its checks green; a stale `BEHIND` head
 goes through the update-branch loop above first.
 
 **A queue merge does not clean up the head branch, and `--delete-branch`
-cannot be used to make it.** `gh pr merge -d` is refused outright on a queued
-repo, so cleanup falls entirely to the repo's own `delete_branch_on_merge`
-setting — which is off on `ccc-node`:
+must never be used to make it.** `gh pr merge -d` is *not* refused on a queued
+repo (that was the belief until 2026-11-06): gh 2.45.0 printed `! The merge
+strategy for main is set by the merge queue`, then **enqueued the PR and
+deleted its head branch in the same second** — a2a-nexus#2500's timeline reads
+`added_to_merge_queue` → `closed` → `head_ref_deleted` →
+`removed_from_merge_queue` within three seconds, and an approved PR was closed
+unmerged (ccc-node#2685). Cleanup therefore falls entirely to the repo's own
+`delete_branch_on_merge` setting — which is off on `ccc-node`:
 
 ```
 ccc-node  delete_branch_on_merge=false     piri  true     fleet-skills  true
