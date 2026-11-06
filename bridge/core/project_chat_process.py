@@ -841,6 +841,8 @@ class ProjectChatProcessMixin:
         if not callable(setter):
             return
 
+        scope = self._stream_key(user_id, chat_id)
+
         def observe_sdk_frame(message: Any) -> None:
             if isinstance(message, RateLimitEvent):
                 # Account-global windows, deliberately not conversation-scoped
@@ -848,6 +850,15 @@ class ProjectChatProcessMixin:
                 self._record_claude_rate_limit(message)
             elif isinstance(message, ResultMessage):
                 self.record_claude_result_snapshot(user_id, chat_id, message)
+            # Tool spans (#2684 slice 2): pair tool use/result blocks of this
+            # conversation's frames. After the turn span so a ResultMessage's
+            # turn-end cleanup never races its own record; own try/except.
+            tool_spans = getattr(self, "_tool_spans", None)
+            if tool_spans is not None:
+                try:
+                    tool_spans.observe(scope, message)
+                except Exception:
+                    logger.debug("Tool span observe failed", exc_info=True)
 
         setter(observe_sdk_frame)
 

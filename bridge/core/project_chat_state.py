@@ -1126,6 +1126,14 @@ class ProjectChatStateMixin:
             cached.token,
         )
         if entry is not None:
+            # The session's stream is gone: its in-flight tool calls can never
+            # complete, so forget them (#2684 slice 2). Never raises.
+            tool_spans = getattr(self, "_tool_spans", None)
+            if tool_spans is not None:
+                try:
+                    tool_spans.reset(key)
+                except Exception:
+                    logger.debug("Tool span reset failed", exc_info=True)
             await self._close_agent_session(entry.session)
 
     async def _close_agent_session(self, session: Any) -> None:

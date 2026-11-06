@@ -80,8 +80,9 @@ ALLOWED_TYPES: Mapping[str, str] = {
     "gen_ai.usage.input_tokens": _INT,
     "gen_ai.usage.output_tokens": _INT,
     "gen_ai.conversation.id": _STR,
-    # Reserved for the PostToolUse tool-span slice.
+    # Tool spans (core/tool_spans.py): the tool name only, never input/output.
     "gen_ai.tool.name": _STR,
+    "ccc.tool.scope": _STR,
     "ccc.node": _STR,
     "ccc.channel": _STR,
     "ccc.turn_id": _STR,
