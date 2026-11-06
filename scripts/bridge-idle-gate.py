@@ -16,6 +16,15 @@ MCP servers are direct ``node``/``python3``/``ssh`` children without that
 wrapper. So a tool command is a shell under the bridge whose argv names a
 shell snapshot, or (other providers) a shell whose parent is the provider CLI.
 
+An MCP server registered through a shell wrapper (``bash /usr/local/bin/
+wiki-agent mcp-serve``, ``bash -c "npm exec chrome-devtools-mcp"``) is also a
+shell whose parent is the provider CLI, and it lives as long as the provider
+session — so it kept the gate busy forever (#2677). A provider-parented shell
+without the snapshot wrapper is therefore not a tool command when it runs one
+simple command (no shell control characters) whose argv names an MCP server
+(``mcp-serve``, ``mcp-server[-*]``, ``mcp-*``, ``*-mcp``, ``*_mcp`` as a word
+or path component). A snapshot-wrapped shell always counts.
+
 Idle means all of:
   * health.json is fresh (``--max-health-age``) and names the same PID;
   * ``workload.active_requests == 0`` and ``requests.delegated_tasks_active == 0``;
@@ -125,6 +134,34 @@ def _is_provider(name: str) -> bool:
     return name.startswith(PROVIDER_PREFIXES)
 
 
+_SHELL_CONTROL = frozenset(";&|<>`$()\n")
+_MCP_NAMES = frozenset({"mcp", "mcp-serve", "mcp-server"})
+_SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs", ".py", ".sh")
+
+
+def _is_mcp_word(word: str) -> bool:
+    for part in word.split("/"):
+        name = part.split("@", 1)[0] if not part.startswith("@") else ""
+        for suffix in _SCRIPT_SUFFIXES:
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        if not name:
+            continue
+        if name in _MCP_NAMES or name.startswith("mcp-") or name.endswith(("-mcp", "_mcp")):
+            return True
+    return False
+
+
+def _is_mcp_server_shell(argv: list[str]) -> bool:
+    """A wrapper shell that only runs one MCP server command (#2677)."""
+
+    body = " ".join(argv[1:])
+    if not body or any(ch in _SHELL_CONTROL for ch in body):
+        return False
+    return any(_is_mcp_word(word) for word in body.split() if not word.startswith("-"))
+
+
 def tool_commands(proc: Path, main_pid: int) -> list[dict[str, Any]]:
     """Outermost tool-command shells under ``main_pid``, with their subtree names."""
 
@@ -140,7 +177,9 @@ def tool_commands(proc: Path, main_pid: int) -> list[dict[str, Any]]:
             continue
         parent = table[pid][0]
         parent_name = _base(_argv(proc, parent), _comm(proc, parent))
-        if any(SNAPSHOT_MARK in arg for arg in argv) or _is_provider(parent_name):
+        if any(SNAPSHOT_MARK in arg for arg in argv):
+            marked.add(pid)
+        elif _is_provider(parent_name) and not _is_mcp_server_shell(argv):
             marked.add(pid)
     roots = [pid for pid in sorted(marked) if table[pid][0] not in marked]
     found = []
