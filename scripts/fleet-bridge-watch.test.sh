@@ -381,6 +381,109 @@ ok "memory: a plain bridge run neither judges memory nor writes streaks" \
   'test "$RC" = 0 && grep -q "^OK mnow (/opt/ccc-node)$" "$OUT" && [ ! -e "$MEMSTATE" ]'
 rm -f "$TMP"/reply/m*
 
+# ---- retired nodes are still doctor-checked (#2703) ------------------------
+# #2343 made a node with no bridge and a retirement marker answer
+# `AVAIL=retired` and stop there, before the doctor block. With 11 of 12 nodes
+# retired the 2026-11-06 doctor sweep judged one node; the node of the #2659
+# incident was among the 11. A retired node now carries DOCTOR/MEMORY on the
+# doctor sweep and is judged on them; the retirement itself still never fails.
+reply_ret() { # <node> <doctor> [<memory>] [<doctor-note>]
+  printf 'RUNTIME=-\nAVAIL=retired\nRETIRED=frontends\nUNIT=-\nPREPARED=-\nDOCTOR=%s\n' "$2" > "$TMP/reply/$1"
+  [ -z "${3:-}" ] || printf 'MEMORY=%s\n' "$3" >> "$TMP/reply/$1"
+  [ -z "${4:-}" ] || printf 'DOCTOR_NOTE=%s\n' "$4" >> "$TMP/reply/$1"
+}
+rm -rf "$TMP/mem-state"
+# (a) healthy harness + healthy memory: exactly the pre-#2703 line.
+reply_ret rok 0 ok
+CCC_FLEET_DOCTOR=1 run "rok"
+okc "$RC" 0 "retired doctor: a healthy retired node does not fail the sweep"
+ok "retired doctor: a healthy retired node is exactly the RETIRED line" \
+  '[ "$(grep " rok" "$OUT")" = "RETIRED rok marker=frontends" ]'
+# (b) doctor drift on a retired node is DRIFT, counted into the owner title.
+reply_ret rdrift 1 ok
+CCC_FLEET_DOCTOR=1 run "rok rdrift"
+okc "$RC" 1 "retired doctor: doctor drift on a retired node fails the sweep"
+ok "retired doctor: the drift is a DRIFT row naming the retirement, not RETIRED" \
+  'grep -q "^DRIFT rdrift doctor_exit=1 retired=frontends$" "$OUT" && ! grep -q "^RETIRED rdrift" "$OUT" && [ "$(grep -c " rdrift" "$OUT")" = 1 ]'
+ok "retired doctor: the healthy retired peer is unaffected" 'grep -q "^RETIRED rok marker=frontends$" "$OUT"'
+owner_title() { # <task> -> first line of agent-cron's owner text for $OUT/$RC
+  python3 - "$ROOT/scripts" "$OUT" "$RC" "$1" <<'PY'
+import importlib.util, sys
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location("agent_cron_fleet_retired", sys.argv[1] + "/agent_cron.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+text = module.build_owner_text(sys.argv[4], "run-retired", None, "failed",
+                               {"exitCode": int(sys.argv[3]), "stdout": open(sys.argv[2]).read(), "stderr": ""})
+print(text.splitlines()[0])
+PY
+}
+ret_title=$(owner_title fleet-doctor-sweep)
+ok "retired doctor: the drift enters the owner alert title ($ret_title)" \
+  '[ "$ret_title" = "agent-cron fleet alert for task fleet-doctor-sweep: DRIFT=1 (rdrift)" ]'
+# A retired DRIFT row stays on the node's telegram pair in change mode: the
+# `retired=` note is not a channel token.
+ok "retired doctor: the note is not read as a channel by the state tracker" \
+  '[ "$(python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import fleet_watch_state as s; print(\" \".join(s.parse_verdicts(open(sys.argv[2]).read())))" "$ROOT/scripts" "$OUT")" = "rok/telegram rdrift/telegram" ]'
+# (c) memory degraded on two consecutive sweeps: pending, then DRIFT.
+reply_ret rmem 0 degraded:mempalace.index-diverged
+CCC_FLEET_DOCTOR=1 run "rmem"
+okc "$RC" 0 "retired doctor: a first degraded memory sweep does not page"
+ok "retired doctor: the pending degradation is visible on the RETIRED line" \
+  '[ "$(grep " rmem" "$OUT")" = "RETIRED rmem marker=frontends memory-pending:degraded:mempalace.index-diverged 1/2" ]'
+ok "retired doctor: the streak is counted once per sweep" \
+  '[ "$(grep -c "^rmem	1	" "$MEMSTATE")" = 1 ]'
+CCC_FLEET_DOCTOR=1 run "rmem"
+okc "$RC" 1 "retired doctor: a confirmed memory degradation fails the sweep"
+ok "retired doctor: the confirmed degradation is a DRIFT row" \
+  '[ "$(grep " rmem" "$OUT")" = "DRIFT rmem memory=degraded:mempalace.index-diverged sweeps=2/2 retired=frontends" ]'
+reply_ret rmem 0 ok
+CCC_FLEET_DOCTOR=1 run "rmem"
+ok "retired doctor: recovered memory clears the streak and the plain line returns" \
+  'test "$RC" = 0 && [ "$(grep " rmem" "$OUT")" = "RETIRED rmem marker=frontends" ] && ! grep -q "^rmem	" "$MEMSTATE"'
+# A doctor drift outranks memory on a retired node too; the streak still counts.
+reply_ret rboth 2 degraded:nunchi.feed-count
+CCC_FLEET_DOCTOR=1 run "rboth"
+ok "retired doctor: doctor drift outranks pending memory, one row" \
+  'test "$RC" = 1 && [ "$(grep " rboth" "$OUT")" = "DRIFT rboth doctor_exit=2 retired=frontends" ] && grep -q "^rboth	1	" "$MEMSTATE"'
+# (d) off/optional never count, however many sweeps; unknown is a note only.
+reply_ret roff 0 off
+reply_ret ropt 0 optional
+for _ in 1 2 3; do CCC_FLEET_DOCTOR=1 run "roff ropt"; done
+okc "$RC" 0 "retired doctor: off/optional memory never fails the sweep"
+ok "retired doctor: off/optional are the plain RETIRED line" \
+  'grep -q "^RETIRED roff marker=frontends$" "$OUT" && grep -q "^RETIRED ropt marker=frontends$" "$OUT"'
+ok "retired doctor: off/optional keep no streak" '! grep -qE "^(roff|ropt)	" "$MEMSTATE"'
+reply_ret runk 0 unknown
+CCC_FLEET_DOCTOR=1 run "runk"
+ok "retired doctor: an unknown memory check is a note, not a failure" \
+  'test "$RC" = 0 && [ "$(grep " runk" "$OUT")" = "RETIRED runk marker=frontends memory:unknown" ]'
+# (f) no harness found on the node: never a failure, but said on the line so a
+# sweep that inspects nothing is visible.
+reply_ret rnone - unknown no-harness
+CCC_FLEET_DOCTOR=1 run "rnone"
+okc "$RC" 0 "retired doctor: a retired node without a harness does not fail"
+ok "retired doctor: the missing harness is named on the RETIRED line" \
+  '[ "$(grep " rnone" "$OUT")" = "RETIRED rnone marker=frontends doctor:no-harness" ]'
+# An answer that lost its DOCTOR column is an incomplete inspection.
+printf 'RUNTIME=-\nAVAIL=retired\nRETIRED=frontends\nUNIT=-\nPREPARED=-\n' > "$TMP/reply/rlost"
+CCC_FLEET_DOCTOR=1 run "rlost"
+ok "retired doctor: a doctor answer without DOCTOR is UNVERIFIED" \
+  'test "$RC" = 1 && grep -q "^UNVERIFIED rlost inspection=incomplete-doctor retired=frontends$" "$OUT"'
+# (e) the plain and light runs are unchanged: no doctor flag is sent and the
+# line is the RETIRED line, whatever DOCTOR/MEMORY a reply happens to carry.
+reply_ret rdrift 1 degraded:mempalace.index-diverged
+run "rdrift"
+ok "retired doctor: a plain run ignores doctor/memory on a retired node" \
+  'test "$RC" = 0 && [ "$(cat "$OUT")" = "RETIRED rdrift marker=frontends" ]'
+rm -f "$TMP"/reply/r*.flags
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen
+CCC_FLEET_NODES="rdrift" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  CCC_FLEET_DOCTOR=1 bash "$SC" --light >"$OUT" 2>/dev/null || RC=$?
+ok "retired doctor: --light sends no doctor flag and prints the RETIRED line only" \
+  'test "$RC" = 0 && [ "$(cat "$OUT")" = "RETIRED rdrift marker=frontends" ] && [ "$(cat "$TMP/reply/rdrift.flags")" = "CCC_FLEET_DOCTOR=0" ]'
+rm -f "$TMP"/reply/r*
+
 # The remote probe is a quoted heredoc — invisible to bash -n on the script
 # itself. Extract and parse it as POSIX sh so a probe typo cannot ship.
 probe_body="$TMP/probe-body.sh"
@@ -862,9 +965,18 @@ if [ "$(id -u)" = 0 ]; then
 else
   echo 'SKIP: root-owned prepared probe routing fixture (metadata/reference tests run on all users)'
 fi
-chmod 644 "$TMP/probe-home/.claude/self-update.repo"
-PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
-ok "unsafe installation record is unverified" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
+# The reference is a path, not a secret (#2703): world-readable 0644, the shape
+# every VPS node carries, is accepted; one others could rewrite is not.
+if [ "$(id -u)" = 0 ]; then
+  chmod 644 "$TMP/probe-home/.claude/self-update.repo"
+  PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+  ok "a read-only 0644 installation record is accepted" 'grep -q "^DOCTOR_ROOT=$TMP/install-repo$" "$TMP/prep-out" && grep -q "^DOCTOR=0$" "$TMP/prep-out"'
+fi
+for unsafe_mode in 664 646; do
+  chmod "$unsafe_mode" "$TMP/probe-home/.claude/self-update.repo"
+  PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+  ok "a writable-by-others installation record ($unsafe_mode) is unverified" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
+done
 
 # Interrupted/malformed inspection output cannot be interpreted as DOWN.
 printf 'RUNTIME=/opt/ccc-node\n' > "$TMP/reply/partial"
@@ -1180,6 +1292,116 @@ ok "a running bridge is judged on its answer despite a list without telegram" \
   'grep -q "^AVAIL=no$" "$TMP/fe-running.out" && ! grep -q "^AVAIL=retired$" "$TMP/fe-running.out"'
 PATH="$TMP/probe-bin:$PATH" HOME="$TMP/fe-matrix" sh "$TMP/owner-probe.sh" > "$TMP/fe-running.out"
 ok "a healthy bridge is available despite a list without telegram" 'grep -q "^AVAIL=yes$" "$TMP/fe-running.out"'
+
+# ---- retired on purpose: the doctor sweep still inspects the node (#2703) ---
+# Execute the transmitted probe against fixture homes. With no bridge there is
+# no bridge account, so the probing account itself is inspected: its
+# ~/.claude, and the harness its operator-owned self-update.repo names (the
+# same metadata check a prepared runtime uses), else the self-update default
+# checkout locations. The fixture paths are physical: the metadata check
+# refuses symlinked components. `/opt/ccc-node` is redirected so the test
+# never runs this host's real doctor.
+RH="$(cd "$TMP" && pwd -P)/ret-doc"
+mkdir -p "$RH"
+sed "s#/opt/ccc-node#$RH/opt-ccc-node#g" "$probe_body" > "$TMP/ret-probe.sh"
+ret_harness() { # <root>: a minimal checkout the metadata check accepts
+  mkdir -p "$1/scripts" "$1/claude" "$1/bridge"
+  cat > "$1/scripts/ccc-doctor.sh" <<EOF
+printf '%s\n' "doctor root=$1 CCC_DOCTOR_CLAUDE_DIR=\${CCC_DOCTOR_CLAUDE_DIR:-}" >> "$TMP/ret-calls"
+exit "\${RET_DOCTOR:-0}"
+EOF
+  cat > "$1/scripts/ccc-memory-check.sh" <<EOF
+printf '%s\n' "memory \$* CCC_STATE_DIR=\${CCC_STATE_DIR:-} CCC_MEMORY_CACHE_DIR=\${CCC_MEMORY_CACHE_DIR:-}" >> "$TMP/ret-calls"
+[ -z "\${RET_MEMORY:-}" ] || cat "\$RET_MEMORY"
+EOF
+  : > "$1/claude/settings.base.json"; : > "$1/bridge/start.sh"
+  find "$1" -type d -exec chmod 700 {} +; find "$1" -type f -exec chmod 600 {} +
+}
+ret_home() { # <home>: retired by its frontend list, owner-only like a real home
+  mkdir -p "$1/.claude"; printf 'matrix\n' > "$1/.claude/frontends"; chmod 700 "$1" "$1/.claude"
+}
+ret_ref() { # <home> <repo> [<mode>]: the operator-owned install reference
+  printf '%s\n' "$2" > "$1/.claude/self-update.repo"; chmod "${3:-600}" "$1/.claude/self-update.repo"
+}
+ret_probe() { # <home> [env...]
+  : > "$TMP/ret-calls"
+  env PATH="$TMP/empty-bin:$PATH" HOME="$1" "${@:2}" sh "$TMP/ret-probe.sh" > "$TMP/ret-out"
+}
+ret_harness "$RH/inst"
+ret_home "$RH/h-ref"; ret_ref "$RH/h-ref" "$RH/inst"
+# A decoy home checkout must not win over the operator's reference.
+ret_harness "$RH/h-ref/ccc-node"
+ret_probe "$RH/h-ref" CCC_FLEET_DOCTOR=1 RET_MEMORY="$TMP/mem-diverged.json"
+ok "retired probe: the doctor sweep still runs the doctor, from the installed reference" \
+  'grep -q "^AVAIL=retired$" "$TMP/ret-out" && grep -q "^RETIRED=frontends$" "$TMP/ret-out" && grep -qx "DOCTOR_ROOT=$RH/inst" "$TMP/ret-out" && grep -q "^DOCTOR=0$" "$TMP/ret-out"'
+ok "retired probe: the doctor inspects the probing account's own claude dir" \
+  'grep -qx "doctor root=$RH/inst CCC_DOCTOR_CLAUDE_DIR=$RH/h-ref/.claude" "$TMP/ret-calls" && ! grep -q "root=$RH/h-ref/ccc-node" "$TMP/ret-calls"'
+ok "retired probe: the memory check runs with the doctor's state dirs" \
+  'grep -qx "memory --json CCC_STATE_DIR=$RH/h-ref/.claude/state CCC_MEMORY_CACHE_DIR=$RH/h-ref/.claude/hooks/cache" "$TMP/ret-calls" && grep -q "^MEMORY=degraded:mempalace.index-diverged$" "$TMP/ret-out"'
+ok "retired probe: the doctor columns precede the completion marker" \
+  '[ "$(tail -1 "$TMP/ret-out")" = PROBE_COMPLETE=1 ] && [ "$(grep -c "^DOCTOR=" "$TMP/ret-out")" = 1 ] && [ "$(grep -c "^MEMORY=" "$TMP/ret-out")" = 1 ]'
+ret_probe "$RH/h-ref" CCC_FLEET_DOCTOR=1 RET_DOCTOR=1
+ok "retired probe: a drifted harness reports its doctor exit" 'grep -q "^DOCTOR=1$" "$TMP/ret-out"'
+# (e) without the doctor flag the retired answer is byte-for-byte the old one.
+ret_probe "$RH/h-ref"
+ok "retired probe: a plain probe is unchanged and runs nothing" \
+  '[ "$(cat "$TMP/ret-out")" = "$(printf "RUNTIME=-\nAVAIL=retired\nRETIRED=frontends\nUNIT=-\nPREPARED=-\nPROBE_COMPLETE=1")" ] && [ ! -s "$TMP/ret-calls" ]'
+ret_probe "$RH/h-ref" CCC_FLEET_DOCTOR=0
+ok "retired probe: CCC_FLEET_DOCTOR=0 is the plain probe" \
+  '[ "$(cat "$TMP/ret-out")" = "$(printf "RUNTIME=-\nAVAIL=retired\nRETIRED=frontends\nUNIT=-\nPREPARED=-\nPROBE_COMPLETE=1")" ] && [ ! -s "$TMP/ret-calls" ]'
+# The live VPS shape: a root-written, world-readable 0644 reference (#2703).
+ret_home "$RH/h-ref644"; ret_ref "$RH/h-ref644" "$RH/inst" 644
+ret_probe "$RH/h-ref644" CCC_FLEET_DOCTOR=1
+ok "retired probe: a read-only 0644 reference is used" \
+  'grep -qx "DOCTOR_ROOT=$RH/inst" "$TMP/ret-out" && grep -q "^DOCTOR=0$" "$TMP/ret-out" && grep -qx "doctor root=$RH/inst CCC_DOCTOR_CLAUDE_DIR=$RH/h-ref644/.claude" "$TMP/ret-calls"'
+# A reference that fails the metadata check (writable by others) is not
+# replaced by a guess.
+ret_home "$RH/h-badref"; ret_ref "$RH/h-badref" "$RH/inst" 664
+ret_harness "$RH/h-badref/ccc-node"
+ret_probe "$RH/h-badref" CCC_FLEET_DOCTOR=1
+ok "retired probe: an unsafe reference runs nothing and says so" \
+  'grep -q "^DOCTOR=-$" "$TMP/ret-out" && grep -q "^DOCTOR_NOTE=unverified-reference$" "$TMP/ret-out" && grep -q "^MEMORY=unknown$" "$TMP/ret-out" && [ ! -s "$TMP/ret-calls" ] && [ "$(tail -1 "$TMP/ret-out")" = PROBE_COMPLETE=1 ]'
+# No reference: the self-update default checkout (~/ccc-node), then /opt.
+ret_home "$RH/h-home"; ret_harness "$RH/h-home/ccc-node"
+ret_probe "$RH/h-home" CCC_FLEET_DOCTOR=1
+ok "retired probe: without a reference the home checkout is used" \
+  'grep -qx "DOCTOR_ROOT=$RH/h-home/ccc-node" "$TMP/ret-out" && grep -q "^DOCTOR=0$" "$TMP/ret-out" && grep -q "^MEMORY=unknown$" "$TMP/ret-out"'
+ret_home "$RH/h-opt"; ret_harness "$RH/opt-ccc-node"
+ret_probe "$RH/h-opt" CCC_FLEET_DOCTOR=1
+ok "retired probe: without a reference or home checkout /opt/ccc-node is used" \
+  'grep -qx "DOCTOR_ROOT=$RH/opt-ccc-node" "$TMP/ret-out" && grep -qx "doctor root=$RH/opt-ccc-node CCC_DOCTOR_CLAUDE_DIR=$RH/h-opt/.claude" "$TMP/ret-calls"'
+rm -rf "$RH/opt-ccc-node"
+# A candidate whose scripts someone else could rewrite is not executed.
+ret_home "$RH/h-unsafe"; ret_harness "$RH/h-unsafe/ccc-node"; chmod g+w "$RH/h-unsafe/ccc-node/scripts/ccc-doctor.sh"
+ret_probe "$RH/h-unsafe" CCC_FLEET_DOCTOR=1
+ok "retired probe: a writable-by-others checkout runs nothing and says so" \
+  'grep -q "^DOCTOR=-$" "$TMP/ret-out" && grep -q "^DOCTOR_NOTE=unverified-harness$" "$TMP/ret-out" && [ ! -s "$TMP/ret-calls" ]'
+# (f) nothing to inspect: DOCTOR=- with its reason, never a failure.
+ret_home "$RH/h-none"
+ret_probe "$RH/h-none" CCC_FLEET_DOCTOR=1
+ok "retired probe: no harness anywhere is DOCTOR=- no-harness, MEMORY=unknown" \
+  'grep -q "^DOCTOR=-$" "$TMP/ret-out" && grep -q "^DOCTOR_NOTE=no-harness$" "$TMP/ret-out" && grep -q "^MEMORY=unknown$" "$TMP/ret-out" && [ "$(tail -1 "$TMP/ret-out")" = PROBE_COMPLETE=1 ]'
+# (g) the #2659 incident shape end to end: a retired node whose MemPalace index
+# is diverged, probed by the watcher itself (CCC_FLEET_SELF runs the real
+# probe locally), pages on the second doctor sweep.
+ret_home "$RH/self"; ret_harness "$RH/self/ccc-node"
+rm -rf "$TMP/mem-state"
+self_sweep() {
+  OUT="$TMP/out"; RC=0; : > "$TMP/ret-calls"
+  env PATH="$TMP/empty-bin:$PATH" HOME="$RH/self" RET_MEMORY="$TMP/mem-diverged.json" \
+    CCC_FLEET_NODES=rself CCC_FLEET_SELF=rself CCC_FLEET_SSH="$STUB" CCC_FLEET_RETRY_DELAY=0 \
+    CCC_FLEET_DOCTOR=1 bash "$SC" >"$OUT" 2>&1 || RC=$?
+}
+self_sweep
+ok "retired end to end: the first index-diverged sweep is pending, not a page" \
+  'test "$RC" = 0 && [ "$(cat "$OUT")" = "RETIRED rself marker=frontends memory-pending:degraded:mempalace.index-diverged 1/2" ] && grep -q "^doctor root=$RH/self/ccc-node " "$TMP/ret-calls"'
+self_sweep
+ok "retired end to end: the second index-diverged sweep pages as DRIFT" \
+  'test "$RC" = 1 && [ "$(cat "$OUT")" = "DRIFT rself memory=degraded:mempalace.index-diverged sweeps=2/2 retired=frontends" ]'
+ret_title=$(owner_title fleet-doctor-sweep)
+ok "retired end to end: the page names the node in the owner alert title ($ret_title)" \
+  '[ "$ret_title" = "agent-cron fleet alert for task fleet-doctor-sweep: DRIFT=1 (rself)" ]'
+rm -rf "$TMP/mem-state"
 
 # ---- runtime owner is not the service manager ------------------------------
 # Execute the POSIX probe: a system service may use User=gongmyoung without

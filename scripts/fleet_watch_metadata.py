@@ -35,6 +35,28 @@ def private_text(path: Path, uid: int) -> str:
     return value.decode('utf-8')
 
 
+def reference_text(path: Path, uid: int) -> str:
+    """Read the self-update.repo install reference: integrity, not secrecy.
+
+    The reference is a path, not a secret, and setups that wrote it before
+    `chmod 600` leave it 0644 (#2703: every VPS node's reference failed
+    private_text, so no retired node could be inspected). Nobody but root or
+    the owner may be able to rewrite it: owner in {0, uid}, no group/other
+    write bit, a regular file opened without following a symlink, under a
+    physical parent. Every other record keeps private_text.
+    """
+    physical(path.parent)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        st = os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, uid) or st.st_mode & 0o022:
+            raise ValueError('unsafe_reference')
+        value = stream.read(1024 * 1024 + 1)
+    if len(value) > 1024 * 1024:
+        raise ValueError('oversize_record')
+    return value.decode('utf-8')
+
+
 def protected_path(path: Path, uid: int) -> None:
     """Reject foreign replacement/write access, including ancestor replacement.
 
@@ -67,12 +89,24 @@ def protected_path(path: Path, uid: int) -> None:
 
 def installed_root(project: Path, uid: int) -> Path:
     protected_path(project / '.claude', uid)
-    value = private_text(project / '.claude/self-update.repo', uid).strip()
+    value = reference_text(project / '.claude/self-update.repo', uid).strip()
     # Line-oriented shell output must never become executable syntax or extra
     # probe keys. Supported operator paths have no whitespace/metacharacters.
     if not re.fullmatch(r'/[A-Za-z0-9_./-]+', value):
         raise ValueError('invalid_install_reference')
-    root = physical(Path(value))
+    return harness_root(Path(value), uid)
+
+
+def harness_root(candidate: Path, uid: int) -> Path:
+    """Accept a checkout whose doctor the probing account may execute.
+
+    Shared by the install reference and by a retired node's fallback to the
+    self-update default checkout locations (#2703): no file anyone but root or
+    the owner could rewrite is run.
+    """
+    if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(candidate)):
+        raise ValueError('invalid_install_reference')
+    root = physical(candidate)
     for name in ('scripts/ccc-doctor.sh', 'claude/settings.base.json', 'bridge/start.sh'):
         path = physical(root / name)
         protected_path(path, uid)
@@ -154,6 +188,8 @@ def main() -> int:
         root, job, project, uid = Path(source), Path(prepared), Path(home), int(owner)
         if mode == 'installed':
             print(installed_root(project, uid))
+        elif mode == 'harness':
+            print(harness_root(root, uid))
         elif mode == 'checkout':
             checkout_proof(root, job, project, uid)
             print('verified')

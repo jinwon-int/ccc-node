@@ -27,7 +27,9 @@
 #                     the 2026-10-16 fleet retirement left behind (Wiki
 #                     DOC-4014, #2343) still counts (marker=<dir name>). A
 #                     running bridge is judged on its answer regardless of
-#                     either marker.
+#                     either marker. A retired channel is not a retired
+#                     harness: the doctor sweep still inspects such a node
+#                     as its probing account (see CCC_FLEET_DOCTOR, #2703).
 #   2. canonical    — the checkout it serves from is one the fleet installs at,
 #                     not a PR/issue work tree
 #   3. boot path    — the systemd unit that would restart the bridge points at
@@ -65,6 +67,16 @@
 #                    ~/.claude/state/fleet-watch/memory-degraded.tsv; give each
 #                    scheduled task its own). off/optional (Termux) never page;
 #                    an unknown memory check never fails a node.
+#                    Nodes whose Telegram bridge is retired are swept too
+#                    (#2703): with no bridge account, the doctor and memory
+#                    check run as the probing account against its own
+#                    ~/.claude, from the harness its ~/.claude/self-update.repo
+#                    names, else ~/ccc-node or /opt/ccc-node (metadata-checked
+#                    either way). A failure is `DRIFT <node> … retired=<marker>`;
+#                    a healthy one stays `RETIRED <node> marker=<m>` (plus a
+#                    memory-pending/unknown note), and a node with no usable
+#                    harness is `RETIRED … doctor:<reason>`, not a failure.
+#                    The per-node doctor budget (110 s) applies alike.
 #   CCC_FLEET_RETRIES extra attempts per node on transport failure (default 2,
 #                    capped at 5; only UNREACHABLE is retried — a node that
 #                    answers, even DOWN, is judged on its single answer)
@@ -237,6 +249,78 @@ is_prepared_runtime() {
 
 # POSIX sh, runs on every node including Termux. Emits KEY=VALUE lines only.
 read -r -d '' PROBE <<'PROBE_EOF' || true
+# Metadata code travels with the watcher: peers need not upgrade or install it.
+# No temporary remote files, receipt writes, or launches are performed.
+# Reads $root $prepared $bpath $runuid at call time.
+metadata() {
+  python3 - "$1" "$root" "$prepared" "$bpath" "$runuid" <<'METADATA_PY'
+__CCC_FLEET_METADATA_SOURCE__
+METADATA_PY
+}
+
+# doctor_sweep: run ccc-doctor and the memory check from $doctor_root against
+# $cdir as the account $runuid/$runuser, and emit DOCTOR_ROOT=, DOCTOR= and
+# MEMORY=. Shared by a serving bridge (its owner and project) and a retired one
+# (the probing account itself, #2703).
+#
+# Known false positive, deliberately NOT worked around here: on piri nodes the
+# doctor reports `distill extractor ... executable=missing` for a CLI that is
+# installed and healthy, because CCC_PIRI_CLI_PATH exists only as a systemd
+# `Environment=` line on the bridge unit and a `su -` login shell never sees it.
+# Carrying the bridge's CLI-path variables across looks like the obvious fix and
+# is not: CCC_CODEX_CLI_PATH points at the memory-materializing ccc-codex
+# wrapper, and the doctor's Codex `--version` probe times out through it, so the
+# carry trades four false DRIFTs on piri nodes for a false DRIFT on every codex
+# node (measured on dungae and daegyo, 2026-08-11). The fix belongs in the
+# doctor, which alone knows which of its checks are existence tests and which
+# are live probes.
+doctor_sweep() {
+  echo "DOCTOR_ROOT=$doctor_root"
+  if [ "$(id -u)" = "$runuid" ]; then
+    CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+  elif [ "$(id -u)" != 0 ]; then
+    sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
+  else
+    su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 bash '$doctor_root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
+  fi
+  echo "DOCTOR=$?"
+  # Memory health (#2659). The doctor reports a degraded nunchi/MemPalace as
+  # a 경고, which by contract leaves its exit code alone, so a node's index
+  # sat diverged for nine days behind a passing sweep. Read the memory check
+  # itself, with the state/cache dirs the doctor's own memory row uses, and
+  # reduce it to one body-free token; the watcher decides how long it may
+  # persist. A missing, failing or unparseable check is `unknown`, never a
+  # verdict.
+  mem=unknown
+  mem_script="$doctor_root/scripts/ccc-memory-check.sh"
+  if [ -f "$mem_script" ]; then
+    if [ "$(id -u)" = "$runuid" ]; then
+      mem_json=$(CCC_STATE_DIR="$cdir/state" CCC_MEMORY_CACHE_DIR="$cdir/hooks/cache" timeout 20 bash "$mem_script" --json 2>/dev/null)
+    elif [ "$(id -u)" != 0 ]; then
+      mem_json=$(sudo -n -H -u "$runuser" -- env CCC_STATE_DIR="$cdir/state" CCC_MEMORY_CACHE_DIR="$cdir/hooks/cache" timeout 20 bash "$mem_script" --json 2>/dev/null)
+    else
+      mem_json=$(su - "$runuser" -c "CCC_STATE_DIR='$cdir/state' CCC_MEMORY_CACHE_DIR='$cdir/hooks/cache' timeout 20 bash '$mem_script' --json" 2>/dev/null)
+    fi
+    # degraded/error components name themselves and their reasons; otherwise
+    # off (both off), optional (MemPalace optional, e.g. Termux) or ok. Any
+    # other status (probe unavailable, ...) is unknown.
+    mem=$(printf '%s' "$mem_json" | jq -r '
+      [["nunchi", .nunchi], ["mempalace", .mempalace]]
+      | map({n: .[0], s: ((.[1].status? // "unknown") | tostring),
+             r: [(.[1].reasons? // [])[]? | tostring]}) as $c
+      | [$c[] | select(.s == "degraded" or .s == "error")] as $bad
+      | if ($bad | length) > 0 then
+          (if any($bad[]; .s == "error") then "error" else "degraded" end) + ":"
+          + ([$bad[] | .n + "." + (if (.r | length) > 0 then (.r | join("+")) else .s end)] | join(","))
+        elif all($c[]; .s == "off") then "off"
+        elif all($c[]; .s == "ok" or .s == "off" or .s == "optional") then
+          (if any($c[]; .s == "optional") then "optional" else "ok" end)
+        else "unknown" end' 2>/dev/null | head -1 | tr -cd 'A-Za-z0-9._,:+-' | cut -c1-160)
+    [ -n "$mem" ] || mem=unknown
+  fi
+  echo "MEMORY=$mem"
+}
+
 # uid, not user: the `user` column truncates names longer than 8 characters
 # ("gongmyoung" -> "gongmyo+"), and the truncated form is not a valid su target.
 #
@@ -392,7 +476,39 @@ if [ -z "$line" ]; then
     done
   fi
   if [ -n "$retired" ]; then
-    echo "RUNTIME=-"; echo "AVAIL=retired"; echo "RETIRED=$retired"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
+    echo "RUNTIME=-"; echo "AVAIL=retired"; echo "RETIRED=$retired"; echo "UNIT=-"; echo "PREPARED=-"
+    # A retired channel is not a retired harness (#2703). Exiting here kept
+    # every retired node — 11 of 12 on 2026-11-06, the #2659 incident node
+    # among them — out of the doctor sweep. With no bridge there is no bridge
+    # account: inspect the probing account itself, whose home holds the
+    # retirement declaration just read. The harness is the one its
+    # operator-owned self-update.repo names (the metadata check a prepared
+    # runtime uses; a reference that fails it is not replaced by a guess);
+    # without a reference, the first of the self-update default checkout
+    # locations that holds a doctor — ~/ccc-node, then /opt/ccc-node — under
+    # the same check. Finding none is DOCTOR=- with its reason, which the
+    # watcher shows but never fails on.
+    if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
+      runuid=$(id -u); runuser=$(id -nu 2>/dev/null || printf '%s' "$runuid")
+      root="" prepared="" bpath=$HOME cdir="$HOME/.claude" doctor_root="" doctor_note=no-harness
+      if [ -e "$cdir/self-update.repo" ] || [ -L "$cdir/self-update.repo" ]; then
+        doctor_note=unverified-reference
+        doctor_root=$(metadata installed 2>/dev/null) || doctor_root=""
+      else
+        for _cand in "$HOME/ccc-node" /opt/ccc-node; do
+          [ -f "$_cand/scripts/ccc-doctor.sh" ] || continue
+          doctor_note=unverified-harness
+          doctor_root=$(root=$_cand; metadata harness 2>/dev/null) || doctor_root=""
+          break
+        done
+      fi
+      if [ -n "$doctor_root" ] && [ -f "$doctor_root/scripts/ccc-doctor.sh" ]; then
+        doctor_sweep
+      else
+        echo "DOCTOR=-"; echo "DOCTOR_NOTE=$doctor_note"; echo "MEMORY=unknown"
+      fi
+    fi
+    echo "PROBE_COMPLETE=1"; exit 0
   fi
   echo "RUNTIME=-"; echo "AVAIL=no"; echo "UNIT=-"; echo "PREPARED=-"; echo "PROBE_COMPLETE=1"; exit 0
 fi
@@ -445,13 +561,6 @@ else
   echo "PREPARED=-"
 fi
 
-# Metadata code travels with the watcher: peers need not upgrade or install it.
-# No temporary remote files, receipt writes, or launches are performed.
-metadata() {
-  python3 - "$1" "$root" "$prepared" "$bpath" "$runuid" <<'METADATA_PY'
-__CCC_FLEET_METADATA_SOURCE__
-METADATA_PY
-}
 case "$root" in
   */.ccc-node/checkouts/*)
     if [ -n "$prepared" ] && [ "$(metadata checkout 2>/dev/null)" = verified ]; then
@@ -531,19 +640,7 @@ done
 echo "UNIT=${unit_root:--}"
 
 # doctor (opt-in). Runs as the account that owns the bridge, against the claude
-# dir that belongs to it — both derived above, never guessed.
-#
-# Known false positive, deliberately NOT worked around here: on piri nodes the
-# doctor reports `distill extractor ... executable=missing` for a CLI that is
-# installed and healthy, because CCC_PIRI_CLI_PATH exists only as a systemd
-# `Environment=` line on the bridge unit and a `su -` login shell never sees it.
-# Carrying the bridge's CLI-path variables across looks like the obvious fix and
-# is not: CCC_CODEX_CLI_PATH points at the memory-materializing ccc-codex
-# wrapper, and the doctor's Codex `--version` probe times out through it, so the
-# carry trades four false DRIFTs on piri nodes for a false DRIFT on every codex
-# node (measured on dungae and daegyo, 2026-08-11). The fix belongs in the
-# doctor, which alone knows which of its checks are existence tests and which
-# are live probes.
+# dir that belongs to it — both derived above, never guessed (doctor_sweep).
 if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
   cdir="${bpath:-$HOME}/.claude"
   doctor_root=$root
@@ -556,50 +653,7 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
   if [ -z "$doctor_root" ] || [ ! -f "$doctor_root/scripts/ccc-doctor.sh" ]; then
     echo 'DOCTOR=unverified'
   else
-    echo "DOCTOR_ROOT=$doctor_root"
-    if [ "$(id -u)" = "$runuid" ]; then
-      CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
-    elif [ "$(id -u)" != 0 ]; then
-      sudo -n -H -u "$runuser" -- env CCC_DOCTOR_CLAUDE_DIR="$cdir" timeout 60 bash "$doctor_root/scripts/ccc-doctor.sh" >/dev/null 2>&1
-    else
-      su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 bash '$doctor_root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
-    fi
-    echo "DOCTOR=$?"
-    # Memory health (#2659). The doctor reports a degraded nunchi/MemPalace as
-    # a 경고, which by contract leaves its exit code alone, so a node's index
-    # sat diverged for nine days behind a passing sweep. Read the memory check
-    # itself, with the state/cache dirs the doctor's own memory row uses, and
-    # reduce it to one body-free token; the watcher decides how long it may
-    # persist. A missing, failing or unparseable check is `unknown`, never a
-    # verdict.
-    mem=unknown
-    mem_script="$doctor_root/scripts/ccc-memory-check.sh"
-    if [ -f "$mem_script" ]; then
-      if [ "$(id -u)" = "$runuid" ]; then
-        mem_json=$(CCC_STATE_DIR="$cdir/state" CCC_MEMORY_CACHE_DIR="$cdir/hooks/cache" timeout 20 bash "$mem_script" --json 2>/dev/null)
-      elif [ "$(id -u)" != 0 ]; then
-        mem_json=$(sudo -n -H -u "$runuser" -- env CCC_STATE_DIR="$cdir/state" CCC_MEMORY_CACHE_DIR="$cdir/hooks/cache" timeout 20 bash "$mem_script" --json 2>/dev/null)
-      else
-        mem_json=$(su - "$runuser" -c "CCC_STATE_DIR='$cdir/state' CCC_MEMORY_CACHE_DIR='$cdir/hooks/cache' timeout 20 bash '$mem_script' --json" 2>/dev/null)
-      fi
-      # degraded/error components name themselves and their reasons; otherwise
-      # off (both off), optional (MemPalace optional, e.g. Termux) or ok. Any
-      # other status (probe unavailable, ...) is unknown.
-      mem=$(printf '%s' "$mem_json" | jq -r '
-        [["nunchi", .nunchi], ["mempalace", .mempalace]]
-        | map({n: .[0], s: ((.[1].status? // "unknown") | tostring),
-               r: [(.[1].reasons? // [])[]? | tostring]}) as $c
-        | [$c[] | select(.s == "degraded" or .s == "error")] as $bad
-        | if ($bad | length) > 0 then
-            (if any($bad[]; .s == "error") then "error" else "degraded" end) + ":"
-            + ([$bad[] | .n + "." + (if (.r | length) > 0 then (.r | join("+")) else .s end)] | join(","))
-          elif all($c[]; .s == "off") then "off"
-          elif all($c[]; .s == "ok" or .s == "off" or .s == "optional") then
-            (if any($c[]; .s == "optional") then "optional" else "ok" end)
-          else "unknown" end' 2>/dev/null | head -1 | tr -cd 'A-Za-z0-9._,:+-' | cut -c1-160)
-      [ -n "$mem" ] || mem=unknown
-    fi
-    echo "MEMORY=$mem"
+    doctor_sweep
   fi
 else
   echo "DOCTOR=-"
@@ -769,8 +823,36 @@ probe_complete() {
   [ -n "$out" ] && [ "$probe_rc" = 0 ] && [ "$(printf '%s\n' "$out" | tail -1)" = PROBE_COMPLETE=1 ]
 }
 
+# judge_doctor_exit <node> <where>: the doctor exits nonzero on 교정가능/수동필요
+# findings; 경고 does not count. Prints the DRIFT row (ending in <where>, e.g.
+# " runtime=<root>"), sets fail=1 and returns 1 on drift. Reads $doctor.
+judge_doctor_exit() {
+  if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
+    echo "DRIFT $1 doctor_exit=$doctor$2"; fail=1; return 1
+  fi
+  return 0
+}
+
+# judge_memory <node> <where>: persistent memory degradation (#2659) is
+# reported as DRIFT: it is a doctor sweep finding, and DRIFT is already counted
+# into the owner alert title. Below the threshold it stays visible without
+# paging: sets $mem_note for the node's normal line instead. Reads $memory and
+# $mem_n from the streak count in judge_node.
+judge_memory() {
+  mem_note=""
+  case "$memory" in
+    degraded*|error*)
+      if [ "$mem_n" -ge "$MEMORY_CONFIRM" ]; then
+        echo "DRIFT $1 memory=$memory sweeps=$mem_n/$MEMORY_CONFIRM$2"; fail=1; return 1
+      fi
+      mem_note="memory-pending:$memory $mem_n/$MEMORY_CONFIRM" ;;
+    unknown) mem_note="memory:unknown" ;;
+  esac
+  return 0
+}
+
 # judge_node <node> [<ok-tag>] [<degraded-note>]: classify $out and print the
-# node's one verdict line; sets fail=1 on anything but OK.
+# node's one verdict line; sets fail=1 on anything but OK or RETIRED.
 judge_node() {
   node=$1 ok_note=${2:-} degraded_note=${3:-}
   if [ -z "$out" ]; then
@@ -821,9 +903,32 @@ judge_node() {
   # with its marker, and nobody should be paged to restore it. It is reported
   # under its own name rather than as OK, so the report still shows which
   # nodes no longer serve the channel, and it is not a failure.
+  #
+  # Its harness is still judged on the doctor sweep (#2703), by the same
+  # doctor-exit and memory-streak rules as a serving node. A failure is that
+  # DRIFT row with `retired=<marker>` in place of the runtime (not `channel=`,
+  # which the change-mode tracker reads as the pair's channel). Otherwise the
+  # RETIRED line, with the pending/unknown memory note an OK line would carry,
+  # or the reason no harness was inspected (`doctor:<reason>`, never a failure).
   if [ "$avail" = retired ]; then
     marker=$(printf '%s\n' "$out" | sed -n 's/^RETIRED=//p' | head -1)
-    echo "RETIRED $node marker=${marker:-unknown}"; return
+    retired_note=""
+    if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ]; then
+      doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
+      case "$doctor" in
+        '') echo "UNVERIFIED $node inspection=incomplete-doctor retired=${marker:-unknown}"; fail=1; return ;;
+        unverified) echo "UNVERIFIED $node inspection=harness-reference retired=${marker:-unknown}"; fail=1; return ;;
+      esac
+      if [ "$doctor" = - ]; then
+        doctor_note=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR_NOTE=//p' | head -1 | tr -cd 'a-z-' | cut -c1-40)
+        retired_note=" doctor:${doctor_note:-none}"
+      else
+        judge_doctor_exit "$node" " retired=${marker:-unknown}" || return
+        judge_memory "$node" " retired=${marker:-unknown}" || return
+        [ -z "$mem_note" ] || retired_note=" $mem_note"
+      fi
+    fi
+    echo "RETIRED $node marker=${marker:-unknown}$retired_note"; return
   fi
 
   if [ "$avail" != yes ] && [ "$avail" != no ]; then
@@ -891,10 +996,7 @@ judge_node() {
   if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ] && { [ -z "$doctor" ] || [ -z "$dual" ] || { [ "$kind" = ccc ] && [ "$doctor" = - ]; }; }; then
     echo "UNVERIFIED $node runtime=$runtime inspection=incomplete-doctor"; fail=1; return
   fi
-  # doctor exits nonzero on 교정가능/수동필요 findings; 경고 does not count.
-  if [ -n "$doctor" ] && [ "$doctor" != "-" ] && [ "$doctor" != "0" ]; then
-    echo "DRIFT $node doctor_exit=$doctor runtime=$runtime"; fail=1; return
-  fi
+  judge_doctor_exit "$node" " runtime=$runtime" || return
 
   # gongmyoung dual-domain coherence (#980). Emitted only by the doctor sweep;
   # "-" (single-domain node) and "skip" (probe lacked root) are not failures.
@@ -903,17 +1005,8 @@ judge_node() {
     fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; return ;;
   esac
 
-  # Persistent memory degradation (#2659) is reported as DRIFT: it is a doctor
-  # sweep finding, and DRIFT is already counted into the owner alert title.
-  # Below the threshold it stays visible on the OK line without paging.
-  case "$memory" in
-    degraded*|error*)
-      if [ "$mem_n" -ge "$MEMORY_CONFIRM" ]; then
-        echo "DRIFT $node memory=$memory sweeps=$mem_n/$MEMORY_CONFIRM runtime=$runtime"; fail=1; return
-      fi
-      ok_note="$ok_note, memory-pending:$memory $mem_n/$MEMORY_CONFIRM" ;;
-    unknown) ok_note="$ok_note, memory:unknown" ;;
-  esac
+  judge_memory "$node" " runtime=$runtime" || return
+  [ -z "$mem_note" ] || ok_note="$ok_note, $mem_note"
 
   # The generation is shown for Danso nodes because nothing else identifies
   # which image is serving: two nodes at the same path can be running different
