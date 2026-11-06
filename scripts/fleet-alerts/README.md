@@ -35,7 +35,7 @@ retired. See "「한데」 lane" below.
 |---|---|
 | `fleet_alerts_receiver.py` | HTTP receiver: verifies `X-Fleet-Node` / `X-Fleet-Timestamp` / `X-Fleet-Signature`, enforces the per-node secret allowlist, replay skew and body cap, queues the formatted text. stdlib only. |
 | `fleet_alerts_sender.py` | Matrix transport (ccc-node `MatrixTransport`) draining the queue into the one configured room with a stable txn id; inbound is read only for exact `ok/hold <id>` replies, nothing is ever executed. Needs the bridge venv's matrix extra. |
-| `fleet_alerts_sender_hande.py` | 「한데」 lane: mirror table + trigger on the queue (`--install-only` / `--uninstall` / `--status`), Unix-socket FLEET-WORKER port for the relay bot (answers `turn` with an empty result, pushes paced `notice` frames). stdlib only. |
+| `fleet_alerts_sender_hande.py` | 「한데」 lane: mirror table + trigger on the queue (`--install-only` / `--uninstall` / `--status`), Unix-socket FLEET-WORKER port for the relay bot (answers `turn` with an empty result, pushes paced `notice` frames with an `id` and drops a row only on the bot's `notice_ack`, family-messenger#703; `--no-notice-ack` = old write-then-delete). stdlib only. |
 | `fleet_alerts_reply.py` | Stage 3: deterministic `ok/hold <id>` parser, reply receipt + `ack` row; used by the Matrix sender (admitted owner text) and the 「한데」 lane (owner-device `turn` frames). |
 | `fleet_alerts_policy.py` | Tier policy (stage 2): info digest at 09:00 KST, action/critical re-notify at 15 min / 1 h / 4 h (2nd/3rd not 00–07 KST, #2674) until a reply or a `resolved` receipt; derived `digest`/`renotify` rows, `meta` table for the digest day. Pure queue operations, no network. |
 | `fleet_alerts_receipt.py` | Operator read of one alert's receipts by alert id or txn (local, metadata only, exit 3 when unknown). |
@@ -56,8 +56,10 @@ Every queued alert gets a 6-char **alert id** (base36, derived from the txn,
 unique in the queue) that the owner can quote back (`ok <id>` / `hold <id>`,
 later stage); the queued text starts with `[<name>] #<id> …`. Each channel
 records a **delivery receipt** in the queue: the Matrix sender's event id
-(`matrix-event`, strong) and the 「한데」 lane's hand-off (`socket-write`, weak —
-the relay bot has no notice ack). `notified` = at least one strong receipt;
+(`matrix-event`, strong) and the 「한데」 lane's hand-off (`socket-write`, weak),
+replaced by `hande-ack` (strong, ref = relay seq) once the relay bot acks the
+notice (family-messenger#703) or by `hande-dropped` (ref = nack reason) when
+the bot refuses it for good. `notified` = at least one strong receipt;
 an `action` alert without one must be treated as *not* notified (fail-closed
 for L2 pre-notification, a2a-nexus#2317). Read receipts on the relay host:
 
@@ -245,11 +247,26 @@ actor (`commit_actor_mismatch` otherwise), so use a hyphen-free actor such as
 3. Canary: one alert must appear in **both** rooms; `--status` shows the mirror
    backlog (0 when drained).
 
-Delivery semantics: a mirror row is deleted when its `notice` frame is written
-to the bot's socket — the bot has no acknowledgement for notices, so a bot
-crash between the write and its relay POST can lose that one 「한데」 copy
-(Matrix is unaffected). Per-channel receipts are #2413's follow-up. Rows older
-than 24h are dropped (a stopped lane is not an archive). The lane never posts
+Delivery semantics (family-messenger#703): each `notice` frame carries
+`"id"` (the row's txn, or `hande-<row id>`), and the mirror row stays until the
+bot answers on the same connection. One notice is in flight at a time, so
+order is preserved.
+
+| bot answer | lane |
+| --- | --- |
+| `{"type":"notice_ack","id":…,"seq":N}` | row deleted, `hande-ack` receipt (strong) |
+| `notice_nack` `rate` | row kept, resent after ~60 s |
+| `notice_nack` `relay` · `conflict` · `client_id_reuse` | row kept, resent on the next round (or the next connection) |
+| `notice_nack` any other reason | reason logged (never the body), row deleted, `hande-dropped` receipt |
+| none yet | wait — never resent on the same connection (the bot is still retrying its relay POST); a warning after 5 min |
+
+If the connection ends before the answer, the unacked row is resent first on
+the next connection (at-least-once: a bot crash after its relay POST but
+before the ack can post it twice). `--no-notice-ack` restores the old
+behaviour for a bot without acks — no `id`, the row is deleted once its frame
+is written, so a bot crash between the write and its relay POST can lose that
+one 「한데」 copy (Matrix is unaffected). Rows older than 24h are dropped (a
+stopped lane is not an archive). The lane never posts
 on its own behalf in reply to room traffic: every `turn` gets an empty
 complete `result`, approve/deny/tool frames are ignored, no AI runtime.
 

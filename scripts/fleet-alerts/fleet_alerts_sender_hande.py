@@ -30,12 +30,23 @@ side:
   complete ``result``, so the bot posts nothing and the room stays read-only
   in practice; approve/deny/cancel/tool frames are ignored.
 
-Delivery scope (known limit, #2413 receipts): a mirror row is deleted once its
-notice frame is written to the bot's socket. The bot has no acknowledgement
-frame for notices, so a bot crash between the write and its relay POST can
-lose that one alert in 「한데」 (Matrix is unaffected). Mirror rows older than
-24h are dropped, so a stopped lane never turns the mirror into an indefinite
-alert-text archive. Bodies, tokens and frames are never logged.
+Delivery (family-messenger#703, notice ack): every notice frame carries
+``"id"`` (the row's txn, or ``hande-<row id>``) and the row stays in the mirror
+until the bot answers on the same connection — ``notice_ack`` (posted, relay
+seq known → row deleted, strong ``hande-ack`` receipt) or ``notice_nack``.
+Only one notice is in flight at a time, so order is preserved. A nack
+``rate`` keeps the row and retries after ~60s; ``relay`` / ``conflict`` /
+``client_id_reuse`` keep it and resend on the next round; any other reason is
+logged (reason only) and the row is dropped. A slow ack is never answered by
+a resend on the same connection (the bot is still retrying its relay POST);
+if the connection ends first, the unacked row is resent on the next one
+(at-least-once: a bot crash after the POST but before the ack can post it
+twice). ``--no-notice-ack`` restores the old behaviour for a bot without
+acks: no id, the row is deleted once its frame is written (a bot crash
+between the write and its relay POST can then lose that one 「한데」 copy;
+Matrix is unaffected). Mirror rows older than 24h are dropped, so a stopped
+lane never turns the mirror into an indefinite alert-text archive. Bodies,
+tokens and frames are never logged.
 
 Rollback: stop the service, then ``--uninstall`` (drops trigger + mirror table).
 stdlib only.
@@ -66,6 +77,14 @@ MAX_FRAME_BYTES = 512 * 1024
 MAX_TEXT_BYTES = 8000  # bot reply_max_bytes is 8 KiB; stay below so nothing is cut
 MAX_PER_MIN = 9  # the bot drops notices above 10/min per room
 TRUNCATION_MARKER = "…(길어서 줄임)"
+# family-messenger#703: notice ids and the bot's answers.
+NOTICE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+NACK_REASON_RE = re.compile(r"^[a-z_]{1,32}$")
+NACK_RETRY_LATER = frozenset({"rate"})  # bot's per-room minute cap — back off, then resend
+NACK_RESEND = frozenset({"relay", "conflict", "client_id_reuse"})  # not stored — resend next round
+RATE_RETRY_SECONDS = 60.0
+RESEND_DELAY_SECONDS = 5.0
+ACK_WARN_SECONDS = 300.0  # an in-flight notice this old gets one warning (old bot without acks?)
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS hande_alerts (
@@ -136,8 +155,42 @@ def bounded(text: str, limit: int = MAX_TEXT_BYTES) -> str:
     return cut + TRUNCATION_MARKER
 
 
-def notice_frame(room: str, body: str) -> str:
-    return json.dumps({"type": "notice", "room": room, "text": bounded(body.strip())}, ensure_ascii=False) + "\n"
+def notice_frame(room: str, body: str, notice_id: Optional[str] = None) -> str:
+    frame = {"type": "notice", "room": room, "text": bounded(body.strip())}
+    if notice_id is not None:
+        if not NOTICE_ID_RE.match(notice_id):
+            raise ValueError("invalid notice id")
+        frame["id"] = notice_id
+    return json.dumps(frame, ensure_ascii=False) + "\n"
+
+
+def notice_id_of(row_id: int, txn: Optional[str]) -> str:
+    """The ``id`` a row's notice carries (#703): its txn when that fits the bot's rule, else ``hande-<row id>``."""
+    if isinstance(txn, str) and NOTICE_ID_RE.match(txn):
+        return txn
+    return f"hande-{int(row_id)}"
+
+
+def notice_answer(line: str) -> Optional[tuple[str, str, str]]:
+    """Parse a ``notice_ack`` / ``notice_nack`` line (#703) as ``(kind, id, detail)``, else None.
+
+    ``detail`` is the relay seq for an ack and the reason for a nack (an
+    unexpected reason shape becomes ``"invalid"`` so nothing odd is logged).
+    """
+    try:
+        frame = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(frame, dict) or frame.get("type") not in ("notice_ack", "notice_nack"):
+        return None
+    notice_id = frame.get("id")
+    if not isinstance(notice_id, str) or not NOTICE_ID_RE.match(notice_id):
+        return None
+    if frame["type"] == "notice_ack":
+        seq = frame.get("seq")
+        return "ack", notice_id, str(seq) if isinstance(seq, int) and not isinstance(seq, bool) else ""
+    reason = frame.get("reason")
+    return "nack", notice_id, reason if isinstance(reason, str) and NACK_REASON_RE.match(reason) else "invalid"
 
 
 def answer(line: str, queue: Optional[os.PathLike | str] = None, *, owner_actor: str = "owner") -> Optional[str]:
@@ -188,6 +241,28 @@ class Pacer:
         self.sent.append(now)
 
 
+class _InFlight:
+    """The one notice handed to the bot and not yet answered (#703)."""
+
+    __slots__ = ("row_id", "txn", "notice_id", "sent_at", "warned")
+
+    def __init__(self, row_id: int, txn: Optional[str], notice_id: str, sent_at: float) -> None:
+        self.row_id = row_id
+        self.txn = txn
+        self.notice_id = notice_id
+        self.sent_at = sent_at
+        self.warned = False
+
+
+def _receipt(queue: os.PathLike | str, txn: Optional[str], kind: str, ref: str) -> None:
+    if not txn:
+        return
+    try:
+        outbox.receipt(queue, txn, "hande", kind, ref)
+    except Exception:
+        logging.warning("hande receipt not recorded txn=%s", txn)
+
+
 def serve_connection(
     conn: socket.socket,
     queue: os.PathLike | str,
@@ -198,60 +273,147 @@ def serve_connection(
     max_notices: Optional[int] = None,
     clock=time.time,
     owner_actor: str = "owner",
+    notice_ack: bool = True,
 ) -> str:
     """Serve one bot connection until it ends; returns the reason.
 
-    ``max_notices`` stops after that many notices were handed over (tests only).
+    ``notice_ack`` (default, #703): send each notice with an ``id`` and keep its
+    row until the bot's ``notice_ack`` / ``notice_nack`` for that id arrives on
+    this connection; one notice in flight at a time. In-flight state lives only
+    in this call — the row itself stays the oldest in the mirror, so the next
+    connection resends it. ``notice_ack=False`` is the old write-then-delete path.
+
+    ``max_notices`` stops after that many notices were settled — written
+    (legacy) or acked/dropped (ack mode) — tests only.
     """
-    conn.setblocking(False)
-    inbound = b""
-    next_poll = 0.0
-    handed = 0
-    while True:
-        readable, _, _ = select.select([conn], [], [], poll)
-        if readable:
-            chunk = conn.recv(65536)
-            if not chunk:
-                return "bot disconnected"
-            inbound += chunk
-            if len(inbound) > MAX_FRAME_BYTES and b"\n" not in inbound:
-                return "oversized frame"
-            while b"\n" in inbound:
-                line, inbound = inbound.split(b"\n", 1)
-                out_frame = answer(line.decode("utf-8", "replace"), queue, owner_actor=owner_actor)
-                if out_frame:
-                    conn.setblocking(True)
-                    conn.sendall(out_frame.encode("utf-8"))
-                    conn.setblocking(False)
-                    logging.info("answered a fleet-alert-room turn with an empty result")
-        now = clock()
-        if now < next_poll or not pacer.ready(now):
-            continue
-        next_poll = now + poll
-        item = next_alert(queue, now)
-        if item is None:
-            if max_notices is not None and handed >= max_notices:
+    return _Connection(conn, queue, room, pacer, poll=poll, max_notices=max_notices, clock=clock,
+                       owner_actor=owner_actor, notice_ack=notice_ack).run()
+
+
+class _Connection:
+    """One bot connection: the read loop (turns, acks) and the paced notice hand-off."""
+
+    def __init__(self, conn: socket.socket, queue: os.PathLike | str, room: str, pacer: Pacer, *,
+                 poll: float, max_notices: Optional[int], clock, owner_actor: str, notice_ack: bool) -> None:
+        self.conn = conn
+        self.queue = queue
+        self.room = room
+        self.pacer = pacer
+        self.poll = poll
+        self.max_notices = max_notices
+        self.clock = clock
+        self.owner_actor = owner_actor
+        self.notice_ack = notice_ack
+        self.inbound = b""
+        self.next_poll = 0.0
+        self.retry_at = 0.0
+        self.handed = 0
+        self.inflight: Optional[_InFlight] = None
+
+    def _done(self) -> bool:
+        return self.max_notices is not None and self.handed >= self.max_notices and self.inflight is None
+
+    def _send(self, frame: str) -> None:
+        self.conn.setblocking(True)
+        self.conn.sendall(frame.encode("utf-8"))
+        self.conn.setblocking(False)
+
+    def run(self) -> str:
+        self.conn.setblocking(False)
+        while True:
+            readable, _, _ = select.select([self.conn], [], [], self.poll)
+            if readable:
+                ended = self._read()
+                if ended:
+                    return ended
+            if self._done():
                 return "max notices reached"
-            continue
+            self._tick(self.clock())
+            if self._done():
+                return "max notices reached"
+
+    def _read(self) -> Optional[str]:
+        chunk = self.conn.recv(65536)
+        if not chunk:
+            return "bot disconnected"
+        self.inbound += chunk
+        if len(self.inbound) > MAX_FRAME_BYTES and b"\n" not in self.inbound:
+            return "oversized frame"
+        while b"\n" in self.inbound:
+            line, self.inbound = self.inbound.split(b"\n", 1)
+            text = line.decode("utf-8", "replace")
+            settled = notice_answer(text)
+            if settled is not None:
+                self._settle(*settled)
+                continue
+            out_frame = answer(text, self.queue, owner_actor=self.owner_actor)
+            if out_frame:
+                self._send(out_frame)
+                logging.info("answered a fleet-alert-room turn with an empty result")
+        return None
+
+    def _settle(self, kind: str, notice_id: str, detail: str) -> None:
+        current = self.inflight
+        if current is None or notice_id != current.notice_id:
+            logging.info("ignored a notice_%s for a notice not in flight", kind)
+            return
+        self.inflight = None
+        if kind == "ack":
+            self._finish(current, "hande-ack", detail)
+            logging.info("한데 fleet alert posted txn=%s seq=%s", current.txn, detail or "?")
+        elif detail in NACK_RETRY_LATER:
+            self.retry_at = self.clock() + RATE_RETRY_SECONDS
+            logging.warning("한데 fleet alert deferred by the bot (%s) txn=%s; retry in %ds",
+                            detail, current.txn, int(RATE_RETRY_SECONDS))
+        elif detail in NACK_RESEND:
+            self.retry_at = self.clock() + RESEND_DELAY_SECONDS
+            logging.warning("한데 fleet alert not stored by the bot (%s) txn=%s; will resend", detail, current.txn)
+        else:
+            self._finish(current, "hande-dropped", detail)
+            logging.warning("한데 fleet alert dropped by the bot (%s) txn=%s", detail, current.txn)
+
+    def _finish(self, current: _InFlight, receipt_kind: str, ref: str) -> None:
+        forget(self.queue, current.row_id)
+        _receipt(self.queue, current.txn, receipt_kind, ref)
+        self.handed += 1
+        self.next_poll = 0.0  # settled: the next row may go out at once (pacer permitting)
+
+    def _tick(self, now: float) -> None:
+        if self.inflight is not None:
+            # Never resend on this connection while the ack is pending: the bot
+            # keeps retrying its relay POST and a resend would post twice.
+            if not self.inflight.warned and now - self.inflight.sent_at >= ACK_WARN_SECONDS:
+                self.inflight.warned = True
+                logging.warning("no notice_ack after %ds txn=%s (bot without acks? see --no-notice-ack)",
+                                int(now - self.inflight.sent_at), self.inflight.txn)
+            return
+        if self._done() or now < self.next_poll or now < self.retry_at or not self.pacer.ready(now):
+            return
+        self.next_poll = now + self.poll
+        item = next_alert(self.queue, now)
+        if item is None:
+            return
         row_id, txn, body = item
         if not body.strip():
-            forget(queue, row_id)
-            continue
-        conn.setblocking(True)
-        conn.sendall(notice_frame(room, body).encode("utf-8"))
-        conn.setblocking(False)
-        pacer.mark(now)
-        forget(queue, row_id)
-        # Weak receipt (#2413): the frame left for the bot; there is no notice ack.
-        if txn:
-            try:
-                outbox.receipt(queue, txn, "hande", "socket-write", "")
-            except Exception:
-                logging.warning("hande receipt not recorded txn=%s", txn)
-        handed += 1
-        logging.info("한데 fleet alert handed to the bot txn=%s", txn)
-        if max_notices is not None and handed >= max_notices:
-            return "max notices reached"
+            forget(self.queue, row_id)
+            self.next_poll = 0.0  # look at the next row right away
+            return
+        if not self.notice_ack:
+            self._send(notice_frame(self.room, body))
+            self.pacer.mark(now)
+            forget(self.queue, row_id)
+            # Weak receipt (#2413): the frame left for the bot; no ack in this mode.
+            _receipt(self.queue, txn, "socket-write", "")
+            self.handed += 1
+            logging.info("한데 fleet alert handed to the bot txn=%s", txn)
+            return
+        notice_id = notice_id_of(row_id, txn)
+        self._send(notice_frame(self.room, body, notice_id))
+        self.pacer.mark(now)
+        self.inflight = _InFlight(row_id, txn, notice_id, now)
+        # Weak until the bot's notice_ack replaces it with ``hande-ack`` (strong).
+        _receipt(self.queue, txn, "socket-write", "")
+        logging.info("한데 fleet alert handed to the bot txn=%s (awaiting ack)", txn)
 
 
 def listen(path: str, owner_uid: Optional[int]) -> socket.socket:
@@ -283,6 +445,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--socket-owner", help="user name that may connect (the bot user)")
     parser.add_argument("--per-min", type=int, default=8, help=f"notice pace per minute, 1..{MAX_PER_MIN}")
     parser.add_argument("--owner-actor", default="owner", help="relay actor whose devices may reply ok/hold <id>")
+    parser.add_argument("--no-notice-ack", action="store_true",
+                        help="old bot without notice_ack (family-messenger#703): send without id, delete on write")
     parser.add_argument("--install-only", action="store_true", help="create mirror table + trigger and exit")
     parser.add_argument("--uninstall", action="store_true", help="drop mirror table + trigger and exit")
     parser.add_argument("--status", action="store_true", help="print mirror backlog and exit")
@@ -309,11 +473,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         owner_uid = pwd.getpwnam(args.socket_owner).pw_uid
     server = listen(args.socket, owner_uid)
     pacer = Pacer(args.per_min)
+    logging.info("notice ack mode: %s", "off (--no-notice-ack)" if args.no_notice_ack else "on")
     while True:
         conn, _ = server.accept()
         logging.info("fleet alert bot connected")
         try:
-            reason = serve_connection(conn, args.queue, args.room, pacer, owner_actor=args.owner_actor)
+            reason = serve_connection(conn, args.queue, args.room, pacer, owner_actor=args.owner_actor,
+                                      notice_ack=not args.no_notice_ack)
         except OSError as exc:
             reason = type(exc).__name__
         finally:
