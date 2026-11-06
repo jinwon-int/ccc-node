@@ -343,6 +343,11 @@ class Config:
     # #2656: close an open intake PR whose `skills` check has been red this
     # many days (first `ci=failure` skip row); 0 turns the close sweep off.
     ci_red_close_days: int = 3
+    # #2705 (owner decision A): a read-only a2a-nexus clone that follows main,
+    # used ONLY for the review/revise worker-procedure docs. None (default)
+    # reads them from `a2a_nexus_dir` exactly as before. The dispatcher script
+    # always stays on `a2a_nexus_dir` (it must match the deployed broker).
+    procedure_docs_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -938,6 +943,10 @@ def _config(environment: dict[str, str] | None = None) -> Config:
         ).absolute(),
         dispatch_ci_wait_sec=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_DISPATCH_CI_WAIT_SEC", 600, 60, 3600),
         ci_red_close_days=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_CI_RED_CLOSE_DAYS", 3, 0, 90),
+        procedure_docs_dir=(
+            Path(env["CCC_SKILL_PROMOTION_PROCEDURE_DOCS_DIR"]).absolute()
+            if env.get("CCC_SKILL_PROMOTION_PROCEDURE_DOCS_DIR", "").strip() else None
+        ),
         autorepair_enabled=autorepair_enabled,
         require_usage=require_usage,
         min_skill_uses=_secure_fs.bounded_int_env(env, "CCC_SKILL_PROMOTION_MIN_SKILL_USES", 1, 0, 100),
@@ -2729,6 +2738,117 @@ def _worker_procedure_from_docs(nexus_dir: Path, *, doc_name: str, end_marker: s
     return procedure
 
 
+# #2705 (owner decision A + provenance). The worker-procedure docs used to come
+# only from `a2a_nexus_dir`, which on the publisher host is the T1 broker's
+# deploy checkout (detached at the deployed commit), so a merged docs change
+# reached reviewers only at the next broker deploy (a2a-nexus#2508 sat unread).
+# `procedure_docs_dir` (opt-in) points the two procedure reads at a clone that
+# follows main; the dispatcher script stays on `a2a_nexus_dir`. Every dispatch
+# row records which procedure text it used.
+_PROCEDURE_DOCS_KIND = "a2a-procedure-docs"
+_RUBRIC_MARK_RE = re.compile(r"Rubric version: `([^`]+)`")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _procedure_docs_dir(config: Config) -> Path | None:
+    # getattr: test doubles and older Config shapes predate the field.
+    value = getattr(config, "procedure_docs_dir", None)
+    return value if isinstance(value, Path) else None
+
+
+def _procedure_docs_root(config: Config) -> Path:
+    docs_dir = _procedure_docs_dir(config)
+    return docs_dir if docs_dir is not None else config.a2a_nexus_dir
+
+
+def _git_head(root: Path) -> str:
+    """Full HEAD sha of a docs checkout, or "" (not a repo, unreadable)."""
+    try:
+        completed = _run(["git", "-C", str(root), "rev-parse", "HEAD"], timeout=30)
+    except PromotionError:
+        return ""
+    sha = completed.stdout.decode("utf-8", "replace").strip()
+    return sha if _GIT_SHA_RE.fullmatch(sha) else ""
+
+
+def _worker_procedure(config: Config, *, doc_name: str, end_marker: str) -> tuple[str, dict[str, object]]:
+    """The worker procedure plus the provenance fields its dispatch row keeps.
+
+    With `procedure_docs_dir` set, a review procedure whose `Rubric version:`
+    mark disagrees with `_INTAKE_RUBRIC_VERSION` is refused
+    (`dispatch_docs_rubric_mismatch`) — main can carry a rubric this publisher
+    does not emit yet. Without it the read is unchanged (the deploy checkout
+    and this code move together)."""
+    root = _procedure_docs_root(config)
+    procedure = _worker_procedure_from_docs(root, doc_name=doc_name, end_marker=end_marker)
+    if _procedure_docs_dir(config) is not None and doc_name == "skills-intake-review.md":
+        marks = set(_RUBRIC_MARK_RE.findall(procedure))
+        if marks and marks != {_INTAKE_RUBRIC_VERSION}:
+            raise PromotionError("dispatch_docs_rubric_mismatch")
+    meta: dict[str, object] = {
+        "procedure_doc": doc_name,
+        "procedure_sha256": hashlib.sha256(procedure.encode("utf-8")).hexdigest()[:16],
+        "procedure_source": "docs-dir" if _procedure_docs_dir(config) is not None else "nexus-dir",
+    }
+    head = _git_head(root)
+    if head:
+        meta["procedure_commit"] = head[:12]
+    return procedure, meta
+
+
+def _refresh_procedure_docs(config: Config) -> dict[str, object] | None:
+    """Fast-forward `procedure_docs_dir` to its upstream once per collect (#2705).
+
+    Never blocks the collect: on any failure the previous tree stays in use and
+    one ledger row names the reason. Rows are written only when the head moves
+    or the failure (code, head) changes, so a 15-minute cycle does not spam."""
+    root = _procedure_docs_dir(config)
+    if root is None:
+        return None
+    before = _git_head(root)
+    code = ""
+    if not before:
+        code = "docs_not_git"
+    else:
+        steps = (
+            ("docs_fetch_failed", ["git", "-C", str(root), "fetch", "--quiet", "origin"], 120),
+            ("docs_dirty", ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"], 30),
+            ("docs_not_ff", ["git", "-C", str(root), "merge", "--ff-only", "--quiet", "@{u}"], 60),
+        )
+        for step_code, argv, timeout in steps:
+            try:
+                completed = _run(argv, timeout=timeout)
+            except PromotionError:
+                code = step_code
+                break
+            if step_code == "docs_dirty" and completed.stdout.strip():
+                code = step_code
+                break
+    after = _git_head(root) or before
+    result: dict[str, object] = (
+        {"status": "failed", "code": code, "head": before[:12]}
+        if code else {"status": "updated" if after != before else "current", "old": before[:12], "new": after[:12]}
+    )
+    if result["status"] == "current":
+        return result
+    try:
+        last = next(
+            (row for row in reversed(_ledger_rows(config)) if row.get("kind") == _PROCEDURE_DOCS_KIND), None
+        )
+    except PromotionError:
+        last = None
+    if (
+        result["status"] == "failed" and last is not None and last.get("status") == "failed"
+        and last.get("code") == result["code"] and last.get("head") == result["head"]
+    ):
+        return result
+    try:
+        _append_ledger(config, {"ts": _utc_now(), "kind": _PROCEDURE_DOCS_KIND, **result})
+    except PromotionError:
+        pass
+    return result
+
+
 def _broker_id(config: Config, secret: str) -> str:
     try:
         with _edge_secret_header(secret) as header_argv:
@@ -3510,8 +3630,8 @@ def _dispatch_intake_review_attempt(  # noqa: C901
                 "outcome": "dispatch-skipped", "code": "dispatch_ci_not_green",
                 "head_sha": head, "ci": _skills_check_state(config, head),
             }
-        procedure = _worker_procedure_from_docs(
-            config.a2a_nexus_dir,
+        procedure, procedure_meta = _worker_procedure(
+            config,
             doc_name="skills-intake-review.md",
             end_marker=_DISPATCH_DOC_END,
         )
@@ -3609,6 +3729,7 @@ def _dispatch_intake_review_attempt(  # noqa: C901
             "name": candidate.name,
             "tree_sha256": candidate.tree_sha256,
             "branch": branch,
+            **procedure_meta,
         },
     )
     try:
@@ -4698,8 +4819,8 @@ def _dispatch_intake_revise(
     except PromotionError as error:
         return {"outcome": "revise-skipped", "code": error.code}
     try:
-        procedure = _worker_procedure_from_docs(
-            config.a2a_nexus_dir, doc_name=_REVISE_DOC_NAME, end_marker=_REVISE_DOC_END
+        procedure, procedure_meta = _worker_procedure(
+            config, doc_name=_REVISE_DOC_NAME, end_marker=_REVISE_DOC_END
         )
         branch = row.get("branch") if isinstance(row.get("branch"), str) and row.get("branch") else f"skill-intake/{node}/{name}-{provider}-{tree12}"
         tree_sha256 = row.get("tree_sha256") if isinstance(row.get("tree_sha256"), str) and row.get("tree_sha256") else _pr_manifest_tree(
@@ -4759,6 +4880,7 @@ def _dispatch_intake_revise(
         "provider": str(provider),
         "name": name,
         "tree_sha256": tree_sha256,
+        **procedure_meta,
         "round": round_no,
         **({"final": True} if final else {}),
         **({"identity": True} if identity else {}),
@@ -8356,7 +8478,12 @@ def _collect(
                 "published": [],
                 "errors": [],
             }, lock_wait)
-        return collector(config, dry_run=False)
+        # #2705: fast-forward the procedure-docs clone before any dispatch reads it.
+        docs = _refresh_procedure_docs(config)
+        result = collector(config, dry_run=False)
+        if docs is not None and isinstance(result, dict):
+            result["procedure_docs"] = docs
+        return result
 
 
 def _collect_sources(config: Config) -> tuple[tuple[str, str], ...]:
