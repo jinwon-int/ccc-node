@@ -92,6 +92,57 @@ def test_other_provider_shell_under_its_cli_counts(tmp_path: Path) -> None:
     assert report["verdict"] == "busy" and report["tool_commands"][0]["pid"] == 300
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bash", "/usr/local/bin/wiki-agent", "mcp-serve"],  # nosuk 2026-11-05
+        ["/bin/bash", "-c", "npm exec chrome-devtools-mcp@latest"],  # bangtong
+        ["sh", "-c", "exec npx -y @upstash/context7-mcp@4.4.1"],
+        ["bash", "-c", "node /usr/lib/node_modules/firecrawl-mcp/dist/index.js"],
+        ["bash", "-c", "uvx mcp-server-fetch"],
+    ],
+)
+def test_shell_wrapped_mcp_server_under_the_cli_is_idle(tmp_path: Path, argv: list[str]) -> None:
+    # #2677: a resident MCP server started through a shell wrapper is a
+    # provider-parented shell, but not a tool command.
+    proc = FakeProc(tmp_path / "proc")
+    _bridge(proc)
+    proc.add(300, 200, argv, started=1_000.0)
+    proc.add(301, 300, ["node", "/srv/mcp/server.js"], started=1_000.0)
+    report = gate.evaluate(proc.root, MAIN, _health(tmp_path / "h.json"), now=NOW)
+    assert report["verdict"] == "idle" and report["tool_commands"] == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bash", "-c", "sleep 600"],  # #2567 background watcher stays busy
+        ["bash", "-c", "wiki-agent mcp-serve; sleep 600"],  # compound: not one server
+        ["bash", "-c", "npx firecrawl-mcp && ./watch.sh"],
+        ["bash", "-lc", "pytest -q tests/test_mcp_bridge.py"],
+        ["bash", "-c", "exec $HOME/bin/foo-mcp"],  # expansion: cannot tell
+    ],
+)
+def test_provider_shell_that_is_not_only_an_mcp_server_is_busy(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    proc = FakeProc(tmp_path / "proc")
+    _bridge(proc)
+    proc.add(300, 200, argv)
+    report = gate.evaluate(proc.root, MAIN, _health(tmp_path / "h.json"), now=NOW)
+    assert report["verdict"] == "busy" and report["tool_commands"][0]["pid"] == 300
+
+
+def test_snapshot_wrapped_mcp_command_still_counts(tmp_path: Path) -> None:
+    # A Bash-tool command is a tool command even when it starts an MCP server.
+    proc = FakeProc(tmp_path / "proc")
+    _bridge(proc)
+    snapshot = "source /root/.claude/shell-snapshots/snapshot-bash-1.sh && eval 'npx foo-mcp'"
+    proc.add(300, 200, ["/usr/bin/bash", "-c", snapshot])
+    report = gate.evaluate(proc.root, MAIN, _health(tmp_path / "h.json"), now=NOW)
+    assert report["verdict"] == "busy" and report["tool_commands"][0]["pid"] == 300
+
+
 def test_shell_outside_the_bridge_tree_is_ignored(tmp_path: Path) -> None:
     proc = FakeProc(tmp_path / "proc")
     _bridge(proc)
