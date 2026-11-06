@@ -16,7 +16,7 @@ cat > "$TMP/ssh" <<'SH'
 #!/bin/sh
 cat >/dev/null
 for arg in "$@"; do
-  case "$arg" in alpha|beta|gamma) node=$arg ;; esac
+  case "$arg" in alpha|beta|gamma|delta) node=$arg ;; esac
 done
 printf '%s\n' "$node" >> "$CALLS_FILE"
 [ -f "$REPLY_DIR/$node" ] || exit 255
@@ -35,6 +35,17 @@ set -e
 assert test "$rc" = 1
 assert grep -qx 'OK alpha channel=matrix reason=available' <<< "$out"
 assert grep -qx 'DOWN beta channel=matrix reason=no-process' <<< "$out"
+
+# #2682: a retired Matrix frontend is reported and is not a failure.
+printf 'MATRIX_STATUS=RETIRED\nMATRIX_REASON=frontends\nPROBE_COMPLETE=1\n' > "$TMP/reply/delta"
+set +e
+out=$(REPLY_DIR="$TMP/reply" CALLS_FILE="$TMP/calls" CCC_FLEET_NODES='alpha delta' CCC_FLEET_SSH="$TMP/ssh" \
+  CCC_FLEET_SELF=_never_ CCC_FLEET_MATRIX_RETRY_DELAY=0 \
+  bash "$ROOT/scripts/fleet-matrix-watch.sh")
+rc=$?
+set -e
+assert test "$rc" = 0
+assert grep -qx 'RETIRED delta channel=matrix reason=frontends' <<< "$out"
 
 set +e
 out=$(REPLY_DIR="$TMP/reply" CALLS_FILE="$TMP/calls" CCC_FLEET_NODES='gamma' CCC_FLEET_SSH="$TMP/ssh" \

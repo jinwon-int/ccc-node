@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -31,6 +32,10 @@ class MatrixProbeTest(unittest.TestCase):
         self.config = self.root / "config.json"
         self.config.write_text(json.dumps({"state_directory": str(self.state)}))
         self.now = time.time()
+        # Hermetic: the default frontend list is read from $HOME (#2682), never the runner's.
+        home = mock.patch.dict(os.environ, {"HOME": str(self.root / "home-none")})
+        home.start()
+        self.addCleanup(home.stop)
 
     def process(self, pid: int, *, channel: str, cgroup: str = "/") -> None:
         target = self.proc / str(pid)
@@ -261,6 +266,88 @@ class MatrixProbeTest(unittest.TestCase):
         self.process(200, channel="telegram", cgroup="/system.slice/ccc-matrix-bridge.service")
         (self.proc / "200" / "environ").unlink()
         self.assertEqual(probe.probe(self.proc), ("UNVERIFIED", "data-directory"))
+
+
+class MatrixRetiredTest(unittest.TestCase):
+    """#2682: a Matrix frontend retired on purpose is RETIRED frontends, not DOWN."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.fs = self.root / "fs"
+        (self.fs / "etc/systemd/system").mkdir(parents=True)
+        (self.fs / "root").mkdir()
+        (self.fs / "home").mkdir()
+        self.frontends = self.root / "frontends"
+        self.runit = self.root / "var/service/ccc-matrix-bridge"
+
+    def verdict(self) -> tuple[str, str]:
+        return probe.probe(
+            self.proc, frontends=self.frontends, roots=[self.fs], runit_dir=self.runit
+        )
+
+    def wants(self, base: Path, target: str = "multi-user.target.wants") -> None:
+        link = base / target / probe.UNIT
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.write_text("")
+
+    def test_list_without_matrix_and_no_autostart_is_retired(self) -> None:
+        self.frontends.write_text("hande\n")
+        self.assertEqual(self.verdict(), ("RETIRED", "frontends"))
+
+    def test_list_parse_matches_bridge_watch(self) -> None:
+        for text, named in (
+            ("# matrix\nhande\n", False),       # comment only
+            ("hande,matrix\n", True),           # comma
+            ("hande\tmatrix\r\n", True),        # tab + CRLF
+            ("matrixx hande\n", False),         # exact names only
+            ("", False),                          # empty list = nothing declared
+        ):
+            with self.subTest(text=text):
+                self.frontends.write_text(text)
+                self.assertEqual(probe.frontends_name_matrix(self.frontends), named)
+
+    def test_list_naming_matrix_stays_down(self) -> None:
+        self.frontends.write_text("hande matrix\n")
+        self.assertEqual(self.verdict(), ("DOWN", "no-process"))
+
+    def test_no_list_stays_down(self) -> None:
+        self.assertEqual(self.verdict(), ("DOWN", "no-process"))
+
+    def test_half_retired_system_unit_still_enabled_stays_down(self) -> None:
+        self.frontends.write_text("hande\n")
+        self.wants(self.fs / "etc/systemd/system")
+        self.assertEqual(self.verdict(), ("DOWN", "no-process"))
+
+    def test_half_retired_user_unit_still_enabled_stays_down(self) -> None:
+        self.frontends.write_text("hande\n")
+        for home in (self.fs / "root", self.fs / "home/gm"):
+            with self.subTest(home=home.name):
+                base = home / ".config/systemd/user"
+                self.wants(base, "default.target.wants")
+                self.assertEqual(self.verdict(), ("DOWN", "no-process"))
+                (base / "default.target.wants" / probe.UNIT).unlink()
+        self.assertEqual(self.verdict(), ("RETIRED", "frontends"))
+
+    def test_termux_runit_service_needs_down_file(self) -> None:
+        self.frontends.write_text("hande\n")
+        self.runit.mkdir(parents=True)
+        self.assertEqual(self.verdict(), ("DOWN", "no-process"))
+        (self.runit / "down").write_text("")
+        self.assertEqual(self.verdict(), ("RETIRED", "frontends"))
+
+    def test_running_matrix_is_judged_on_its_answer(self) -> None:
+        # A bridge that runs is never RETIRED, even if the list dropped it (rollback needs no cleanup).
+        self.frontends.write_text("hande\n")
+        target = self.proc / "4242"
+        target.mkdir()
+        (target / "cmdline").write_bytes(b"/venv/bin/python\0-m\0telegram_bot\0--path\0/x\0")
+        (target / "environ").write_bytes(b"CCC_CHANNEL=matrix\0")
+        (target / "cgroup").write_text("0::/\n")
+        self.assertEqual(self.verdict(), ("UNVERIFIED", "data-directory"))
 
 
 if __name__ == "__main__":
