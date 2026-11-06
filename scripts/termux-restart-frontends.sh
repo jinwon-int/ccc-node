@@ -51,6 +51,12 @@
 #      entirely (no restart, no recovery arming) so a self-update never
 #      revives a retired Telegram bridge; steps 2–3 run unchanged. No list at
 #      all keeps the legacy behaviour (Telegram runs).
+#   Matrix-retired nodes (Matrix → 「한데」 cut-over): the same list rule
+#      applies to `matrix` — a declared list that does not name it skips the
+#      Matrix step (no `sv restart`, no follower, no --verify judgement), so a
+#      self-update never revives a stopped Matrix bridge (`sv restart` starts a
+#      service that was `sv down`). The hande step still runs. No list at all
+#      keeps the legacy behaviour (Matrix runs).
 #
 # Usage: termux-restart-frontends.sh            (default: both frontends)
 #        termux-restart-frontends.sh --matrix-only [wait_seconds]
@@ -117,6 +123,15 @@ telegram_enabled() {
     return 0
   fi
   printf '%s\n' "$list" | tr -s ' \t,' '\n' | grep -qx telegram
+}
+
+# Same rule for Matrix (Matrix → 「한데」 cut-over). Absent list = legacy: Matrix runs.
+matrix_enabled() {
+  local list
+  if [ -n "${CCC_FRONTENDS:-}" ]; then list="$CCC_FRONTENDS"
+  elif [ -f "$FRONTENDS_FILE" ]; then list="$(sed 's/#.*//' "$FRONTENDS_FILE" 2>/dev/null)"
+  else return 0; fi
+  printf '%s\n' "$list" | tr -s ' \t,' '\n' | grep -qx matrix
 }
 
 # #2526: the hande frontend is followed when its runit service dir exists or the
@@ -334,16 +349,24 @@ dry_run_line() { # one frontend's dry-run fields
 case "${1:-}" in
   --dry-run)
     w="$(want)"
-    line="bridge-current=$w $(dry_run_line "$w") survive=${SURVIVE}s telegram=$(telegram_enabled && echo enabled || echo retired)"
+    if matrix_enabled; then mline="$(dry_run_line "$w")"; else mline="matrix=retired"; fi
+    line="bridge-current=$w $mline survive=${SURVIVE}s telegram=$(telegram_enabled && echo enabled || echo retired)"
     if hande_present; then line="$line | $(as_hande dry_run_line "$w")"; else line="$line | hande=absent"; fi
     echo "$line"
     exit 0 ;;
   --verify)
     [ -z "${2:-}" ] || SURVIVE="$2"
-    verify_current; rc=$?
+    rc=0
+    if matrix_enabled; then verify_current; rc=$?; else echo "matrix: retired (frontend list)"; fi
     if hande_present; then as_hande verify_current; hrc=$?; [ "$rc" = 0 ] && rc=$hrc; fi
     exit "$rc" ;;
-  --matrix-only) matrix_follow $(( $(now) + ${2:-3600} )); frc=$?; note_deferred "done" matrix "rc=$frc"; exit "$frc" ;;
+  --matrix-only)
+    # A follower detached before the list retired Matrix must not revive it.
+    if ! matrix_enabled; then
+      log "matrix retired on this node (frontend list has no matrix): follower skipped"
+      note_deferred "done" matrix "rc=0 retired"; exit 0
+    fi
+    matrix_follow $(( $(now) + ${2:-3600} )); frc=$?; note_deferred "done" matrix "rc=$frc"; exit "$frc" ;;
   --hande-only) as_hande matrix_follow $(( $(now) + ${2:-3600} )); frc=$?; note_deferred "done" hande "rc=$frc"; exit "$frc" ;;
   "") ;;
   *) echo "termux-restart-frontends: unknown argument $1" >&2; exit 2 ;;
@@ -359,7 +382,12 @@ else
   log "telegram retired on this node (frontend list has no telegram): restart skipped"
 fi
 deadline_m=$(( ${CCC_BRIDGE_RESTART_DEADLINE_EPOCH:-$(( $(now) + 300 ))} - 30 ))
-matrix_follow "$deadline_m"; m=$?
+m=0
+if matrix_enabled; then
+  matrix_follow "$deadline_m"; m=$?
+else
+  log "matrix retired on this node (frontend list has no matrix): restart skipped"
+fi
 if [ "$m" = 2 ]; then
   note_deferred pending matrix "want=$(want) max_wait=$FOLLOWER_WAIT"
   ( nohup setsid bash "$0" --matrix-only "$FOLLOWER_WAIT" > /dev/null 2>&1 < /dev/null & )
