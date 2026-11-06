@@ -317,6 +317,10 @@ _SS_FINAL = "".join(
 ).replace("있", "").replace("겠", "")
 PAST_PREDICATE = re.compile(f"[{_SS_FINAL}](?:다(?!면)|고|습니다|는데|지만|으며|으나|어요|어서|던)")
 PAST_WINDOW_CHARS = 25
+# A past-tense verb can still report a future commitment: "24시간 뒤
+# 판정하기로 했습니다" (decided to), "알리겠다고 했다" (said it will), "재확인할
+# 예정이었다". Any of these in the clause keeps the term a window.
+FUTURE_INTENT = re.compile(r"기로|겠|예정|것")
 CLAUSE_END = re.compile(r"[,，;]|[.!?。](?:\s|$)|\n")
 # A relative term glossing a month-day clock time it sits next to: "다음 보충은
 # **10-31 11:27:19**(약 15시간 뒤)" (family-messenger#616). The moment is
@@ -833,7 +837,8 @@ def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
         return REL_PROCESS
     if _is_generic_possibility(paragraph, match):
         return REL_GENERIC
-    if PAST_PREDICATE.search(_clause_after(paragraph, match)):
+    clause = _clause_after(paragraph, match)
+    if PAST_PREDICATE.search(clause) and not FUTURE_INTENT.search(clause):
         return REL_PAST_EVENT
     return None
 

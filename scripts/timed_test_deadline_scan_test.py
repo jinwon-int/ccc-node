@@ -1068,6 +1068,12 @@ class RelativeFalsePositive2544Tests(unittest.TestCase):
             "48시간 뒤 재확인 예정, 지난번엔 버렸다",
             "48시간 뒤 재확인한다. 지난번엔 그냥 지나갔다",
             "24시간 관측했고 이상 없음",
+            # Past-tense verbs reporting a future commitment.
+            "24시간 뒤 판정하기로 했습니다",
+            "48시간 뒤 다시 보기로 했다",
+            "며칠 뒤 알리겠다고 했다",
+            "48시간 뒤 재확인할 예정이었다",
+            "3시간 후 재시도할 것이라고 했다",
         ):
             with self.subTest(line=line):
                 self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
