@@ -161,7 +161,7 @@ run_selfup() {
   CCC_SELF_UPDATE_CRONTAB_CMD="$FAKEBIN/crontab" CCC_CRONTAB_CMD="$FAKEBIN/crontab" \
   FAKE_CRON="$FAKE_CRON" PATH="$FAKEBIN:$PATH" \
   CCC_SELF_UPDATE_RESTART_WAIT_SECONDS=3 \
-  CCC_NODE=testnode bash "$SELFUP" "$@"
+  CCC_NODE="${TEST_CCC_NODE-testnode}" bash "$SELFUP" "$@"
 }
 
 # --- 1) up-to-date: no setup, no restarts -------------------------------------
@@ -1871,6 +1871,8 @@ run_selfup run >/dev/null 2>&1; rc=$?
 ok "notify=none: update still applied" '[ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$TMP/seed" rev-parse HEAD)" ]'
 ok "notify=none: no SelfUpdate record queued" '! ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
 ok "notify=none: suppression is logged" 'grep -q "notify=suppressed reason=operator-notify-none" "$STATE/self-update.log"'
+ok "notify=none: the suppressed success notice is logged with its dedup and class (#2589)" \
+  'grep -q "notify=suppressed reason=operator-notify-none dedup=SelfUpdate:ok-.* class=info" "$STATE/self-update.log"'
 # env override wins over the file
 rm -f "$TMP/spool"/*.json 2>/dev/null
 echo notify-env > "$TMP/seed/file.txt"
@@ -1878,6 +1880,115 @@ git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm notify-env && git -C 
 CCC_SELF_UPDATE_NOTIFY=all run_selfup run >/dev/null 2>&1; rc=$?
 ok "CCC_SELF_UPDATE_NOTIFY=all overrides the file" 'ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
 rm -f "$CLAUDE/self-update.notify"
+
+# --- #2589: notify modes never swallow failures; node identity is not localhost --
+# A node with `none` (2026-10) suppressed five consecutive `prepare-failed rc=3`
+# alerts: the owner saw nothing. `none`/`failures` mute success notices only;
+# a full mute needs the explicit `silent`, which warns on every run. Each case
+# gets fresh claude/state dirs (a failed tick leaves activation evidence) and a
+# scratch HOME (never the node's real ~/a2a-broker-worker).
+NM_SAVED_CLAUDE="$CLAUDE"
+nm_fresh() { # <tag> [notify-mode]
+  CLAUDE="$TMP/claude-2589-$1"; STATE="$CLAUDE/state"; mkdir -p "$STATE"
+  printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
+  [ -n "${2:-}" ] && printf '%s\n' '# operator choice' "$2" > "$CLAUDE/self-update.notify"
+  rm -f "$TMP/spool"/*.json 2>/dev/null
+}
+nm_bump() { echo "$1" > "$TMP/seed/nm-$1.txt"; git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm "nm-$1" && git -C "$TMP/seed" push -q origin main; }
+nm_run() { HOME="$TMP/home-2589" run_selfup "$@"; }
+mkdir -p "$TMP/home-2589"
+nm_spool_dedup() { cat "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | jq -r .dedup 2>/dev/null; }
+nm_spool_node() { cat "$TMP/spool"/*SelfUpdate*.json 2>/dev/null | jq -r .node 2>/dev/null; }
+
+# none + prepare failure (the real incident) -> pushed, and the push is logged.
+nm_fresh none-prepare none
+printf 'exit 3\n' > "$CLAUDE/self-update.prepare-cmd"
+nm_bump none-prepare
+nm_run run >/dev/null 2>&1; rc=$?
+ok "notify=none: prepare failure still exits 15" '[ "$rc" = 15 ]'
+ok "notify=none: prepare failure is still pushed to the owner" 'nm_spool_dedup | grep -q "^SelfUpdate:prepare-fail-"'
+ok "notify=none: the pushed alert is logged as overriding the mode" \
+  'grep -q "notify=pushed mode=none class=alert dedup=SelfUpdate:prepare-fail-" "$STATE/self-update.log"'
+ok "notify=none: the failure is not logged as suppressed" '! grep -q "notify=suppressed reason=operator-notify-none dedup=SelfUpdate:prepare-fail" "$STATE/self-update.log"'
+
+# none + stall (dirty tree) -> pushed.
+nm_fresh none-stall none
+echo dirt > "$REPO/dirt-2589.txt"
+nm_run run >/dev/null 2>&1; rc=$?
+ok "notify=none: a stall (dirty tree) is still pushed" '[ "$rc" = 4 ] && nm_spool_dedup | grep -qx "SelfUpdate:stalled-dirty-tree"'
+rm -f "$REPO/dirt-2589.txt"
+
+# failures: explicit name for the same policy — success muted, failure pushed.
+nm_fresh failures-ok failures
+nm_bump failures-ok
+nm_run run >/dev/null 2>&1; rc=$?
+ok "notify=failures: a successful update queues nothing" '[ "$rc" = 0 ] && ! ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
+ok "notify=failures: the suppressed success is logged" \
+  'grep -q "notify=suppressed reason=operator-notify-failures dedup=SelfUpdate:ok-.* class=info" "$STATE/self-update.log"'
+echo dirt > "$REPO/dirt-2589.txt"
+nm_run run >/dev/null 2>&1; rc=$?
+ok "notify=failures: a stall is pushed" '[ "$rc" = 4 ] && nm_spool_dedup | grep -qx "SelfUpdate:stalled-dirty-tree"'
+rm -f "$REPO/dirt-2589.txt"
+ok "notify=failures via env overrides an operator file" \
+  'rm -f "$TMP/spool"/*.json; printf "%s\n" all > "$CLAUDE/self-update.notify"; nm_bump failures-env; CCC_SELF_UPDATE_NOTIFY=failures nm_run run >/dev/null 2>&1; ! ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
+
+# silent: deliberate full mute — failures suppressed too, logged, warned each run.
+nm_fresh silent-prepare silent
+printf 'exit 3\n' > "$CLAUDE/self-update.prepare-cmd"
+nm_bump silent-prepare
+out="$(nm_run run 2>&1)"; rc=$?
+ok "notify=silent: prepare failure exits 15 and queues nothing" '[ "$rc" = 15 ] && ! ls "$TMP/spool"/*SelfUpdate*.json >/dev/null 2>&1'
+ok "notify=silent: the suppressed failure is logged with its class" \
+  'grep -q "notify=suppressed reason=operator-notify-silent dedup=SelfUpdate:prepare-fail-.* class=alert" "$STATE/self-update.log"'
+ok "notify=silent: the run logs a full-mute warning" 'grep -q "notify=warning mode=silent" "$STATE/self-update.log"'
+ok "notify=silent: the run warns on stderr" 'grep -q "notify mode is .silent." <<<"$out"'
+nm_fresh silent-uptodate silent
+out="$(nm_run run 2>&1)"; rc=$?
+ok "notify=silent: an up-to-date run warns too (every run)" \
+  '[ "$rc" = 0 ] && grep -q "notify=warning mode=silent" "$STATE/self-update.log" && grep -q "notify mode is .silent." <<<"$out"'
+nm_fresh all-uptodate
+out="$(nm_run run 2>&1)"; rc=$?
+ok "notify=all: no mute warning" '[ "$rc" = 0 ] && ! grep -q "notify=warning" "$STATE/self-update.log" && ! grep -q "notify mode is" <<<"$out"'
+printf '%s\n' none > "$CLAUDE/self-update.notify"
+out="$(nm_run status 2>&1)"
+ok "status names the notify mode" 'grep -q "^notify mode: none (success notices muted; failures and incomplete activations still pushed)" <<<"$out"'
+
+# Node identity: CCC_NODE > state/node.txt (#2541) > hostname -s, never localhost.
+HB_LOCAL="$TMP/hostbin-localhost"; HB_NAMED="$TMP/hostbin-named"; HB_EMPTY="$TMP/hostbin-empty"
+mkdir -p "$HB_LOCAL" "$HB_NAMED" "$HB_EMPTY"
+printf '#!/usr/bin/env bash\necho localhost\n' > "$HB_LOCAL/hostname"
+printf '#!/usr/bin/env bash\necho fixture-host\n' > "$HB_NAMED/hostname"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$HB_EMPTY/hostname"
+chmod +x "$HB_LOCAL/hostname" "$HB_NAMED/hostname" "$HB_EMPTY/hostname"
+nm_node_run() { # <hostbin> <CCC_NODE value> — one dirty-tree stall, prints stderr
+  rm -f "$TMP/spool"/*.json; : > "$STATE/self-update.log"
+  echo dirt > "$REPO/dirt-2589.txt"
+  { PATH="$1:$PATH" TEST_CCC_NODE="$2" nm_run run >/dev/null; } 2>&1
+  rm -f "$REPO/dirt-2589.txt"
+}
+nm_fresh node-id
+printf '%s\n' 'node-from-file' > "$STATE/node.txt"
+nm_node_run "$HB_LOCAL" env-node >/dev/null
+ok "node: CCC_NODE wins over node.txt and hostname" '[ "$(nm_spool_node)" = env-node ]'
+nm_node_run "$HB_LOCAL" "" >/dev/null
+ok "node: node.txt is used when CCC_NODE is unset" '[ "$(nm_spool_node)" = node-from-file ]'
+nm_node_run "$HB_NAMED" localhost >/dev/null
+ok "node: CCC_NODE=localhost is not an identity (falls through)" '[ "$(nm_spool_node)" = node-from-file ]'
+rm -f "$STATE/node.txt"
+nm_node_run "$HB_NAMED" "" >/dev/null
+ok "node: hostname -s is the last real source" '[ "$(nm_spool_node)" = fixture-host ]'
+printf '%s\n' '  ' > "$STATE/node.txt"
+# shellcheck disable=SC2034  # err is read via eval inside ok()
+err="$(nm_node_run "$HB_LOCAL" "")"
+ok "node: a Termux localhost host never reports node=localhost" '[ "$(nm_spool_node)" = unknown-node ]'
+ok "node: the localhost fallback is logged and warned" \
+  'grep -q "notify node=unknown-node reason=no-node-identity hostname=localhost" "$STATE/self-update.log" && grep -q "no node identity" <<<"$err"'
+nm_node_run "$HB_EMPTY" "" >/dev/null
+ok "node: an empty hostname also falls back to unknown-node" \
+  '[ "$(nm_spool_node)" = unknown-node ] && grep -q "notify node=unknown-node reason=no-node-identity hostname=empty" "$STATE/self-update.log"'
+
+CLAUDE="$NM_SAVED_CLAUDE"; STATE="$CLAUDE/state"
+rm -f "$TMP/spool"/*.json 2>/dev/null
 
 # --- #2207 ③: prepare-cmd runs after setup.sh and before any restart ---------
 # Termux serves a prepared generation; the operator's prepare command builds

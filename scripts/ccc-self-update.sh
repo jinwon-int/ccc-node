@@ -28,10 +28,13 @@
 #      startup identity. It is the only supported way to reconcile a pending
 #      activation record on an unchanged tick; without it
 #      the serving identity is unknown and stays pending (#1527).)
-#   ~/.claude/self-update.notify (optional: `all` (default) or `none`. `none`
-#      queues no owner notification at all — success, warning or stall — and
-#      only logs `notify=suppressed`; the audit log and status are unchanged.
-#      Env override: CCC_SELF_UPDATE_NOTIFY. Unknown values mean `all`.)
+#   ~/.claude/self-update.notify (optional: `all` (default), `failures`,
+#      `none`/`off` or `silent`. `failures` and `none` mute only the success
+#      notices (update completed, pending activation reconciled); every failure,
+#      stall, warning and incomplete activation is still pushed (#2589).
+#      `silent` is the deliberate full mute and warns on every run. Each
+#      suppressed notice logs `notify=suppressed`; the audit log and status are
+#      unchanged. Env override: CCC_SELF_UPDATE_NOTIFY. Unknown values mean `all`.)
 #   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
 #      file exists, installer-managed cron is never rewritten. Env override:
 #      CCC_SELF_UPDATE_REAPPLY=0. Agent must not write the file.)
@@ -365,22 +368,84 @@ resolve_repo() {
   printf '%s' "${HOME:-/root}/ccc-node"
 }
 
-notify_mode() { # all (default) | none — env CCC_SELF_UPDATE_NOTIFY, else operator file
+# Notify modes (#2182, #2589) — env CCC_SELF_UPDATE_NOTIFY, else operator file:
+#   all      (default; unknown values too) push every notice
+#   failures push alerts only; success notices are logged as suppressed
+#   none|off same as `failures`. The opt-out meant "no update notices in this
+#            channel"; silently dropping failures was the harm (#2589: five
+#            consecutive prepare-failed rc=3 ticks reached nobody)
+#   silent   deliberate full mute: alerts are suppressed too (logged), and
+#            every run logs + prints a warning so the mute is never forgotten
+# The class is decided by the call site, never by message text: notify()
+# defaults to `alert`; only the two pure success notices pass `info`.
+notify_mode() {
   local m="${CCC_SELF_UPDATE_NOTIFY:-}"
   [ -n "$m" ] || m="$(read_operator_cmd "$CLAUDE_DIR/self-update.notify" 2>/dev/null || true)"
-  case "$m" in none|off) printf none ;; *) printf all ;; esac
+  case "$m" in
+    none|off) printf none ;;
+    failures) printf failures ;;
+    silent) printf silent ;;
+    *) printf all ;;
+  esac
 }
 
-notify() { # <text> <dedup-suffix>
-  if [ "$(notify_mode)" = none ]; then
-    # Operator opted this node out of owner pushes (e.g. a node whose channel
-    # must stay quiet). The decision is still auditable here.
-    log "notify=suppressed reason=operator-notify-none dedup=SelfUpdate:$2"
-    return 0
-  fi
+notify_mode_describe() { # <mode> — one line for `status` and the silent warning
+  case "$1" in
+    all) printf 'all (every notice pushed)' ;;
+    failures|none) printf '%s (success notices muted; failures and incomplete activations still pushed)' "$1" ;;
+    silent) printf 'silent (FULL MUTE: failures and incomplete activations are NOT pushed, only logged)' ;;
+  esac
+}
+
+warn_if_notify_silent() { # once per run, after the lock
+  [ "$(notify_mode)" = silent ] || return 0
+  log "notify=warning mode=silent reason=operator-notify-silent detail=failure-and-activation-incomplete-alerts-not-pushed"
+  say "self-update: warning — notify mode is 'silent': failure and activation-incomplete alerts are NOT pushed, only logged. Use 'none' or 'failures' to mute success notices only." >&2
+}
+
+# Fleet identity for the spool record's `node` (#2589). Same order the other
+# fleet scripts use (load-memory.sh, statusline.sh, install-skill-*-cron.sh):
+# CCC_NODE, then $STATE_DIR/node.txt (seeded once by setup.sh, #2541), then
+# `hostname -s`. `localhost` is never an identity — Termux reports it, so every
+# Termux node used to arrive as node "localhost" — and neither is an empty
+# value; with no real source the record says `unknown-node` and the run warns.
+NOTIFY_NODE=""
+node_identity_usable() { # <candidate>
+  case "${1,,}" in ''|localhost|localhost.*) return 1 ;; esac
+  return 0
+}
+resolve_notify_node() { # sets NOTIFY_NODE (resolved once per run)
+  [ -n "$NOTIFY_NODE" ] && return 0
+  local v host
+  v="$(printf '%s' "${CCC_NODE:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if node_identity_usable "$v"; then NOTIFY_NODE="$v"; return 0; fi
+  v="$(head -n1 "$STATE_DIR/node.txt" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if node_identity_usable "$v"; then NOTIFY_NODE="$v"; return 0; fi
+  host="$(hostname -s 2>/dev/null | head -n1 | tr -d '[:space:]')" || host=""
+  if node_identity_usable "$host"; then NOTIFY_NODE="$host"; return 0; fi
+  NOTIFY_NODE="unknown-node"
+  log "notify node=unknown-node reason=no-node-identity hostname=${host:-empty} hint=set-CCC_NODE-or-$STATE_DIR/node.txt"
+  say "self-update: warning — no node identity (CCC_NODE unset, $STATE_DIR/node.txt missing/empty, hostname '${host:-}'); notices say node=unknown-node. Write the fleet node name to $STATE_DIR/node.txt." >&2
+}
+
+notify() { # <text> <dedup-suffix> [class: alert (default) | info]
+  local class="${3:-alert}" mode
+  mode="$(notify_mode)"
+  case "$mode:$class" in
+    failures:info|none:info|silent:*)
+      # Operator opted this node out of these pushes (e.g. a node whose
+      # channel must stay quiet). The decision is still auditable here.
+      log "notify=suppressed reason=operator-notify-$mode dedup=SelfUpdate:$2 class=$class"
+      return 0
+      ;;
+    failures:alert|none:alert)
+      log "notify=pushed mode=$mode class=alert dedup=SelfUpdate:$2"
+      ;;
+  esac
   mkdir -p "$SPOOL" 2>/dev/null || return 0
   local node now fname
-  node="${CCC_NODE:-$(hostname -s 2>/dev/null || echo node)}"
+  resolve_notify_node
+  node="$NOTIFY_NODE"
   now="$(ts)"
   # $RANDOM in the name: one run can legitimately emit TWO notifies (e.g. the
   # #1328 wrong-branch recovery notice followed by the completion notice), and
@@ -550,7 +615,7 @@ report_pending_activation() {
     fi
     log "pending-activation result=reconciled target=$PENDING_TARGET_SHA serving=$serving"
     audit "activation-reconciled" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
-    notify "self-update: 이전에 실패했던 ${PENDING_TARGET_SHA:0:7} 세대 활성화가 서빙 세대 일치로 확인됐습니다 — 보류 기록을 정리했습니다." "reconciled-$PENDING_TARGET_SHA"
+    notify "self-update: 이전에 실패했던 ${PENDING_TARGET_SHA:0:7} 세대 활성화가 서빙 세대 일치로 확인됐습니다 — 보류 기록을 정리했습니다." "reconciled-$PENDING_TARGET_SHA" info
     say "self-update: pending activation reconciled — runtime verified serving ${PENDING_TARGET_SHA:0:7}"
     return 0
   fi
@@ -991,6 +1056,7 @@ if [ "$MODE" = "status" ]; then
   say "prepare command: $(resolve_prepare_cmd >/dev/null 2>&1 && echo "configured (timeout ${PREPARE_COMMAND_TIMEOUT_SECONDS}s, source=${PREPARE_BUDGET_SOURCE}${PREPARE_BUDGET_NOTE:+, $PREPARE_BUDGET_NOTE})" || echo none)"
   for _w in "${PREPARE_BUDGET_WARNINGS[@]}"; do say "prepare budget warning: $_w (budget stays ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)"; done
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
+  say "notify mode: $(notify_mode_describe "$(notify_mode)")"
   say "installed A2A handler refresh: $([ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ] && echo "disabled (CCC_SELF_UPDATE_A2A_HANDLERS=0)" || echo "enabled (existing copies only)")"
   pending_rc=0
   load_pending_activation || pending_rc=$?
@@ -1034,6 +1100,7 @@ fi
 # --- lock (stale after 30 minutes; foreign regular file recovered, #1945) ------
 acquire_lock || exit 3
 trap cleanup EXIT
+warn_if_notify_silent
 
 # Unsafe or interrupted activation evidence blocks every run, including forced
 # and changed ticks, before repository recovery, fetch, setup or restart.
@@ -2458,7 +2525,7 @@ fi
 
 audit "ok" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON"
 if [ "$CHANGED" = "true" ]; then
-  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}${A2A_HANDLER_NOTE}${RESUME_NOTE}." "ok-$NEW_SHA"
+  notify "self-update 완료: ${OLD_SHA:0:7} → ${SHORT_NEW}, 서비스 ${RESTARTED}개 재시작${REAPPLY_NOTE}${A2A_HANDLER_NOTE}${RESUME_NOTE}." "ok-$NEW_SHA" info
 fi
 say "self-update: ok (${OLD_SHA:0:7} → ${SHORT_NEW}, services restarted: $RESTARTED${REAPPLY_NOTE}${A2A_HANDLER_NOTE}${RESUME_NOTE:+, deferred restart resumed})"
 exit 0
