@@ -741,6 +741,12 @@ else
   err "skill-promotion possible-token API path mask tests failed (a gh api path would void a valid revision, or a real token would pass, #2399)"
   tail -10 "$TMP/skill-promotion-api-path-mask-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_skill_promotion_procedure_docs_test.py >"$TMP/skill-promotion-procedure-docs-test.out" 2>&1; then
+  say "  ok skill-promotion procedure docs dir tests (#2705)"
+else
+  err "skill-promotion procedure docs dir tests failed (merged procedure docs would not reach reviewers, or a docs refresh could block a collect, #2705)"
+  tail -10 "$TMP/skill-promotion-procedure-docs-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_doc_url_mask_test.py >"$TMP/skill-promotion-doc-url-mask-test.out" 2>&1; then
   say "  ok skill-promotion possible-token public docs URL mask tests (#2694)"
 else
