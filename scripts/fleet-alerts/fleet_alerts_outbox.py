@@ -28,7 +28,8 @@ DEFAULT_DEDUP_WINDOW_S = 900.0
 # (``ok <id>`` / ``hold <id>``) and a tier; each channel records a delivery
 # receipt. A "strong" receipt is a channel acknowledgement that the message is
 # in the room; "socket-write" (the hande lane's hand-off to the relay bot) is
-# weak — the bot has no notice ack. ``notified`` means at least one strong one.
+# weak until the bot's notice_ack replaces it with "hande-ack" (family-messenger#703).
+# ``notified`` means at least one strong one.
 # ``notice`` (#2628): immediate + 「한데」 mirror like action, but no re-notify and no ok/hold.
 TIERS = ("info", "notice", "action", "critical")
 # Derived rows the policy module creates (never accepted from a node payload —
