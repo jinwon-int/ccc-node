@@ -1019,6 +1019,63 @@ class RelativeFalsePositive2544Tests(unittest.TestCase):
         # JSONL dumps predating the author field must not demote everything.
         self.assertFlagged(_issue(comments=[_comment("며칠 관찰 후 완전 삭제", REL_AT)]))
 
+    # -- past-event offsets (#2635) -------------------------------------------
+    def test_past_tense_incident_offset_is_demoted(self) -> None:
+        # family-messenger#616: incident forensics ("15시간 뒤에야 일어났고"),
+        # and the ccc-node#2659 shape ("N일 동안 … 0건이었습니다") with a term
+        # RELATIVE_DURATION actually matches.
+        for line in (
+            "2. 재시도가 성공하려면 새 기기가 30분(`siblingInviteTTL`) 안에 키를 다시 채워야 함. "
+            "그런데 이번에는 안드로이드 크롬 탭이 백그라운드로 가서(추정, 확인 필요) 보충이 "
+            "15시간 뒤에야 일어났고, 아이폰은 30분 뒤 대기열을 버림(🔔 「초대 포기」)",
+            "- 하지만 `mempalace-refresh.status.json`은 계속 `state=ok`로 남았고, "
+            "**며칠 동안 알림이 0건**이었습니다. 수동으로 플릿 점검을 돌리고 나서야 발견했습니다.",
+            "복구는 2시간 뒤였다.",
+            "롤백까지 3시간 후 완료했습니다.",
+            "인증서 갱신에 며칠 걸렸다",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(body=line, author="seoseo-ai"), "past-event-offset")
+
+    def test_past_event_offset_issue_has_no_high_finding(self) -> None:
+        # The #616 regression as the issue states it: high 0, low 1.
+        body = (
+            "## 원인\n\n그런데 이번에는 안드로이드 크롬 탭이 백그라운드로 가서 보충이 "
+            "15시간 뒤에야 일어났고, 아이폰은 30분 뒤 대기열을 버림\n"
+        )
+        findings = scanner.scan([_rel_issue(body=body)], NOW, "relative")
+        self.assertEqual([f.confidence for f in findings], ["low"])
+        self.assertEqual(scanner.scan([_rel_issue(body=body)], NOW, "relative", min_confidence="high"), [])
+
+    def test_ccc_node_2659_sentence_is_not_a_relative_term(self) -> None:
+        # The sentence ccc-node#2659's comment quoted: "9일 동안" is not a
+        # RELATIVE_DURATION branch, so it was never the matched span (the hit
+        # was the body's "며칠씩 조용히 이어질 수 있습니다").
+        line = ("- 하지만 `mempalace-refresh.status.json`은 계속 `state=ok`로 남았고, "
+                "**9일 동안 알림이 0건**이었습니다. 수동으로 플릿 점검을 돌리고 나서야 발견했습니다.")
+        self.assertIsNone(scanner.judge_issue(_rel_issue(body=line), NOW, "relative"))
+
+    def test_future_window_wording_stays_high(self) -> None:
+        for line in (
+            "24시간 관측 후 판정",
+            "배포 48시간 뒤 재확인",
+            "T+24h 뒤 판정합니다",
+            "며칠 동안 관측합니다",
+            "24시간 뒤 판정하겠습니다",
+            "24시간 뒤 에러가 없었다면 승격",
+            "48시간 뒤 정상화됐는지 확인",
+            "15시간 뒤에야 판정할 수 있다",
+            "48시간 뒤 재확인 예정, 지난번엔 버렸다",
+            "48시간 뒤 재확인한다. 지난번엔 그냥 지나갔다",
+            "24시간 관측했고 이상 없음",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    def test_past_term_beside_a_future_one_stays_high(self) -> None:
+        line = "지난번엔 15시간 뒤에야 일어났고 이번엔 48시간 뒤 재확인"
+        self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
     def test_demoted_finding_is_low_in_report_and_dropped_at_high(self) -> None:
         issue = _rel_issue(comments=[_rel_comment("페이지 넘김은 당분간 오너 수동.")])
         findings = scanner.scan([issue], NOW, "relative")

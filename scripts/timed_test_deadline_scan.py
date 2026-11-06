@@ -255,6 +255,7 @@ REL_CHECKBOX_JUDGED = "checkbox-verdict-recorded"  # family-messenger#167
 REL_OPERATIONAL = "operational-wording"  # esp32-iphone-agent#74/#60, ccc-node#1864
 REL_PLANNING = "planning-estimate"  # family-messenger#271 "스파이크(1~2주)"
 REL_PROCESS = "process-duration"  # family-messenger#338 "수일 소요"
+REL_PAST_EVENT = "past-event-offset"  # family-messenger#616 "15시간 뒤에야 일어났고" (#2635)
 
 # Accounts whose words are the fleet's own (skills/external-github-content:
 # jinon86, seoseo-ai and the fleet dependency bots). GitHub renders an app as
@@ -300,6 +301,21 @@ PROCESS_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 PROCESS_NOUN = re.compile(r"(심사|발급|배송|(?<![\w-])review)", re.IGNORECASE)
+# How long something that already happened took, in incident forensics:
+# "보충이 15시간 뒤에야 일어났고" (family-messenger#616), "며칠 동안 알림이
+# 0건이었습니다" (the ccc-node#2659 shape, #2635). The cue is a past-tense
+# predicate in the term's own clause, at most PAST_WINDOW_CHARS after it and
+# never past a comma or sentence end. Korean past tense is a syllable with the
+# final consonant ㅆ (났·었·였·했·렸·됐 …); 있 (present "exists") and 겠
+# (future "will") share that final and are excluded. Only finished endings
+# count: "없었다면" (conditional), "됐는지" (a question to check later) and
+# "뒤에야 판정할 수 있다" stay windows.
+_SS_FINAL = "".join(
+    chr(0xAC00 + (lead * 21 + vowel) * 28 + 20) for lead in range(19) for vowel in range(21)
+).replace("있", "").replace("겠", "")
+PAST_PREDICATE = re.compile(f"[{_SS_FINAL}](?:다(?!면)|고|습니다|는데|지만|으며|으나|어요|어서|던)")
+PAST_WINDOW_CHARS = 25
+CLAUSE_END = re.compile(r"[,，;]|[.!?。](?:\s|$)|\n")
 
 # Anchor + offset bookings (#2252). a2a-nexus#1504 booked Phase 7-B as
 # "실행 예약: … OnCalendar=2026-10-09 22:00:00 KST" with "B8: 관측 타이머
@@ -773,6 +789,10 @@ def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
         return REL_PROCESS
     if PROCESS_NOUN.search(paragraph[max(0, match.start() - PLANNING_WINDOW_CHARS): match.start()]):
         return REL_PROCESS
+    window = paragraph[match.end(): match.end() + PAST_WINDOW_CHARS]
+    clause_end = CLAUSE_END.search(window)
+    if PAST_PREDICATE.search(window[: clause_end.start()] if clause_end else window):
+        return REL_PAST_EVENT
     return None
 
 
@@ -797,7 +817,7 @@ def classify_relative_paragraph(
         A task-list item, and a verdict comment (strict, as in followup mode)
         was posted after it (family-messenger#167, PASS recorded).
 
-    The remaining three judge the wording, so they never apply when the
+    The remaining four judge the wording, so they never apply when the
     paragraph names an observation (``OBSERVATION_WORD``), and every unquoted
     term must be explained by one of them:
 
@@ -806,6 +826,9 @@ def classify_relative_paragraph(
                              the term ("스파이크(1~2주)") or the term alone in
                              brackets after a plan item.
     ``process-duration``     how long an outside procedure takes ("수일 소요").
+    ``past-event-offset``    how long something already took: a past-tense
+                             predicate in the term's clause ("15시간 뒤에야
+                             일어났고", #2635).
     """
     if author is not None and not is_fleet_author(author):
         return REL_EXTERNAL_AUTHOR
