@@ -161,7 +161,7 @@ def _matrix_processes(proc_root: Path) -> tuple[list[tuple[int, list[bytes]]], b
 # (a half-done retirement that a reboot or self-update would revive) all stay
 # `DOWN no-process`. CCC_FRONTENDS / CCC_FRONTENDS_FILE are deliberately not
 # read: the probe runs in a fresh ssh login, never the bridge's environment.
-# On 2026-11-06 a passed retirement canary paged `DOWN sogyo channel=matrix`.
+# On 2026-11-06 a passed retirement canary paged `DOWN <node> channel=matrix`.
 UNIT = "ccc-matrix-bridge.service"
 PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
 
