@@ -72,7 +72,19 @@ def installed_root(project: Path, uid: int) -> Path:
     # probe keys. Supported operator paths have no whitespace/metacharacters.
     if not re.fullmatch(r'/[A-Za-z0-9_./-]+', value):
         raise ValueError('invalid_install_reference')
-    root = physical(Path(value))
+    return harness_root(Path(value), uid)
+
+
+def harness_root(candidate: Path, uid: int) -> Path:
+    """Accept a checkout whose doctor the probing account may execute.
+
+    Shared by the install reference and by a retired node's fallback to the
+    self-update default checkout locations (#2703): no file anyone but root or
+    the owner could rewrite is run.
+    """
+    if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(candidate)):
+        raise ValueError('invalid_install_reference')
+    root = physical(candidate)
     for name in ('scripts/ccc-doctor.sh', 'claude/settings.base.json', 'bridge/start.sh'):
         path = physical(root / name)
         protected_path(path, uid)
@@ -154,6 +166,8 @@ def main() -> int:
         root, job, project, uid = Path(source), Path(prepared), Path(home), int(owner)
         if mode == 'installed':
             print(installed_root(project, uid))
+        elif mode == 'harness':
+            print(harness_root(root, uid))
         elif mode == 'checkout':
             checkout_proof(root, job, project, uid)
             print('verified')

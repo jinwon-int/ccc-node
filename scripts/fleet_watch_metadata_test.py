@@ -97,6 +97,30 @@ class MetadataTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             meta.installed_root(self.home, self.uid)
 
+    def test_harness_candidate_without_reference(self):
+        # A retired node's fallback (#2703): same checks, no reference file.
+        self.ref.unlink()
+        self.assertEqual(meta.harness_root(self.repo, self.uid), self.repo)
+        alias = self.home / 'alias'
+        alias.symlink_to(self.repo, target_is_directory=True)
+        for candidate in (alias, Path('relative'), Path(str(self.repo) + ' x'),
+                          Path(str(self.repo) + "'")):
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                meta.harness_root(candidate, self.uid)
+        script = self.repo / 'scripts/ccc-doctor.sh'
+        script.chmod(0o620)
+        with self.assertRaises(ValueError):
+            meta.harness_root(self.repo, self.uid)
+
+    def test_harness_mode_prints_only_a_verified_root(self):
+        argv = [sys.executable, str(Path(meta.__file__)), 'harness', str(self.repo), '', str(self.home),
+                str(self.uid)]
+        done = subprocess.run(argv, text=True, capture_output=True)
+        self.assertEqual((done.returncode, done.stdout), (0, f'{self.repo}\n'))
+        (self.repo / 'bridge/start.sh').unlink()
+        done = subprocess.run(argv, text=True, capture_output=True)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, '', ''))
+
     @unittest.skipUnless(os.getuid() == 0 and shutil.which('runuser'), 'requires root/runuser')
     def test_actual_foreign_replacement_cannot_select_doctor(self):
         # Separate shared-temp fixture so the unprivileged attacker can traverse.

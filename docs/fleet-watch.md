@@ -57,6 +57,32 @@ after the reviewed fix is integrated into the normal checkout.
   disable the bridge, then write a `~/.claude/frontends` that leaves out
   `telegram` (e.g. `matrix`); to un-retire, add `telegram` back to the list and
   start the bridge — a marker is inert while a bridge runs.
+
+  A retired channel is not a retired harness (#2703). Until then the probe
+  answered `RETIRED` and stopped before the doctor, so the 2026-11-06 doctor
+  sweep judged 1 of 12 nodes. With `CCC_FLEET_DOCTOR=1` a retired node is now
+  inspected as the account the watcher logs in as (there is no bridge account):
+  `ccc-doctor` against its `~/.claude` and `ccc-memory-check.sh --json` with
+  that dir's state/cache, from the harness its `~/.claude/self-update.repo`
+  names. Without a reference the first of `~/ccc-node` and `/opt/ccc-node`
+  holding a doctor is used; either way the checkout must pass the same
+  ownership/permission check as a prepared runtime's install reference, and a
+  reference that fails it is not replaced by a guess. Verdicts, same rules and
+  per-node budget (110 s) as a serving node:
+  - doctor exit ≠ 0 → `DRIFT <node> doctor_exit=<n> retired=<marker>`;
+  - memory degraded/error for `CCC_FLEET_MEMORY_CONFIRM` sweeps →
+    `DRIFT <node> memory=<state> sweeps=N/M retired=<marker>`;
+  - otherwise `RETIRED <node> marker=<marker>`, with
+    ` memory-pending:<state> N/M` or ` memory:unknown` appended like an `OK`
+    line's note;
+  - no usable harness → `RETIRED <node> marker=<marker> doctor:<reason>`
+    (`no-harness`, `unverified-reference`, `unverified-harness`), never a
+    failure.
+
+  `retired=` is deliberately not `channel=`: the change-mode tracker reads
+  `channel=` as the pair's channel, and the row belongs to the node's Telegram
+  pair. Plain and `--light` runs are unchanged (no doctor, the bare `RETIRED`
+  line).
 - **Matrix availability:** identify the Matrix process by its exact
   `CCC_CHANNEL=matrix` environment or systemd cgroup. Check its private
   `BOT_DATA_DIR/health.json` only when it is fresh and names that PID. An older
