@@ -255,6 +255,9 @@ REL_CHECKBOX_JUDGED = "checkbox-verdict-recorded"  # family-messenger#167
 REL_OPERATIONAL = "operational-wording"  # esp32-iphone-agent#74/#60, ccc-node#1864
 REL_PLANNING = "planning-estimate"  # family-messenger#271 "스파이크(1~2주)"
 REL_PROCESS = "process-duration"  # family-messenger#338 "수일 소요"
+REL_PAST_EVENT = "past-event-offset"  # family-messenger#616 "15시간 뒤에야 일어났고" (#2635)
+REL_CLOCK_GLOSS = "anchored-clock-gloss"  # family-messenger#616 "10-31 11:27:19(약 15시간 뒤)"
+REL_GENERIC = "generic-duration"  # ccc-node#2659 "며칠씩 … 이어질 수 있습니다"
 
 # Accounts whose words are the fleet's own (skills/external-github-content:
 # jinon86, seoseo-ai and the fleet dependency bots). GitHub renders an app as
@@ -300,6 +303,43 @@ PROCESS_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 PROCESS_NOUN = re.compile(r"(심사|발급|배송|(?<![\w-])review)", re.IGNORECASE)
+# How long something that already happened took, in incident forensics:
+# "보충이 15시간 뒤에야 일어났고" (family-messenger#616), "며칠 동안 알림이
+# 0건이었습니다" (the ccc-node#2659 shape, #2635). The cue is a past-tense
+# predicate in the term's own clause, at most PAST_WINDOW_CHARS after it and
+# never past a comma or sentence end. Korean past tense is a syllable with the
+# final consonant ㅆ (났·었·였·했·렸·됐 …); 있 (present "exists") and 겠
+# (future "will") share that final and are excluded. Only finished endings
+# count: "없었다면" (conditional), "됐는지" (a question to check later) and
+# "뒤에야 판정할 수 있다" stay windows.
+_SS_FINAL = "".join(
+    chr(0xAC00 + (lead * 21 + vowel) * 28 + 20) for lead in range(19) for vowel in range(21)
+).replace("있", "").replace("겠", "")
+PAST_PREDICATE = re.compile(f"[{_SS_FINAL}](?:다(?!면)|고|습니다|는데|지만|으며|으나|어요|어서|던)")
+PAST_WINDOW_CHARS = 25
+# A past-tense verb can still report a future commitment: "24시간 뒤
+# 판정하기로 했습니다" (decided to), "알리겠다고 했다" (said it will), "재확인할
+# 예정이었다". Any of these in the clause keeps the term a window.
+FUTURE_INTENT = re.compile(r"기로|겠|예정|것")
+CLAUSE_END = re.compile(r"[,，;]|[.!?。](?:\s|$)|\n")
+# A relative term glossing a month-day clock time it sits next to: "다음 보충은
+# **10-31 11:27:19**(약 15시간 뒤)" (family-messenger#616). The moment is
+# absolute; the offset only says how far it was from the writing. _dates_in
+# needs a year, so the gloss is judged here instead of widening it. The term
+# must close the gloss — a bracket, clause end or the paragraph end right after
+# it — so "10-31 11:27(15시간 뒤 재확인)" stays a booking.
+CLOCK_GLOSS_BEFORE = re.compile(
+    r"(?<![\d-])\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*KST)?"
+    r"[\s*_`]{0,3}[(（]?\s*(?:약|대략|about|~)?\s*$",
+    re.IGNORECASE,
+)
+CLOCK_GLOSS_AFTER = re.compile(r"[\s*_`]*(?:[)）,，;.。]|$)")
+CLOCK_GLOSS_LOOKBACK = 40
+# A distributive duration in a possibility, not a schedule: "실제 장애가
+# 며칠씩 조용히 이어질 수 있습니다" (ccc-node#2659). The term takes the 씩
+# particle and the same clause ends in a "can/could" form (수 있다 …).
+DISTRIBUTIVE_SUFFIX = re.compile(r"[*_]*씩")
+POSSIBILITY_ENDING = re.compile(r"수\s*있(?:다|습니다|음|어요|고|으며|는)")
 
 # Anchor + offset bookings (#2252). a2a-nexus#1504 booked Phase 7-B as
 # "실행 예약: … OnCalendar=2026-10-09 22:00:00 KST" with "B8: 관측 타이머
@@ -759,10 +799,32 @@ def _is_quoted(paragraph: str, start: int, end: int) -> bool:
     return False
 
 
+def _clause_after(paragraph: str, match: re.Match[str]) -> str:
+    """Up to PAST_WINDOW_CHARS after the term, cut at the clause end."""
+    window = paragraph[match.end(): match.end() + PAST_WINDOW_CHARS]
+    clause_end = CLAUSE_END.search(window)
+    return window[: clause_end.start()] if clause_end else window
+
+
+def _is_clock_gloss(paragraph: str, match: re.Match[str]) -> bool:
+    before = paragraph[max(0, match.start() - CLOCK_GLOSS_LOOKBACK): match.start()]
+    return bool(CLOCK_GLOSS_BEFORE.search(before) and CLOCK_GLOSS_AFTER.match(paragraph, match.end()))
+
+
+def _is_generic_possibility(paragraph: str, match: re.Match[str]) -> bool:
+    return bool(
+        DISTRIBUTIVE_SUFFIX.match(paragraph, match.end())
+        and POSSIBILITY_ENDING.search(_clause_after(paragraph, match))
+    )
+
+
 def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
-    """Operational / planning / process wording for one unquoted relative term."""
+    """Operational / planning / process / incident wording for one unquoted relative term."""
     if OPERATIONAL_TERM.match(match.group(0)):
         return REL_OPERATIONAL
+    # Before the bracket rule: "09:25(3시간 뒤)" is a gloss, not an estimate.
+    if _is_clock_gloss(paragraph, match):
+        return REL_CLOCK_GLOSS
     before = paragraph[: match.start()].rstrip(" *_")
     after = paragraph[match.end():].lstrip(" *_")
     if before.endswith(("(", "（")) and after.startswith((")", "）")):
@@ -773,6 +835,11 @@ def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
         return REL_PROCESS
     if PROCESS_NOUN.search(paragraph[max(0, match.start() - PLANNING_WINDOW_CHARS): match.start()]):
         return REL_PROCESS
+    if _is_generic_possibility(paragraph, match):
+        return REL_GENERIC
+    clause = _clause_after(paragraph, match)
+    if PAST_PREDICATE.search(clause) and not FUTURE_INTENT.search(clause):
+        return REL_PAST_EVENT
     return None
 
 
@@ -797,15 +864,22 @@ def classify_relative_paragraph(
         A task-list item, and a verdict comment (strict, as in followup mode)
         was posted after it (family-messenger#167, PASS recorded).
 
-    The remaining three judge the wording, so they never apply when the
+    The remaining six judge the wording, so they never apply when the
     paragraph names an observation (``OBSERVATION_WORD``), and every unquoted
     term must be explained by one of them:
 
     ``operational-wording``  "당분간" — a standing arrangement.
+    ``anchored-clock-gloss`` the term glosses an adjacent month-day clock time
+                             ("10-31 11:27:19(약 15시간 뒤)", #2635).
     ``planning-estimate``    an effort estimate: a planning noun just before
                              the term ("스파이크(1~2주)") or the term alone in
                              brackets after a plan item.
     ``process-duration``     how long an outside procedure takes ("수일 소요").
+    ``generic-duration``     a distributive term (씩) in a possibility clause
+                             ("며칠씩 이어질 수 있습니다", #2635).
+    ``past-event-offset``    how long something already took: a past-tense
+                             predicate in the term's clause ("15시간 뒤에야
+                             일어났고", #2635).
     """
     if author is not None and not is_fleet_author(author):
         return REL_EXTERNAL_AUTHOR

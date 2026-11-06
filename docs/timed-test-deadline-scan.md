@@ -124,10 +124,13 @@ under `dropped_candidates`. Checked in this order:
 | `quoted-term` | every relative term sits inside quotes (`"…"`, `'…'`, `“…”`, `「…」`), inline code, or a fenced code block: rule text or a citation, not a booking | family-messenger#179 |
 | `checkbox-verdict-recorded` | a task-list item (`- [ ]`, `- [x]`), and a strict verdict comment (first-line conclusion or a `판정:`/`Verdict:` label line, as in follow-up mode) was posted after it | family-messenger#167 |
 | `operational-wording` | the term is `당분간` (a standing arrangement) | esp32-iphone-agent#74, #60, ccc-node#1864 |
+| `anchored-clock-gloss` | the term glosses a month-day clock time right before it (`**10-31 11:27:19**(약 15시간 뒤)`, `11/02 09:25(3시간 뒤)`): at most 3 markup/space characters, an optional bracket and `약`/`대략`/`~` in between, and a closing bracket, clause end or paragraph end right after the term. Checked before the bracketed `planning-estimate` rule. `10-31 11:27(15시간 뒤 재확인)` and a clock in another clause stay high | family-messenger#616 |
 | `planning-estimate` | an effort estimate: a planning noun (`스파이크`, `구현`, `개발`, `작업`, `일정`, `spike`, `estimate`, …) within 15 characters before the term, or the term alone in brackets after a plan item (`**D. 푸시**(1~2주)`) | family-messenger#271 |
 | `process-duration` | how long an outside procedure takes: `소요`/`걸림`/`takes` right after the term, or `심사`/`발급`/`배송`/`review` just before it | family-messenger#338, #584 |
+| `generic-duration` | a distributive term (`며칠씩`, `몇 주씩`) whose clause, within 25 characters, ends in a possibility (`수 있다`/`있습니다`/`있음`): a generic "could last for days", not a schedule | ccc-node#2659 |
+| `past-event-offset` | how long something already took, in incident forensics: a past-tense predicate (`일어났고`, `걸렸다`, `였다`, `이었습니다`, `했습니다` — a syllable ending in ㅆ other than `있`/`겠`, with a finished ending) within 25 characters after the term, in the same clause (no comma or sentence end in between). `없었다면`, `됐는지`, `뒤에야 판정할 수 있다` stay windows | family-messenger#616, ccc-node#2635 |
 
-The last three judge the wording, so they never apply when the paragraph names
+The last six judge the wording, so they never apply when the paragraph names
 an observation (`관찰`, `관측`, `소크`, `카나리`, `모니터링`, `파일럿`,
 `시범 운영`, `soak`, `canary`, `monitor`, `observ…`, `pilot`, `burn-in`), and
 every unquoted term in the paragraph must be explained by one of them. The
