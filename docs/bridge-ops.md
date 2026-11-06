@@ -340,27 +340,29 @@ hooks; registration stays a separate, approved step.
 ## Turn spans (#2684)
 
 Beside the per-turn cost ledger (`.telegram_bot/usage-cost-ledger.jsonl`), the
-bridge appends one body-free span per terminal Claude result to
-`.telegram_bot/spans/YYYY-MM-DD.jsonl` (`core/span_ledger.py`). The file is
+bridge appends one body-free `turn` span per terminal Claude result and one
+`tool` span per completed tool call to `.telegram_bot/spans/YYYY-MM-DD.jsonl`
+(`core/span_ledger.py`, `core/tool_spans.py`). The file is
 named by the **UTC** day of the write; one line is one JSON object. Attribute
 names follow the OpenTelemetry GenAI conventions so a later exporter needs no
 rename; no collector, OTLP exporter or trace propagation is involved.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `kind` | str | `turn` (this slice); `tool`, `model`, `a2a` are reserved |
+| `kind` | str | `turn` or `tool`; `model`, `a2a` are reserved |
 | `status` | str | `ok`, `error` or `timeout` |
-| `error.type` | str | Result subtype of an error turn (e.g. `error_max_turns`) |
-| `start_ts` | float | Epoch seconds: write time minus `duration_ms` |
-| `duration_ms` | int | SDK `ResultMessage.duration_ms` |
-| `gen_ai.operation.name` | str | `invoke_agent` for a turn |
+| `error.type` | str | Result subtype of an error turn (e.g. `error_max_turns`); `tool_error` for a tool result with `is_error` |
+| `start_ts` | float | Epoch seconds. Turn: write time minus `duration_ms`. Tool: when the bridge saw the tool use |
+| `duration_ms` | int | Turn: SDK `ResultMessage.duration_ms`. Tool: bridge-observed latency (monotonic, see below) |
+| `gen_ai.operation.name` | str | `invoke_agent` for a turn, `execute_tool` for a tool call |
 | `gen_ai.request.model` | str | Model with the most output in the turn's usage delta |
 | `gen_ai.usage.input_tokens` | int | Per-turn input **including** cache read/creation (OTel semantics) |
 | `gen_ai.usage.output_tokens` | int | Per-turn output tokens |
 | `gen_ai.conversation.id` | str | `sha256("ccc-span:" + session_id)[:16]` — never the raw id |
-| `gen_ai.tool.name` | str | Reserved for tool spans |
+| `gen_ai.tool.name` | str | Tool spans: the tool name only (`Read`, `Bash`, `mcp__server__tool`); must match `^[A-Za-z0-9_-]{1,128}$`, otherwise omitted |
+| `ccc.tool.scope` | str | Tool spans: `main` (the turn's own call, incl. a `Task`) or `subagent` (a call the SDK forwarded with `parent_tool_use_id`) |
 | `ccc.node` / `ccc.channel` | str | `CCC_NODE` (else short hostname) / `CCC_CHANNEL` |
-| `ccc.turn_id` | str | SDK `ResultMessage.uuid` |
+| `ccc.turn_id` | str | Turn spans: SDK `ResultMessage.uuid`. Not on tool spans (unknown while the tool runs) |
 | `ccc.skill` | str | Reserved |
 | `ccc.outcome` | str | SDK result subtype (`success`, `error_during_execution`, …) |
 | `ccc.cost_usd` | float | Per-turn cost delta, for cross-checking the cost ledger |
@@ -383,6 +385,52 @@ regular files named exactly `YYYY-MM-DD.jsonl` (a real date) that are at least
 directories and symlinks are never touched. Kill switch:
 `CCC_SPAN_LEDGER_ENABLED=false` (default `true`); `CCC_USAGE_METER_ENABLED=false`
 turns spans off together with the meter and the cost ledger.
+
+### Tool spans (#2684 slice 2)
+
+Source: the SDK frame stream the bridge already observes
+(`set_sdk_frame_observer`), not a `PostToolUse` hook — a hook process knows
+neither the project's spans directory nor the conversation, and would need a
+fleet `settings.json` change. `ToolSpanTracker` pairs each assistant
+`ToolUseBlock` with the `ToolResultBlock` of the same `tool_use_id` in a later
+user message; one span is written when the result arrives.
+
+- **Body-free:** only the tool name is read from the use block and only
+  `tool_use_id`/`is_error` from the result block. Tool input, output, file
+  paths and command text are never read into the span; the raw call id is an
+  in-memory pairing key only and is not stored. The allowlist sanitizer above
+  still runs on every line.
+- **Latency meaning:** `duration_ms` = monotonic time between the frame with
+  the use and the frame with its result, as seen by the bridge. It includes
+  SDK/CLI transport and any approval wait, not only the tool's own work.
+- **Linking to the turn:** a tool span carries the same hashed
+  `gen_ai.conversation.id` as its turn span (from `AssistantMessage.session_id`,
+  else the last session seen for that conversation) but no `ccc.turn_id`; join
+  by conversation id and `start_ts` within the turn's
+  `[start_ts, start_ts + duration_ms]`.
+- **Subagents:** the parent's `Task` use/result is one `main` span; nested
+  calls the SDK forwards (with `parent_tool_use_id`) are their own `subagent`
+  spans. Each call id is counted at most once (a re-seen use or a second result
+  is ignored). A per-tool rollup that wants only top-level work filters on
+  `ccc.tool.scope=main`.
+- **Server-side tools** (`ServerToolUseBlock`: web search, advisor, …) are not
+  tool spans: they run inside the API call and arrive in one message, so the
+  observed latency would always be ~0.
+- **Unmatched calls:** a terminal `ResultMessage` drops that conversation's
+  unmatched top-level calls (the CLI gives every call a result before it ends a
+  turn — interrupts get an `is_error` result — so this is an anomaly, not a
+  timeout; nothing is written). Subagent calls survive it, since a background
+  subagent can outlive the parent's result. When the bridge drops a session
+  (`/new`, `/revert`, error recovery) all its pending calls are forgotten.
+  Turns that end without a `ResultMessage` write no tool span for in-flight
+  calls (later slice).
+- **Bounds and cost:** at most 256 calls in flight per bridge process (oldest
+  evicted); idle-evicted sessions' leftovers age out through that bound. One
+  small `O_APPEND` line per completed call on the event loop, no fsync — a turn
+  with hundreds of tool calls costs hundreds of tiny appends, negligible next to
+  the tool calls themselves.
+- **Scope:** Claude provider only (the frame-observer seam); autonomous
+  between-turns turns are covered too. Codex/Piri/Danso: later slice.
 
 ## Group rows still holding a DM session (#2075)
 

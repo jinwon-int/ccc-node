@@ -51,6 +51,7 @@ from telegram_bot.core.usage import (
 )
 from telegram_bot.core.usage_cost_ledger import CostLedger
 from telegram_bot.core.span_ledger import SpanLedger, turn_span_from_claude_result
+from telegram_bot.core.tool_spans import ToolSpanTracker
 from telegram_bot.core.fleet_alert_relay import default_node_name
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.core.async_completion_event import (
@@ -352,6 +353,12 @@ class ProjectChatHandler(
             except Exception:
                 logger.exception("Cost ledger unavailable; continuing without spend tracking")
             self._span_ledger = self._build_span_ledger()
+        # Tool spans (#2684 slice 2) share the span ledger and its kill switches.
+        self._tool_spans: Optional[ToolSpanTracker] = (
+            ToolSpanTracker(self._span_ledger, clock=self._clock.time)
+            if self._span_ledger is not None
+            else None
+        )
         if self._usage_meter is not None and self._agent_runtime is not None:
             set_usage_recorder = getattr(self._agent_runtime, "set_usage_recorder", None)
             if callable(set_usage_recorder):

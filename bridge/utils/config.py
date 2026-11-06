@@ -477,7 +477,7 @@ class Config(
         default=True,
         alias="CCC_SPAN_LEDGER_ENABLED",
         description=(
-            "Body-free per-turn spans with OTel GenAI attribute names (#2684) in "
+            "Body-free per-turn and per-tool-call spans with OTel GenAI attribute names (#2684) in "
             ".telegram_bot/spans/YYYY-MM-DD.jsonl. Also off when "
             "CCC_USAGE_METER_ENABLED=false. Span writes never block turns."
         ),

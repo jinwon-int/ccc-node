@@ -259,7 +259,7 @@ Claude:  ...
 | `CCC_RESUME_PERSISTED_SESSIONS` | 仅 Claude | `true` | SDK transcript 仍存在时，在重启后恢复持久化会话；dead-session wakeup 的前置条件 |
 | `CCC_DEAD_SESSION_WAKEUP` | 仅 Claude | `false` | 唤醒已退出的会话并交付待处理的后台任务通知，避免通知一直孤立在 transcript 中直到下一条手动消息。启用后会发起消耗 token 的自主轮次，在 `usage-meter.json` 中记为 `autonomous`，并受 Claude 每日自主用量额度门控；跳过计数可在 health/status 中查看；要求 `CCC_RESUME_PERSISTED_SESSIONS=true` |
 | `CCC_USAGE_METER_ENABLED` | 否 | `true` | 按提供商及 interactive/autonomous 模式将无正文的用量计数写入 `.telegram_bot/usage-meter.json` |
-| `CCC_SPAN_LEDGER_ENABLED` | 仅 Claude | `true` | 每个 Claude 终止结果向 `.telegram_bot/spans/YYYY-MM-DD.jsonl` 追加一条无正文的 `turn` span（OTel GenAI 属性名）；`CCC_USAGE_METER_ENABLED=false` 时同样关闭。从不阻塞轮次 |
+| `CCC_SPAN_LEDGER_ENABLED` | 仅 Claude | `true` | 每个 Claude 终止结果向 `.telegram_bot/spans/YYYY-MM-DD.jsonl` 追加一条无正文的 `turn` span，每个完成的工具调用追加一条 `tool` span（OTel GenAI 属性名）；`CCC_USAGE_METER_ENABLED=false` 时同样关闭。从不阻塞轮次 |
 | `CCC_SPAN_RETENTION_DAYS` | 否 | `14` | span 日文件保留天数（1–366）；更早的 `YYYY-MM-DD.jsonl` 每个 UTC 日最多清理一次 |
 | `CCC_USAGE_BUDGET_TOKENS_CLAUDE` | 仅 Claude | `0` | Claude 每日自主输入+输出 token 额度；`0` 表示禁用门控。交互用量仍会计量，但不消耗此额度且不会被拒绝 |
 | `CCC_USAGE_BUDGET_TOKENS_CODEX` | 仅 Codex | `0` | Codex 每日自主输入+输出 token 额度；`0` 表示禁用门控。交互用量仍会计量，但不消耗此额度且不会被拒绝 |
