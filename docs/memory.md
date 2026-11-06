@@ -336,6 +336,22 @@ repair-status` drawer comparison. Missing, failed, stale, malformed, or
 provider-mismatched refreshes and an unknown, `DIVERGED` or malformed index state degrade
 readiness even when SQLite is readable and recently touched.
 
+After a successful refresh the wrapper also runs the read-only `mempalace
+repair-status` (bounded by `CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TIMEOUT_SEC`,
+1-120 s, default 30) and records its verdict in the status as
+`index_status: {"state": "ok"|"diverged"|"unknown", "sqlite": N, "hnsw": N}`
+(#2693), classified by the same `parse_repair_status` in the installed
+`hooks/ccc_memory_probe.py`; the report itself is never written. MemPalace's
+flush-lag `OK` (#2336) records `ok`. A missing parser, failing or hung
+`repair-status`, or unparseable output records `unknown` and never fails the
+refresh. The readiness probe projects the field as `mempalace.refresh.index_status`
+(`absent` for older records or non-ok runs) and reports a recorded `diverged`
+as `index-diverged` when the live read is inconclusive (for example an
+`index-timeout` on a large palace) — once, and never over a live `ok`, which is
+fresher. Audience-scoped Piri lanes have no live per-scope read, so a scope's
+recorded `diverged` counts as `refresh_index_diverged` and degrades the lane
+with `index-diverged`.
+
 The readiness probe resolves `CCC_STATE_DIR`, `NUNCHI_HOME`, `NUNCHI_DB`, and
 `NUNCHI_SNAPSHOT` from the current process first, then from the recognized
 managed cron entries. Conflicting managed values fail closed instead of

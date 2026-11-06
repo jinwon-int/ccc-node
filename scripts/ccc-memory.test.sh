@@ -386,7 +386,8 @@ out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_s
   CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "failed refresh diagnostics stay bounded and body-free" '[ "$rc" = 0 ] && jq -e '\''
   .mempalace.status == "degraded" and (.mempalace.reasons | index("refresh-error")) != null
-  and .mempalace.refresh == {status:"error", provider:"codex", exit_code:17, age_seconds:10}
+  and .mempalace.refresh == {status:"error", provider:"codex", exit_code:17, age_seconds:10,
+    index_status:{state:"absent", sqlite:-1, hnsw:-1}}
 '\'' >/dev/null <<<"$out" && ! grep -q "PROBE_SECRET_REFRESH_ERROR" <<<"$out"'
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
 
@@ -398,6 +399,78 @@ ok "memory check detects a readable SQLite palace with a diverged HNSW index" '[
   .mempalace.status == "degraded" and (.mempalace.reasons | index("index-diverged")) != null
   and .mempalace.index == {status:"diverged", sqlite_count:100, hnsw_count:10, divergence:90}
 '\'' >/dev/null <<<"$out"'
+
+# #2693: mempalace-refresh.sh records the post-sweep repair-status verdict as
+# `index_status`. The probe surfaces a recorded `diverged` with the same
+# `index-diverged` reason the live check uses (so the #2692 doctor-sweep MEMORY
+# column picks it up unchanged), never twice, and never over a live `ok`
+# (the live read is fresher than the hourly record).
+ix_record() { # <index_status-json|-> [state]
+  python3 - "$probe_nunchi/mempalace-refresh.status.json" "$1" "${2:-ok}" <<'PY'
+import json, sys
+path, index, state = sys.argv[1:4]
+doc = {"schema": "ccc.nunchi.mempalace-refresh.v1", "provider": "codex", "state": state,
+       "exit_code": 0 if state == "ok" else 17, "started_at": 180, "finished_at": 190}
+if index != "-":
+    doc["index_status"] = json.loads(index)
+open(path, "w").write(json.dumps(doc) + "\n")
+PY
+}
+ix_probe() { # <live-repair-text>
+  HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+    CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$1" \
+    CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
+}
+ix_record '{"state":"diverged","sqlite":56690,"hnsw":11392}'
+out="$(ix_probe "")"; rc=$?
+ok "refresh index_status=diverged degrades MemPalace as index-diverged when the live read is inconclusive" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "degraded" and (.mempalace.reasons | index("index-diverged")) != null
+  and .mempalace.index.status == "unknown"
+  and .mempalace.refresh.status == "ok"
+  and .mempalace.refresh.index_status == {state:"diverged", sqlite:56690, hnsw:11392}
+'\'' >/dev/null <<<"$out"'
+out="$(ix_probe "$repair_diverged")"; rc=$?
+ok "a live index-diverged plus a recorded diverged index reports index-diverged exactly once" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "degraded" and ([.mempalace.reasons[] | select(. == "index-diverged")] | length) == 1
+'\'' >/dev/null <<<"$out"'
+out="$(ix_probe "$repair_ok")"; rc=$?
+ok "a live ok index read overrides an older recorded diverged index" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "ok" and .mempalace.reasons == []
+  and .mempalace.refresh.index_status.state == "diverged"
+'\'' >/dev/null <<<"$out"'
+ix_record '{"state":"ok","sqlite":303009,"hnsw":302895}'
+out="$(ix_probe "")"; rc=$?
+ok "a recorded #2336 flush-lag index_status=ok adds no reason" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.reasons == ["index-unknown"]
+  and .mempalace.refresh.index_status == {state:"ok", sqlite:303009, hnsw:302895}
+'\'' >/dev/null <<<"$out"'
+ix_record '{"state":"unknown","sqlite":-1,"hnsw":-1}'
+out="$(ix_probe "$repair_ok")"; rc=$?
+ok "a recorded index_status=unknown (repair-status unavailable) is not a degradation" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "ok" and .mempalace.refresh.status == "ok" and .mempalace.refresh.index_status.state == "unknown"
+'\'' >/dev/null <<<"$out"'
+ix_record '-'
+out="$(ix_probe "$repair_ok")"; rc=$?
+ok "a pre-#2693 refresh record without index_status stays ok and projects absent" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "ok" and .mempalace.refresh.status == "ok"
+  and .mempalace.refresh.index_status == {state:"absent", sqlite:-1, hnsw:-1}
+'\'' >/dev/null <<<"$out"'
+for ix_bad in '"diverged"' '{"state":"PROBE_SECRET_IX","sqlite":1,"hnsw":1}' '{"state":"diverged","sqlite":true,"hnsw":1}' '{"state":"diverged","sqlite":1}' '{"state":"diverged","sqlite":1,"hnsw":1,"body":"PROBE_SECRET_IX"}'; do
+  ix_record "$ix_bad"
+  out="$(ix_probe "")"; rc=$?
+  ok "a malformed index_status ($ix_bad) projects unknown, keeps the refresh valid and adds no index-diverged" '[ "$rc" = 0 ] && jq -e '\''
+    .mempalace.refresh.status == "ok" and .mempalace.refresh.index_status == {state:"unknown", sqlite:-1, hnsw:-1}
+    and (.mempalace.reasons | index("index-diverged")) == null
+  '\'' >/dev/null <<<"$out" && ! grep -q PROBE_SECRET_IX <<<"$out"'
+done
+ix_record '{"state":"diverged","sqlite":56690,"hnsw":11392}' error
+out="$(ix_probe "")"; rc=$?
+ok "index_status on a non-ok refresh record is not judged" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.refresh.status == "error" and .mempalace.refresh.index_status.state == "absent"
+  and (.mempalace.reasons | index("index-diverged")) == null
+'\'' >/dev/null <<<"$out"'
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
 
 PROBE_PY="$ROOT/scripts/ccc_memory_probe.py" python3 - <<'PY'
 import importlib.util
@@ -649,6 +722,28 @@ ok "a Piri audience-scoped lane still judges per-scope refresh status" '[ "$rc" 
   and (.mempalace.reasons | index("refresh-count")) != null
   and (.mempalace.reasons | index("refresh-stale")) != null
 '\'' >/dev/null <<<"$out"'
+# #2693: scoped lanes run no live per-scope repair-status, so the index state
+# each scope's refresh recorded is the only index signal there.
+mkdir -p "$cs_private/nunchi"; chmod 700 "$cs_private/nunchi"
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"piri","state":"ok","exit_code":0,"started_at":190,"finished_at":195,"index_status":{"state":"diverged","sqlite":56690,"hnsw":11392}}' \
+  > "$cs_root/shared/nunchi/mempalace-refresh.status.json"
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"piri","state":"ok","exit_code":0,"started_at":190,"finished_at":195,"index_status":{"state":"ok","sqlite":10,"hnsw":10}}' \
+  > "$cs_private/nunchi/mempalace-refresh.status.json"
+chmod 600 "$cs_root/shared/nunchi/mempalace-refresh.status.json" "$cs_private/nunchi/mempalace-refresh.status.json"
+out="$(run_cs_probe "$cs_piri")"; rc=$?
+ok "a Piri audience-scoped lane surfaces a scope's recorded diverged index as index-diverged" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "degraded" and .mempalace.reasons == ["index-diverged"]
+  and .nunchi.audience_scoped.refresh_index_diverged == 1
+'\'' >/dev/null <<<"$out"'
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"piri","state":"ok","exit_code":0,"started_at":190,"finished_at":195,"index_status":{"state":"ok","sqlite":303009,"hnsw":302895}}' \
+  > "$cs_root/shared/nunchi/mempalace-refresh.status.json"
+out="$(run_cs_probe "$cs_piri")"; rc=$?
+ok "a Piri audience-scoped lane with recorded ok indexes stays ok" '[ "$rc" = 0 ] && jq -e '\''
+  .mempalace.status == "ok" and .mempalace.reasons == [] and .nunchi.audience_scoped.refresh_index_diverged == 0
+'\'' >/dev/null <<<"$out"'
+rm -f "$cs_private/nunchi/mempalace-refresh.status.json"
+printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"piri","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' \
+  > "$cs_root/shared/nunchi/mempalace-refresh.status.json"
 out="$(run_cs_probe $'*/10 * * * * bash /tmp/ingest-cron.sh # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816')"; rc=$?
 ok "a non-scoped Claude lane still requires its refresh cron when the CLI is installed" '[ "$rc" = 0 ] && jq -e '\''
   .nunchi.status == "degraded" and (.nunchi.reasons | index("refresh-count")) != null
