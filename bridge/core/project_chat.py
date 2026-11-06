@@ -50,6 +50,8 @@ from telegram_bot.core.usage import (
     synthesize_service_windows,
 )
 from telegram_bot.core.usage_cost_ledger import CostLedger
+from telegram_bot.core.span_ledger import SpanLedger, turn_span_from_claude_result
+from telegram_bot.core.fleet_alert_relay import default_node_name
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE, UsageMeter
 from telegram_bot.core.async_completion_event import (
     NormalizedAsyncCompletionEvent,
@@ -325,6 +327,7 @@ class ProjectChatHandler(
         self._claude_rate_limit: Optional[UsageSnapshot] = None
         self._usage_meter: Optional[UsageMeter] = None
         self._cost_ledger: Optional[CostLedger] = None
+        self._span_ledger: Optional[SpanLedger] = None
         if getattr(self._config, "usage_meter_enabled", True):
             try:
                 self._usage_meter = UsageMeter(
@@ -348,6 +351,7 @@ class ProjectChatHandler(
                 )
             except Exception:
                 logger.exception("Cost ledger unavailable; continuing without spend tracking")
+            self._span_ledger = self._build_span_ledger()
         if self._usage_meter is not None and self._agent_runtime is not None:
             set_usage_recorder = getattr(self._agent_runtime, "set_usage_recorder", None)
             if callable(set_usage_recorder):
@@ -373,6 +377,27 @@ class ProjectChatHandler(
         """Node-local durable usage meter, when enabled (#388)."""
 
         return self._usage_meter
+
+    def _build_span_ledger(self) -> Optional[SpanLedger]:
+        """Body-free turn spans (#2684) beside the cost ledger.
+
+        Built only under the same metering opt-out as the cost ledger, plus its
+        own ``CCC_SPAN_LEDGER_ENABLED`` kill switch. Never raises.
+        """
+
+        if not getattr(self._config, "span_ledger_enabled", True):
+            return None
+        try:
+            return SpanLedger(
+                self.project_root / ".telegram_bot" / "spans",
+                retention_days=int(getattr(self._config, "span_retention_days", 14) or 14),
+                clock=self._clock.time,
+                node=default_node_name(),
+                channel=str(getattr(self._config, "channel", "telegram") or "telegram"),
+            )
+        except Exception:
+            logger.exception("Span ledger unavailable; continuing without spans")
+            return None
 
     def render_cost_report(self, *, days: int = 7) -> str:
         """Render the additive per-model spend block for ``/usage``.
@@ -972,19 +997,30 @@ class ProjectChatHandler(
         key = (user_id, chat_id, session_id)
         snapshot = parse_claude_result(msg, observed_at=self._clock.time())
         cost_ledger = getattr(self, "_cost_ledger", None)
-        if cost_ledger is not None:
+        span_ledger = getattr(self, "_span_ledger", None)
+        if cost_ledger is not None or span_ledger is not None:
             # The SDK's ResultMessage totals are session-cumulative running
             # totals, zeroed on ConversationResetMessage — appending them raw
             # re-counted every earlier turn in the window (#1205 D-3). Write
             # the per-turn delta against the previous cached snapshot for this
             # session key instead; a reset surfaces as a new key (no previous)
             # or a backwards total, both handled inside delta_from_snapshots.
-            previous = self._claude_usage.get(key)
-            cost_ledger.record_snapshot(
-                delta_from_snapshots(previous, snapshot),
-                provider="claude",
-                session_id=session_id,
-            )
+            delta = delta_from_snapshots(self._claude_usage.get(key), snapshot)
+            if cost_ledger is not None:
+                cost_ledger.record_snapshot(
+                    delta,
+                    provider="claude",
+                    session_id=session_id,
+                )
+            if span_ledger is not None:
+                # One body-free ``turn`` span per terminal result (#2684), from
+                # the same per-turn delta. Never blocks the turn.
+                try:
+                    span_ledger.record(
+                        turn_span_from_claude_result(msg, delta, end_ts=self._clock.time())
+                    )
+                except Exception:
+                    logger.debug("Turn span record failed", exc_info=True)
         self._claude_usage[key] = snapshot
         self._claude_usage = dict(tuple(self._claude_usage.items())[-128:])
 

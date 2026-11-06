@@ -337,6 +337,53 @@ admin-only), so run it where that session lives — the relay node — e.g. week
 from cron with `GH_CONFIG_DIR` pointing at that session. It never creates
 hooks; registration stays a separate, approved step.
 
+## Turn spans (#2684)
+
+Beside the per-turn cost ledger (`.telegram_bot/usage-cost-ledger.jsonl`), the
+bridge appends one body-free span per terminal Claude result to
+`.telegram_bot/spans/YYYY-MM-DD.jsonl` (`core/span_ledger.py`). The file is
+named by the **UTC** day of the write; one line is one JSON object. Attribute
+names follow the OpenTelemetry GenAI conventions so a later exporter needs no
+rename; no collector, OTLP exporter or trace propagation is involved.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `kind` | str | `turn` (this slice); `tool`, `model`, `a2a` are reserved |
+| `status` | str | `ok`, `error` or `timeout` |
+| `error.type` | str | Result subtype of an error turn (e.g. `error_max_turns`) |
+| `start_ts` | float | Epoch seconds: write time minus `duration_ms` |
+| `duration_ms` | int | SDK `ResultMessage.duration_ms` |
+| `gen_ai.operation.name` | str | `invoke_agent` for a turn |
+| `gen_ai.request.model` | str | Model with the most output in the turn's usage delta |
+| `gen_ai.usage.input_tokens` | int | Per-turn input **including** cache read/creation (OTel semantics) |
+| `gen_ai.usage.output_tokens` | int | Per-turn output tokens |
+| `gen_ai.conversation.id` | str | `sha256("ccc-span:" + session_id)[:16]` — never the raw id |
+| `gen_ai.tool.name` | str | Reserved for tool spans |
+| `ccc.node` / `ccc.channel` | str | `CCC_NODE` (else short hostname) / `CCC_CHANNEL` |
+| `ccc.turn_id` | str | SDK `ResultMessage.uuid` |
+| `ccc.skill` | str | Reserved |
+| `ccc.outcome` | str | SDK result subtype (`success`, `error_during_execution`, …) |
+| `ccc.cost_usd` | float | Per-turn cost delta, for cross-checking the cost ledger |
+| `ccc.usage.cache_read_tokens` / `ccc.usage.cache_creation_tokens` | int | Cache share of `gen_ai.usage.input_tokens` (the cost ledger's `in` excludes it) |
+
+Guarantees: keys outside this table are dropped; strings must be
+identifier-shaped (no whitespace), are capped at 128 characters and run through
+`utils/redaction.py` (a match stores `[REDACTED_CREDENTIAL]`), so prompt, tool
+and answer text cannot be recorded. Writes are a single `O_APPEND` `write()` of
+one line (safe with a Telegram and a Matrix frontend on one project root),
+files are `0600` in a `0700` directory, the day file is opened `O_NOFOLLOW`,
+a symlinked spans directory is refused, and every failure is swallowed (debug
+log only) — the turn path is never blocked. No fsync: spans are telemetry; a
+crash can lose the last unflushed lines. Readers (`iter_spans`) skip corrupt
+or torn lines.
+
+Retention: at most once per UTC day per process, the first span write deletes
+regular files named exactly `YYYY-MM-DD.jsonl` (a real date) that are at least
+`CCC_SPAN_RETENTION_DAYS` days old (default `14`, range 1–366); other names,
+directories and symlinks are never touched. Kill switch:
+`CCC_SPAN_LEDGER_ENABLED=false` (default `true`); `CCC_USAGE_METER_ENABLED=false`
+turns spans off together with the meter and the cost ledger.
+
 ## Group rows still holding a DM session (#2075)
 
 Before #2092, a group/room row in `sessions.json` could end up holding the
