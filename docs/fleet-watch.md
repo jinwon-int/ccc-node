@@ -64,10 +64,12 @@ after the reviewed fix is integrated into the normal checkout.
   inspected as the account the watcher logs in as (there is no bridge account):
   `ccc-doctor` against its `~/.claude` and `ccc-memory-check.sh --json` with
   that dir's state/cache, from the harness its `~/.claude/self-update.repo`
-  names. Without a reference the first of `~/ccc-node` and `/opt/ccc-node`
-  holding a doctor is used; either way the checkout must pass the same
-  ownership/permission check as a prepared runtime's install reference, and a
-  reference that fails it is not replaced by a guess. Verdicts, same rules and
+  names (read under the integrity rule of **Installed harness** below: 0644 is
+  fine, writable by others or foreign-owned is not). Without a reference the
+  first of `~/ccc-node` and `/opt/ccc-node` holding a doctor is used; either
+  way the checkout must pass the same ownership/permission check as a prepared
+  runtime's install reference, and a reference that fails it is not replaced
+  by a guess. Verdicts, same rules and
   per-node budget (110 s) as a serving node:
   - doctor exit ≠ 0 → `DRIFT <node> doctor_exit=<n> retired=<marker>`;
   - memory degraded/error for `CCC_FLEET_MEMORY_CONFIRM` sweeps →
@@ -107,9 +109,13 @@ after the reviewed fix is integrated into the normal checkout.
   seal, editable package, dependency fingerprint and native probes. This is
   local provenance, not a fresh network fetch or an immutability guarantee.
   The existing sibling `preparations/<name>/{source,job}` layout stays supported.
-- **Installed harness:** for a prepared launch, use the owner-private
+- **Installed harness:** for a prepared launch, use the
   `.claude/self-update.repo` recorded by setup and maintained by the operator.
-  Validate the reference, expected CCC files, imported script tree and their
+  The reference is a path, not a secret, so integrity decides, not privacy
+  (#2703): a regular file (never a symlink) owned by root or the inspected
+  account with no group/other write bit — the 0644 most nodes carry is
+  accepted, 0664/0646/0666 or a foreign owner are not. Preparation receipts
+  stay owner-private. Validate the reference, expected CCC files, imported script tree and their
   ancestor ownership/write permissions (root or the serving owner; Android
   platform ancestors are treated separately); do not search for a checkout
   that happens to pass. Missing, unsafe or unusable references alert as

@@ -965,9 +965,18 @@ if [ "$(id -u)" = 0 ]; then
 else
   echo 'SKIP: root-owned prepared probe routing fixture (metadata/reference tests run on all users)'
 fi
-chmod 644 "$TMP/probe-home/.claude/self-update.repo"
-PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
-ok "unsafe installation record is unverified" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
+# The reference is a path, not a secret (#2703): world-readable 0644, the shape
+# every VPS node carries, is accepted; one others could rewrite is not.
+if [ "$(id -u)" = 0 ]; then
+  chmod 644 "$TMP/probe-home/.claude/self-update.repo"
+  PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+  ok "a read-only 0644 installation record is accepted" 'grep -q "^DOCTOR_ROOT=$TMP/install-repo$" "$TMP/prep-out" && grep -q "^DOCTOR=0$" "$TMP/prep-out"'
+fi
+for unsafe_mode in 664 646; do
+  chmod "$unsafe_mode" "$TMP/probe-home/.claude/self-update.repo"
+  PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
+  ok "a writable-by-others installation record ($unsafe_mode) is unverified" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
+done
 
 # Interrupted/malformed inspection output cannot be interpreted as DOWN.
 printf 'RUNTIME=/opt/ccc-node\n' > "$TMP/reply/partial"
@@ -1340,8 +1349,14 @@ ok "retired probe: a plain probe is unchanged and runs nothing" \
 ret_probe "$RH/h-ref" CCC_FLEET_DOCTOR=0
 ok "retired probe: CCC_FLEET_DOCTOR=0 is the plain probe" \
   '[ "$(cat "$TMP/ret-out")" = "$(printf "RUNTIME=-\nAVAIL=retired\nRETIRED=frontends\nUNIT=-\nPREPARED=-\nPROBE_COMPLETE=1")" ] && [ ! -s "$TMP/ret-calls" ]'
-# A reference that fails the metadata check is not replaced by a guess.
-ret_home "$RH/h-badref"; ret_ref "$RH/h-badref" "$RH/inst" 644
+# The live VPS shape: a root-written, world-readable 0644 reference (#2703).
+ret_home "$RH/h-ref644"; ret_ref "$RH/h-ref644" "$RH/inst" 644
+ret_probe "$RH/h-ref644" CCC_FLEET_DOCTOR=1
+ok "retired probe: a read-only 0644 reference is used" \
+  'grep -qx "DOCTOR_ROOT=$RH/inst" "$TMP/ret-out" && grep -q "^DOCTOR=0$" "$TMP/ret-out" && grep -qx "doctor root=$RH/inst CCC_DOCTOR_CLAUDE_DIR=$RH/h-ref644/.claude" "$TMP/ret-calls"'
+# A reference that fails the metadata check (writable by others) is not
+# replaced by a guess.
+ret_home "$RH/h-badref"; ret_ref "$RH/h-badref" "$RH/inst" 664
 ret_harness "$RH/h-badref/ccc-node"
 ret_probe "$RH/h-badref" CCC_FLEET_DOCTOR=1
 ok "retired probe: an unsafe reference runs nothing and says so" \

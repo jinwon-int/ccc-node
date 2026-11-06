@@ -44,13 +44,43 @@ class MetadataTest(unittest.TestCase):
                     meta.installed_root(self.home, self.uid)
 
     def test_reference_permissions_and_owner(self):
-        for mode in (0o644, 0o660, 0o666):
+        # The reference is a path, not a secret (#2703): readable by others is
+        # fine, rewritable by anyone but root or its owner is not.
+        for mode in (0o600, 0o640, 0o644, 0o444):
+            self.ref.chmod(mode)
+            with self.subTest(mode=mode):
+                self.assertEqual(meta.installed_root(self.home, self.uid), self.repo)
+        for mode in (0o620, 0o660, 0o664, 0o602, 0o646, 0o666):
             self.ref.chmod(mode)
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 meta.installed_root(self.home, self.uid)
-        self.ref.chmod(0o600)
+        self.ref.chmod(0o644)
+        if self.uid != 0:
+            with self.assertRaises(ValueError):
+                meta.installed_root(self.home, self.uid + 1)
+
+    @unittest.skipUnless(os.getuid() == 0, 'requires chown')
+    def test_reference_owner_must_be_root_or_runtime_owner(self):
+        nobody = pwd.getpwnam('nobody').pw_uid
+        self.ref.chmod(0o644)
+        # root-owned 0644 (the live VPS shape) serves a non-root owner too
+        self.assertEqual(meta.installed_root(self.home, nobody), self.repo)
+        os.chown(self.ref, nobody, -1)
+        self.assertEqual(meta.installed_root(self.home, nobody), self.repo)
+        # foreign-owned: neither root nor the inspected account
         with self.assertRaises(ValueError):
-            meta.installed_root(self.home, self.uid + 1)
+            meta.installed_root(self.home, 0)
+        with self.assertRaises(ValueError):
+            meta.installed_root(self.home, pwd.getpwnam('daemon').pw_uid)
+
+    def test_reference_reader_is_only_for_the_reference(self):
+        # Every other record (preparation receipts) stays owner-only.
+        record = self.home / 'record.json'
+        record.write_text('{}')
+        record.chmod(0o644)
+        with self.assertRaises(ValueError):
+            meta.private_text(record, self.uid)
+        self.assertEqual(meta.reference_text(record, self.uid), '{}')
 
     def test_reference_symlink(self):
         other = self.ref.with_name('original')
