@@ -28,7 +28,9 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
 
-REPLY_RE = re.compile(r"^\s*(ok|hold)\s+#?([0-9a-z]{6})\s*$", re.IGNORECASE)
+# An optional ``1.``/``2)`` list marker is the 「한데」 choice card's line (#2700,
+# ``outbox.reply_choices``); the rest of the line stays the exact ``ok/hold <id>``.
+REPLY_RE = re.compile(r"^\s*(?:[0-9]{1,2}[.)][ \t]+)?(ok|hold)\s+#?([0-9a-z]{6})\s*$", re.IGNORECASE)
 ACK_TIER = "ack"
 REPLY_CHANNEL = "reply"
 ACTIONABLE_TIERS = ("action", "critical")
@@ -37,7 +39,7 @@ KST_LABEL = "Asia/Seoul"
 
 
 def parse_reply(text: object) -> Optional[tuple[str, str]]:
-    """``(verb, alert_id)`` for an exact ``ok <id>`` / ``hold <id>`` line, else None."""
+    """``(verb, alert_id)`` for an exact ``ok <id>`` / ``hold <id>`` line (optionally ``1. ok <id>``), else None."""
     if not isinstance(text, str) or len(text) > 64:
         return None
     m = REPLY_RE.match(text)

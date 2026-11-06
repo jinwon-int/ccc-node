@@ -331,9 +331,11 @@ def make_renotify(root: os.PathLike | str, now: Optional[float] = None) -> list[
         label = "🚨" if tier == "critical" else "⏰"
         left = total - done - 1
         tail = f"남은 재통지 {left}회" if left else "마지막 재통지"
+        # #2700: the ok/hold choice block at the end → a tap-to-choose card in 한데.
         text = (f"{label} 재통지 {done + 1}/{total} #{alert_id} ({tier}, {ago} 전 알림, 회신 없음) — "
-                f"`ok {alert_id}` 또는 `hold {alert_id}`로 답하면 멈춥니다({tail}). "
-                f"상세: 릴레이 호스트 fleet_alerts_receipt.py --queue <큐> {alert_id}")
+                f"아래에서 고르거나 `ok {alert_id}` 또는 `hold {alert_id}`로 답하면 멈춥니다({tail}). "
+                f"상세: 릴레이 호스트 fleet_alerts_receipt.py --queue <큐> {alert_id}"
+                f"\n\n{outbox.reply_choices(alert_id)}")
         new_txn, _ = outbox.enqueue(
             root, text, node=node, event="FleetAlertRenotify", tier=RENOTIFY_TIER,
             body_with_id=lambda aid, t=text: f"#{aid} {t}",

@@ -23,6 +23,21 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 MAX_BODY_BYTES = 16_000
+# Room the caller's ``body_with_id`` may add on top of a validated body: the
+# ``[sender] #<id>`` prefix and, for action/critical rows, the reply choice
+# block (#2700).
+BODY_WITH_ID_SLACK_BYTES = 256
+
+# #2700: a reply choice block under the agent-choices answer-needed header, so
+# 「한데」 renders ``ok``/``hold`` as a single-choice card. The card sends one
+# ``1. ok <id>`` line, which ``fleet_alerts_reply.parse_reply`` accepts like the
+# typed ``ok <id>``. Matrix shows it as a plain numbered list.
+REPLY_CHOICE_HEADER = "[답변 필요] 하나만 선택"
+
+
+def reply_choices(alert_id: str) -> str:
+    """The ``ok``/``hold`` choice block for one alert id (no leading blank line)."""
+    return f"{REPLY_CHOICE_HEADER}\n1. ok {alert_id}\n2. hold {alert_id}"
 DEFAULT_DEDUP_WINDOW_S = 900.0
 # Contract v2 (#2413): every alert carries a short id the owner can quote back
 # (``ok <id>`` / ``hold <id>``) and a tier; each channel records a delivery
@@ -290,7 +305,7 @@ def enqueue(
                 return existing[0], True
         alert_id = _alert_id(conn, txn)
         final = body_with_id(alert_id) if body_with_id is not None else body
-        if not isinstance(final, str) or not final.strip() or len(final.encode("utf-8")) > MAX_BODY_BYTES + 64:
+        if not isinstance(final, str) or not final.strip() or len(final.encode("utf-8")) > MAX_BODY_BYTES + BODY_WITH_ID_SLACK_BYTES:
             raise ValueError("invalid alert text")
         conn.execute(
             "INSERT INTO alerts(txn,body,created,fingerprint,node,event,alert_id,tier) VALUES (?,?,?,?,?,?,?,?)",

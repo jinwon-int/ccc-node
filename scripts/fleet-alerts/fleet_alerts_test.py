@@ -470,7 +470,9 @@ class ContractV2Test(_Base):
             outbox.delivered(self.queue, item[0], "$x")
         self.assertEqual(len(texts), 3)
         for t in texts:
-            self.assertRegex(t, r"^\[node-a\] #[0-9a-z]{6} 🔔 formatted$")
+            # #2700: the critical row also ends with the ok/hold choice block; info rows do not.
+            self.assertRegex(t, r"^\[node-a\] #([0-9a-z]{6}) 🔔 formatted(\n\n\[답변 필요\] 하나만 선택\n1\. ok \1\n2\. hold \1)?$")
+        self.assertEqual(sum("[답변 필요]" in t for t in texts), 1)
         payload = _payload(record="r-bad.json")
         payload["schema"] = "ccc.fleet-alert.v9"
         headers, body = _signed("ka", "node-a", payload, int(time.time()))
@@ -889,6 +891,52 @@ class ReplyTest(_Base):
         self.assertEqual(reply.actor_of("owner-web-87576b"), "owner")
         self.assertEqual(reply.actor_of("fleet-bot"), "fleet")
 
+
+
+class ReplyChoiceCardTest(_Base):
+    """#2700: action/critical alerts and re-notifies end with an ok/hold block 한데 draws as a card."""
+
+    def _body(self, txn: str) -> str:
+        with outbox.database(self.queue) as conn:
+            return conn.execute("SELECT body FROM alerts WHERE txn=?", (txn,)).fetchone()[0]
+
+    def test_card_line_parses_like_the_typed_reply(self) -> None:
+        self.assertEqual(reply.parse_reply("1. ok p3tw6n"), ("ok", "p3tw6n"))
+        self.assertEqual(reply.parse_reply("  2) HOLD #P3TW6N\n"), ("hold", "p3tw6n"))
+        for bad in ("1. ok p3tw6n\n2. hold p3tw6n", "123. ok p3tw6n", "1.ok p3tw6n", "1. ok p3tw6n please", "- ok p3tw6n"):
+            self.assertIsNone(reply.parse_reply(bad), bad)
+
+    def test_choice_block_items_round_trip_through_the_parser(self) -> None:
+        block = outbox.reply_choices("p3tw6n")
+        lines = block.split("\n")
+        self.assertEqual(lines[0], "[답변 필요] 하나만 선택")
+        self.assertEqual([reply.parse_reply(x) for x in lines[1:]], [("ok", "p3tw6n"), ("hold", "p3tw6n")])
+
+    def test_action_and_critical_alerts_end_with_the_block_info_does_not(self) -> None:
+        for tier, want in (("action", True), ("critical", True), ("info", False)):
+            txn, _ = rx.queue_payload(self.queue, _payload(tier=tier, record=f"{tier}.json"), None)
+            aid = outbox.alert_id_of(self.queue, txn)
+            body = self._body(txn)
+            self.assertTrue(body.startswith(f"[node-a] #{aid} 🔔 formatted"), body)
+            self.assertEqual(body.endswith(f"\n\n{outbox.reply_choices(aid)}"), want, tier)
+
+    def test_near_limit_action_text_still_fits_with_prefix_and_block(self) -> None:
+        text = "가" * (outbox.MAX_BODY_BYTES // 3)
+        txn, _ = rx.queue_payload(self.queue, _payload(text=text, tier="action", record="big.json"), None)
+        self.assertTrue(self._body(txn).endswith(outbox.reply_choices(outbox.alert_id_of(self.queue, txn))))
+
+    def test_renotify_ends_with_the_block_for_the_original_alert(self) -> None:
+        t0 = _kst(2026, 11, 6, 9, 0)
+        ta, _ = outbox.enqueue(self.queue, "look", node="node-a", tier="action")
+        outbox.delivered(self.queue, ta, "$" + ta)
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE alerts SET delivered=? WHERE txn=?", (t0, ta))
+        made = policy.make_renotify(self.queue, t0 + 16 * 60)
+        self.assertEqual(len(made), 1)
+        aid = outbox.alert_id_of(self.queue, ta)
+        body = self._body(made[0])
+        self.assertIn(f"`ok {aid}` 또는 `hold {aid}`로 답하면 멈춥니다(남은 재통지 2회)", body)
+        self.assertTrue(body.endswith(f"\n\n{outbox.reply_choices(aid)}"), body)
 
 if __name__ == "__main__":
     unittest.main()
