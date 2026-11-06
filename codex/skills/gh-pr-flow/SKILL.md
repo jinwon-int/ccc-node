@@ -74,6 +74,19 @@ so the account name is not an identity.
    gh pr view NUMBER --repo OWNER/REPO --json state,mergeStateStatus
    ```
 
+   **Never run `gh pr merge` on a queued repo, with any flag** — the merge-
+   strategy line is informational and gh still enqueues; `--delete-branch`
+   then removes the head and closes the PR (a2a-nexus#2500). Recovery: push
+   the same commit, `gh pr reopen`, wait for the re-run checks, enqueue over
+   GraphQL; the exact-head approval survives.
+
+   **Enqueue as a user, never as `GITHUB_TOKEN`.** A `merge_group` event made
+   by `GITHUB_TOKEN` (e.g. `auto-merge.yml` running `gh pr merge --auto`) starts
+   no workflow runs, so required checks stay pending and the queue drops the
+   PR at its timeout (~60 min; a2a-nexus#2501). `AWAITING_CHECKS` with no
+   `gh run list --event merge_group` entry for `pr-<n>` is that cause —
+   re-enqueue as a user at once.
+
    Enabling a queue on a further repo has a prerequisite: every *required*
    check's workflow must also trigger on `merge_group`, or the group never
    reports and enqueued PRs wait forever.
@@ -82,8 +95,9 @@ so the account name is not an identity.
    squash-merged branch.
 
    A queue merge does **not** clean up the head branch, and `gh pr merge -d` is
-   refused on a queued repo, so cleanup falls entirely to the repo's
-   `delete_branch_on_merge` — off on `ccc-node`, on for `piri`/`fleet-skills`.
+   **not refused** on a queued repo: it enqueues and then deletes the head ref,
+   which closes the PR unmerged (a2a-nexus#2500, 2026-11-06, ccc-node#2685).
+   Cleanup therefore falls entirely to the repo's `delete_branch_on_merge` — off on `ccc-node`, on for `piri`/`fleet-skills`.
    The same flow therefore self-cleans on one repo and leaks branches on
    another; `ccc-node` carries 95 remote heads as of 2026-09-21. Check and
    delete explicitly:
