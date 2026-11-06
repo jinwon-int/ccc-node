@@ -95,8 +95,8 @@ def test_other_provider_shell_under_its_cli_counts(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["bash", "/usr/local/bin/wiki-agent", "mcp-serve"],  # nosuk 2026-11-05
-        ["/bin/bash", "-c", "npm exec chrome-devtools-mcp@latest"],  # bangtong
+        ["bash", "/usr/local/bin/wiki-agent", "mcp-serve"],  # observed 2026-11-05
+        ["/bin/bash", "-c", "npm exec chrome-devtools-mcp@latest"],  # observed 2026-11-05
         ["sh", "-c", "exec npx -y @upstash/context7-mcp@4.4.1"],
         ["bash", "-c", "node /usr/lib/node_modules/firecrawl-mcp/dist/index.js"],
         ["bash", "-c", "uvx mcp-server-fetch"],
