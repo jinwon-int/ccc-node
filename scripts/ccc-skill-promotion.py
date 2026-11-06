@@ -152,10 +152,57 @@ def _mask_word_paths(text: str) -> str:
     return _SLASH_RUN_RE.sub(replace, text)
 
 
+# #2694 (owner decision A): a long public documentation link reads as a token
+# (fleet-skills#617 r2: `https://docs.docker.com/<5 word segments>/`, 40+ run,
+# revision voided). #2371 keeps general URLs unmasked because a webhook path
+# can carry a secret, so this masks ONLY a fixed allowlist of public docs
+# hosts, and only when the host is exact (no userinfo, port or longer host),
+# the URL has no query/fragment/percent-escape/`+`, and EVERY path segment is
+# shorter than the token threshold and reads as a `_PATH_WORD_RE` word. One
+# non-word segment keeps the whole URL. Any host outside the list stays
+# unmasked. Keep `_PUBLIC_DOC_HOSTS` and `_PUBLIC_DOC_URL_RE` byte-identical to
+# fleet-skills scripts/validate.py `PUBLIC_DOC_HOSTS` / `PUBLIC_DOC_URL_RE`.
+_PUBLIC_DOC_HOSTS = (
+    "caddyserver.com",
+    "developers.cloudflare.com",
+    "docs.docker.com",
+    "docs.github.com",
+    "docs.haproxy.org",
+    "docs.python.org",
+    "kubernetes.io",
+    "man7.org",
+    "nginx.org",
+    "www.freedesktop.org",
+    "www.gnu.org",
+)
+_PUBLIC_DOC_URL_RE = re.compile(
+    r"https?://(?:" + "|".join(re.escape(host) for host in _PUBLIC_DOC_HOSTS) + r")"
+    r"(?![A-Za-z0-9._~@:+-])(?:/[A-Za-z0-9._~+-]*)*"
+)
+_PUBLIC_DOC_URL_STOP = frozenset("?#@%:=&;")
+
+
+def _mask_public_doc_urls(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        url = match.group(0)
+        if "+" in url:
+            return url
+        if match.end() < len(text) and text[match.end()] in _PUBLIC_DOC_URL_STOP:
+            return url  # query, fragment, userinfo, percent-escape or port-like tail: keep
+        segments = [segment for segment in url.split("://", 1)[1].split("/")[1:] if segment]
+        if all(len(segment) < 40 and _PATH_WORD_RE.fullmatch(segment) for segment in segments):
+            return " " * len(url)
+        return url
+
+    return _PUBLIC_DOC_URL_RE.sub(replace, text)
+
+
 def _token_haystack(text: str) -> str:
-    """What the `possible-token` pattern scans: public namespace URIs (#2371)
-    and word-only slash paths (#2399) blanked, same length so lines hold."""
-    return _mask_word_paths(_PUBLIC_NAMESPACE_URI_RE.sub(lambda m: " " * len(m.group(0)), text))
+    """What the `possible-token` pattern scans: public namespace URIs (#2371),
+    allowlisted public docs URLs (#2694) and word-only slash paths (#2399)
+    blanked, same length so lines hold."""
+    masked = _PUBLIC_NAMESPACE_URI_RE.sub(lambda m: " " * len(m.group(0)), text)
+    return _mask_word_paths(_mask_public_doc_urls(masked))
 
 
 _HOME_PATH_RE = re.compile(r"(?:^|[^A-Za-z0-9_])/(?:root|home|Users)/[^\s`'\"<>]+")
