@@ -433,12 +433,45 @@ def mempalace_index_probe(mp_cli: Path, home: Path) -> dict[str, object]:
     return parse_repair_status(result.stdout + "\n" + result.stderr)
 
 
+_REFRESH_INDEX_STATES = frozenset({"ok", "diverged", "unknown"})
+
+
+def refresh_index_status(doc: dict[str, object]) -> dict[str, object]:
+    """Project the post-sweep index verdict mempalace-refresh.sh records (#2693).
+
+    Only a successful refresh carries one. Records written before #2693 (or by
+    a non-ok run) project ``absent``; a present but malformed value projects
+    ``unknown`` instead of invalidating the whole refresh record, so a writer
+    newer than this probe can never turn a healthy refresh into refresh-invalid.
+    """
+    absent: dict[str, object] = {"state": "absent", "sqlite": -1, "hnsw": -1}
+    if doc.get("state") != "ok" or "index_status" not in doc:
+        return absent
+    raw = doc["index_status"]
+    unknown = {**absent, "state": "unknown"}
+    if not isinstance(raw, dict) or set(raw) != {"state", "sqlite", "hnsw"}:
+        return unknown
+    state, sqlite_count, hnsw_count = raw["state"], raw["sqlite"], raw["hnsw"]
+    if (
+        state not in _REFRESH_INDEX_STATES
+        or type(sqlite_count) is not int
+        or type(hnsw_count) is not int
+        or sqlite_count < -1
+        or hnsw_count < -1
+    ):
+        return unknown
+    if state == "unknown":
+        return unknown
+    return {"state": state, "sqlite": sqlite_count, "hnsw": hnsw_count}
+
+
 def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
     payload: dict[str, object] = {
         "status": "missing",
         "provider": "unknown",
         "exit_code": -1,
         "age_seconds": -1,
+        "index_status": {"state": "absent", "sqlite": -1, "hnsw": -1},
     }
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -488,6 +521,7 @@ def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
         "provider": provider,
         "exit_code": exit_code,
         "age_seconds": max(0, now - reference),
+        "index_status": refresh_index_status(doc),
     }
 
 
@@ -577,6 +611,7 @@ _AUDIENCE_COUNT_FIELDS = (
     "refresh_error",
     "refresh_invalid",
     "refresh_stale",
+    "refresh_index_diverged",
     "invalid_entries",
 )
 
@@ -595,7 +630,10 @@ def _safe_audience_item(path: Path, *, directory: bool) -> bool:
     )
 
 
-def _audience_refresh_state(path: Path, *, ttl: int, now: int) -> tuple[str, bool]:
+def _audience_refresh_state(
+    path: Path, *, ttl: int, now: int
+) -> tuple[str, bool, bool]:
+    """Return (state, stale, index-diverged) for one scope's refresh record."""
     try:
         if path.stat().st_size > 8192:
             raise ValueError
@@ -612,8 +650,11 @@ def _audience_refresh_state(path: Path, *, ttl: int, now: int) -> tuple[str, boo
         ):
             raise ValueError
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return "invalid", False
-    return str(state), state in {"ok", "running"} and now - timestamp > ttl
+        return "invalid", False, False
+    # Scoped lanes run no live per-scope repair-status, so the verdict the
+    # scope's refresh recorded is their only index signal (#2693).
+    diverged = refresh_index_status(record)["state"] == "diverged"
+    return str(state), state in {"ok", "running"} and now - timestamp > ttl, diverged
 
 
 def _audience_child_counts(
@@ -643,9 +684,10 @@ def _audience_child_counts(
             continue
         counts[field] += 1
         if field == "mempalace_status_partitions":
-            state, stale = _audience_refresh_state(path, ttl=ttl, now=now)
+            state, stale, diverged = _audience_refresh_state(path, ttl=ttl, now=now)
             counts[f"refresh_{state}"] += 1
             counts["refresh_stale"] += int(stale)
+            counts["refresh_index_diverged"] += int(diverged)
     palace = child / "mempalace-home/.mempalace/palace"
     indexes = [palace / name for name in ("chroma.sqlite3", "memory.db")]
     existing = [path for path in indexes if path.exists() or path.is_symlink()]
@@ -1182,6 +1224,19 @@ def probe_mempalace(
         index_status = str(index["status"])
         if index_status != "ok":
             mp_reasons.append("index-" + index_status)
+        # The refresh records its own bounded repair-status verdict (#2693).
+        # It speaks when the live read could not (timeout/error/unknown on a
+        # large palace), under the live reason name so the doctor sweep sees
+        # one `index-diverged`; a conclusive live `ok` is fresher and wins.
+        refresh_index = refresh.get("index_status")
+        if (
+            refresh.get("status") == "ok"
+            and isinstance(refresh_index, dict)
+            and refresh_index.get("state") == "diverged"
+            and index_status != "ok"
+            and "index-diverged" not in mp_reasons
+        ):
+            mp_reasons.append("index-diverged")
         if required and mp_cli.is_file():
             if managed_refresh_count != 1:
                 mp_reasons.append("refresh-count")
@@ -1324,6 +1379,8 @@ def main() -> int:
                 scoped_reasons.append("refresh-stale")
             if int(audience_probe["refresh_degraded"]):
                 scoped_reasons.append("refresh-degraded")
+            if int(audience_probe["refresh_index_diverged"]):
+                scoped_reasons.append("index-diverged")
             scoped_status = "ok" if not scoped_reasons else "degraded"
         else:
             scoped_status = "optional"

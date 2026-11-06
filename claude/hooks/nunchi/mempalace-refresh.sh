@@ -19,6 +19,7 @@ case "$provider" in
   *) echo "usage: mempalace-refresh.sh <claude|codex|piri|danso> <transcript-dir>" >&2; exit 2 ;;
 esac
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 state_dir="${CCC_STATE_DIR:-$HOME/.claude/state}"
 nunchi_home="${NUNCHI_HOME:-$HOME/.nunchi}"
 status_file="${CCC_NUNCHI_MEMPALACE_STATUS:-$nunchi_home/mempalace-refresh.status.json}"
@@ -30,6 +31,16 @@ case "$timeout_sec" in
   ''|*[!0-9]*|?????*) timeout_sec=3300 ;;
   *) [ "$timeout_sec" -ge 1 ] && [ "$timeout_sec" -le 3300 ] || timeout_sec=3300 ;;
 esac
+# Post-sweep index read (#2693): read-only `repair-status`, 1..120 s, default 30.
+repair_timeout="${CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TIMEOUT_SEC:-30}"
+case "$repair_timeout" in
+  ''|*[!0-9]*|????*) repair_timeout=30 ;;
+  *) [ "$repair_timeout" -ge 1 ] && [ "$repair_timeout" -le 120 ] || repair_timeout=30 ;;
+esac
+# setup.sh installs scripts/ccc_memory_probe.py as hooks/ccc_memory_probe.py,
+# one level above this hook; its parse_repair_status is the classifier
+# ccc-memory-check.sh and the #2692 doctor sweep already use.
+probe_py="${CCC_MEMORY_PROBE_PATH:-${script_dir%/*}/ccc_memory_probe.py}"
 
 [ "$(cat "$mode_file" 2>/dev/null || true)" = on ] || exit 0
 
@@ -104,8 +115,8 @@ PY
 fi
 mkdir -p "$nunchi_home"
 
-write_status() {
-  python3 - "$status_file" "$provider" "$1" "$2" "$3" "$4" <<'PY'
+write_status() { # <state> <exit_code> <started> <finished> [index_status-json]
+  python3 - "$status_file" "$provider" "$1" "$2" "$3" "$4" "${5:-}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -121,6 +132,21 @@ payload = {
     "started_at": int(sys.argv[5]),
     "finished_at": int(sys.argv[6]),
 }
+if sys.argv[7]:
+    # Body-free post-sweep index verdict (#2693); anything off-shape is unknown.
+    index = {"state": "unknown", "sqlite": -1, "hnsw": -1}
+    try:
+        raw = json.loads(sys.argv[7])
+    except ValueError:
+        raw = None
+    if (
+        isinstance(raw, dict)
+        and set(raw) == set(index)
+        and raw["state"] in {"ok", "diverged"}
+        and all(type(raw[key]) is int and raw[key] >= -1 for key in ("sqlite", "hnsw"))
+    ):
+        index = raw
+    payload["index_status"] = index
 path.parent.mkdir(parents=True, exist_ok=True)
 fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
@@ -243,8 +269,55 @@ fi
 rc=$?
 set -e
 finished="$(date +%s)"
+
+# Post-sweep index consistency (#2693): a sweep can succeed while the HNSW
+# index silently lags SQLite (#2659: `state=ok` for nine days, 80% missing).
+# `repair-status` is the same read-only report ccc-memory-check.sh reads; it is
+# bounded by GNU timeout (which signals the whole process group), its output
+# stays in memory (1 MiB cap) and only {state,sqlite,hnsw} is recorded. Any
+# failure (no installed parser, non-zero exit, timeout, unparseable output)
+# records `unknown` and never fails the refresh.
+index_status_json() {
+  local unknown='{"state":"unknown","sqlite":-1,"hnsw":-1}' report verdict
+  if [ ! -f "$probe_py" ]; then
+    printf '%s' "$unknown"
+    return 0
+  fi
+  if ! report="$(
+    set +e
+    "$timeout_cli" -k 5s "$repair_timeout" "$mp" repair-status </dev/null 2>&1 | head -c 1048576
+    exit "${PIPESTATUS[0]}"
+  )"; then
+    printf '%s' "$unknown"
+    return 0
+  fi
+  # -I: neither $HOME (the cwd) nor PYTHON* env can shadow the stdlib.
+  if verdict="$(printf '%s' "$report" | "$timeout_cli" -k 5s 20 python3 -I -c '
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+sys.path.insert(0, str(path.resolve().parent))  # its sibling ccc_secure_fs
+spec = importlib.util.spec_from_file_location("ccc_memory_probe", path)
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+index = probe.parse_repair_status(sys.stdin.buffer.read().decode("utf-8", "replace"))
+if index.get("status") in {"ok", "diverged"}:
+    out = {"state": index["status"], "sqlite": index["sqlite_count"], "hnsw": index["hnsw_count"]}
+else:
+    out = {"state": "unknown", "sqlite": -1, "hnsw": -1}
+print(json.dumps(out, separators=(",", ":")))
+' "$probe_py" 2>/dev/null)"; then
+    printf '%s' "$verdict"
+  else
+    printf '%s' "$unknown"
+  fi
+}
+
 if [ "$rc" = 0 ]; then
-  write_status ok 0 "$started" "$finished"
+  write_status ok 0 "$started" "$finished" "$(index_status_json)"
 else
   write_status error "$rc" "$started" "$finished"
 fi

@@ -994,5 +994,84 @@ out="$(env -u HOME -u CODEX_HOME "${no_home_env[@]}" bash "$ROOT/scripts/install
 ok "status (no args) without HOME in the environment does not die on an unbound HOME (#2275)" \
   '! grep -q "unbound variable" <<<"$out" && [ "$rc" = 0 ]'
 
+# --- #2693: after a successful refresh the status records the read-only
+# `repair-status` index consistency as `index_status`, so `state=ok` with an
+# 80%-missing HNSW index (#2659) is no longer invisible. The layout is the one
+# setup.sh installs: hooks/nunchi/mempalace-refresh.sh beside
+# hooks/ccc_memory_probe.py (+ hooks/ccc_secure_fs.py), whose real
+# parse_repair_status classifies the output. Fixtures mirror #2336/#2692.
+ix_home="$TMP/ix-home"
+ix_hooks="$ix_home/.claude/hooks"
+ix_state="$ix_home/.claude/state"
+ix_nunchi="$ix_home/.nunchi"
+ix_status="$ix_nunchi/mempalace-refresh.status.json"
+ix_calls="$TMP/ix-calls"
+mkdir -p "$ix_hooks/nunchi" "$ix_state" "$ix_nunchi" "$ix_home/sessions" "$ix_home/bin"
+printf 'on' > "$ix_state/nunchi.mode"
+cp "$ROOT/claude/hooks/nunchi/mempalace-refresh.sh" "$ix_hooks/nunchi/"
+chmod 755 "$ix_hooks/nunchi/mempalace-refresh.sh"
+cp "$ROOT/scripts/ccc_memory_probe.py" "$ix_hooks/ccc_memory_probe.py"
+cp "$ROOT/bridge/utils/secure_fs.py" "$ix_hooks/ccc_secure_fs.py"
+chmod 644 "$ix_hooks/ccc_memory_probe.py" "$ix_hooks/ccc_secure_fs.py"
+write_exec_stub "$ix_home/bin/mempalace" <<'SH'
+printf '%s\n' "$*" >> "${IX_CALLS:?}"
+case "${1:-}" in
+  repair-status)
+    [ -z "${IX_REPAIR_SLEEP:-}" ] || sleep "$IX_REPAIR_SLEEP"
+    printf '%b\n' "${IX_REPAIR_TEXT:-}"
+    exit "${IX_REPAIR_RC:-0}" ;;
+  *) exit "${IX_SWEEP_RC:-0}" ;;
+esac
+SH
+ix_refresh() { # [env...] — one hermetic claude refresh into $ix_status
+  : > "$ix_calls"; rm -f "$ix_status"
+  env -i PATH="/usr/bin:/bin" HOME="$ix_home" CCC_STATE_DIR="$ix_state" \
+    NUNCHI_HOME="$ix_nunchi" CCC_NUNCHI_MEMPALACE_CLI="$ix_home/bin/mempalace" \
+    IX_CALLS="$ix_calls" "$@" \
+    bash "$ix_hooks/nunchi/mempalace-refresh.sh" claude "$ix_home/sessions" >/dev/null 2>&1
+}
+ix_diverged='  [drawers]\n    sqlite count:   56,690\n    hnsw count:     11,392\n    divergence:     45,298\n    status:         DIVERGED\n\n  [closets]\n    IX_SECRET_BODY'
+ix_flush_lag='  [drawers]\n    sqlite count:   303,009\n    hnsw count:     302,895\n    divergence:     114\n    status:         OK\n    note: HNSW 302,895 / sqlite 303,009 (within flush-lag tolerance)\n\n  [closets]'
+
+ix_refresh IX_REPAIR_TEXT="$ix_diverged"; rc=$?
+ok "refresh success + DIVERGED repair-status records index_status=diverged (#2693)" \
+  '[ "$rc" = 0 ] && jq -e '\''.schema == "ccc.nunchi.mempalace-refresh.v1" and .state == "ok" and .exit_code == 0
+    and .index_status == {state:"diverged", sqlite:56690, hnsw:11392}'\'' "$ix_status" >/dev/null'
+ok "index_status is read with a read-only repair-status after the sweep" \
+  '[ "$(cat "$ix_calls")" = "sweep $ix_home/sessions"$'\''\n'\''"repair-status" ]'
+ok "index_status stays body-free and the status owner-only" \
+  '! grep -q "IX_SECRET_BODY\|closets" "$ix_status" && [ "$(stat -c %a "$ix_status")" = 600 ]'
+
+ix_refresh IX_REPAIR_TEXT="$ix_flush_lag"; rc=$?
+ok "#2336 flush-lag (OK + SQLite slightly ahead) records index_status=ok" \
+  '[ "$rc" = 0 ] && jq -e '\''.state == "ok" and .index_status == {state:"ok", sqlite:303009, hnsw:302895}'\'' "$ix_status" >/dev/null'
+
+ix_refresh IX_REPAIR_TEXT="$ix_diverged" IX_REPAIR_RC=3; rc=$?
+ok "failing repair-status records index_status=unknown and the refresh stays ok" \
+  '[ "$rc" = 0 ] && jq -e '\''.state == "ok" and .exit_code == 0 and .index_status == {state:"unknown", sqlite:-1, hnsw:-1}'\'' "$ix_status" >/dev/null'
+
+ix_refresh IX_REPAIR_TEXT='no drawers section here'; rc=$?
+ok "unparseable repair-status records index_status=unknown" \
+  '[ "$rc" = 0 ] && jq -e '\''.state == "ok" and .index_status.state == "unknown"'\'' "$ix_status" >/dev/null'
+
+ix_t0="$(date +%s)"
+ix_refresh IX_REPAIR_TEXT="$ix_diverged" IX_REPAIR_SLEEP=30 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TIMEOUT_SEC=1; rc=$?
+# shellcheck disable=SC2034  # ix_elapsed is read via eval inside ok()
+ix_elapsed=$(( $(date +%s) - ix_t0 ))
+ok "a hung repair-status is time-bounded: index_status=unknown, refresh ok" \
+  '[ "$rc" = 0 ] && [ "$ix_elapsed" -lt 10 ] && jq -e '\''.state == "ok" and .index_status.state == "unknown"'\'' "$ix_status" >/dev/null'
+
+ix_refresh IX_REPAIR_TEXT="$ix_diverged" IX_SWEEP_RC=7; rc=$?
+ok "a failed sweep records state=error without index_status and never runs repair-status" \
+  '[ "$rc" = 7 ] && jq -e '\''.state == "error" and .exit_code == 7 and (has("index_status") | not)'\'' "$ix_status" >/dev/null && ! grep -q repair-status "$ix_calls"'
+
+mv "$ix_hooks/ccc_memory_probe.py" "$ix_hooks/ccc_memory_probe.py.off"
+ix_refresh IX_REPAIR_TEXT="$ix_diverged"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "without the installed probe parser the refresh records unknown and skips repair-status" \
+  '[ "$rc" = 0 ] && jq -e '\''.state == "ok" and .index_status.state == "unknown"'\'' "$ix_status" >/dev/null && ! grep -q repair-status "$ix_calls"'
+mv "$ix_hooks/ccc_memory_probe.py.off" "$ix_hooks/ccc_memory_probe.py"
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
