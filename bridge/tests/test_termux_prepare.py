@@ -136,18 +136,47 @@ def test_runner_preserves_failure_without_echoing_child_body(tmp_path, capsys):
     assert (tmp_path / "fixture.log").stat().st_mode & 0o777 == 0o600
 
 
+def _publish_pids(marker, expr):
+    """Probe source that publishes ``expr`` into ``marker`` atomically.
+
+    A plain ``write_text`` creates the file empty before writing it, so a
+    reader -- or a cancellation signal -- landing in between left an empty
+    marker behind (#2630). The probe needs ``os`` and ``Path`` imported.
+    """
+    tmp = f"{marker}.tmp"
+    return f"Path({tmp!r}).write_text({expr}); os.replace({tmp!r}, {str(marker)!r})"
+
+
+def _read_pids(marker, count, *, driver=None, timeout=5.0):
+    """Wait until ``marker`` holds ``count`` parseable PIDs and return them."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            pids = tuple(int(part) for part in marker.read_text().split())
+        except (FileNotFoundError, ValueError):
+            pids = ()
+        if len(pids) == count:
+            return pids
+        if driver is not None and driver.poll() is not None:
+            pytest.fail(driver.communicate()[1])
+        if time.monotonic() >= deadline:
+            pytest.fail(f"probe marker {marker.name} not fully written within {timeout}s")
+        time.sleep(0.01)
+
+
 def test_deadline_kills_descendant_and_prevents_next_spawn(tmp_path):
     runner = prep.Runner(tmp_path, dict(os.environ), 0.3)
     marker = tmp_path / "pid"
-    code = ("import subprocess,time; from pathlib import Path; "
+    code = ("import os,subprocess,time; from pathlib import Path; "
             "p=subprocess.Popen(['sleep','30']); "
-            f"Path({str(marker)!r}).write_text(str(p.pid)); time.sleep(30)")
+            f"{_publish_pids(marker, 'str(p.pid)')}; time.sleep(30)")
     with pytest.raises(prep.PreparationError, match="slow_timeout"):
         runner.run("slow", [sys.executable, "-c", code])
     with pytest.raises(prep.PreparationError, match="budget_exhausted"):
         runner.run("never", [sys.executable, "-c", "raise SystemExit(0)"])
     assert len(runner.stages) == 1
-    proc = Path(f"/proc/{int(marker.read_text())}/stat")
+    (pid,) = _read_pids(marker, 1, timeout=1.0)
+    proc = Path(f"/proc/{pid}/stat")
     for _ in range(100):
         try:
             if proc.read_text().split()[2] == "Z":
@@ -229,6 +258,8 @@ def test_cli_cancellation_kills_probe_and_keeps_receipt(tmp_path, sig):
     work = tmp_path / "job"
     marker = tmp_path / "probe.pid"
     source = Path(prep.__file__).resolve()
+    probe = ("import os,time; from pathlib import Path; "
+             f"{_publish_pids(marker, 'str(os.getpid())')}; time.sleep(30)")
     # Run the real CLI lifecycle with a controlled readiness probe. This uses
     # verify_runtime's actual Runner path, including its process group owner.
     code = f'''
@@ -238,7 +269,7 @@ spec = importlib.util.spec_from_file_location("preparation_fixture", {str(source
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.android_build_api = lambda: 24
 m.require_base_interpreter = lambda: None
-m.PROBES = (("blocked", ("-c", "import os,time; from pathlib import Path; Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(30)")),)
+m.PROBES = (("blocked", ("-c", {probe!r})),)
 def prepare(runner, source, report, reinstall):
     report["scenarios"]["fresh_install"] = "in_progress"
     original = runner.run
@@ -257,12 +288,7 @@ raise SystemExit(m.main(["--work-dir", {str(work)!r}]))
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, start_new_session=True) as driver:
         try:
-            deadline = time.monotonic() + 5
-            while not marker.exists() and time.monotonic() < deadline:
-                if driver.poll() is not None:
-                    pytest.fail(driver.communicate()[1])
-                time.sleep(0.02)
-            assert marker.exists()
+            (probe_pid,) = _read_pids(marker, 1, driver=driver)
             driver.send_signal(sig)
             stdout, _ = driver.communicate(timeout=5)
         finally:
@@ -275,7 +301,7 @@ raise SystemExit(m.main(["--work-dir", {str(work)!r}]))
     assert report["scenarios"]["fresh_install"] == "fail"
     assert json.loads((work / "receipt.json").read_text()) == report
     with pytest.raises(ProcessLookupError):
-        os.kill(int(marker.read_text()), 0)  # The direct probe was reaped.
+        os.kill(probe_pid, 0)  # The direct probe was reaped.
 
 
 def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
@@ -284,9 +310,10 @@ def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
 
     marker = tmp_path / "pids"
     source = Path(prep.__file__).resolve().parent
+    publish = _publish_pids(marker, "str(os.getpid())+' '+str(p.pid)")
     probe = ("import os,subprocess,sys,time; from pathlib import Path; "
              "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-             f"Path({str(marker)!r}).write_text(str(os.getpid())+' '+str(p.pid)); time.sleep(0.7)")
+             f"{publish}; time.sleep(0.7)")
     code = (f"import sys,signal; sys.path.insert(0,{str(source)!r}); import termux_prepare as m; "
             f"r=m.Runner(m.Path({str(tmp_path)!r}),dict(m.os.environ),10); "
             f"r.run('fixture',[sys.executable,'-c',{probe!r}])")
@@ -294,11 +321,7 @@ def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as driver:
         leader = worker = None
         try:
-            deadline = time.monotonic() + 5
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert marker.exists()
-            leader, worker = map(int, marker.read_text().split())
+            leader, worker = _read_pids(marker, 2)
             os.kill(driver.pid, signal.SIGSTOP)
             time.sleep(0.9)  # The leader exits while the driver cannot reap it.
             os.kill(driver.pid, signal.SIGINT)
