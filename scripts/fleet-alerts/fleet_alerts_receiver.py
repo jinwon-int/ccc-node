@@ -194,14 +194,19 @@ def queue_payload(queue_dir: Path, payload: dict, labels: Optional[NodeLabels] =
     prefix = f"[{label}] " if label else ""
     key = str(payload.get("record") or payload.get("dedup") or "")
     fp = outbox.fingerprint(node, key) if key else None
+    tier = normalize_tier(payload.get("tier"))
+    # #2700: action/critical alerts take an ok/hold reply → end with the choice
+    # block so 한데 shows it as a card (info rows take no reply).
+    choices = tier in ("action", "critical")
     txn, dup = outbox.enqueue(
         queue_dir,
         text,
         node=node,
         event=str(payload.get("event") or ""),
         fingerprint=fp,
-        tier=normalize_tier(payload.get("tier")),
-        body_with_id=lambda alert_id: f"{prefix}#{alert_id} {text}",
+        tier=tier,
+        body_with_id=lambda alert_id: f"{prefix}#{alert_id} {text}"
+        + (f"\n\n{outbox.reply_choices(alert_id)}" if choices else ""),
     )
     if not dup and (opens or resolves):
         closed = outbox.record_conditions(queue_dir, txn, node, opens, resolves)

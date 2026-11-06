@@ -139,7 +139,11 @@ digest>:<alertedAt>`, the "cleared" notice resolves it). Keys are split with
 `:` because the owner spool masks any 24+ char run of `[A-Za-z0-9_./+=-]`.
 
 **Replies (stage 3).** The owner answers an alert by writing exactly
-`ok <id>` or `hold <id>` in either room. The Matrix sender reads it through
+`ok <id>` or `hold <id>` in either room. Action/critical alerts and their
+re-notify rows end with a `[답변 필요] 하나만 선택` block (`1. ok <id>` /
+`2. hold <id>`, #2700): 「한데」 draws it as a single-choice card whose
+[보내기] sends the one line `1. ok <id>`, which the parser accepts like the
+typed form (Matrix shows a plain numbered list). The Matrix sender reads it through
 the transport's normal admission (owner sender, decrypted text, verified
 pinned device); the 「한데」 lane reads it from the relay bot's `turn` frame
 (`sender` = `@<device>:hande`, MLS-authenticated — devices of the owner actor
