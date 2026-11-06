@@ -151,6 +151,55 @@ def _matrix_processes(proc_root: Path) -> tuple[list[tuple[int, list[bytes]]], b
     return matches, uncertain
 
 
+# Matrix → 「한데」 cut-over (#2682). A node whose operator-owned frontend list
+# `~/.claude/frontends` (#2346/#2348; the probing account's home, as for the
+# Telegram marker in fleet-bridge-watch.sh) exists and does not name `matrix`,
+# and that has no autostart registration left for the Matrix unit, retired the
+# channel on purpose: `RETIRED frontends`, which fleet_watch_state.py treats as
+# normal. Absence is softened only when BOTH hold — a list that names matrix,
+# no list at all, or a list that dropped matrix while the unit is still enabled
+# (a half-done retirement that a reboot or self-update would revive) all stay
+# `DOWN no-process`. CCC_FRONTENDS / CCC_FRONTENDS_FILE are deliberately not
+# read: the probe runs in a fresh ssh login, never the bridge's environment.
+# On 2026-11-06 a passed retirement canary paged `DOWN <node> channel=matrix`.
+UNIT = "ccc-matrix-bridge.service"
+PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+
+
+def frontends_name_matrix(path: Path) -> bool | None:
+    """Whether the frontend list names matrix; None when there is no readable list."""
+    try:
+        if not path.is_file() or path.stat().st_size > 64 * 1024:
+            return None
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    names: list[str] = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0]
+        for sep in "\t\r,":
+            line = line.replace(sep, " ")
+        names.extend(line.split())
+    return "matrix" in names
+
+
+def autostart_registered(roots: list[Path], runit_dir: Path) -> bool:
+    """Whether anything would still start the Matrix unit on boot or self-update."""
+    if runit_dir.is_dir() and not (runit_dir / "down").exists():
+        return True
+    for root in roots:
+        if any((root / "etc/systemd/system").glob(f"*.wants/{UNIT}")):
+            return True
+        for home in [root / "root", *sorted((root / "home").glob("*"))]:
+            if any((home / ".config/systemd/user").glob(f"*.wants/{UNIT}")):
+                return True
+    return False
+
+
+def retired(frontends: Path, roots: list[Path], runit_dir: Path) -> bool:
+    return frontends_name_matrix(frontends) is False and not autostart_registered(roots, runit_dir)
+
+
 def _env_value(env: list[bytes], name: bytes) -> Path | None:
     values = [entry.partition(b"=")[2] for entry in env if entry.startswith(name + b"=")]
     if len(values) != 1:
@@ -198,12 +247,23 @@ def _db_health(
 def probe(
     proc_root: Path, *, now: float | None = None, max_age: int = 120,
     max_error_age: int = STALE_ERROR_SECS,
+    frontends: Path | None = None, roots: list[Path] | None = None,
+    runit_dir: Path | None = None,
 ) -> tuple[str, str]:
     matches, uncertain = _matrix_processes(proc_root)
     if len(matches) > 1:
         return "UNVERIFIED", "multiple-processes"
     if not matches:
-        return ("UNVERIFIED", "process-inspection") if uncertain else ("DOWN", "no-process")
+        if uncertain:
+            return "UNVERIFIED", "process-inspection"
+        if retired(
+            frontends if frontends is not None
+            else Path(os.environ.get("HOME", "/nonexistent")) / ".claude/frontends",
+            roots if roots is not None else [Path("/")],
+            runit_dir if runit_dir is not None else Path(PREFIX) / "var/service/ccc-matrix-bridge",
+        ):
+            return "RETIRED", "frontends"
+        return "DOWN", "no-process"
 
     pid, env = matches[0]
     data_dir = _env_value(env, b"BOT_DATA_DIR")
