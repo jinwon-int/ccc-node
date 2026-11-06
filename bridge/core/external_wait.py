@@ -611,6 +611,27 @@ class ExternalWaitRegistry:
 
         return bool(self._mutate(_do))
 
+    def note_queue_empty_polls(self, wait_id: str, count: int) -> bool:
+        """Persist how many consecutive reads saw no merge-queue entry (#2640).
+
+        An empty entry on a still-OPEN PR is only an eviction once it has
+        settled; the count lives on the record so a bridge restart mid-settle
+        neither forgets nor skips confirmations. Returns True on a change.
+        """
+        value = max(0, int(count))
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None or rec.get("state") != STATE_MONITORING:
+                return False
+            if int(rec.get("queue_empty_polls") or 0) == value:
+                return False
+            rec["queue_empty_polls"] = value
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return bool(self._mutate(_do))
+
     def note_run_status(self, wait_id: str, run_status: str) -> bool:
         """Remember an Actions run's live status for display (#2590).
 
