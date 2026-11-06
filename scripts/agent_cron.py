@@ -1354,11 +1354,33 @@ _OWNER_SAFE_NAME_VERSION = re.compile(
     r'[0-9][A-Za-z0-9_+-]*\.[A-Za-z0-9._+-]*'
     % (_OWNER_LONG_RUN_MIN - 2, _OWNER_LONG_RUN_MIN - 1)
 )
+# Container image references (#2624): image drift/deploy alerts read
+# `[REDACTED_CREDENTIAL]:1.2.3` because `ghcr.io/<org>/<repo>` is one long run
+# (the `:` of the tag and the `@` of a digest already end the run). Same
+# invariant as the spans above:
+#   * a fixed registry host allowlist, matched as a whole sub-run — the
+#     lookbehind admits only the start of the run or an `=` (`image=`), so
+#     `evil.ghcr.io/…`, `x/ghcr.io/…` and `ghcr.io.evil.example/…` match nothing;
+#   * lowercase `[a-z0-9._-]` segments only (no uppercase, `+` or `=`), each
+#     shorter than the run threshold, and the whole span is anchored to the end
+#     of the run — i.e. the reference must end at its `:` tag, `@` digest or
+#     the run boundary. Anything trailing (`…/runnerABC`, `…/repo=…`) makes the
+#     span match nothing, so the run is masked as a whole rather than kept up
+#     to the last clean segment.
+# A `@sha256:<64hex>` digest is a separate run and stays masked: 64 hex
+# characters are indistinguishable from a token, and the path plus tag is
+# what the alert needs. Add a host only when the fleet actually pulls from it.
+_OWNER_SAFE_IMAGE_REF = re.compile(
+    r'(?<![A-Za-z0-9_./+-])'
+    r'(?:ghcr\.io|docker\.io|quay\.io|registry\.k8s\.io|gcr\.io|public\.ecr\.aws)'
+    r'(?:/[a-z0-9._-]{1,%d})+$' % (_OWNER_LONG_RUN_MIN - 1)
+)
 _OWNER_SAFE_SPANS = re.compile(
-    '%s|%s|%s' % (
+    '%s|%s|%s|%s' % (
         _OWNER_SAFE_PATH.pattern,
         _OWNER_SAFE_GITHUB_URL.pattern,
         _OWNER_SAFE_NAME_VERSION.pattern,
+        _OWNER_SAFE_IMAGE_REF.pattern,
     )
 )
 
