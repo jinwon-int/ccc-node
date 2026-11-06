@@ -1365,6 +1365,7 @@ async def test_bridge_ledgers_stay_outside_danso_task_workspace(configured):
     private = Path(configured.bot_data_dir)
     assert handler._usage_meter._path.is_relative_to(private)
     assert handler._cost_ledger._path.is_relative_to(private)
+    assert handler._span_ledger.root.is_relative_to(private)
     assert handler._async_completion_journal.root.is_relative_to(private)
     response = await handler.process_message("ok", 7, 9)
     assert response.success

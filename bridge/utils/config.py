@@ -473,6 +473,22 @@ class Config(
             ".telegram_bot/usage-meter.json. Metering never blocks turns."
         ),
     )
+    span_ledger_enabled: bool = Field(
+        default=True,
+        alias="CCC_SPAN_LEDGER_ENABLED",
+        description=(
+            "Body-free per-turn spans with OTel GenAI attribute names (#2684) in "
+            ".telegram_bot/spans/YYYY-MM-DD.jsonl. Also off when "
+            "CCC_USAGE_METER_ENABLED=false. Span writes never block turns."
+        ),
+    )
+    span_retention_days: int = Field(
+        default=14,
+        ge=1,
+        le=366,
+        alias="CCC_SPAN_RETENTION_DAYS",
+        description="Days of span day files kept before the daily prune deletes them.",
+    )
     usage_budget_tokens_claude: int = Field(
         # Fleet default since 2026-09-02: a finite daily autonomous allowance so
         # provider-neutral distill and wakeups are not fail-closed on every node
