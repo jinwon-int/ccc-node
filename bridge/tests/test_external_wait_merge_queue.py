@@ -26,6 +26,8 @@ from telegram_bot.core.external_wait import (
     render_waits,
 )
 from telegram_bot.core.external_wait_monitor import (
+    MERGE_QUEUE_SETTLE_DELAY_SECONDS,
+    MERGE_QUEUE_SETTLE_TRIES,
     NOT_ENQUEUED_GRACE_SECONDS,
     ExternalWaitMonitor,
     MergeQueueState,
@@ -175,6 +177,91 @@ async def test_eviction_after_queue_seen_names_the_failed_group_run(tmp_path: Pa
     assert "Dropped from merge queue" in text and "36990888999" in text
     prompt = recorder.resumes[0][1]
     assert "terminal=evicted" in prompt and "failed_run=36990888999" in prompt
+
+
+@pytest.mark.anyio
+async def test_empty_entry_right_after_landing_settles_to_merged(tmp_path: Path) -> None:
+    # Right after a squash-land GitHub drops the entry before the PR state
+    # flips: one OPEN + no-entry read must not end the wait as dropped (#2640).
+    clock = Clock()
+    transport = QueueTransport(
+        [_queued(), _queued(in_queue=False), _queued(in_queue=False, state="MERGED")],
+        failed_run=36990888999,
+    )
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+
+    await monitor._tick()
+    clock.advance(130)
+    await monitor._tick()
+    record = registry.get(wait_id)
+    assert record["state"] == "monitoring"
+    assert record["queue_empty_polls"] == 1
+    # The confirming re-read comes after the settle delay, not a backed-off poll.
+    assert record["next_poll_epoch"] - clock() == pytest.approx(MERGE_QUEUE_SETTLE_DELAY_SECONDS)
+    await _run(monitor, clock, 3, step=MERGE_QUEUE_SETTLE_DELAY_SECONDS)
+
+    record = registry.get(wait_id)
+    assert record["terminal_status"] == TERMINAL_MERGED
+    assert transport.run_lookups == 0
+    assert "Merged via merge queue" in recorder.notifications[0][1]
+    assert "terminal=merged" in recorder.resumes[0][1]
+
+
+@pytest.mark.anyio
+async def test_empty_entry_then_closed_settles_to_closed(tmp_path: Path) -> None:
+    clock = Clock()
+    transport = QueueTransport(
+        [_queued(), _queued(in_queue=False), _queued(in_queue=False, state="CLOSED")]
+    )
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+
+    await _run(monitor, clock, 4)
+
+    assert registry.get(wait_id)["terminal_status"] == TERMINAL_CLOSED
+    assert transport.run_lookups == 0
+
+
+@pytest.mark.anyio
+async def test_persistent_empty_entry_is_evicted_only_after_settling(tmp_path: Path) -> None:
+    clock = Clock()
+    transport = QueueTransport([_queued(), _queued(in_queue=False)], failed_run=36990888999)
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+
+    await monitor._tick()  # seen in the queue
+    clock.advance(130)
+    for confirmed in range(1, MERGE_QUEUE_SETTLE_TRIES + 1):
+        await monitor._tick()
+        record = registry.get(wait_id)
+        assert record["state"] == "monitoring", f"evicted after {confirmed} empty read(s)"
+        assert record["queue_empty_polls"] == confirmed
+        clock.advance(MERGE_QUEUE_SETTLE_DELAY_SECONDS)
+    assert transport.run_lookups == 0
+    await monitor._tick()
+
+    record = registry.get(wait_id)
+    assert record["terminal_status"] == TERMINAL_EVICTED
+    assert record["terminal_detail"] == {"reason": "dropped", "failed_run_id": 36990888999}
+    assert transport.queue_calls == 1 + MERGE_QUEUE_SETTLE_TRIES + 1
+    assert transport.run_lookups == 1
+
+
+@pytest.mark.anyio
+async def test_entry_reappearing_during_settle_resets_and_keeps_waiting(tmp_path: Path) -> None:
+    clock = Clock()
+    empty = _queued(in_queue=False)
+    # Each empty run is one read short of an eviction; the entry reappearing
+    # in between must restart the count, so this never ends as dropped.
+    flap = [empty] * MERGE_QUEUE_SETTLE_TRIES + [_queued()]
+    transport = QueueTransport([_queued()] + flap * 3 + [_queued()])
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+
+    await _run(monitor, clock, 1 + len(flap) * 3 + 2)
+
+    record = registry.get(wait_id)
+    assert record["state"] == "monitoring"
+    assert record["queue_empty_polls"] == 0
+    assert recorder.notifications == []
+    assert transport.run_lookups == 0
 
 
 @pytest.mark.anyio

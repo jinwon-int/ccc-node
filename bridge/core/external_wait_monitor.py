@@ -64,6 +64,12 @@ DEFAULT_RESUME_DAILY_CAP = 10
 NOT_ENQUEUED_GRACE_SECONDS = 180.0
 #: Merge-queue polls back off to this ceiling (group runs take minutes).
 MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS = 120.0
+#: An empty queue entry on a still-OPEN PR is re-read this many times,
+#: ``MERGE_QUEUE_SETTLE_DELAY_SECONDS`` apart, before it counts as an eviction
+#: (#2640): right after a squash-land GitHub drops the entry a moment before
+#: the PR state flips to MERGED. Same settle as merge-queue-watch.sh (#2208).
+MERGE_QUEUE_SETTLE_TRIES = 3
+MERGE_QUEUE_SETTLE_DELAY_SECONDS = 5.0
 #: Actions-run polls back off to this ceiling (#2590): builds and release
 #: uploads take minutes, a 5-minute ceiling would add most of a poll to every
 #: wake.
@@ -950,6 +956,9 @@ class ExternalWaitMonitor:
         if state.in_queue:
             if not record.get("queue_seen"):
                 self._registry.mark_queue_seen(wait_id)
+            if record.get("queue_empty_polls"):
+                # The entry is back: the empty read(s) were a blip (#2640).
+                self._registry.note_queue_empty_polls(wait_id, 0)
             self._reschedule(record, ceiling=MERGE_QUEUE_MAX_POLL_INTERVAL_SECONDS)
             return
         if not record.get("queue_seen"):
@@ -958,6 +967,22 @@ class ExternalWaitMonitor:
                 return
             self._registry.finish(
                 wait_id, TERMINAL_EVICTED, now=now, detail={"reason": "never-enqueued"}
+            )
+            return
+        empty_polls = int(record.get("queue_empty_polls") or 0)
+        if empty_polls < MERGE_QUEUE_SETTLE_TRIES:
+            # Entry gone, PR still OPEN: right after a squash-land GitHub
+            # reports exactly this for a moment before the state flips to
+            # MERGED (#2640). Re-read shortly instead of declaring a drop; a
+            # MERGED/CLOSED re-read ends the wait above, a reappearing entry
+            # resets the count.
+            self._registry.note_queue_empty_polls(wait_id, empty_polls + 1)
+            self._registry.reschedule(
+                wait_id,
+                next_poll_epoch=self._clock() + MERGE_QUEUE_SETTLE_DELAY_SECONDS,
+                poll_interval_seconds=float(
+                    record.get("poll_interval_seconds") or DEFAULT_POLL_INTERVAL_SECONDS
+                ),
             )
             return
         detail: Dict[str, Any] = {"reason": "dropped"}
@@ -1231,6 +1256,8 @@ __all__ = [
     "ExternalWaitMonitor",
     "GhCliTransport",
     "MAX_TRANSPORT_ERRORS",
+    "MERGE_QUEUE_SETTLE_DELAY_SECONDS",
+    "MERGE_QUEUE_SETTLE_TRIES",
     "MergeQueueState",
     "MergeQueueTransport",
     "NOT_ENQUEUED_GRACE_SECONDS",
