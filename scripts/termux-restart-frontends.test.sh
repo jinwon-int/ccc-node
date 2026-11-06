@@ -363,6 +363,46 @@ out="$(run --dry-run)"
 ok "no service dir and no list entry → absent again" '[[ "$out" == *"| hande=absent"* ]]'
 kill "$LIVEH" "$LIVEH2" 2>/dev/null; unset SVDIR
 
+# ---------------------------------------------------------------- Matrix-retired node (Matrix → 「한데」 cut-over)
+export SVDIR="$TMP/svdir"; mkdir -p "$SVDIR/ccc-hande-bridge"
+sleep 600 & LIVEH=$!
+sleep 600 & LIVEH2=$!
+printf '# matrix retired here (hande cut-over)\nhande\n' > "$HOME/.claude/frontends"
+
+# pointer moved, both behind → hande restarted and verified; Matrix never touched
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; hwrite "$LIVEH" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_NEW_PID=$LIVEH2" "FAKE_NEW_GEN=gen-B"
+out="$(run)"; rc=$?
+ok "matrix retired: no Matrix restart, hande restarted and verified, exit 0" '[ "$rc" = 0 ] && ! grep -q "sv restart ccc-matrix-bridge" "$CALLS" && grep -q "sv restart ccc-hande-bridge" "$CALLS" && grep -q "matrix retired on this node (frontend list has no matrix): restart skipped" "$LOG" && grep -q "hande verified: gen=gen-B pid=$LIVEH2" "$LOG"'
+ok "matrix retired: Telegram untouched too (list names neither)" '! grep -q bridge-current "$CALLS"'
+ok "matrix retired: Matrix health file left as it was" 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"process\"][\"pid\"]==int(sys.argv[2])" "$HOME/.ccc-matrix/health.json" "$LIVE1"'
+
+out="$(run --dry-run)"
+ok "dry-run reports matrix=retired and still shows hande" '[[ "$out" == *"bridge-current=gen-B matrix=retired survive="* ]] && [[ "$out" == *"| hande_running=gen-B"* ]]'
+
+# a stopped (dead-pid) Matrix is not judged by --verify; hande is
+reset; write_health "$DEAD" "$(( $(date +%s) - 500 ))" available gen-B 0; hwrite "$LIVEH2" "$(( $(date +%s) - 500 ))" available gen-B 0
+setfake; echo "$(( $(date +%s) - 500 ))" > "$TMP/started"
+out="$(run --verify 2)"; rc=$?
+ok "--verify skips a retired Matrix and judges hande" '[ "$rc" = 0 ] && [[ "$out" == *"matrix: retired (frontend list)"* ]] && [[ "$out" == *"hande verified: gen=gen-B"* ]]'
+
+# a follower detached before retirement must not revive Matrix
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
+setfake "FAKE_NEW_PID=$LIVE2" "FAKE_NEW_GEN=gen-B"
+out="$(run --matrix-only 5)"; rc=$?
+ok "--matrix-only on a retired node never restarts Matrix" '[ "$rc" = 0 ] && ! grep -q "sv restart" "$CALLS" && grep -q "matrix retired on this node (frontend list has no matrix): follower skipped" "$LOG"'
+
+# CCC_FRONTENDS env (no file) retires Matrix the same way; naming it keeps it
+rm -f "$HOME/.claude/frontends"
+reset; point gen-B; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0; hwrite "$LIVEH2" "$(( $(date +%s) - 500 ))" available gen-B 0
+setfake "FAKE_NEW_PID=$LIVE2" "FAKE_NEW_GEN=gen-B"
+out="$(CCC_FRONTENDS=hande run)"; rc=$?
+ok "CCC_FRONTENDS=hande retires Matrix" '[ "$rc" = 0 ] && ! grep -q "sv restart ccc-matrix-bridge" "$CALLS" && grep -q "matrix retired on this node" "$LOG"'
+reset; write_health "$LIVE1" "$(( $(date +%s) - 500 ))" available gen-A 0
+out="$(CCC_FRONTENDS="matrix,hande" run)"; rc=$?
+ok "CCC_FRONTENDS naming matrix keeps the Matrix restart" '[ "$rc" = 0 ] && grep -q "sv restart ccc-matrix-bridge" "$CALLS" && grep -q "matrix verified: gen=gen-B" "$LOG"'
+kill "$LIVEH" "$LIVEH2" 2>/dev/null; unset SVDIR
+
 # ---------------------------------------------------------------- usage
 out="$(run --bogus)"; rc=$?
 ok "unknown argument → exit 2" '[ "$rc" = 2 ]'
