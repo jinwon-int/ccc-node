@@ -152,7 +152,9 @@ node's ccc-node self-update notice lands in that node's own room rather than
 the fleet room. A node that sets the variable explicitly replaces the
 default — keep `SelfUpdate` in its list to keep this behaviour, or set an
 empty value to send everything to the relay. A node whose
-`~/.claude/self-update.notify` is `none` writes no `SelfUpdate` record at all.
+`~/.claude/self-update.notify` is `none` or `failures` writes `SelfUpdate`
+records only for failures and incomplete activations (#2589); only `silent`
+writes none at all.
 
 Semantics are otherwise unchanged: `sent/` archive, dedup window, rate
 limit and fan-out mirrors behave exactly as in owner-room mode. A 2xx
