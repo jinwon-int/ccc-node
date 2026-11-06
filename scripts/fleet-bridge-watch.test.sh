@@ -17,6 +17,9 @@ okc() { if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "
 TMP_BASE="${TMPDIR:-$(dirname "$ROOT")}"; mkdir -p "$TMP_BASE"
 TMP="$(mktemp -d "$TMP_BASE/fleet-watch-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+# Doctor-sweep memory streaks (#2659) never touch the real ~/.claude/state.
+MEMSTATE="$TMP/mem-state/fleet-watch/memory-degraded.tsv"
+export CCC_FLEET_MEMORY_STATE="$MEMSTATE"
 
 # Stub ssh: replies per node from $TMP/reply/<node>; missing file = unreachable.
 # The shebang is resolved at run time: the script under test invokes the stub
@@ -269,6 +272,115 @@ run "noroot"
 okc "$RC" 0 "root-less probe skip is not a failure"
 ok "skipped dual-domain still reports OK" 'grep -q "^OK noroot" "$OUT"'
 
+# ---- persistent memory degradation (#2659) ---------------------------------
+# A node's MemPalace index lost 80% of its vectors and ccc-memory-check said
+# `mempalace.status=degraded reasons=[index-diverged]` for nine days while every
+# doctor sweep passed: the doctor reports it as a 경고, which by contract does
+# not change its exit code, and the sweep kept only that exit code. The sweep
+# now reads the probe's MEMORY column and fails the node once the degradation
+# has lasted CCC_FLEET_MEMORY_CONFIRM consecutive sweeps (default 2), so a
+# one-off transient (a refresh in flight) does not page.
+reply_mem() { # <node> <memory>
+  printf 'RUNTIME=/opt/ccc-node\nAVAIL=yes\nUNIT=/opt/ccc-node\nDOCTOR=0\nDUALDOMAIN=-\nMEMORY=%s\n' "$2" > "$TMP/reply/$1"
+}
+rm -rf "$TMP/mem-state"
+reply_mem mdiv degraded:mempalace.index-diverged
+reply_mem mok ok
+CCC_FLEET_DOCTOR=1 run "mdiv mok"
+okc "$RC" 0 "memory: a first degraded sweep does not page"
+ok "memory: the first degraded sweep is visible on the OK line" \
+  'grep -q "^OK mdiv (/opt/ccc-node, memory-pending:degraded:mempalace.index-diverged 1/2)$" "$OUT"'
+ok "memory: a healthy peer is a plain OK" 'grep -q "^OK mok (/opt/ccc-node)$" "$OUT"'
+ok "memory: the streak file is owner-only" '[ "$(stat -c %a "$MEMSTATE")" = 600 ]'
+CCC_FLEET_DOCTOR=1 run "mdiv mok"
+okc "$RC" 1 "memory: a degradation confirmed on the second sweep fails the run"
+ok "memory: the confirmed node is a DRIFT row naming the memory state" \
+  'grep -q "^DRIFT mdiv memory=degraded:mempalace.index-diverged sweeps=2/2 runtime=/opt/ccc-node$" "$OUT" && ! grep -q "^OK mdiv" "$OUT"'
+ok "memory: the healthy peer is unaffected" 'grep -q "^OK mok (/opt/ccc-node)$" "$OUT"'
+# The run's nonzero exit is what telegram-owner-on-failure spools; the row must
+# also be counted into the alert title so the owner sees which node.
+mem_title=$(python3 - "$ROOT/scripts" "$OUT" "$RC" <<'PY'
+import importlib.util, sys
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location("agent_cron_fleet_memory", sys.argv[1] + "/agent_cron.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+text = module.build_owner_text("fleet-doctor-sweep", "run-memory", None, "failed",
+                               {"exitCode": int(sys.argv[3]), "stdout": open(sys.argv[2]).read(), "stderr": ""})
+print(text.splitlines()[0])
+PY
+)
+ok "memory: the confirmed row enters the owner alert title ($mem_title)" \
+  '[ "$mem_title" = "agent-cron fleet alert for task fleet-doctor-sweep: DRIFT=1 (mdiv)" ]'
+CCC_FLEET_DOCTOR=1 run "mdiv"
+ok "memory: a persisting degradation keeps failing, with its count" \
+  'test "$RC" = 1 && grep -q "^DRIFT mdiv memory=degraded:mempalace.index-diverged sweeps=3/2 " "$OUT"'
+# Recovery clears the streak: a later one-off degradation is pending again.
+reply_mem mdiv ok
+CCC_FLEET_DOCTOR=1 run "mdiv"
+ok "memory: a recovered node is a plain OK" 'test "$RC" = 0 && grep -q "^OK mdiv (/opt/ccc-node)$" "$OUT"'
+ok "memory: recovery drops the node from the streak file" '! grep -q "^mdiv	" "$MEMSTATE"'
+reply_mem mdiv degraded:mempalace.refresh-stale
+CCC_FLEET_DOCTOR=1 run "mdiv"
+ok "memory: a one-off transient after recovery does not page" \
+  'test "$RC" = 0 && grep -q "^OK mdiv (/opt/ccc-node, memory-pending:degraded:mempalace.refresh-stale 1/2)$" "$OUT"'
+# An inspection that could not run neither confirms nor clears the streak.
+reply_mem mdiv unknown
+CCC_FLEET_DOCTOR=1 run "mdiv"
+ok "memory: an unknown memory state never fails the node" \
+  'test "$RC" = 0 && grep -q "^OK mdiv (/opt/ccc-node, memory:unknown)$" "$OUT"'
+reply_mem mdiv degraded:mempalace.refresh-stale
+CCC_FLEET_DOCTOR=1 run "mdiv"
+ok "memory: an unknown sweep does not reset the streak" \
+  'test "$RC" = 1 && grep -q "^DRIFT mdiv memory=degraded:mempalace.refresh-stale sweeps=2/2 " "$OUT"'
+reply_mem merr error:nunchi.db-error
+CCC_FLEET_DOCTOR=1 run "merr"; CCC_FLEET_DOCTOR=1 run "merr"
+ok "memory: an error state is confirmed like a degraded one" \
+  'test "$RC" = 1 && grep -q "^DRIFT merr memory=error:nunchi.db-error sweeps=2/2 " "$OUT"'
+# Termux nodes (MemPalace optional) and nodes with nunchi off are never paged,
+# however many sweeps report it; neither is a harness without the column.
+reply_mem mopt optional
+reply_mem moff off
+reply_dd mold /opt/ccc-node yes /opt/ccc-node 0 -
+for _ in 1 2 3; do CCC_FLEET_DOCTOR=1 run "mopt moff mold"; done
+okc "$RC" 0 "memory: optional/off/absent never fail the sweep"
+ok "memory: optional, off and absent are plain OK rows" \
+  'grep -q "^OK mopt (/opt/ccc-node)$" "$OUT" && grep -q "^OK moff (/opt/ccc-node)$" "$OUT" && grep -q "^OK mold (/opt/ccc-node)$" "$OUT"'
+ok "memory: optional/off nodes have no streak" '! grep -qE "^(mopt|moff|mold)	" "$MEMSTATE"'
+# Bridge problems outrank memory, and the streak is still counted under them.
+printf 'RUNTIME=/opt/ccc-node\nAVAIL=yes\nUNIT=/opt/ccc-node\nDOCTOR=1\nDUALDOMAIN=-\nMEMORY=degraded:mempalace.index-diverged\n' > "$TMP/reply/mboth"
+CCC_FLEET_DOCTOR=1 run "mboth"; CCC_FLEET_DOCTOR=1 run "mboth"
+ok "memory: doctor drift outranks memory, one row per node" \
+  'grep -q "^DRIFT mboth doctor_exit=1 " "$OUT" && [ "$(grep -c " mboth " "$OUT")" = 1 ]'
+# Threshold knob: 1 pages on the first degraded sweep, no state needed.
+rm -rf "$TMP/mem-state"
+reply_mem mnow degraded:mempalace.index-diverged
+CCC_FLEET_DOCTOR=1 CCC_FLEET_MEMORY_CONFIRM=1 run "mnow"
+ok "memory: CCC_FLEET_MEMORY_CONFIRM=1 pages on the first sweep" \
+  'test "$RC" = 1 && grep -q "^DRIFT mnow memory=degraded:mempalace.index-diverged sweeps=1/1 " "$OUT"'
+ok "memory: CCC_FLEET_MEMORY_CONFIRM=1 keeps no streak file" '[ ! -e "$MEMSTATE" ]'
+# Unusable streak state must never make the sweep quieter: confirm at once.
+printf 'x' > "$TMP/mem-not-a-dir"
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen
+CCC_FLEET_NODES="mnow" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  CCC_FLEET_DOCTOR=1 CCC_FLEET_MEMORY_STATE="$TMP/mem-not-a-dir/memory.tsv" bash "$SC" >"$OUT" 2>"$TMP/err" || RC=$?
+ok "memory: unusable streak state confirms on first sight, loudly" \
+  'test "$RC" = 1 && grep -q "^DRIFT mnow memory=degraded:mempalace.index-diverged sweeps=1/1 " "$OUT" && grep -q "memory streak state" "$TMP/err"'
+# A symlinked streak file is refused, never followed.
+mkdir -p "$TMP/mem-link"; printf 'mnow\t9\t0\n' > "$TMP/mem-link/target"
+ln -s "$TMP/mem-link/target" "$TMP/mem-link/memory.tsv"
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen
+CCC_FLEET_NODES="mnow" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
+  CCC_FLEET_DOCTOR=1 CCC_FLEET_MEMORY_STATE="$TMP/mem-link/memory.tsv" bash "$SC" >"$OUT" 2>"$TMP/err" || RC=$?
+ok "memory: a symlinked streak file is refused and left untouched" \
+  'test "$RC" = 1 && grep -q "sweeps=1/1 " "$OUT" && [ "$(cat "$TMP/mem-link/target")" = "$(printf "mnow\t9\t0")" ]'
+# Only the doctor sweep reads the column (the probe sends it only there).
+rm -rf "$TMP/mem-state"
+run "mnow"
+ok "memory: a plain bridge run neither judges memory nor writes streaks" \
+  'test "$RC" = 0 && grep -q "^OK mnow (/opt/ccc-node)$" "$OUT" && [ ! -e "$MEMSTATE" ]'
+rm -f "$TMP"/reply/m*
+
 # The remote probe is a quoted heredoc — invisible to bash -n on the script
 # itself. Extract and parse it as POSIX sh so a probe typo cannot ship.
 probe_body="$TMP/probe-body.sh"
@@ -486,7 +598,7 @@ ok "retries disabled means exactly one attempt" '[ "$(grep -c "^blip0$" "$TMP/ca
 # Execute the remote body, not only canned SSH replies: a non-root SSH account
 # must inspect a root-owned Danso/CCC runtime with non-interactive sudo.
 mkdir -p "$TMP/probe-bin" "$TMP/probe-repo/scripts" "$TMP/probe-home"
-touch "$TMP/probe-repo/scripts/ccc-doctor.sh"
+touch "$TMP/probe-repo/scripts/ccc-doctor.sh" "$TMP/probe-repo/scripts/ccc-memory-check.sh"
 chmod +x "$TMP/probe-repo/scripts/ccc-doctor.sh"
 cat > "$TMP/probe-bin/ps" <<EOF
 #!$(command -v sh)
@@ -502,7 +614,7 @@ cat > "$TMP/probe-bin/sudo" <<EOF
 printf '%s\n' "\$*" >> "$TMP/sudo-calls"
 [ "\$*" != "" ] || exit 99
 [ "\${PROBE_DENIED:-0}" = 0 ] || exit 1
-case "\$*" in *--status) printf '%s\n' "Bot status: \${PROBE_STATUS:-available}"; [ -z "\${PROBE_STATUS_BODY:-}" ] || printf '%b\n' "\$PROBE_STATUS_BODY" ;; *) exit "\${PROBE_DOCTOR:-0}" ;; esac
+case "\$*" in *--status) printf '%s\n' "Bot status: \${PROBE_STATUS:-available}"; [ -z "\${PROBE_STATUS_BODY:-}" ] || printf '%b\n' "\$PROBE_STATUS_BODY" ;; *ccc-memory-check.sh*) [ -z "\${PROBE_MEMORY:-}" ] || cat "\$PROBE_MEMORY"; exit "\${PROBE_MEMORY_RC:-0}" ;; *) exit "\${PROBE_DOCTOR:-0}" ;; esac
 EOF
 cat > "$TMP/probe-bin/su" <<EOF
 #!$(command -v sh)
@@ -519,6 +631,73 @@ ok "doctor runs as the actual runtime owner" 'grep -q "^DOCTOR=0$" "$TMP/owner-o
 ok "status preserves runtime project path" 'grep -q -- "-n -H -u root -- bash $TMP/probe-repo/bridge/start.sh --path $TMP/probe-home --status" "$TMP/sudo-calls"'
 ok "root runtime does not require retired user service" 'grep -q "^DUALDOMAIN=-$" "$TMP/owner-out"'
 ok "unprivileged caller never attempts interactive su" '[ ! -e "$TMP/su-calls" ]'
+
+# The MEMORY column (#2659) is computed node-side from `ccc-memory-check.sh
+# --json`, run as the runtime owner with the doctor's own state/cache dirs.
+# Index fixtures come from the real repair-status classifier, so the
+# flush-lag shape that #2336 modelled as normal (MemPalace `OK` with SQLite a
+# little ahead of HNSW) is exactly what a node would report.
+mem_fixture() { # <name> <nunchi-status> <mempalace-status|from-repair> [repair-text]
+  python3 - "$ROOT/scripts" "$TMP/mem-$1.json" "$2" "$3" "${4:-}" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import ccc_memory_probe as probe
+out, nunchi, mempalace, text = sys.argv[2:6]
+doc = {"nunchi": {"status": nunchi, "reasons": ["feed-count"] if nunchi == "degraded" else []}}
+if mempalace == "from-repair":
+    index = probe.parse_repair_status(text.replace("\\n", "\n"))
+    reasons = [] if index["status"] == "ok" else ["index-" + index["status"]]
+    doc["mempalace"] = {"status": "degraded" if reasons else "ok", "reasons": reasons, "index": index}
+else:
+    doc["mempalace"] = {"status": mempalace, "reasons": []}
+json.dump(doc, open(out, "w"))
+PY
+}
+mem_probe() { # <fixture-name> [extra env...]
+  : > "$TMP/sudo-calls"
+  env PATH="$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 PROBE_MEMORY="$TMP/mem-$1.json" "${@:2}" \
+    sh "$TMP/owner-probe.sh" > "$TMP/mem-out"
+}
+mem_fixture diverged ok from-repair '[drawers]\nsqlite count: 56,690\nhnsw count: 11,392\ndivergence: 45,298\nstatus: DIVERGED\n[closets]'
+mem_probe diverged
+ok "memory probe: an index-diverged palace is MEMORY=degraded with its reason" \
+  'grep -q "^MEMORY=degraded:mempalace.index-diverged$" "$TMP/mem-out" && tail -1 "$TMP/mem-out" | grep -q "^PROBE_COMPLETE=1$"'
+ok "memory probe: runs as the runtime owner with the doctor state dirs" \
+  'grep -q -- "-n -H -u root -- env CCC_STATE_DIR=$TMP/probe-home/.claude/state CCC_MEMORY_CACHE_DIR=$TMP/probe-home/.claude/hooks/cache timeout 20 bash $TMP/probe-repo/scripts/ccc-memory-check.sh --json" "$TMP/sudo-calls"'
+mem_fixture flushlag ok from-repair '[drawers]\nsqlite count: 303,009\nhnsw count: 302,895\ndivergence: 114\nstatus: OK\nnote: HNSW 302,895 / sqlite 303,009 (within flush-lag tolerance)\n[closets]'
+mem_probe flushlag
+ok "memory probe: modelled flush-lag (OK + small divergence, #2336) is MEMORY=ok" \
+  'grep -q "^MEMORY=ok$" "$TMP/mem-out"'
+mem_fixture termux ok optional
+mem_probe termux
+ok "memory probe: Termux (MemPalace optional) is MEMORY=optional" 'grep -q "^MEMORY=optional$" "$TMP/mem-out"'
+mem_fixture off off off
+mem_probe off
+ok "memory probe: nunchi off is MEMORY=off" 'grep -q "^MEMORY=off$" "$TMP/mem-out"'
+mem_fixture both degraded from-repair '[drawers]\nsqlite count: 9\nhnsw count: 2\ndivergence: 7\nstatus: DIVERGED'
+mem_probe both
+ok "memory probe: every degraded component and reason is named" \
+  'grep -q "^MEMORY=degraded:nunchi.feed-count,mempalace.index-diverged$" "$TMP/mem-out"'
+mem_fixture unavailable unavailable unavailable
+mem_probe unavailable
+ok "memory probe: an unavailable probe is MEMORY=unknown" 'grep -q "^MEMORY=unknown$" "$TMP/mem-out"'
+printf '{"nunchi":{"status":"ok","reasons":[]},"mempalace":{"status":"degraded","reasons":["x y;$(id)`z`"]}}' > "$TMP/mem-hostile.json"
+mem_probe hostile
+ok "memory probe: reasons are reduced to a safe token" \
+  'grep -q "^MEMORY=degraded:mempalace.xyidz$" "$TMP/mem-out"'
+printf 'not json' > "$TMP/mem-garbage.json"
+mem_probe garbage
+ok "memory probe: unparseable output is MEMORY=unknown" 'grep -q "^MEMORY=unknown$" "$TMP/mem-out"'
+mem_probe diverged PROBE_MEMORY_RC=1 PROBE_MEMORY=
+ok "memory probe: a failed memory check is MEMORY=unknown, and the doctor still counts" \
+  'grep -q "^MEMORY=unknown$" "$TMP/mem-out" && grep -q "^DOCTOR=0$" "$TMP/mem-out"'
+mv "$TMP/probe-repo/scripts/ccc-memory-check.sh" "$TMP/ccc-memory-check.sh.away"
+mem_probe diverged
+ok "memory probe: a harness without ccc-memory-check is MEMORY=unknown" \
+  'grep -q "^MEMORY=unknown$" "$TMP/mem-out" && ! grep -q "ccc-memory-check" "$TMP/sudo-calls"'
+mv "$TMP/ccc-memory-check.sh.away" "$TMP/probe-repo/scripts/ccc-memory-check.sh"
+PATH="$TMP/probe-bin:$PATH" sh "$TMP/owner-probe.sh" > "$TMP/mem-out"
+ok "memory probe: the plain bridge probe never runs the memory check" '! grep -q "^MEMORY=" "$TMP/mem-out"'
 PATH="$TMP/probe-bin:$PATH" PROBE_STATUS=unavailable sh "$TMP/owner-probe.sh" > "$TMP/owner-out"
 ok "confirmed unavailable status remains down" 'grep -q "^AVAIL=no$" "$TMP/owner-out"'
 PATH="$TMP/probe-bin:$PATH" PROBE_DENIED=1 sh "$TMP/owner-probe.sh" > "$TMP/owner-out"

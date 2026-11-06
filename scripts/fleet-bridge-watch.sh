@@ -56,6 +56,15 @@
 #                    sweep is scheduled separately with its own timeout, since
 #                    only 3 of 12 nodes have agent-cron and the rest would
 #                    otherwise never be checked for harness drift.
+#                    The sweep also reads `ccc-memory-check.sh --json` per node
+#                    (#2659) and reports `DRIFT <node> memory=<state> sweeps=N/M`
+#                    once nunchi/MemPalace stays degraded or error for
+#                    CCC_FLEET_MEMORY_CONFIRM consecutive sweeps (default 2,
+#                    1–30; 1 pages at once). Streaks are kept in
+#                    CCC_FLEET_MEMORY_STATE (default
+#                    ~/.claude/state/fleet-watch/memory-degraded.tsv; give each
+#                    scheduled task its own). off/optional (Termux) never page;
+#                    an unknown memory check never fails a node.
 #   CCC_FLEET_RETRIES extra attempts per node on transport failure (default 2,
 #                    capped at 5; only UNREACHABLE is retried — a node that
 #                    answers, even DOWN, is judged on its single answer)
@@ -556,6 +565,41 @@ if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
       su - "$runuser" -c "CCC_DOCTOR_CLAUDE_DIR='$cdir' timeout 60 bash '$doctor_root/scripts/ccc-doctor.sh'" >/dev/null 2>&1
     fi
     echo "DOCTOR=$?"
+    # Memory health (#2659). The doctor reports a degraded nunchi/MemPalace as
+    # a 경고, which by contract leaves its exit code alone, so a node's index
+    # sat diverged for nine days behind a passing sweep. Read the memory check
+    # itself, with the state/cache dirs the doctor's own memory row uses, and
+    # reduce it to one body-free token; the watcher decides how long it may
+    # persist. A missing, failing or unparseable check is `unknown`, never a
+    # verdict.
+    mem=unknown
+    mem_script="$doctor_root/scripts/ccc-memory-check.sh"
+    if [ -f "$mem_script" ]; then
+      if [ "$(id -u)" = "$runuid" ]; then
+        mem_json=$(CCC_STATE_DIR="$cdir/state" CCC_MEMORY_CACHE_DIR="$cdir/hooks/cache" timeout 20 bash "$mem_script" --json 2>/dev/null)
+      elif [ "$(id -u)" != 0 ]; then
+        mem_json=$(sudo -n -H -u "$runuser" -- env CCC_STATE_DIR="$cdir/state" CCC_MEMORY_CACHE_DIR="$cdir/hooks/cache" timeout 20 bash "$mem_script" --json 2>/dev/null)
+      else
+        mem_json=$(su - "$runuser" -c "CCC_STATE_DIR='$cdir/state' CCC_MEMORY_CACHE_DIR='$cdir/hooks/cache' timeout 20 bash '$mem_script' --json" 2>/dev/null)
+      fi
+      # degraded/error components name themselves and their reasons; otherwise
+      # off (both off), optional (MemPalace optional, e.g. Termux) or ok. Any
+      # other status (probe unavailable, ...) is unknown.
+      mem=$(printf '%s' "$mem_json" | jq -r '
+        [["nunchi", .nunchi], ["mempalace", .mempalace]]
+        | map({n: .[0], s: ((.[1].status? // "unknown") | tostring),
+               r: [(.[1].reasons? // [])[]? | tostring]}) as $c
+        | [$c[] | select(.s == "degraded" or .s == "error")] as $bad
+        | if ($bad | length) > 0 then
+            (if any($bad[]; .s == "error") then "error" else "degraded" end) + ":"
+            + ([$bad[] | .n + "." + (if (.r | length) > 0 then (.r | join("+")) else .s end)] | join(","))
+          elif all($c[]; .s == "off") then "off"
+          elif all($c[]; .s == "ok" or .s == "off" or .s == "optional") then
+            (if any($c[]; .s == "optional") then "optional" else "ok" end)
+          else "unknown" end' 2>/dev/null | head -1 | tr -cd 'A-Za-z0-9._,:+-' | cut -c1-160)
+      [ -n "$mem" ] || mem=unknown
+    fi
+    echo "MEMORY=$mem"
   fi
 else
   echo "DOCTOR=-"
@@ -700,7 +744,9 @@ probe_node() {
   # has to parse a modified argv.
   payload="CCC_FLEET_DOCTOR=$2
 $PROBE"
-  if [ "$2" = "1" ]; then node_budget=90; else node_budget=30; fi
+  # Doctor budget: its own 60s cap plus the memory check's 20s (#2659), with
+  # the bridge status call's margin unchanged.
+  if [ "$2" = "1" ]; then node_budget=110; else node_budget=30; fi
   attempt=0
   while :; do
     if [ "$1" = "$SELF" ]; then
@@ -735,6 +781,22 @@ judge_node() {
   # by this watcher, so there is no older remote protocol to fall back to.
   if [ "$probe_rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -1)" != PROBE_COMPLETE=1 ]; then
     echo "UNVERIFIED $node inspection=incomplete-probe"; fail=1; return
+  fi
+
+  # Memory streak (#2659): counted on every complete doctor answer before any
+  # higher-ranked verdict returns, so a node whose doctor also drifted keeps
+  # its count. Only ok/off/optional clear it; unknown or absent
+  # (no memory check on that harness) neither confirms nor clears.
+  memory="" mem_n=0
+  if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ]; then
+    memory=$(printf '%s\n' "$out" | sed -n 's/^MEMORY=//p' | head -1 | tr -cd 'A-Za-z0-9._,:+-' | cut -c1-160)
+    case "$memory" in
+      degraded*|error*)
+        mem_n=$(( ${mem_streak[$node]:-0} + 1 ))
+        [ "$mem_n" -le 999999 ] || mem_n=999999
+        mem_streak[$node]=$mem_n; mem_seen[$node]=$mem_now ;;
+      ok|off|optional) unset "mem_streak[$node]" "mem_seen[$node]" ;;
+    esac
   fi
 
   avail=$(printf '%s\n' "$out" | sed -n 's/^AVAIL=//p' | head -1)
@@ -841,6 +903,18 @@ judge_node() {
     fail\ *) echo "DUALDOMAIN $node ${dual#fail }"; fail=1; return ;;
   esac
 
+  # Persistent memory degradation (#2659) is reported as DRIFT: it is a doctor
+  # sweep finding, and DRIFT is already counted into the owner alert title.
+  # Below the threshold it stays visible on the OK line without paging.
+  case "$memory" in
+    degraded*|error*)
+      if [ "$mem_n" -ge "$MEMORY_CONFIRM" ]; then
+        echo "DRIFT $node memory=$memory sweeps=$mem_n/$MEMORY_CONFIRM runtime=$runtime"; fail=1; return
+      fi
+      ok_note="$ok_note, memory-pending:$memory $mem_n/$MEMORY_CONFIRM" ;;
+    unknown) ok_note="$ok_note, memory:unknown" ;;
+  esac
+
   # The generation is shown for Danso nodes because nothing else identifies
   # which image is serving: two nodes at the same path can be running different
   # binaries, and a restart that re-execs the same image looks identical to one
@@ -872,6 +946,56 @@ RECHECK="${CCC_FLEET_DEGRADED_RECHECK:-1}"
 RECHECK_DELAY="${CCC_FLEET_DEGRADED_RECHECK_DELAY:-75}"
 case "$RECHECK_DELAY" in ''|*[!0-9]*) RECHECK_DELAY=75 ;; esac
 [ "$RECHECK_DELAY" -le 300 ] || RECHECK_DELAY=300
+
+# Memory degradation streaks (#2659), doctor sweep only. A degraded/error
+# MEMORY answer fails its node once it has been seen on CCC_FLEET_MEMORY_CONFIRM
+# consecutive sweeps (default 2, capped at 30), so a refresh caught mid-run
+# does not page. The count lives in a small owner-only TSV
+# (`node<TAB>count<TAB>last-epoch`, entries older than 7 days dropped),
+# replaced atomically after the run. A streak file that cannot be used never
+# makes the sweep quieter: it is said on stderr and degradation confirms on
+# first sight, the same as CCC_FLEET_MEMORY_CONFIRM=1 (which keeps no file).
+MEMORY_CONFIRM="${CCC_FLEET_MEMORY_CONFIRM:-2}"
+case "$MEMORY_CONFIRM" in ''|*[!0-9]*|0) MEMORY_CONFIRM=2 ;; esac
+[ "$MEMORY_CONFIRM" -le 30 ] || MEMORY_CONFIRM=30
+MEMORY_STATE="${CCC_FLEET_MEMORY_STATE:-${HOME:-/root}/.claude/state/fleet-watch/memory-degraded.tsv}"
+MEMORY_STATE_USABLE=0
+declare -A mem_streak=() mem_seen=()
+mem_now=$(date +%s)
+if [ "${CCC_FLEET_DOCTOR:-0}" = 1 ] && [ "$MEMORY_CONFIRM" -gt 1 ]; then
+  mem_dir=$(dirname "$MEMORY_STATE")
+  if [ ! -L "$MEMORY_STATE" ] && (umask 077; mkdir -p "$mem_dir") 2>/dev/null \
+      && [ -d "$mem_dir" ] && [ -w "$mem_dir" ] \
+      && { [ ! -e "$MEMORY_STATE" ] || { [ -f "$MEMORY_STATE" ] && [ -O "$MEMORY_STATE" ] && [ -r "$MEMORY_STATE" ]; }; }; then
+    MEMORY_STATE_USABLE=1
+    if [ -f "$MEMORY_STATE" ]; then
+      while IFS=$'\t' read -r m_node m_count m_seen; do
+        case "$m_node" in ''|*[!A-Za-z0-9._@:-]*) continue ;; esac
+        case "$m_count" in ''|*[!0-9]*|???????*) continue ;; esac
+        case "$m_seen" in ''|*[!0-9]*|????????????*) continue ;; esac
+        [ $((mem_now - m_seen)) -le 604800 ] || continue
+        mem_streak[$m_node]=$m_count; mem_seen[$m_node]=$m_seen
+      done < "$MEMORY_STATE"
+    fi
+  else
+    echo "fleet-bridge-watch: memory streak state $MEMORY_STATE is unusable; confirming memory degradation on first sight" >&2
+    MEMORY_CONFIRM=1
+  fi
+fi
+save_memory_state() {
+  [ "$MEMORY_STATE_USABLE" = 1 ] || return 0
+  [ "${#mem_streak[@]}" -gt 0 ] || [ -e "$MEMORY_STATE" ] || return 0
+  m_tmp="$MEMORY_STATE.tmp.$$"
+  if ( umask 077
+       for m_node in "${!mem_streak[@]}"; do
+         printf '%s\t%s\t%s\n' "$m_node" "${mem_streak[$m_node]}" "${mem_seen[$m_node]}"
+       done > "$m_tmp" ) 2>/dev/null && mv -f "$m_tmp" "$MEMORY_STATE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$m_tmp"
+  # The next sweep would start from a stale count: say so in the report.
+  echo "UNVERIFIED watcher memory-state=unwritable"; fail=1
+}
 
 declare -A deferred_out=()
 deferred=""
@@ -926,4 +1050,5 @@ if [ -n "$deferred" ]; then
     fi
   done
 fi
+save_memory_state
 exit $fail

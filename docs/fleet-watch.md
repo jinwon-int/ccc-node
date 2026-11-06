@@ -93,6 +93,24 @@ after the reviewed fix is integrated into the normal checkout.
   Read the worker cgroup, then check that system or user manager. A system unit
   with `User=gongmyoung` does not need a user unit or user-bus cron variables.
   Numeric systemd User values are compared as UIDs. Unknown domains alert.
+- **Memory health (doctor sweep, #2659):** the doctor reports a degraded
+  nunchi/MemPalace as a non-fatal 경고, so the sweep also runs
+  `ccc-memory-check.sh --json` as the runtime owner and reduces it to
+  `MEMORY=ok|off|optional|unknown|degraded:<component>.<reasons>|error:…`.
+  A degraded/error node fails as `DRIFT <node> memory=<state> sweeps=N/M`
+  only after `CCC_FLEET_MEMORY_CONFIRM` consecutive sweeps (default 2; `1`
+  pages at once); before that it is `OK (…, memory-pending:<state> 1/2)`.
+  `ok`/`off`/`optional` clear the streak; `unknown` (check missing, failing or
+  unparseable) neither fails nor clears it. MemPalace's flush-lag `OK` with
+  SQLite slightly ahead of HNSW (#2336) is already `ok` in the memory check.
+  Streaks are kept per node in `CCC_FLEET_MEMORY_STATE` (default
+  `~/.claude/state/fleet-watch/memory-degraded.tsv`, `0600`, replaced
+  atomically, entries unseen for 7 days dropped); use one file per scheduled
+  task. A streak file that is a symlink, foreign-owned or not writable is
+  reported on stderr and degradation then confirms on first sight; a failed
+  write adds `UNVERIFIED watcher memory-state=unwritable`. `--light` never
+  runs it; with `--state-file` on a full sweep the two confirmations stack
+  (`NEW DRIFT` on the third degraded sweep with both defaults).
 - **Git access:** check readability, directory write access and existing
   reflog/FETCH_HEAD write access as the updater account. Readable immutable
   root-owned objects alone are not drift. Git inspection errors never mean
