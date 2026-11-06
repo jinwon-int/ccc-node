@@ -1072,6 +1072,48 @@ class RelativeFalsePositive2544Tests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
 
+    def test_clock_anchored_gloss_is_demoted(self) -> None:
+        # family-messenger#616: "(약 15시간 뒤)" glosses a month-day clock time.
+        for line in (
+            "- `mls_lobby_keypackages`: 새 기기가 20:02:23에 로비 키를 **8개** 올렸고, 아이폰이 "
+            "20:02:24~36에 8개 방 초대로 **8개 전부 소비**. 다음 보충은 **10-31 11:27:19**(약 15시간 뒤)",
+            "다음 점검 11/02 09:25(3시간 뒤), 담당 서서",
+            "재시작 10-31 11:27 KST (48시간 후).",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(body=line), "anchored-clock-gloss")
+
+    def test_offset_without_an_adjacent_clock_stays_high(self) -> None:
+        for line in (
+            "약 15시간 뒤 판정",
+            "10-31 11:27:19에 배포했다. 약 15시간 뒤 판정",
+            "배포 10-31 11:27, 이후 약 15시간 뒤 판정",
+            "10-31 11:27(15시간 뒤 재확인)",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    def test_distributive_possibility_is_demoted(self) -> None:
+        # ccc-node#2659 line 3: a generic "could last for days" statement.
+        for line in (
+            "`ccc-memory-check.sh`가 `mempalace.status=degraded`를 내도, 플릿의 정기 점검 경로에서는 "
+            "아무 알림도 나가지 않습니다. 그래서 실제 장애가 며칠씩 조용히 이어질 수 있습니다.",
+            "토큰 갱신이 몇 주씩 밀릴 수 있음",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(body=line, author="jinon86"), "generic-duration")
+
+    def test_distributive_controls_stay_high(self) -> None:
+        for line in (
+            "며칠씩 관측할 수 있습니다",
+            "며칠 뒤 판정",
+            "며칠 지나면 정리할 수 있습니다",
+            "며칠씩 돌려 본다",
+            "며칠씩 돌려 본다, 그 뒤 승격할 수 있다",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
     def test_past_term_beside_a_future_one_stays_high(self) -> None:
         line = "지난번엔 15시간 뒤에야 일어났고 이번엔 48시간 뒤 재확인"
         self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
