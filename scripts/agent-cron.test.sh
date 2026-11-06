@@ -674,9 +674,27 @@ kept = (
     "openssl=3.0.13-0ubuntu3.6",
     "linux-image=6.8.0-136-generic",
     "nodejs=22.23.4-1nodesource1 chrome=156.0.8078.47-1",
+    # container image references (#2624: drift alerts lost which image it was).
+    "image=ghcr.io/jinwon-int/a2a-docker-runner:1.2.3",
+    "pulled ghcr.io/jinwon-int/a2a-docker-runner:v2026.11.01",
+    "image=docker.io/library/postgres:16.4-bookworm",
+    "running searxng/searxng:2026.10.30-abc123",
+    "quay.io/prometheus/node-exporter:v1.8.2",
+    "registry.k8s.io/ingress-nginx/controller:v1.11.2",
+    "gcr.io/distroless/static-debian12:nonroot",
+    "public.ecr.aws/docker/library/redis:7.4",
+    "ghcr.io/jinwon-int/a2a-docker-runner",
 )
 for raw in kept:
     assert module.redact_for_owner(raw) == raw, raw
+
+# The digest is 64 hex characters, indistinguishable from a token: the path
+# stays readable but the digest itself is still masked (#2624).
+digest_ref = "ghcr.io/jinwon-int/a2a-docker-runner@sha256:" + "0123456789abcdef" * 4
+assert module.redact_for_owner(digest_ref) == (
+    "ghcr.io/jinwon-int/a2a-docker-runner@sha256:"
+    + module._canonical_redaction.REDACTION_MARKER
+), module.redact_for_owner(digest_ref)
 
 # ...without turning the path exemption into a smuggling channel. The invariant:
 # no run of _OWNER_LONG_RUN_MIN+ token characters survives, and every preserved
@@ -712,6 +730,18 @@ masked = (
     # both sides short, so only the version shape keeps these masked:
     "cookie=QWxhZGRpbjpvcGVuIHNl",              # value does not start with a digit
     "sid=1" + "a" * 20,                          # digit start but no `.`
+    # image-reference span (#2624) must not open a side channel either:
+    "evil.example/jinwon-int/a2a-docker-runner",       # host not allowlisted
+    "ghcr.io.evil.example/jinwon-int/runner",          # look-alike host
+    "image=evil.ghcr.io/jinwon-int/a2a-runner",        # allowlisted suffix only
+    "ghcr.io/jinwon-int/" + "a" * 30,                  # over-long segment
+    "ghcr.io/" + "b" * 24 + "/runner",                 # 24-char segment mid-path
+    "ghcr.io/Jinwon-Int/A2a-Docker-Runner",            # uppercase segments
+    "ghcr.io/o/r" + "ABCDEFGHIJKLMN",                  # uppercase glued to a segment
+    "ghcr.io/o/" + "abc+defghijklmnop",                # base64 `+` in a segment
+    "docker.io/library/postgres=" + "Q" * 10,          # `=` after the path
+    "image=ghcr.io/jinwon-int/a2a-docker-runner/" + "S" * 30,  # trailing blob
+    "K" * 30 + "=ghcr.io/jinwon-int/runner",           # blob before the image
 )
 for raw in masked:
     out = module.redact_for_owner(raw)
