@@ -432,6 +432,49 @@ user message; one span is written when the result arrives.
 - **Scope:** Claude provider only (the frame-observer seam); autonomous
   between-turns turns are covered too. Codex/Piri/Danso: later slice.
 
+### Daily span rollup (#2684 slice 3)
+
+`scripts/spans-rollup.py` turns one **KST** day of spans (default: yesterday;
+`--date YYYY-MM-DD`) into one per-node summary. Because files are named by UTC
+day it reads the two UTC files the KST day overlaps and keeps spans with
+`start_ts` inside `[00:00, 24:00) KST`.
+
+- **Contents:** per tool — calls, errors (`status != ok`), error rate, p50/p95
+  `duration_ms` (linear interpolation; `main` and `subagent` calls together,
+  the scope split is in the totals); per model (turn spans) — turns,
+  input/output/cache-read tokens, cost; turn `status` / `ccc.outcome` /
+  `error.type` counts; `ccc.skill` counts when present; `kind=a2a` ok/failed
+  and top-5 failure classes only when such spans exist.
+- **Cost-ledger cross-check** against `.telegram_bot/usage-cost-ledger.jsonl`
+  for the same window, on node totals: turns, input tokens, output tokens and
+  cost, each with a discrepancy % (target < 5 %, `⚠` in the digest when
+  exceeded). The ledger writes rows only for priced turns, so the span side
+  counts turns with `ccc.cost_usd > 0`; the ledger's `in` excludes cache
+  tokens, so `ccc.usage.cache_*_tokens` are subtracted first. It is not per
+  model: a turn span names one model, a ledger row lists every model of the
+  turn.
+- **Body-free:** every line goes through the checkout's
+  `span_ledger.sanitize_span` before it is counted (loaded by path, so the
+  cron's plain `python3` needs no bridge venv; if it cannot load, the run
+  exits 4 and delivers nothing). Only aggregates and identifier-shaped
+  allow-listed values reach the output; the cost ledger contributes numbers
+  only (no model names, no session ids).
+- **Delivery:** one `class: metrics/span-rollup` entry in
+  `$CCC_STATE_DIR/wiki-candidates.md` (same human-gated queue as the weekly
+  cost rollup), plus one owner-only push-spool record (`event=SpansRollup`,
+  `tier=info`) that the fleet-alerts relay holds for its 09:00 KST
+  「🔔 플릿 알림」 digest. The spool file name is recorded in the entry as
+  `digest-spool:`. `--no-digest` queues only; `--dry-run` prints the entry
+  and digest text and writes nothing (`--json` for the raw summary).
+  Idempotent per `(date, node)` via `<!-- spans-rollup:DATE:NODE -->`.
+- **Never fails on data:** missing spans dir, empty day, unreadable or
+  corrupt lines → exit 0; an empty day prints `skipped: no-spans` and
+  delivers nothing (read counters are in the summary).
+- **Schedule:** opt-in line in the cost-ledger managed cron block,
+  `scripts/install-cost-ledger-cron.sh --apply --spans` (03:41 KST,
+  `CCC_SPANS_ROLLUP_CRON`); it reads the bridge project at the cron user's
+  `$HOME`. Install it on bridge nodes only, after owner approval.
+
 ## Group rows still holding a DM session (#2075)
 
 Before #2092, a group/room row in `sessions.json` could end up holding the

@@ -41,6 +41,11 @@ SCHEDULE="${CCC_COST_LEDGER_CRON:-29 3 * * *}"
 # Sunday, so the previous ISO week is complete when it is queued.
 WEEKLY_SCHEDULE="${CCC_COST_LEDGER_WEEKLY_CRON:-17 5 * * 1}"
 WEEKLY_CMD="${CCC_COST_LEDGER_WEEKLY_CMD:-$SELF_DIR/cost-ledger-weekly.py}"
+# Daily span rollup (#2684 slice 3): 03:41 KST, after midnight closes the KST
+# day and after the 03:29 ledger run, well before the fleet-alerts relay's
+# 09:00 KST info digest that its spool record is held for.
+SPANS_SCHEDULE="${CCC_SPANS_ROLLUP_CRON:-41 3 * * *}"
+SPANS_CMD="${CCC_SPANS_ROLLUP_CMD:-$SELF_DIR/spans-rollup.py}"
 LOG="${CCC_COST_LEDGER_CRON_LOG:-$STATE_DIR/cost-ledger.cron.log}"
 CRONTAB="${CCC_CRONTAB_CMD:-crontab}"
 MARKER="# ccc-node:cost-ledger"
@@ -49,6 +54,7 @@ BLOCK_END="# ccc-node:cost-ledger:end"
 APPLY=0
 REMOVE=0
 WEEKLY=0
+SPANS=0
 
 # Shared installer libs (#1081, #1077): gen stamps + records, and the common
 # crontab install/remove driver.
@@ -67,6 +73,7 @@ GEN="$(ccc_installer_gen_stamp_auto "$SELF")"
 usage() {
   cat <<EOF
 Usage: install-cost-ledger-cron.sh [--dry-run|--apply] [--remove] [--schedule SPEC]
+                                   [--weekly] [--spans]
 
 Installs (or removes) a crontab entry that runs cost-ledger.py once a day and
 appends one row per (date, node) to the local ledger, so per-model token and
@@ -90,10 +97,17 @@ Options:
                    cost-ledger-weekly.py queues the previous ISO week's
                    per-model totals into the wiki-candidates queue (human
                    gate; never auto-PR). Default: "$WEEKLY_SCHEDULE".
+  --spans          Also install the daily span rollup entry (#2684):
+                   spans-rollup.py summarises yesterday's (KST) bridge spans
+                   from \$HOME/.telegram_bot/spans into one wiki-candidates
+                   entry plus one info-tier push-spool record for the daily
+                   「🔔 플릿 알림」 digest. Bridge nodes only (an idle day or a
+                   node without spans exits 0 and delivers nothing).
+                   Default: "$SPANS_SCHEDULE".
 
 Env overrides: CCC_CLAUDE_DIR, CCC_STATE_DIR, CCC_COST_LEDGER_CMD,
 CCC_COST_LEDGER_FILE, CCC_COST_LEDGER_CRON, CCC_COST_LEDGER_CRON_LOG,
-CCC_CRONTAB_CMD.
+CCC_SPANS_ROLLUP_CRON, CCC_SPANS_ROLLUP_CMD, CCC_CRONTAB_CMD.
 EOF
 }
 
@@ -104,6 +118,7 @@ while [ $# -gt 0 ]; do
     --remove) REMOVE=1 ;;
     --schedule) ccc_cron_need_val "$1" "${2:-}"; SCHEDULE="$2"; shift ;;
     --weekly) WEEKLY=1 ;;
+    --spans) SPANS=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -122,6 +137,13 @@ if [ "$WEEKLY" = 1 ]; then
   CRON_LINE="$CRON_LINE"$'\n'"$WEEKLY_SCHEDULE bash -lc 'CCC_STATE_DIR=\"$STATE_DIR\" python3 \"$WEEKLY_CMD\" --ledger \"$LEDGER_OUT\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
 fi
 
+if [ "$SPANS" = 1 ]; then
+  # Same managed block + gen stamp. The rollup reads the bridge project at the
+  # cron user's $HOME (the fleet bridge's PROJECT_ROOT); nothing else is baked
+  # into the line, so a self-update replay cannot drop a setting (#1867).
+  CRON_LINE="$CRON_LINE"$'\n'"$SPANS_SCHEDULE bash -lc 'CCC_STATE_DIR=\"$STATE_DIR\" python3 \"$SPANS_CMD\"' >> \"$LOG\" 2>&1  $MARKER gen=$GEN"
+fi
+
 if [ "$APPLY" = 1 ] && [ "$REMOVE" != 1 ]; then
   # The entry appends to "$LOG" under STATE_DIR; create the directory now
   # rather than when the job first fires (same as the sibling installers).
@@ -134,6 +156,7 @@ fi
 # while verification still passes on the daily line's fresh gen stamp.
 record_argv=(--apply --schedule "$SCHEDULE")
 if [ "$WEEKLY" = 1 ]; then record_argv+=(--weekly); fi
+if [ "$SPANS" = 1 ]; then record_argv+=(--spans); fi
 
 ccc_cron_installer_finish \
   --label "cost-ledger" \

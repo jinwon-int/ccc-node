@@ -128,7 +128,7 @@ CRON_MARKER_INSTALLERS = (
     # here, so every node's correctly-installed entry surfaced as an unknown
     # unmanaged marker (12/12 nodes on the 2026-09-02 fleet sweep).
     ("cost-ledger", "# ccc-node:cost-ledger", "scripts/install-cost-ledger-cron.sh",
-     "run scripts/install-cost-ledger-cron.sh --apply (add --weekly if the node had the weekly line)"),
+     "run scripts/install-cost-ledger-cron.sh --apply (add --weekly / --spans if the node had those lines)"),
     ("fleet-skills-sync", "# ccc-node:fleet-skills-sync", "scripts/install-fleet-skills-sync-cron.sh",
      "run scripts/install-fleet-skills-sync-cron.sh --apply"),
     ("tunnel-audit", "# ccc-node:tunnel-audit", "scripts/install-tunnel-audit-cron.sh",
