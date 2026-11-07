@@ -183,6 +183,19 @@ ok "record argv drops --weekly when reinstalled without it" \
   '! jq -e ".argv | index(\"--weekly\")" "$REC" >/dev/null 2>&1'
 bash "$INSTALLER" --apply --remove >/dev/null 2>&1
 
+# --- daily span rollup entry (#2684 slice 3): opt-in --spans ----------------
+bash "$INSTALLER" --apply --weekly --spans >/dev/null 2>&1
+ok "--spans adds the 03:41 span rollup line inside the same managed block" \
+  '[ "$(marker_count)" = 3 ] && grep -F "spans-rollup.py" "$FAKE_CRON" | grep -qF "41 3 * * *"'
+ok "spans line carries CCC_STATE_DIR and the gen stamp" \
+  'grep "spans-rollup.py" "$FAKE_CRON" | grep -qF "CCC_STATE_DIR=" && grep "spans-rollup.py" "$FAKE_CRON" | grep -qE "gen=h_[0-9a-f]{12}$"'
+ok "--spans and --weekly are both materialized in the install record (#1264 class)" \
+  'jq -e "(.argv | index(\"--spans\")) and (.argv | index(\"--weekly\"))" "$REC" >/dev/null 2>&1'
+bash "$INSTALLER" --apply >/dev/null 2>&1
+ok "re-apply without --spans strips the span rollup line (opt-in is not sticky)" \
+  '[ "$(marker_count)" = 1 ] && ! grep -qF "spans-rollup.py" "$FAKE_CRON"'
+bash "$INSTALLER" --apply --remove >/dev/null 2>&1
+
 # --- stage 2: codex collector (#1205 D-1) -----------------------------------
 # turn_context carries the model; token_count events carry total (cumulative)
 # AND last (per-turn delta) — the ledger must use `last`.
