@@ -27,7 +27,9 @@ enqueued alert into `hande_alerts`, and the lane hands each row to a dedicated
 relay bot (`native-mls-bot … steward <device> --responder-unix <sock>`) as a
 FLEET-WORKER `notice` frame over a Unix socket. During the transition both
 senders run (every alert in both rooms); afterwards the Matrix sender is
-retired. See "「한데」 lane" below.
+retired — the 「한데」 lane's opt-in `--close-source` takes over closing queue
+rows and running the tier policy. See "「한데」 lane" and "Retiring the Matrix
+sender" below.
 
 ## Files
 
@@ -109,14 +111,16 @@ python3 fleet_alerts_receipt.py --relay-url "$CCC_PUSH_FLEET_RELAY_URL" --node <
 # exit 0 found · 3 unknown/not yours · 4 refused · 5 unreachable
 ```
 
-**Delivery policy per tier (stage 2, `fleet_alerts_policy.py`, run by the
-Matrix sender before every round):**
+**Delivery policy per tier (stage 2, `fleet_alerts_policy.py`, run before every
+round by the Matrix sender — and by the 「한데」 lane under `--close-source`;
+`tick` holds a non-blocking `policy.lock` in the queue directory, so two lanes
+never run it at once):**
 
 | tier | leaves the queue | re-notify |
 |---|---|---|
 | `info` | held; one **digest** row per day at **09:00 KST** (`📋 플릿 알림 다이제스트 <date> — info N건 · K종`; grouped by event as `■ <event> N건 (node counts)`, groups with a problem signal first; each item `• HH:MM #id <label> <first content line>` plus up to 2 `└` detail lines, problem lines first — the ccc-node `🔔` header line and run-id/timestamp/URL bookkeeping are dropped; a group shows its 3 most relevant items then `… 외 N건`; the whole text stays ≤ 7000 bytes (「한데」 cap 8000) by dropping detail lines, then items, then trailing groups); held rows get a `digested` receipt pointing at the digest id | — |
 | `notice` | at once (both rooms — the 「한데」 mirror copies every non-`info` insert) | **never**; not an `ok/hold` target (#2628) |
-| `action` | at once | up to **3 times** (#2674): 15 min, 1 h and 4 h after the Matrix receipt — a derived `⏰ 재통지 k/3 #id …` row each. The chain stops on a `reply` receipt (`ok/hold <id>`) or a `resolved` receipt (below). The 2nd/3rd one never goes out 00:00–07:00 KST: it waits for 07:00, and the 3rd keeps its 3 h gap after the 2nd's due time (15 min / 1 h / 4 h by day; e.g. 23:30 → 23:45, 07:00, 10:00). |
+| `action` | at once | up to **3 times** (#2674): 15 min, 1 h and 4 h after delivery, once the row has a strong receipt (`matrix-event` or 「한데」 `hande-ack`) — a derived `⏰ 재통지 k/3 #id …` row each. The chain stops on a `reply` receipt (`ok/hold <id>`) or a `resolved` receipt (below). The 2nd/3rd one never goes out 00:00–07:00 KST: it waits for 07:00, and the 3rd keeps its 3 h gap after the 2nd's due time (15 min / 1 h / 4 h by day; e.g. 23:30 → 23:45, 07:00, 10:00). |
 | `critical` | at once | like `action`, `🚨` |
 
 **Resolving an alert (#2674).** A sender can say, inside its own alert text,
@@ -277,6 +281,38 @@ complete `result`, approve/deny/tool frames are ignored, no AI runtime.
 Rollback: `systemctl stop fleet-alerts-sender-hande`, then `--uninstall`
 (drops trigger + table). Pausing only: stop the unit — mirror rows wait up to
 24h.
+
+### Retiring the Matrix sender (`--close-source`)
+
+Without the flag only the Matrix sender closes a queue row (`delivered` + body
+wiped) and only its loop runs `policy.tick` (09:00 digest, re-notify), so
+stopping it alone would leave every alert body in the queue and stop both.
+`fleet_alerts_sender_hande.py --close-source` (ack mode only, **off by
+default** — deploying the code changes nothing) takes both jobs over:
+
+| event | `alerts` row |
+| --- | --- |
+| `notice_ack` | closed: `delivered`=now, `event_id` `hande:<notice id>`, body wiped (`hande-ack` receipt as before) |
+| dropping `notice_nack` | closed as `hande-dropped:<reason>` (no strong receipt → never re-notified) |
+| `rate` / `relay` / `conflict` / `client_id_reuse` nack | stays open, resent as before |
+| non-`info` row older than 24h without a mirror row | closed as `hande-expired` |
+| row the Matrix sender already closed (`$event`) | left as it is |
+| `info` row | never closed here — held and closed by the digest (`digested`), as with Matrix |
+
+The lane also runs `policy.tick` once per poll while the bot is connected; the
+digest and re-notify rows it makes are non-`info` inserts, so the mirror
+delivers them to 「한데」. Re-notify accepts `hande-ack` as the strong receipt
+(one candidate per alert even with both receipts).
+
+Cut-over (each step a separate owner decision): (1) add `--close-source` to the
+`fleet-alerts-sender-hande` unit and restart it; (2) stop and disable
+`fleet-alerts-sender` (and drop it from the host's self-update restart list).
+Between (1) and (2) both lanes tick; `policy.lock` lets one of them run each
+round, so no second digest or re-notify is made. A row this lane closes first
+is no longer sent to Matrix (the Matrix sender only sends `delivered IS NULL`
+rows) — that is the intended direction. Rollback: remove the flag and restart
+the lane; re-enabling `fleet-alerts-sender` resumes Matrix delivery for rows
+that are still open (rows already closed by 「한데」 are not re-sent to Matrix).
 
 ## Operations
 

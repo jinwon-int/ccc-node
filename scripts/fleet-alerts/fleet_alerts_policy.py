@@ -2,9 +2,14 @@
 
 Stage 1 gave every alert a tier and an id. This module decides *when* a row
 leaves the queue, as pure functions over the outbox plus one ``tick`` that the
-Matrix sender calls before each delivery round. Nothing here talks to Matrix
-or 「한데」; it only creates and marks rows, so both channels see the same
-policy through the queue (the 「한데」 mirror copies every non-``info`` insert).
+delivering lane calls before each round: the Matrix sender always, and the
+「한데」 lane when it runs with ``--close-source`` (Matrix sender retirement).
+``tick`` holds a non-blocking ``policy.lock`` in the queue directory, so while
+both lanes run (the cut-over window) one tick runs at a time and the other
+lane skips that round — never a second digest or re-notify row. Nothing here
+talks to Matrix or 「한데」; it only creates and marks rows, so both channels
+see the same policy through the queue (the 「한데」 mirror copies every
+non-``info`` insert).
 
 Policy (owner decision 2026-10-27, ccc-node#2413):
 
@@ -15,7 +20,8 @@ Policy (owner decision 2026-10-27, ccc-node#2413):
               a ``digested`` receipt pointing at the digest id.
 ``action``    delivered at once; **re-notified up to 3 times** (#2674, owner decision
               2026-11-05) at ``RENOTIFY_SCHEDULE_S`` = 15 min, 1 h, 4 h after its
-              strong Matrix receipt — each a derived row ``tier=renotify`` that
+              delivery, once it has a strong receipt (``matrix-event`` or
+              ``hande-ack``) — each a derived row ``tier=renotify`` that
               quotes the original id and says ``k/3``. The chain stops at once on a
               ``reply`` receipt (``ok/hold <id>``) or a ``resolved`` receipt (a later
               alert from the same node declared ``resolves=<key>`` for a key this
@@ -38,12 +44,14 @@ delivery — ``tick`` catches and logs, and ``pending`` only ever *excludes*
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import logging
 import os
 import re
 import time
 from collections import Counter
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 from zoneinfo import ZoneInfo
 
 import fleet_alerts_outbox as outbox
@@ -67,6 +75,11 @@ DIGEST_GROUP_ITEMS = 3      # items shown per event group; older plain ones fold
 #: The 「한데」 mirror caps a notice at 8000 bytes (fleet_alerts_sender_hande.MAX_TEXT_BYTES); stay well below.
 DIGEST_MAX_BYTES = 7000
 META_DIGEST_DAY = "digest_last_day"  # KST date of the last digest row, YYYY-MM-DD
+#: Lock file in the queue directory held for one whole ``tick`` (non-blocking; a busy lock skips the round).
+POLICY_LOCK = "policy.lock"
+#: ``(channel, kind)`` receipts that make an action/critical row eligible for re-notify:
+#: the Matrix event id, or the 「한데」 bot's notice_ack (family-messenger#703).
+RENOTIFY_STRONG_RECEIPTS = (("matrix", "matrix-event"), ("hande", "hande-ack"))
 
 
 # ---- meta -----------------------------------------------------------------
@@ -296,21 +309,25 @@ def renotify_due_at(delivered: float, done: int) -> Optional[float]:
 def due_renotify(root: os.PathLike | str, now: float):
     """``(txn, alert_id, node, tier, delivered, done)`` of action/critical rows whose next re-notify is due.
 
-    Excluded: rows without a strong Matrix receipt, replied (``ok``/``hold``) or
-    ``resolved`` rows, rows whose schedule is used up, and resolution-only alerts
-    (they declared ``resolves`` keys and no ``opens`` key).
+    Excluded: rows without a strong receipt (``matrix-event`` or ``hande-ack``,
+    ``RENOTIFY_STRONG_RECEIPTS``), replied (``ok``/``hold``) or ``resolved`` rows,
+    rows whose schedule is used up, and resolution-only alerts (they declared
+    ``resolves`` keys and no ``opens`` key). A row with both strong receipts is
+    one candidate (``EXISTS``, not a join).
     """
+    strong = " OR ".join("(r.channel=? AND r.kind=?)" for _ in RENOTIFY_STRONG_RECEIPTS)
     with outbox.database(root) as conn:
         rows = conn.execute(
             "SELECT a.txn, a.alert_id, a.node, a.tier, a.delivered,"
             " (SELECT COUNT(*) FROM receipts x WHERE x.txn=a.txn AND x.kind='renotify')"
-            " FROM alerts a JOIN receipts r ON r.txn=a.txn AND r.channel='matrix' AND r.kind='matrix-event'"
+            " FROM alerts a"
             " WHERE a.tier IN ('action','critical') AND a.delivered IS NOT NULL AND a.delivered <= ?"
+            f" AND EXISTS (SELECT 1 FROM receipts r WHERE r.txn=a.txn AND ({strong}))"
             " AND NOT EXISTS (SELECT 1 FROM receipts x WHERE x.txn=a.txn AND x.kind IN ('reply','resolved'))"
             " AND NOT (EXISTS (SELECT 1 FROM conditions c WHERE c.txn=a.txn AND c.role='resolves')"
             "          AND NOT EXISTS (SELECT 1 FROM conditions c WHERE c.txn=a.txn AND c.role='opens'))"
             " ORDER BY a.delivered",
-            (now - RENOTIFY_SCHEDULE_S[0],),
+            (now - RENOTIFY_SCHEDULE_S[0], *(v for pair in RENOTIFY_STRONG_RECEIPTS for v in pair)),
         ).fetchall()
     due = []
     for txn, alert_id, node, tier, delivered, done in rows:
@@ -350,19 +367,54 @@ def make_renotify(root: os.PathLike | str, now: Optional[float] = None) -> list[
 
 # ---- tick --------------------------------------------------------------------
 
+@contextmanager
+def tick_lock(root: os.PathLike | str) -> Iterator[bool]:
+    """Hold ``POLICY_LOCK`` for one tick; yields False (and holds nothing) when another lane has it.
+
+    The digest and re-notify steps are several queue transactions each, so two
+    lanes ticking at the same moment could both see a row as due. The lock file
+    is opened like the queue files (private directory, no symlinks, owner-only).
+    """
+    fd = outbox._directory(root)
+    lock = None
+    try:
+        lock = outbox._file(fd, POLICY_LOCK)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            acquired = False
+        else:
+            acquired = True
+        yield acquired
+    finally:
+        if lock is not None:
+            os.close(lock)  # closing the fd releases the flock
+        os.close(fd)
+
+
 def tick(root: os.PathLike | str, now: Optional[float] = None) -> dict:
-    """Run the policy once (cheap when nothing is due). Never raises."""
+    """Run the policy once (cheap when nothing is due). Never raises.
+
+    Skips the round (nothing done) while another lane's tick holds ``POLICY_LOCK``.
+    """
     now = time.time() if now is None else now
     out = {"digest": None, "renotify": 0}
     try:
-        if digest_due(now, meta_get(root, META_DIGEST_DAY)):
-            out["digest"] = make_digest(root, now)
-    except Exception as exc:  # policy must never block action/critical delivery
-        logging.warning("fleet alert digest skipped reason=%s", type(exc).__name__)
-    try:
-        out["renotify"] = len(make_renotify(root, now))
-    except Exception as exc:
-        logging.warning("fleet alert re-notify skipped reason=%s", type(exc).__name__)
+        with tick_lock(root) as mine:
+            if not mine:
+                logging.debug("fleet alert policy tick skipped: another lane is ticking")
+                return out
+            try:
+                if digest_due(now, meta_get(root, META_DIGEST_DAY)):
+                    out["digest"] = make_digest(root, now)
+            except Exception as exc:  # policy must never block action/critical delivery
+                logging.warning("fleet alert digest skipped reason=%s", type(exc).__name__)
+            try:
+                out["renotify"] = len(make_renotify(root, now))
+            except Exception as exc:
+                logging.warning("fleet alert re-notify skipped reason=%s", type(exc).__name__)
+    except Exception as exc:  # unsafe queue directory / lock file
+        logging.warning("fleet alert policy skipped reason=%s", type(exc).__name__)
     return out
 
 

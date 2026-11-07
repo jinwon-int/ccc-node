@@ -755,6 +755,61 @@ class PolicyTest(_Base):
         made = policy.make_renotify(self.queue, t0 + 60 * 60)
         self.assertTrue(any("재통지 2/3" in b for b, _ in self._bodies(made)))
 
+    def _closed_at(self, t0: float, txn: str) -> None:
+        """Close a row the way the 「한데」 lane does under --close-source (no Matrix receipt)."""
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE alerts SET delivered=?, event_id=?, body='' WHERE txn=?", (t0, "hande:" + txn, txn))
+
+    def test_renotify_takes_a_hande_ack_as_the_strong_receipt(self) -> None:
+        # Matrix sender retired: the 「한데」 bot's notice_ack is the only strong receipt.
+        t0 = _kst(2026, 11, 7, 10, 0)
+        ta, _ = outbox.enqueue(self.queue, "hande only", node="node-a", tier="action")
+        self._closed_at(t0, ta)
+        outbox.receipt(self.queue, ta, "hande", "hande-ack", "42")
+        made = policy.make_renotify(self.queue, t0 + 16 * 60)
+        self.assertEqual(len(made), 1)
+        self.assertTrue(any("재통지 1/3" in b for b, _ in self._bodies(made)))
+        self.assertEqual(len(policy.make_renotify(self.queue, t0 + 60 * 60)), 1)
+
+    def test_weak_or_dropped_hande_receipts_are_not_renotified(self) -> None:
+        t0 = _kst(2026, 11, 7, 10, 0)
+        for kind in ("socket-write", "hande-dropped"):
+            with self.subTest(kind=kind):
+                txn, _ = outbox.enqueue(self.queue, f"weak {kind}", node="node-a", tier="action")
+                self._closed_at(t0, txn)
+                outbox.receipt(self.queue, txn, "hande", kind, "")
+                self.assertEqual(policy.due_renotify(self.queue, t0 + 16 * 60), [])
+
+    def test_both_strong_receipts_make_one_renotify_not_two(self) -> None:
+        t0 = _kst(2026, 11, 7, 10, 0)
+        ta, _ = outbox.enqueue(self.queue, "both rooms", node="node-a", tier="critical")
+        self._delivered_at(t0, ta)
+        outbox.receipt(self.queue, ta, "hande", "hande-ack", "7")
+        self.assertEqual([r[0] for r in policy.due_renotify(self.queue, t0 + 16 * 60)], [ta])
+        self.assertEqual(len(policy.make_renotify(self.queue, t0 + 16 * 60)), 1)
+        self.assertEqual(policy.make_renotify(self.queue, t0 + 30 * 60), [])  # 2nd waits for 1 h
+        kinds = [r["kind"] for r in outbox.lookup(self.queue, ta)["receipts"]]
+        self.assertEqual(kinds.count("renotify"), 1)
+
+    def test_tick_skips_the_round_while_another_lane_holds_the_policy_lock(self) -> None:
+        # Cut-over window: both senders tick; the lock keeps them from making a second digest/re-notify.
+        outbox.enqueue(self.queue, "x", tier="info")
+        t0 = _kst(2026, 11, 7, 10, 0)
+        ta, _ = outbox.enqueue(self.queue, "act", node="node-a", tier="action")
+        self._delivered_at(t0, ta)
+        now = t0 + 16 * 60
+        with policy.tick_lock(self.queue) as mine:
+            self.assertTrue(mine)
+            with policy.tick_lock(self.queue) as other:
+                self.assertFalse(other)
+            self.assertEqual(policy.tick(self.queue, now), {"digest": None, "renotify": 0})
+        out = policy.tick(self.queue, now)
+        self.assertIsNotNone(out["digest"])
+        self.assertEqual(out["renotify"], 1)
+        self.assertEqual(policy.tick(self.queue, now), {"digest": None, "renotify": 0})  # sequential: idempotent
+        with policy.tick_lock(self.queue) as again:
+            self.assertTrue(again)  # released after each tick
+
     def test_resolves_marker_stops_the_chain_and_is_not_renotified_itself(self) -> None:
         key = "fw:node-a:hande:20261105T083652Z"
         new = _payload(text=f"NEW UNREACHABLE node-a channel=hande since=2026-11-05T08:36:52Z\n@fleet-alert opens={key}",
