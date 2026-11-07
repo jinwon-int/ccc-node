@@ -515,7 +515,7 @@ def test_turn_span_output_tokens_sum_all_models_not_main_loop_only() -> None:
 
 
 def test_turn_span_output_tokens_second_turn_of_a_session_matches_ledger() -> None:
-    """#2684 slice 4, as measured on gongmyoung 2026-11-07: ``model_usage`` is
+    """#2684 slice 4, as measured on one node on 2026-11-07: ``model_usage`` is
     session-cumulative but the top-level ``usage`` is not, so the snapshot
     delta of the top-level output went to 0 on later turns of a session while
     the per-model delta (what the cost ledger records) stayed correct."""

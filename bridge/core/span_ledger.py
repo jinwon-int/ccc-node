@@ -263,7 +263,7 @@ def turn_span_from_claude_result(
         # (#2684 slice 4). The top-level ``usage.output_tokens`` is wrong here
         # twice over: it leaves out auxiliary/subagent models (haiku), and it
         # is not session-cumulative like ``model_usage``, so its snapshot delta
-        # collapses to 0 on later turns of a session (gongmyoung 2026-11-07:
+        # collapses to 0 on later turns of a session (one node, 2026-11-07:
         # 51,279 span vs 137,598 ledger output tokens over 6 turns). Fall back
         # to it only when no model rows exist.
         output_tokens: Any
