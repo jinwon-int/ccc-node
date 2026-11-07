@@ -34,6 +34,7 @@ from telegram_bot.utils.orphan_reaper import (
     BRIDGE_CHILD_ENV_VALUE,
     BRIDGE_CHILD_ENV_VAR,
 )
+from telegram_bot.core.system_prompt import appended_text
 
 
 async def _reject(_tool_name, _tool_input, _context):
@@ -275,7 +276,8 @@ def test_curated_web_mcp_replaces_native_web_tools(tmp_path: Path) -> None:
         "CCC_BRIDGE_DISTILL_MANAGED": "1",
         BRIDGE_CHILD_ENV_VAR: BRIDGE_CHILD_ENV_VALUE,
     }
-    assert "Curated web routing" in options.system_prompt
+    assert options.system_prompt["type"] == "preset"  # #2712: append, never replace the default prompt
+    assert "Curated web routing" in appended_text(options)
 
 
 # ---- orphan-reaper ownership marker ----------------------------------------

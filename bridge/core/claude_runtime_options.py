@@ -25,6 +25,8 @@ from .browser_mcp import build_browser_mcp
 from .curated_memory import build_curated_memory_settings
 from .family_mcp import build_family_mcp, merge_mcp_bundle
 from .memory_audience import audience_from_claude_environment
+from .output_style import read_output_style
+from .system_prompt import append_system_prompt
 from .tool_policy import (
     BASH_DISABLED,
     EXECUTION_OWNER_OPERATOR,
@@ -200,6 +202,13 @@ class ClaudeRuntimeOptionsMixin:
                 options.setting_sources = ["user", "project", "local"]
                 audience_kind = None
             if options.setting_sources == []:
+                # Without a settings chain the CLI never reads settings.json's
+                # outputStyle, so the node's output style is appended to the
+                # default prompt here, as the governed path would load it (#2712).
+                append_system_prompt(
+                    options,
+                    read_output_style(Path(settings.claude_settings_path).expanduser().parent),
+                )
                 # Owner profiles without a settings chain need the family
                 # servers injected explicitly; the server re-checks the node
                 # policy at call time (shared audiences get none) (#1678).

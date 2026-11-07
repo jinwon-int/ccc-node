@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from telegram_bot.core.system_prompt import append_system_prompt
+
 AUDIENCE_SHARED = "shared"
 
 FAMILY_SKILLS_SERVER = "family-skills"
@@ -162,4 +164,5 @@ def merge_mcp_bundle(options: Any, bundle: dict[str, Any]) -> None:
             **bundle["process_env"],
         }
     if bundle.get("system_prompt"):
-        options.system_prompt = (options.system_prompt or "") + bundle["system_prompt"]
+        # Append, never replace: a plain-string system_prompt replaces the Claude Code default prompt (#2712).
+        append_system_prompt(options, bundle["system_prompt"])
