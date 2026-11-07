@@ -12,6 +12,7 @@ from telegram_bot.core.browser_mcp import (
     build_browser_mcp,
 )
 from telegram_bot.core.family_mcp import merge_mcp_bundle
+from telegram_bot.core.system_prompt import appended_text
 
 # `tools/list` of @playwright/mcp 0.0.82 (the version pinned by
 # jinwon-int/fleet-mcp package-lock.json), captured 2026-09-28. When fleet-mcp
@@ -130,6 +131,8 @@ def test_merges_with_other_bundles_and_rejects_name_collisions() -> None:
     assert set(options.mcp_servers) == {"family-skills", BROWSER_SERVER}
     assert "Read" in options.allowed_tools
     assert f"mcp__{BROWSER_SERVER}__browser_evaluate" in options.disallowed_tools
-    assert options.system_prompt.startswith("base")
+    # #2712: an earlier plain string is kept as the first appended part, under the claude_code preset.
+    assert options.system_prompt["type"] == "preset"
+    assert appended_text(options).startswith("base")
     with pytest.raises(ValueError):
         merge_mcp_bundle(options, build_browser_mcp(_settings()))

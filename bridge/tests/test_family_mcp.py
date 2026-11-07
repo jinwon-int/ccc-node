@@ -18,6 +18,7 @@ from telegram_bot.core.memory_audience import MemoryAudience
 from telegram_bot.core.web_mcp import build_curated_web_mcp
 from telegram_bot.core.agent_runtime import SessionRequest
 from telegram_bot.core.family_skills_server import SERVER_NAME
+from telegram_bot.core.system_prompt import appended_text
 
 
 def _settings(tmp_path: Path, **overrides) -> SimpleNamespace:
@@ -269,8 +270,10 @@ def test_merge_combines_web_and_family_without_clobber(tmp_path: Path) -> None:
         "mcp__searxng__web_url_read",
     ]
     assert options.env["FIRECRAWL_API_KEY"] == "fc-test"
-    assert "Curated web routing" in options.system_prompt
-    assert "Family skill, wiki & ops lookup" in options.system_prompt
+    # #2712: routing hints are appended to the Claude Code preset, never a replacing string.
+    assert options.system_prompt["type"] == "preset" and options.system_prompt["preset"] == "claude_code"
+    assert "Curated web routing" in appended_text(options)
+    assert "Family skill, wiki & ops lookup" in appended_text(options)
 
 
 def test_merge_fails_closed_on_server_name_collision(tmp_path: Path) -> None:
