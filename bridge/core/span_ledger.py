@@ -259,9 +259,18 @@ def turn_span_from_claude_result(
             span["ccc.usage.cache_creation_tokens"] = cache_create
         elif getattr(delta, "input_tokens", None) is not None:
             span["gen_ai.usage.input_tokens"] = getattr(delta, "input_tokens")
-        output_tokens = getattr(delta, "output_tokens", None)
-        if output_tokens is None and models:
+        # Sum per-model output like input above and like the cost ledger does
+        # (#2684 slice 4). The top-level ``usage.output_tokens`` is wrong here
+        # twice over: it leaves out auxiliary/subagent models (haiku), and it
+        # is not session-cumulative like ``model_usage``, so its snapshot delta
+        # collapses to 0 on later turns of a session (gongmyoung 2026-11-07:
+        # 51,279 span vs 137,598 ledger output tokens over 6 turns). Fall back
+        # to it only when no model rows exist.
+        output_tokens: Any
+        if models:
             output_tokens = sum(int(getattr(m, "output_tokens", 0) or 0) for m in models)
+        else:
+            output_tokens = getattr(delta, "output_tokens", None)
         span["gen_ai.usage.output_tokens"] = output_tokens
         span["ccc.cost_usd"] = getattr(delta, "total_cost_usd", None)
     return span

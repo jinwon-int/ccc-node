@@ -499,6 +499,55 @@ def test_turn_span_from_successful_claude_result() -> None:
     assert "claude-session-abc" not in json.dumps(clean)
 
 
+def test_turn_span_output_tokens_sum_all_models_not_main_loop_only() -> None:
+    """#2684 slice 4: the SDK's top-level ``usage.output_tokens`` covers the
+    main loop only, while ``model_usage`` also lists auxiliary/subagent models.
+    The span must sum per-model output (as input and the cost ledger do), so
+    span and ledger totals agree."""
+
+    from dataclasses import replace
+
+    delta = replace(_delta(), output_tokens=48)  # main model only
+    span = turn_span_from_claude_result(_result(), delta, end_ts=BASE)
+    assert span["gen_ai.usage.output_tokens"] == 2 + 48
+    ledger_out = sum(m.output_tokens for m in delta.models)
+    assert span["gen_ai.usage.output_tokens"] == ledger_out
+
+
+def test_turn_span_output_tokens_second_turn_of_a_session_matches_ledger() -> None:
+    """#2684 slice 4, as measured on gongmyoung 2026-11-07: ``model_usage`` is
+    session-cumulative but the top-level ``usage`` is not, so the snapshot
+    delta of the top-level output went to 0 on later turns of a session while
+    the per-model delta (what the cost ledger records) stayed correct."""
+
+    from telegram_bot.core.usage import delta_from_snapshots, parse_claude_result
+
+    def sdk(top_out: int, opus_out: int, haiku_out: int, cost: float):
+        return SimpleNamespace(
+            usage={"input_tokens": 5, "output_tokens": top_out},
+            model_usage={
+                "claude-opus-5-5": {"inputTokens": 50, "outputTokens": opus_out, "costUSD": cost},
+                "claude-haiku-5-5": {"inputTokens": 9, "outputTokens": haiku_out, "costUSD": 0.001},
+            },
+            total_cost_usd=cost + 0.001,
+        )
+
+    first = parse_claude_result(sdk(top_out=4609, opus_out=4609, haiku_out=215, cost=0.8))
+    second = parse_claude_result(sdk(top_out=481, opus_out=4609 + 2788, haiku_out=215, cost=1.0))
+    delta = delta_from_snapshots(first, second)
+    span = turn_span_from_claude_result(_result(), delta, end_ts=BASE)
+    ledger_out = sum(m.output_tokens for m in delta.models)
+    assert ledger_out == 2788
+    assert span["gen_ai.usage.output_tokens"] == ledger_out
+
+
+def test_turn_span_output_tokens_fall_back_to_top_level_without_models() -> None:
+    delta = UsageSnapshot(provider="claude", input_tokens=7, output_tokens=11, total_cost_usd=0.1)
+    span = turn_span_from_claude_result(_result(), delta, end_ts=BASE)
+    assert span["gen_ai.usage.output_tokens"] == 11
+    assert span["gen_ai.usage.input_tokens"] == 7
+
+
 def test_turn_span_from_error_result() -> None:
     span = turn_span_from_claude_result(
         _result(is_error=True, subtype="error_max_turns"), None, end_ts=BASE
