@@ -12,6 +12,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -346,8 +347,8 @@ class _Bot:
         self.send({"type": "notice_nack", "id": notice_id, "reason": reason})
 
 
-class NoticeAckLoopTest(_Base):
-    """family-messenger#703: id on every notice, row kept until notice_ack, nack handling, resend on reconnect."""
+class _AckLoopBase(_Base):
+    """A served connection in ack mode against a fake bot, on a settable clock."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -375,6 +376,10 @@ class NoticeAckLoopTest(_Base):
     def _receipts(self) -> list[tuple[str, str, str]]:
         with outbox.database(self.queue) as conn:
             return conn.execute("SELECT txn, kind, ref FROM receipts WHERE channel='hande' ORDER BY at").fetchall()
+
+
+class NoticeAckLoopTest(_AckLoopBase):
+    """family-messenger#703: id on every notice, row kept until notice_ack, nack handling, resend on reconnect."""
 
     def test_notice_carries_id_row_kept_until_ack_then_deleted_in_order(self) -> None:
         t1, _ = outbox.enqueue(self.queue, "first alert", tier="action")
@@ -543,6 +548,182 @@ class NoticeAckLoopTest(_Base):
         self.assertEqual(hande.backlog(self.queue), 0)
 
 
+def _last_0930_kst() -> float:
+    """The latest 09:30 KST at or before now (a digest is due; the mirror rows are not 24h old)."""
+    import datetime as dt
+    import fleet_alerts_policy as policy
+    local = dt.datetime.now(policy.KST).replace(hour=9, minute=30, second=0, microsecond=0)
+    if local.timestamp() > time.time():
+        local -= dt.timedelta(days=1)
+    return local.timestamp()
+
+
+class CloseSourceTest(_AckLoopBase):
+    """``--close-source`` (Matrix sender retired): this lane closes outbox rows and runs the tier policy."""
+
+    def _alert(self, txn: str) -> tuple[str, bool, object]:
+        with outbox.database(self.queue) as conn:
+            body, delivered, event_id = conn.execute(
+                "SELECT body, delivered, event_id FROM alerts WHERE txn=?", (txn,)).fetchone()
+        return body, delivered is not None, event_id
+
+    def _ack_all(self, frames: list[dict], n: int):
+        def bot_side(bot: _Bot) -> None:
+            for seq in range(n):
+                frame = bot.line()
+                frames.append(frame)
+                bot.ack(frame["id"], seq=seq + 1)
+        return bot_side
+
+    def test_default_ack_leaves_the_outbox_row_and_the_policy_to_the_matrix_sender(self) -> None:
+        import fleet_alerts_policy as policy
+        txn, _ = outbox.enqueue(self.queue, "for both rooms", tier="action")
+        outbox.enqueue(self.queue, "held info", tier="info")
+        self.clock.now = _last_0930_kst()  # a digest would be due
+        self.assertEqual(self._serve(self._ack_all([], 1), max_notices=1), "max notices reached")
+        self.assertEqual(self._alert(txn), ("for both rooms", False, None))
+        self.assertEqual(policy.pending_deliverable(self.queue)[0], txn)  # Matrix still sends it
+        self.assertEqual(len(policy.held_info_rows(self.queue)), 1)       # no tick in this lane
+        self.assertIsNone(policy.meta_get(self.queue, policy.META_DIGEST_DAY))
+
+    def test_ack_closes_the_row_wipes_the_body_and_the_matrix_sender_skips_it(self) -> None:
+        import fleet_alerts_policy as policy
+        self.clock.now = time.time()  # the Matrix sender's own tick below runs on the real clock
+        txn, _ = outbox.enqueue(self.queue, "secret-ish alert", tier="critical")
+        frames: list[dict] = []
+        with self.assertLogs(level="INFO") as logs:
+            reason = self._serve(self._ack_all(frames, 1), max_notices=1, close_source=True)
+        self.assertEqual(reason, "max notices reached")
+        self.assertEqual(frames[0]["text"], "secret-ish alert")
+        self.assertEqual(self._alert(txn), ("", True, "hande:" + txn))
+        self.assertEqual(self._receipts(), [(txn, "hande-ack", "1")])
+        self.assertIsNone(policy.pending_deliverable(self.queue))
+        self.assertEqual(outbox.pending_count(self.queue), 0)
+        fake = _FakeMatrix()
+        self.assertFalse(asyncio.run(tx.deliver_one(self.queue, fake, "!room:hs")))
+        self.assertEqual(fake.sent, [])
+        self.assertNotIn("secret-ish alert", "\n".join(logs.output))
+
+    def test_dropping_nack_closes_the_row_with_its_reason_and_it_is_never_renotified(self) -> None:
+        import fleet_alerts_policy as policy
+        txn, _ = outbox.enqueue(self.queue, "dropped", tier="action")
+
+        def bot_side(bot: _Bot) -> None:
+            bot.nack(bot.line()["id"], "not_joined_or_halted")
+
+        self.assertEqual(self._serve(bot_side, max_notices=1, close_source=True), "max notices reached")
+        self.assertEqual(self._alert(txn), ("", True, "hande-dropped:not_joined_or_halted"))
+        self.assertEqual(policy.due_renotify(self.queue, self.clock.now + 24 * 3600), [])
+
+    def test_retry_nacks_keep_the_row_open(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "rate limited", tier="action")
+
+        def bot_side(bot: _Bot) -> None:
+            bot.nack(bot.line()["id"], "rate")
+            self.assertTrue(bot.silent())
+            self.assertEqual(self._alert(txn), ("rate limited", False, None))
+            bot.sock.shutdown(socket.SHUT_WR)
+
+        self.assertEqual(self._serve(bot_side, close_source=True), "bot disconnected")
+        self.assertEqual(self._alert(txn), ("rate limited", False, None))
+
+    def test_a_row_the_matrix_sender_already_closed_is_left_as_it_is(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "both", tier="action")
+        outbox.delivered(self.queue, txn, "$event")
+        self.assertEqual(self._serve(self._ack_all([], 1), max_notices=1, close_source=True), "max notices reached")
+        self.assertEqual(self._alert(txn), ("", True, "$event"))
+
+    def test_legacy_write_then_delete_mode_ignores_the_flag(self) -> None:
+        txn, _ = outbox.enqueue(self.queue, "legacy", tier="action")
+        ours, bot = socket.socketpair()
+        try:
+            th = threading.Thread(target=lambda: hande.serve_connection(
+                ours, self.queue, "fleet-alerts", hande.Pacer(9), poll=0.02, max_notices=1,
+                clock=self.clock, notice_ack=False, close_source=True), daemon=True)
+            th.start()
+            self.assertEqual(_Bot(bot).line()["text"], "legacy")
+            th.join(timeout=5)
+        finally:
+            ours.close()
+            bot.close()
+        self.assertEqual(self._alert(txn), ("legacy", False, None))
+
+    def test_old_rows_without_a_mirror_row_are_closed_info_rows_wait_for_the_digest(self) -> None:
+        old, _ = outbox.enqueue(self.queue, "old action", tier="action")
+        young, _ = outbox.enqueue(self.queue, "young action", tier="action")
+        info, _ = outbox.enqueue(self.queue, "old info", tier="info")
+        age = hande.MAX_AGE_SECONDS + 5
+        with outbox.database(self.queue) as conn:
+            conn.execute("UPDATE alerts SET created=created-? WHERE txn IN (?,?)", (age, old, info))
+            conn.execute("UPDATE hande_alerts SET created=created-? WHERE txn=?", (age, old))
+        self.assertEqual(hande.next_alert(self.queue)[1], young)  # default: outbox untouched
+        self.assertEqual(self._alert(old), ("old action", False, None))
+        self.assertEqual(hande.next_alert(self.queue, close_source=True)[1], young)
+        self.assertEqual(self._alert(old), ("", True, hande.CLOSED_EXPIRED))
+        self.assertEqual(self._alert(young), ("young action", False, None))
+        self.assertEqual(self._alert(info), ("old info", False, None))
+
+    def test_the_lane_makes_the_digest_sends_it_to_hande_and_closes_it(self) -> None:
+        import fleet_alerts_policy as policy
+        info, _ = outbox.enqueue(self.queue, "[노드A] quiet info line", node="node-a", tier="info")
+        self.assertEqual(hande.backlog(self.queue), 0)  # info is held, not mirrored
+        self.clock.now = _last_0930_kst()
+        frames: list[dict] = []
+        self.assertEqual(self._serve(self._ack_all(frames, 1), max_notices=1, close_source=True),
+                         "max notices reached")
+        self.assertEqual(len(frames), 1)
+        self.assertIn("📋 플릿 알림 다이제스트", frames[0]["text"])
+        self.assertIn("quiet info line", frames[0]["text"])
+        digest_txn = frames[0]["id"]
+        self.assertEqual(outbox.lookup(self.queue, digest_txn)["tier"], "digest")
+        self.assertEqual(self._alert(digest_txn), ("", True, "hande:" + digest_txn))
+        self.assertEqual(self._alert(info), ("", True, None))  # closed by the digest, not by this lane
+        self.assertIn("digested", [r["kind"] for r in outbox.lookup(self.queue, info)["receipts"]])
+        self.assertEqual(policy.meta_get(self.queue, policy.META_DIGEST_DAY), policy.kst_day(self.clock.now))
+        self.assertEqual(outbox.pending_count(self.queue), 0)
+
+    def test_hande_ack_alone_drives_the_renotify_which_is_sent_to_hande(self) -> None:
+        import fleet_alerts_policy as policy
+        policy.meta_set(self.queue, policy.META_DIGEST_DAY, "keep-the-digest-out-of-this-test")
+        self.clock.now = time.time()
+        txn, _ = outbox.enqueue(self.queue, "disk full", node="node-a", tier="action")
+        aid = outbox.alert_id_of(self.queue, txn)
+        frames: list[dict] = []
+
+        def bot_side(bot: _Bot) -> None:
+            first = bot.line()
+            frames.append(first)
+            bot.ack(first["id"], seq=1)
+            self.assertTrue(bot.silent(), "re-notified before 15 min")
+            self.clock.now += 16 * 60
+            second = bot.line()
+            frames.append(second)
+            bot.ack(second["id"], seq=2)
+
+        self.assertEqual(self._serve(bot_side, max_notices=2, close_source=True), "max notices reached")
+        self.assertEqual(frames[0]["id"], txn)
+        self.assertIn(f"재통지 1/3 #{aid}", frames[1]["text"])
+        receipts = {(r["channel"], r["kind"]) for r in outbox.lookup(self.queue, txn)["receipts"]}
+        self.assertEqual(receipts, {("hande", "hande-ack"), ("renotify", "renotify")})  # no Matrix receipt
+        self.assertEqual(self._alert(frames[1]["id"])[1:], (True, "hande:" + frames[1]["id"]))
+        self.assertEqual(outbox.pending_count(self.queue), 0)
+
+    def test_tick_is_skipped_while_the_other_lane_holds_the_policy_lock(self) -> None:
+        import fleet_alerts_policy as policy
+        outbox.enqueue(self.queue, "held info", tier="info")
+        self.clock.now = _last_0930_kst()
+
+        def bot_side(bot: _Bot) -> None:
+            self.assertTrue(bot.silent(0.3))
+            bot.sock.shutdown(socket.SHUT_WR)
+
+        with policy.tick_lock(self.queue) as mine:  # the Matrix sender mid-tick
+            self.assertTrue(mine)
+            self.assertEqual(self._serve(bot_side, close_source=True), "bot disconnected")
+        self.assertEqual(len(policy.held_info_rows(self.queue)), 1)
+        self.assertIsNone(policy.meta_get(self.queue, policy.META_DIGEST_DAY))
+
+
 class ReplyTurnTest(_Base):
     """#2413 stage 3: an owner device's ``ok/hold <id>`` turn becomes a reply receipt; others are ignored."""
 
@@ -615,6 +796,39 @@ class CliTest(_Base):
                 with self.assertRaises(_Stop):
                     hande.main(argv)
             self.assertIs(seen["notice_ack"], expected, extra)
+
+    def test_close_source_is_off_by_default_passed_through_and_needs_ack_mode(self) -> None:
+        from unittest import mock
+
+        class _Stop(Exception):
+            pass
+
+        class _Server:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def accept(self):
+                self.calls += 1
+                if self.calls > 1:
+                    raise _Stop
+                return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM), None
+
+        base = ["--queue", str(self.queue), "--socket", str(self.root / "s"), "--room", "fleet-alerts"]
+        for extra, expected in (([], False), (["--close-source"], True)):
+            seen: dict = {}
+
+            def fake_serve(conn, queue, room, pacer, **kw):
+                seen.update(kw)
+                return "done"
+
+            with mock.patch.object(hande, "listen", return_value=_Server()), \
+                    mock.patch.object(hande, "serve_connection", side_effect=fake_serve):
+                with self.assertRaises(_Stop):
+                    hande.main(base + extra)
+            self.assertIs(seen["close_source"], expected, extra)
+        with self.assertRaises(SystemExit) as cm:
+            hande.main(base + ["--close-source", "--no-notice-ack"])
+        self.assertEqual(cm.exception.code, 2)
 
     def test_run_mode_requires_socket_and_valid_room_and_pace(self) -> None:
         for argv in (

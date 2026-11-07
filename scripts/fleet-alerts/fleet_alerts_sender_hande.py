@@ -48,7 +48,38 @@ Matrix is unaffected). Mirror rows older than 24h are dropped, so a stopped
 lane never turns the mirror into an indefinite alert-text archive. Bodies,
 tokens and frames are never logged.
 
-Rollback: stop the service, then ``--uninstall`` (drops trigger + mirror table).
+Retiring the Matrix sender (``--close-source``, opt-in, ack mode only)
+-----------------------------------------------------------------------
+Without the flag this lane changes nothing in ``alerts``: only the Matrix
+sender closes a row (``delivered`` + body wiped, ``outbox.delivered``), and only
+its loop runs the tier policy (``fleet_alerts_policy.tick``: 09:00 KST info
+digest, action/critical re-notify). Stopping it alone would leave every body in
+the queue and stop the digest and re-notify. With ``--close-source`` this lane
+takes both jobs over (same design as the bunjang 「한데」 sender):
+
+* ``notice_ack`` → the source row is closed: ``delivered`` = now, ``event_id``
+  ``hande:<notice id>``, body wiped (the ``hande-ack`` receipt is unchanged and
+  is what re-notify keys on);
+* a dropping ``notice_nack`` → closed as ``hande-dropped:<reason>`` (no strong
+  receipt, so never re-notified — like a Matrix send that never succeeded);
+* a non-``info`` row older than 24h whose mirror row is gone (expired, or never
+  mirrored) → closed as ``hande-expired``;
+* a row the Matrix sender already closed (``$event``) is left as it is;
+* ``info`` rows are never closed here: as on the Matrix side they are held,
+  not mirrored, and closed by the 09:00 digest (``digested`` receipt);
+* the lane calls ``policy.tick`` once per poll while a bot is connected, so the
+  digest and re-notify rows are created here — and, being non-``info``
+  inserts, reach 「한데」 through the mirror like any alert. ``tick`` holds a
+  non-blocking queue-directory lock, so while both senders still run (the
+  cut-over window) the two ticks never interleave; whichever lane gets the lock
+  runs that round, the other skips it.
+
+Turn it on together with retiring the Matrix sender: while both run, the first
+lane to close a row keeps the other from sending it (the Matrix sender only
+sends rows with ``delivered IS NULL``). Rollback: drop the flag and restart this
+lane; re-enabling the Matrix sender resumes Matrix delivery of still-open rows.
+
+Rollback (lane): stop the service, then ``--uninstall`` (drops trigger + mirror table).
 stdlib only.
 """
 from __future__ import annotations
@@ -68,6 +99,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_alerts_outbox as outbox  # noqa: E402
+import fleet_alerts_policy as policy  # noqa: E402
 import fleet_alerts_reply as reply  # noqa: E402
 
 ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -85,6 +117,10 @@ NACK_RESEND = frozenset({"relay", "conflict", "client_id_reuse"})  # not stored 
 RATE_RETRY_SECONDS = 60.0
 RESEND_DELAY_SECONDS = 5.0
 ACK_WARN_SECONDS = 300.0  # an in-flight notice this old gets one warning (old bot without acks?)
+# --close-source: ``alerts.event_id`` markers for rows this lane closes (a Matrix close is ``$event``).
+CLOSED_ACK_PREFIX = "hande:"
+CLOSED_DROPPED_PREFIX = "hande-dropped:"
+CLOSED_EXPIRED = "hande-expired"
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS hande_alerts (
@@ -125,14 +161,47 @@ def installed(queue: os.PathLike | str) -> bool:
     return int(row[0]) == 2
 
 
-def next_alert(queue: os.PathLike | str, now: Optional[float] = None) -> Optional[tuple[int, str, str]]:
-    """Oldest mirrored alert younger than 24h as ``(id, txn, body)``; expired rows are dropped."""
+def next_alert(
+    queue: os.PathLike | str, now: Optional[float] = None, *, close_source: bool = False,
+) -> Optional[tuple[int, str, str]]:
+    """Oldest mirrored alert younger than 24h as ``(id, txn, body)``; expired rows are dropped.
+
+    With ``close_source`` the non-``info`` outbox rows that lost their mirror row
+    this way (or never had one) are closed too (``hande-expired``), so no alert
+    text outlives 24h once the Matrix sender is retired. Held ``info`` rows wait
+    for the digest, which closes them.
+    """
     now = time.time() if now is None else now
     with outbox.database(queue) as conn:
         expired = conn.execute("DELETE FROM hande_alerts WHERE created < ?", (now - MAX_AGE_SECONDS,)).rowcount
         if expired:
             logging.warning("expired %d undelivered 한데 fleet alerts older than 24h", expired)
+        if close_source:
+            closed = conn.execute(
+                "UPDATE alerts SET delivered=?, event_id=?, body='' WHERE delivered IS NULL AND tier<>'info'"
+                " AND created < ? AND txn NOT IN (SELECT txn FROM hande_alerts WHERE txn IS NOT NULL)",
+                (now, CLOSED_EXPIRED, now - MAX_AGE_SECONDS),
+            ).rowcount
+            if closed:
+                logging.warning("closed %d fleet alerts older than 24h never posted to 한데", closed)
         return conn.execute("SELECT id, txn, body FROM hande_alerts ORDER BY id LIMIT 1").fetchone()
+
+
+def close_source_row(queue: os.PathLike | str, txn: Optional[str], marker: str,
+                     now: Optional[float] = None) -> int:
+    """Close the ``alerts`` row a mirror row came from: delivered, ``event_id`` = marker, body wiped.
+
+    The Matrix sender's ``outbox.delivered`` does the same for a Matrix event; a
+    row it (or the digest) already closed is left untouched. Returns rows closed.
+    """
+    if not txn:
+        return 0
+    now = time.time() if now is None else now
+    with outbox.database(queue) as conn:
+        return int(conn.execute(
+            "UPDATE alerts SET delivered=?, event_id=?, body='' WHERE txn=? AND delivered IS NULL",
+            (now, marker[:256], txn),
+        ).rowcount or 0)
 
 
 def forget(queue: os.PathLike | str, row_id: int) -> None:
@@ -274,6 +343,7 @@ def serve_connection(
     clock=time.time,
     owner_actor: str = "owner",
     notice_ack: bool = True,
+    close_source: bool = False,
 ) -> str:
     """Serve one bot connection until it ends; returns the reason.
 
@@ -283,18 +353,25 @@ def serve_connection(
     in this call — the row itself stays the oldest in the mirror, so the next
     connection resends it. ``notice_ack=False`` is the old write-then-delete path.
 
+    ``close_source`` (ack mode only; ignored with ``notice_ack=False``): this
+    lane owns the queue — it closes the outbox row of every acked, dropped or
+    expired notice and runs ``policy.tick`` once per ``poll`` (see the module
+    docstring, "Retiring the Matrix sender").
+
     ``max_notices`` stops after that many notices were settled — written
     (legacy) or acked/dropped (ack mode) — tests only.
     """
     return _Connection(conn, queue, room, pacer, poll=poll, max_notices=max_notices, clock=clock,
-                       owner_actor=owner_actor, notice_ack=notice_ack).run()
+                       owner_actor=owner_actor, notice_ack=notice_ack,
+                       close_source=close_source and notice_ack).run()
 
 
 class _Connection:
     """One bot connection: the read loop (turns, acks) and the paced notice hand-off."""
 
     def __init__(self, conn: socket.socket, queue: os.PathLike | str, room: str, pacer: Pacer, *,
-                 poll: float, max_notices: Optional[int], clock, owner_actor: str, notice_ack: bool) -> None:
+                 poll: float, max_notices: Optional[int], clock, owner_actor: str, notice_ack: bool,
+                 close_source: bool = False) -> None:
         self.conn = conn
         self.queue = queue
         self.room = room
@@ -304,8 +381,10 @@ class _Connection:
         self.clock = clock
         self.owner_actor = owner_actor
         self.notice_ack = notice_ack
+        self.close_source = close_source
         self.inbound = b""
         self.next_poll = 0.0
+        self.next_policy = 0.0
         self.retry_at = 0.0
         self.handed = 0
         self.inflight: Optional[_InFlight] = None
@@ -359,7 +438,7 @@ class _Connection:
             return
         self.inflight = None
         if kind == "ack":
-            self._finish(current, "hande-ack", detail)
+            self._finish(current, "hande-ack", detail, CLOSED_ACK_PREFIX + current.notice_id)
             logging.info("한데 fleet alert posted txn=%s seq=%s", current.txn, detail or "?")
         elif detail in NACK_RETRY_LATER:
             self.retry_at = self.clock() + RATE_RETRY_SECONDS
@@ -369,16 +448,26 @@ class _Connection:
             self.retry_at = self.clock() + RESEND_DELAY_SECONDS
             logging.warning("한데 fleet alert not stored by the bot (%s) txn=%s; will resend", detail, current.txn)
         else:
-            self._finish(current, "hande-dropped", detail)
+            self._finish(current, "hande-dropped", detail, CLOSED_DROPPED_PREFIX + detail)
             logging.warning("한데 fleet alert dropped by the bot (%s) txn=%s", detail, current.txn)
 
-    def _finish(self, current: _InFlight, receipt_kind: str, ref: str) -> None:
+    def _finish(self, current: _InFlight, receipt_kind: str, ref: str, close_marker: str) -> None:
         forget(self.queue, current.row_id)
         _receipt(self.queue, current.txn, receipt_kind, ref)
+        if self.close_source:
+            try:
+                close_source_row(self.queue, current.txn, close_marker, self.clock())
+            except Exception:  # the 24h sweep closes it later; never lose the connection over it
+                logging.warning("fleet alert source row not closed txn=%s", current.txn)
         self.handed += 1
         self.next_poll = 0.0  # settled: the next row may go out at once (pacer permitting)
 
     def _tick(self, now: float) -> None:
+        if self.close_source and now >= self.next_policy:
+            # Matrix sender retired: the tier policy (digest, re-notify) runs here.
+            # Its rows are non-info inserts, so the mirror hands them to this loop.
+            self.next_policy = now + self.poll
+            policy.tick(self.queue, now)
         if self.inflight is not None:
             # Never resend on this connection while the ack is pending: the bot
             # keeps retrying its relay POST and a resend would post twice.
@@ -390,7 +479,7 @@ class _Connection:
         if self._done() or now < self.next_poll or now < self.retry_at or not self.pacer.ready(now):
             return
         self.next_poll = now + self.poll
-        item = next_alert(self.queue, now)
+        item = next_alert(self.queue, now, close_source=self.close_source)
         if item is None:
             return
         row_id, txn, body = item
@@ -447,6 +536,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--owner-actor", default="owner", help="relay actor whose devices may reply ok/hold <id>")
     parser.add_argument("--no-notice-ack", action="store_true",
                         help="old bot without notice_ack (family-messenger#703): send without id, delete on write")
+    parser.add_argument("--close-source", action="store_true",
+                        help="Matrix sender retired: close acked/dropped/expired outbox rows here and run the"
+                             " tier policy (09:00 digest, re-notify) in this lane; ack mode only, default off")
     parser.add_argument("--install-only", action="store_true", help="create mirror table + trigger and exit")
     parser.add_argument("--uninstall", action="store_true", help="drop mirror table + trigger and exit")
     parser.add_argument("--status", action="store_true", help="print mirror backlog and exit")
@@ -459,6 +551,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.status:
         print(json.dumps({"installed": installed(args.queue), "backlog": backlog(args.queue)}))
         return 0
+    if args.close_source and args.no_notice_ack:
+        parser.error("--close-source needs ack mode (drop --no-notice-ack)")
     install(args.queue)
     if args.install_only:
         return 0
@@ -473,13 +567,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         owner_uid = pwd.getpwnam(args.socket_owner).pw_uid
     server = listen(args.socket, owner_uid)
     pacer = Pacer(args.per_min)
-    logging.info("notice ack mode: %s", "off (--no-notice-ack)" if args.no_notice_ack else "on")
+    logging.info("notice ack mode: %s; outbox rows closed and tier policy run by %s",
+                 "off (--no-notice-ack)" if args.no_notice_ack else "on",
+                 "this lane (--close-source)" if args.close_source else "the Matrix sender")
     while True:
         conn, _ = server.accept()
         logging.info("fleet alert bot connected")
         try:
             reason = serve_connection(conn, args.queue, args.room, pacer, owner_actor=args.owner_actor,
-                                      notice_ack=not args.no_notice_ack)
+                                      notice_ack=not args.no_notice_ack, close_source=args.close_source)
         except OSError as exc:
             reason = type(exc).__name__
         finally:

@@ -16,6 +16,9 @@
 # Prerequisites (scripts/fleet-alerts/README.md, "「한데」 lane"): the relay bot
 # device enrolled for actor fleet-alerts, the 「한데」 fleet alert room created
 # and the bot joined (family-messenger#460). No tokens here; stdlib only.
+# Retiring the Matrix sender: add `--close-source` to ExecStart (this lane then
+# closes queue rows and runs the 09:00 digest / re-notify policy) — see
+# README "Retiring the Matrix sender". Off by default.
 [Unit]
 Description=Fleet alert 「한데」 sender (mirror → relay bot notice frames, send-only)
 After=network-online.target fleet-alerts-receiver.service

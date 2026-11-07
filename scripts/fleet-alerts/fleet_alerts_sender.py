@@ -40,7 +40,9 @@ async def deliver_one(queue: Path, transport: Any, room: str, *, msgtype: str = 
     """
     # Stage 2 (#2413): run the tier policy first (info digest at 09:00 KST,
     # action/critical re-notify once after 15 min), then take the oldest row
-    # that may leave now — held ``info`` rows wait for their digest.
+    # that may leave now — held ``info`` rows wait for their digest. ``tick``
+    # skips the round while the 「한데」 lane (``--close-source``) holds the
+    # policy lock, so the two never make a second digest/re-notify row.
     await asyncio.to_thread(policy.tick, queue)
     item = await asyncio.to_thread(policy.pending_deliverable, queue)
     if item is None:
