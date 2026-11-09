@@ -347,6 +347,87 @@ else
   writeback_json="$(writeback_queue_json "$DISTILL_JOURNAL_DIR")"
 fi
 
+# Journal ownership (#2720). A channel frontend rewrites health.json in its own
+# data dir every watchdog tick (seconds). A journal whose health.json is missing
+# or older than the threshold has no live bridge: nothing will retry or prune
+# its jobs, so leftovers are reported `orphaned` instead of `degraded`. An
+# explicit CCC_DISTILL_JOURNAL_DIR is the operator's chosen scope: `override`,
+# judged like a live journal.
+JOURNAL_LIVE_SEC="${CCC_CHECK_JOURNAL_LIVE_SEC:-3600}"
+case "$JOURNAL_LIVE_SEC" in ''|*[!0-9]*|0) JOURNAL_LIVE_SEC=3600 ;; esac
+journal_owner() { # <journal> -> "<owner> <health_age_seconds>"
+  local health ts age
+  if [ -n "${CCC_DISTILL_JOURNAL_DIR:-}" ]; then
+    printf 'override -1'
+    return 0
+  fi
+  health="$(dirname "$1")/health.json"
+  ts="$(file_epoch "$health")"
+  if [ "$ts" = 0 ]; then
+    printf 'orphaned -1'
+    return 0
+  fi
+  age=$(( $(now_epoch) - ts ))
+  [ "$age" -ge 0 ] || age=0
+  if [ "$age" -le "$JOURNAL_LIVE_SEC" ]; then
+    printf 'live %s' "$age"
+  else
+    printf 'orphaned %s' "$age"
+  fi
+}
+# Status as seen by an operator: queue leftovers in an orphaned journal are not
+# a live write-back failure. `empty`/`missing` stay as they are.
+WB_OWNER_STATUS_JQ='if $owner == "orphaned" and ($wb.status == "degraded" or $wb.status == "active" or $wb.status == "settled") then "orphaned" else $wb.status end'
+
+read -r selected_owner selected_health_age <<<"$(journal_owner "$DISTILL_JOURNAL_DIR")"
+writeback_json="$(jq -c --argjson wb "$writeback_json" --arg owner "$selected_owner" \
+  --argjson health_age "$selected_health_age" \
+  '$wb + {status:('"$WB_OWNER_STATUS_JQ"'), queue_status:$wb.status, owner:$owner, health_age_seconds:$health_age}' -n)"
+
+journals_json='[]'
+while IFS= read -r journal_path; do
+  [ -n "$journal_path" ] || continue
+  if [ "$journal_path" = "$DISTILL_JOURNAL_DIR" ]; then
+    journal_wb="$writeback_json"
+  else
+    journal_wb="$(writeback_queue_json "$journal_path")"
+    read -r journal_owner_name journal_health_age <<<"$(journal_owner "$journal_path")"
+    journal_wb="$(jq -c --argjson wb "$journal_wb" --arg owner "$journal_owner_name" \
+      --argjson health_age "$journal_health_age" \
+      '$wb + {status:('"$WB_OWNER_STATUS_JQ"'), queue_status:$wb.status, owner:$owner, health_age_seconds:$health_age}' -n)"
+  fi
+  journal_dir="$(dirname "$journal_path")"
+  journal_channel="$(basename "$journal_dir")"
+  journal_channel="${journal_channel#.}"
+  case "$journal_path" in */danso-distill-journal) journal_channel="$journal_channel/danso" ;; esac
+  journals_json="$(jq -c --argjson wb "$journal_wb" --arg path "$journal_path" --arg channel "$journal_channel" '
+    . + [{path:$path, channel:$channel, owner:$wb.owner, health_age_seconds:$wb.health_age_seconds,
+          status:$wb.status, queue_status:$wb.queue_status, jobs:$wb.jobs, pending_jobs:$wb.pending_jobs,
+          invalid_records:$wb.invalid_records, oldest_age_seconds:$wb.oldest_age_seconds,
+          status_counts:$wb.status_counts, local_status_counts:$wb.local_status_counts,
+          wiki_status_counts:$wb.wiki_status_counts}]' <<<"$journals_json")"
+done < <(ccc_check_distill_journal_candidates)
+# Node rollup: a degraded/active live (or override) journal decides; orphaned
+# leftovers only surface when nothing live needs attention.
+writeback_journals_json="$(jq -c --argjson live_sec "$JOURNAL_LIVE_SEC" '
+  def owned: .owner == "live" or .owner == "override";
+  {
+    status:(
+      if any(.[]; owned and .queue_status == "degraded") then "degraded"
+      elif any(.[]; owned and .queue_status == "active") then "active"
+      elif any(.[]; .status == "orphaned") then "orphaned"
+      elif any(.[]; .queue_status == "settled") then "settled"
+      elif any(.[]; .queue_status == "empty") then "empty"
+      else "missing" end
+    ),
+    live_threshold_seconds:$live_sec,
+    live:([.[] | select(owned)] | length),
+    orphaned:([.[] | select(.owner == "orphaned")] | length),
+    live_degraded:([.[] | select(owned and .queue_status == "degraded")] | length),
+    orphaned_with_jobs:([.[] | select(.owner == "orphaned" and .jobs > 0)] | length),
+    journals:.
+  }' <<<"$journals_json")"
+
 wiki_enabled="${CCC_WIKI_MEMORY_ENABLED:-1}"
 if [ "${CCC_NODE_ISOLATION_PROFILE:-fleet}" = "external" ]; then
   wiki_enabled=0
@@ -399,6 +480,7 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
     --arg journal_provider "$CCC_CHECK_JOURNAL_PROVIDER" \
     --arg journal_source "$CCC_CHECK_JOURNAL_SOURCE" \
     --argjson writeback "$writeback_json" \
+    --argjson writeback_journals "$writeback_journals_json" \
     --argjson freshness "$freshness_json" \
     --arg index_db "$index_db" \
     --argjson ttl "$TTL" \
@@ -413,6 +495,7 @@ if [ "$OUTPUT" = "--json" ] || [ "$OUTPUT" = "json" ]; then
       mempalace:$mempalace,
       journal_selection:{path:$journal_path, reason:$journal_reason, provider:$journal_provider, source:$journal_source},
       writeback_queue:$writeback,
+      writeback_journals:$writeback_journals,
       freshness:$freshness}'
   exit 0
 fi
@@ -493,3 +576,8 @@ printf -- '- writeback: status=%s jobs=%s pending=%s invalid=%s bytes=%s snapsho
   "${wb_f[0]:-}" "${wb_f[1]:-}" "${wb_f[2]:-}" "${wb_f[3]:-}" "${wb_f[4]:-}" \
   "${wb_f[5]:-}" "${wb_f[6]:-}" "${wb_f[7]:-}" "${wb_f[8]:-}" "${wb_f[9]:-}" \
   "${wb_f[10]:-}"
+# One line per channel journal plus the node rollup (#2720), counters only.
+jq -r '
+  "- writeback_journals: status=\(.status) live=\(.live) orphaned=\(.orphaned) live_degraded=\(.live_degraded) orphaned_with_jobs=\(.orphaned_with_jobs) live_threshold=\(.live_threshold_seconds)s",
+  (.journals[] | "  - \(.channel): owner=\(.owner) status=\(.status) queue=\(.queue_status) jobs=\(.jobs) pending=\(.pending_jobs) invalid=\(.invalid_records) oldest=\(.oldest_age_seconds)s health_age=\(.health_age_seconds)s")
+' <<<"$writeback_journals_json" 2>/dev/null || :
