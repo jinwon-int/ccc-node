@@ -131,7 +131,7 @@
       "name": "bridge-safe-detached-run",
       "source": "skills/bridge-safe-detached-run",
       "status": "active",
-      "tree_sha256": "c7aa70e89cb2b14a327fcd764c21f5441043648f5909a9a9961fa93abd5d881c"
+      "tree_sha256": "cbc31448afcc2382718d5c45d1d2b7f15824344c0433fcaff1c2c09126a999df"
     },
     {
       "audience": "claude",
