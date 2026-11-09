@@ -806,31 +806,8 @@ def cmd_schedule(argv: List[str]) -> int:
     if "--print" in opts or "--dry-run" in opts:
         sys.stdout.write(shlex.join(cmd) + "\n")
         return 0
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
-    except FileNotFoundError:
-        sys.stderr.write("detached_jobs: systemd-run not available on this node (Termux? use setsid + notify)\n")
+    if not _launch_schedule(cmd, user=user):
         return 3
-    except (OSError, subprocess.SubprocessError) as exc:
-        sys.stderr.write(f"detached_jobs: systemd-run failed: {exc}\n")
-        return 3
-    if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "ignore").strip().splitlines()
-        last = tail[-1] if tail else ""
-        sys.stderr.write(f"detached_jobs: systemd-run rc={proc.returncode}: {last}\n")
-        if not user and _geteuid() != 0 and "authentication required" in last.lower():
-            # Non-root harness account (#2710): the system manager wants polkit.
-            sys.stderr.write(
-                "detached_jobs: this account cannot start system units — retry with"
-                " `schedule --user ...` (a user timer; see `loginctl enable-linger` to"
-                " keep it running after logout)\n"
-            )
-        return 3
-    if user and _linger_enabled() is False:
-        sys.stderr.write(
-            "detached_jobs: warning: Linger=no for this user — the user timer stops when"
-            " the last session logs out; `loginctl enable-linger` keeps it armed\n"
-        )
     rec: Dict[str, Any] = {
         "unit": unit,
         "log": log_path,
@@ -852,6 +829,36 @@ def cmd_schedule(argv: List[str]) -> int:
             " (no ⏳ wait; completion arrives as a spool notice)\n"
         )
     return rc
+
+
+def _launch_schedule(cmd: List[str], *, user: bool) -> bool:
+    """Run the ``systemd-run`` argv; explain failures on stderr. True on success."""
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+    except FileNotFoundError:
+        sys.stderr.write("detached_jobs: systemd-run not available on this node (Termux? use setsid + notify)\n")
+        return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write(f"detached_jobs: systemd-run failed: {exc}\n")
+        return False
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "ignore").strip().splitlines()
+        last = tail[-1] if tail else ""
+        sys.stderr.write(f"detached_jobs: systemd-run rc={proc.returncode}: {last}\n")
+        if not user and _geteuid() != 0 and "authentication required" in last.lower():
+            # Non-root harness account (#2710): the system manager wants polkit.
+            sys.stderr.write(
+                "detached_jobs: this account cannot start system units — retry with"
+                " `schedule --user ...` (a user timer; see `loginctl enable-linger` to"
+                " keep it running after logout)\n"
+            )
+        return False
+    if user and _linger_enabled() is False:
+        sys.stderr.write(
+            "detached_jobs: warning: Linger=no for this user — the user timer stops when"
+            " the last session logs out; `loginctl enable-linger` keeps it armed\n"
+        )
+    return True
 
 
 def _geteuid() -> int:
