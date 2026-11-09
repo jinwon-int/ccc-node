@@ -115,8 +115,8 @@ PY
 fi
 mkdir -p "$nunchi_home"
 
-write_status() { # <state> <exit_code> <started> <finished> [index_status-json]
-  python3 - "$status_file" "$provider" "$1" "$2" "$3" "$4" "${5:-}" <<'PY'
+write_status() { # <state> <exit_code> <started> <finished> [index_status-json] [note]
+  python3 - "$status_file" "$provider" "$1" "$2" "$3" "$4" "${5:-}" "${6:-}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -147,6 +147,9 @@ if sys.argv[7]:
     ):
         index = raw
     payload["index_status"] = index
+if len(sys.argv) > 8 and sys.argv[8] in {"sweep-skipped-unchanged"}:
+    # #2722: a fixed token, never free text; the probe ignores unknown keys.
+    payload["note"] = sys.argv[8]
 path.parent.mkdir(parents=True, exist_ok=True)
 fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
@@ -250,6 +253,89 @@ if [ -z "$timeout_cli" ] || [ ! -f "$timeout_cli" ] || [ ! -x "$timeout_cli" ]; 
   exit $?
 fi
 
+# #2722 (B-2): skip a sweep whose transcript tree has not changed. MemPalace's
+# sweep re-upserts - and so re-embeds - every session's last drawer on every
+# run (`< cursor` tie-break), so an idle hour still rewrites about one drawer
+# per session. On a Termux node that took 22.5 minutes per hour with `+0 new`,
+# and every exact search during the window failed with "Palace changed
+# repeatedly". The fingerprint is the sorted (path, size, mtime_ns) of every
+# `*.jsonl` the sweep would read; it is saved only after a successful sweep and
+# is computed BEFORE that sweep starts, so anything written during a sweep is
+# swept next hour. A full sweep still runs at least every
+# CCC_NUNCHI_MEMPALACE_MAX_SKIP_SEC (default 6 h) so a rebuilt or damaged
+# palace self-heals. Default on for Termux only (cron may not export PREFIX, so
+# HOME is checked too); CCC_NUNCHI_MEMPALACE_SKIP_UNCHANGED=1/0 forces it on/off
+# anywhere. codex/piri (`mine`) are untouched.
+fp_file="$nunchi_home/mempalace-refresh.fingerprint.json"
+fingerprint=""
+skip_unchanged=0
+case "${CCC_NUNCHI_MEMPALACE_SKIP_UNCHANGED:-auto}" in
+  1|on|true) skip_unchanged=1 ;;
+  0|off|false) skip_unchanged=0 ;;
+  *) case "${PREFIX:-}:$HOME" in *com.termux*) skip_unchanged=1 ;; esac ;;
+esac
+max_skip_sec="${CCC_NUNCHI_MEMPALACE_MAX_SKIP_SEC:-21600}"
+case "$max_skip_sec" in
+  ''|*[!0-9]*|??????*) max_skip_sec=21600 ;;
+  *) [ "$max_skip_sec" -ge 60 ] && [ "$max_skip_sec" -le 86400 ] || max_skip_sec=21600 ;;
+esac
+if [ "$skip_unchanged" = 1 ] && [ "$provider" != codex ] && [ "$provider" != piri ]; then
+  fingerprint="$(python3 -I - "$target" 2>/dev/null <<'FP' || true
+import hashlib
+import os
+import sys
+
+root = sys.argv[1]
+rows = []
+for directory, names, files in os.walk(root, followlinks=False):
+    for name in files:
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(directory, name)
+        rel = os.path.relpath(path, root)
+        try:
+            st = os.stat(path)
+            rows.append("%s\0%d\0%d" % (rel, st.st_size, st.st_mtime_ns))
+        except OSError:
+            rows.append("%s\0ERR" % rel)
+blob = "\n".join(sorted(rows)).encode("utf-8", "surrogateescape")
+print(hashlib.sha256(blob).hexdigest())
+FP
+)"
+  if [ -n "$fingerprint" ] && prev_index="$(python3 -I - "$fp_file" "$status_file" "$provider" "$fingerprint" "$started" "$max_skip_sec" <<'DECIDE'
+import json
+import sys
+
+fp_path, status_path, provider, fingerprint = sys.argv[1:5]
+now, max_skip = int(sys.argv[5]), int(sys.argv[6])
+try:
+    with open(fp_path, encoding="utf-8") as handle:
+        saved = json.load(handle)
+    with open(status_path, encoding="utf-8") as handle:
+        status = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not (
+    isinstance(saved, dict) and isinstance(status, dict)
+    and saved.get("schema") == "ccc.nunchi.mempalace-refresh-fingerprint.v1"
+    and saved.get("provider") == provider
+    and saved.get("fingerprint") == fingerprint
+    and type(saved.get("swept_at")) is int
+    and 0 <= now - saved["swept_at"] < max_skip
+    and status.get("state") == "ok"
+    and status.get("provider") == provider
+):
+    raise SystemExit(1)
+index = status.get("index_status")
+print(json.dumps(index, separators=(",", ":")) if isinstance(index, dict) else "")
+DECIDE
+)"; then
+    echo "mempalace-refresh: transcripts unchanged since the last sweep; skipped (#2722)"
+    write_status ok 0 "$started" "$(date +%s)" "$prev_index" sweep-skipped-unchanged
+    exit 0
+  fi
+fi
+
 write_status running -1 "$started" 0
 cd "$HOME"
 set +e
@@ -318,6 +404,31 @@ print(json.dumps(out, separators=(",", ":")))
 
 if [ "$rc" = 0 ]; then
   write_status ok 0 "$started" "$finished" "$(index_status_json)"
+  if [ -n "$fingerprint" ]; then
+    # #2722: remember the pre-sweep tree only after the sweep succeeded.
+    python3 -I - "$fp_file" "$provider" "$fingerprint" "$finished" <<'SAVEFP' || true
+import json
+import os
+import sys
+import tempfile
+
+path, provider, fingerprint, swept_at = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+fd, tmp = tempfile.mkstemp(prefix=".fp.", dir=os.path.dirname(path) or ".")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"schema": "ccc.nunchi.mempalace-refresh-fingerprint.v1",
+                   "provider": provider, "fingerprint": fingerprint,
+                   "swept_at": swept_at}, handle, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+finally:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+SAVEFP
+  fi
 else
   write_status error "$rc" "$started" "$finished"
 fi
