@@ -128,6 +128,13 @@ class Retirement:
 # never overwrites it, and — unlike the pre-adoption fail-closed run — it no
 # longer blocks every other approved skill on the node).
 SKIP_ACTIONS = frozenset({"noop", "skip-repo-managed", "skip-user-owned"})
+# #2718: bytes already match, only the marker's commit is stale. Rewritten in
+# place without a backup and not counted in `changed` (reported as `refreshed`).
+REFRESH_ACTION = "refresh"
+MARKER_NAME = ".ccc-fleet-skill.json"
+# #2718: commit-named backups/<sha>/ kept after an apply (newest by mtime; the
+# current ref is always kept). CCC_FLEET_SKILLS_BACKUP_KEEP overrides (>= 1).
+DEFAULT_BACKUP_KEEP = 14
 # The autosave layer's provenance marker (skill-review/ownership.py). Fleet
 # approval outranks autosave ownership (#1344: repo-managed > fleet-approved >
 # autosave-owned > user-owned), so a marker-less target carrying this file is
@@ -562,6 +569,26 @@ def installed_matches(path: Path, skill: ApprovedSkill) -> bool:
     return actual == wanted
 
 
+def installed_action(current: dict[str, Any], wanted: dict[str, object], target: Path,
+                     skill: ApprovedSkill) -> str:
+    """noop / refresh / update for a target that already carries our marker.
+
+    The marker records the fleet-skills commit, which moves on every promote
+    merge. A copy whose bytes and every other provenance field already match
+    only needs its marker's ``commit`` rewritten (``refresh``: in place, no
+    backup, mtime kept) — reinstalling it would back up and replace every
+    unchanged skill each time main moves (#2718).
+    """
+    if not installed_matches(target, skill):
+        return "update"
+    if current == wanted:
+        return "noop"
+    rest = {key: value for key, value in current.items() if key != "commit"}
+    if rest == {key: value for key, value in wanted.items() if key != "commit"}:
+        return REFRESH_ACTION
+    return "update"
+
+
 def installed_tree_sha256(path: Path) -> str:
     """The skill_tree digest of an installed copy, for retirement reconcile.
 
@@ -779,8 +806,7 @@ def operations(cfg: Config, skills: list[ApprovedSkill], *, create_roots: bool) 
                     # here meant zero approved skills landed on the node.
                     rows.append(Operation(provider, skill, target, "skip-user-owned"))
                     continue
-                wanted = marker(cfg, provider, skill)
-                action = "noop" if current == wanted and installed_matches(target, skill) else "update"
+                action = installed_action(current, marker(cfg, provider, skill), target, skill)
             else:
                 action = "install"
             rows.append(Operation(provider, skill, target, action))
@@ -888,23 +914,80 @@ def rollback_prunes(backup_root: Path, pruned: list[Retirement]) -> None:
             os.replace(backup, row.target)
 
 
-def apply_operations(cfg: Config, rows: list[Operation], retired: list[Retirement]) -> int:
-    changed = [row for row in rows if row.action not in SKIP_ACTIONS]
+def replace_marker_bytes(marker_path: Path, payload: bytes, times: tuple[int, int]) -> None:
+    """Atomically swap an owner-only marker's bytes, keeping its (atime, mtime).
+
+    The usage report reads the marker mtime as the current version's install
+    time, so a commit-only refresh must not move it (#2718).
+    """
+    descriptor, raw = tempfile.mkstemp(prefix=".ccc-fleet-marker-", dir=marker_path.parent)
+    temporary = Path(raw)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        descriptor, closing = -1, descriptor
+        os.close(closing)
+        os.utime(temporary, ns=times)
+        os.replace(temporary, marker_path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def refresh_markers(cfg: Config, rows: list[Operation],
+                    refreshed: list[tuple[Path, bytes, tuple[int, int]]]) -> None:
+    for row in rows:
+        marker_path = row.target / MARKER_NAME
+        if existing_marker(row.target) is None:
+            raise SyncError("installed_marker_invalid")
+        metadata = marker_path.lstat()
+        times = (metadata.st_atime_ns, metadata.st_mtime_ns)
+        previous = marker_path.read_bytes()
+        payload = (json.dumps(marker(cfg, row.provider, row.skill), ensure_ascii=False, indent=2) + "\n").encode()
+        replace_marker_bytes(marker_path, payload, times)
+        refreshed.append((marker_path, previous, times))
+
+
+def rollback_refreshes(refreshed: list[tuple[Path, bytes, tuple[int, int]]]) -> None:
+    for marker_path, previous, times in reversed(refreshed):
+        try:
+            replace_marker_bytes(marker_path, previous, times)
+        except OSError:
+            continue
+
+
+def apply_operations(cfg: Config, rows: list[Operation], retired: list[Retirement]) -> tuple[int, int]:
+    """Apply installs/updates/adopts, retirement prunes and marker refreshes.
+
+    Returns ``(changed, refreshed)``: ``changed`` counts real byte changes
+    (installs, updates, adopts, prunes); ``refreshed`` counts commit-only
+    marker rewrites, which take no backup (#2718).
+    """
+    changed = [row for row in rows if row.action not in SKIP_ACTIONS and row.action != REFRESH_ACTION]
+    refreshes = [row for row in rows if row.action == REFRESH_ACTION]
     prunes = [row for row in retired if row.action == RETIRE_PRUNE]
-    if not changed and not prunes:
-        return 0
+    if not changed and not prunes and not refreshes:
+        return 0, 0
     backup_root = cfg.state_dir / "backups" / cfg.ref
-    private_dir(backup_root)
+    if changed or prunes:
+        private_dir(backup_root)
     staged: dict[tuple[str, str], Path] = {}
     backups: dict[tuple[str, str], Path] = {}
     applied: list[Operation] = []
     pruned: list[Retirement] = []
+    refreshed: list[tuple[Path, bytes, tuple[int, int]]] = []
     try:
         stage_and_install(cfg, backup_root, changed, staged, backups, applied)
         # Retirement reconcile runs after installs settle; prunes get the
         # same backup-and-rollback transaction as installs (#92).
         prune_retirements(backup_root, prunes, pruned)
+        # Commit-only marker rewrites go last, inside the same transaction.
+        refresh_markers(cfg, refreshes, refreshed)
     except (OSError, SyncError):
+        rollback_refreshes(refreshed)
         rollback_prunes(backup_root, pruned)
         for row in reversed(changed):
             key = (row.provider, row.skill.name)
@@ -946,7 +1029,48 @@ def apply_operations(cfg: Config, rows: list[Operation], retired: list[Retiremen
     finally:
         os.close(descriptor)
     os.replace(temporary, receipt)
-    return len(changed) + len(pruned)
+    return len(changed) + len(pruned), len(refreshed)
+
+
+def backup_keep() -> int:
+    raw = os.environ.get("CCC_FLEET_SKILLS_BACKUP_KEEP", "")
+    if raw.isascii() and raw.isdigit() and 1 <= int(raw) <= 10000:
+        return int(raw)
+    return DEFAULT_BACKUP_KEEP
+
+
+def prune_backups(cfg: Config, keep: int) -> int:
+    """Keep the newest ``keep`` commit-named backups/<sha>/ dirs (#2718).
+
+    Only real 40-hex directories are candidates — symlinks and any other
+    name (a hand-made backup) are never touched — and the current ref's
+    backup is always kept. Best effort: a removal error leaves the dir for
+    the next run and never fails the apply. Returns the number removed.
+    """
+    root = cfg.state_dir / "backups"
+    try:
+        if root.is_symlink() or not root.is_dir():
+            return 0
+        candidates: list[tuple[int, str, Path]] = []
+        for child in root.iterdir():
+            if not SHA_RE.fullmatch(child.name) or child.name == cfg.ref:
+                continue
+            metadata = child.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                candidates.append((metadata.st_mtime_ns, child.name, child))
+    except OSError:
+        return 0
+    candidates.sort(reverse=True)
+    # The current ref's dir (if any) counts toward the budget.
+    budget = keep - (1 if (root / cfg.ref).is_dir() and not (root / cfg.ref).is_symlink() else 0)
+    removed = 0
+    for _, _, path in candidates[max(budget, 0):]:
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
@@ -965,15 +1089,17 @@ def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
             skills = approved_skills(checkout(cfg, Path(raw)))
             rows = operations(cfg, skills, create_roots=apply)
             retired = retirements(cfg, skills)
-            changed = apply_operations(cfg, rows, retired) if apply else 0
+            changed, refreshed = apply_operations(cfg, rows, retired) if apply else (0, 0)
+            pruned_backups = prune_backups(cfg, backup_keep()) if apply else None
     finally:
         os.close(lock_fd)
-    return {
+    result: dict[str, object] = {
         "ok": True,
         "mode": "apply" if apply else "plan",
         "repo": cfg.repo,
         "commit": cfg.ref,
         "changed": changed,
+        "refreshed": refreshed,
         "skipped_user_owned": sorted(
             f"{row.provider}:{row.skill.name}" for row in rows if row.action == "skip-user-owned"
         ),
@@ -998,6 +1124,9 @@ def execute(cfg: Config, *, apply: bool) -> dict[str, object]:
             for row in retired
         ],
     }
+    if pruned_backups is not None:
+        result["backups_pruned"] = pruned_backups
+    return result
 
 
 def parser() -> argparse.ArgumentParser:

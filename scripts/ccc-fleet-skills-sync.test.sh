@@ -579,5 +579,103 @@ rc=$?
 ok "no danso env contract plans zero operations" \
   '[ "$rc" = 0 ] && jq -e "(.operations | length) == 0" >/dev/null <<<"$out"'
 
+# #2718: a ref move that leaves a skill's bytes untouched must not reinstall
+# it. Before the fix every installed skill was `update`d (backup + replace)
+# whenever fleet-skills main moved, because the marker embeds the commit.
+CHURN_SEED="$TMP/seed-churn"
+git clone -q "$SEED" "$CHURN_SEED"
+CHURN_REMOTE="$TMP/remote-churn.git"
+CHURN_HOME="$TMP/churn-home"
+CHURN_CLAUDE="$CHURN_HOME/.claude/skills"
+CHURN_CODEX="$CHURN_HOME/.codex/skills"
+CHURN_STATE="$CHURN_HOME/.claude/state/fleet-skills"
+mkdir -p "$CHURN_CLAUDE" "$CHURN_CODEX" "$CHURN_HOME/.claude/state"
+chmod 700 "$CHURN_HOME" "$CHURN_HOME/.claude" "$CHURN_HOME/.claude/state" \
+  "$CHURN_HOME/.codex" "$CHURN_CLAUDE" "$CHURN_CODEX"
+churn_env=(
+  "${base_env[@]}"
+  "HOME=$CHURN_HOME"
+  "CCC_FLEET_SKILLS_STATE_DIR=$CHURN_STATE"
+  "CCC_FLEET_SKILLS_CLAUDE_DIR=$CHURN_CLAUDE"
+  "CCC_FLEET_SKILLS_CODEX_DIR=$CHURN_CODEX"
+  "CCC_FLEET_SKILLS_REMOTE=$CHURN_REMOTE"
+)
+git clone -q --bare "$CHURN_SEED" "$CHURN_REMOTE"
+out="$(env "${churn_env[@]}" python3 "$SYNC" apply --ref "$REF")"; rc=$?
+ok "#2718 fixture installs both copies at the first ref" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2" >/dev/null <<<"$out"'
+CHURN_MARKER="$CHURN_CLAUDE/release-checklist/.ccc-fleet-skill.json"
+touch -d "2026-01-02 03:04:05 UTC" "$CHURN_MARKER"
+# shellcheck disable=SC2034  # read via eval inside ok()
+churn_mtime_before="$(stat -c %Y "$CHURN_MARKER")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+churn_inode_before="$(stat -c %i "$CHURN_CLAUDE/release-checklist/SKILL.md")"
+
+printf 'unrelated\n' > "$CHURN_SEED/README.md"
+git -C "$CHURN_SEED" -c user.name=test -c user.email=test@example.invalid add README.md
+git -C "$CHURN_SEED" -c user.name=test -c user.email=test@example.invalid commit -qm unrelated
+REF_MOVED="$(git -C "$CHURN_SEED" rev-parse HEAD)"
+git -C "$CHURN_SEED" push -q "$CHURN_REMOTE" main
+
+out="$(env "${churn_env[@]}" python3 "$SYNC" plan --ref "$REF_MOVED")"; rc=$?
+ok "#2718 ref move with identical bytes plans refresh, not update" \
+  '[ "$rc" = 0 ] && jq -e "(.operations | length) == 2 and (.operations | all(.action == \"refresh\"))" >/dev/null <<<"$out"'
+out="$(env "${churn_env[@]}" python3 "$SYNC" apply --ref "$REF_MOVED")"; rc=$?
+ok "#2718 refresh-only apply reports zero changed and two refreshed" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 0 and .refreshed == 2" >/dev/null <<<"$out"'
+ok "#2718 refresh takes no backup" \
+  '[ ! -e "$CHURN_STATE/backups/$REF_MOVED" ]'
+ok "#2718 refresh rewrites the marker commit in place, owner-only" \
+  '[ "$(stat -c %a "$CHURN_MARKER")" = 600 ] && jq -e --arg ref "$REF_MOVED" ".commit == \$ref and .manager == \"ccc-node-fleet-skills\"" "$CHURN_MARKER" >/dev/null'
+ok "#2718 refresh keeps the marker mtime (usage report install time)" \
+  '[ "$(stat -c %Y "$CHURN_MARKER")" = "$churn_mtime_before" ]'
+ok "#2718 refresh leaves the skill files untouched" \
+  '[ "$(stat -c %i "$CHURN_CLAUDE/release-checklist/SKILL.md")" = "$churn_inode_before" ] && ! ls -A "$CHURN_CLAUDE/release-checklist" | grep -q "^\.ccc-fleet-marker-"'
+ok "#2718 receipt follows the new ref after a refresh-only apply" \
+  'jq -e --arg ref "$REF_MOVED" --arg l "installed@$REF_MOVED" ".commit == \$ref and (.skills | length) == 2 and ([.skills[].lifecycle] | all(. == \$l))" "$CHURN_STATE/installed.json" >/dev/null'
+out="$(env "${churn_env[@]}" python3 "$SYNC" plan --ref "$REF_MOVED")"; rc=$?
+ok "#2718 rerun after refresh converges to noops" \
+  '[ "$rc" = 0 ] && jq -e ".operations | all(.action == \"noop\")" >/dev/null <<<"$out"'
+
+printf '\n4. Confirm the rollback path.\n' >> "$CHURN_SEED/approved/shared/release-checklist/SKILL.md"
+git -C "$CHURN_SEED" -c user.name=test -c user.email=test@example.invalid commit -qam content
+REF_CONTENT="$(git -C "$CHURN_SEED" rev-parse HEAD)"
+git -C "$CHURN_SEED" push -q "$CHURN_REMOTE" main
+out="$(env "${churn_env[@]}" python3 "$SYNC" apply --ref "$REF_CONTENT")"; rc=$?
+ok "#2718 a real content change still updates with a backup" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 2 and .refreshed == 0 and (.operations | all(.action == \"update\"))" >/dev/null <<<"$out" && [ -f "$CHURN_STATE/backups/$REF_CONTENT/claude-release-checklist/SKILL.md" ] && jq -e --arg ref "$REF_CONTENT" ".commit == \$ref" "$CHURN_MARKER" >/dev/null'
+
+# #2718 backup retention: keep the newest N commit-named backups (default
+# 14), always the current ref, and never touch anything that is not a
+# 40-hex directory.
+mkdir -p "$TMP/outside-target"
+printf 'keep\n' > "$TMP/outside-target/sentinel"
+for i in $(seq 1 20); do
+  sha="$(printf '%040x' "$i")"
+  mkdir -p "$CHURN_STATE/backups/$sha/claude-old"
+  touch -d "2026-01-01 00:00:00 UTC + $i hours" "$CHURN_STATE/backups/$sha"
+done
+mkdir -p "$CHURN_STATE/backups/manual-keep"
+# The first-ref install left an (empty) backups/$REF dir: age it so the
+# 20 fixtures + it are 21 candidates and keep=3 (incl. current) removes 19.
+touch -d "2025-01-01 00:00:00 UTC" "$CHURN_STATE/backups/manual-keep" "$CHURN_STATE/backups/$REF_CONTENT" "$CHURN_STATE/backups/$REF"
+ln -s "$TMP/outside-target" "$CHURN_STATE/backups/$(printf '%040x' 99)"
+out="$(env "${churn_env[@]}" CCC_FLEET_SKILLS_BACKUP_KEEP=3 python3 "$SYNC" apply --ref "$REF_CONTENT")"; rc=$?
+ok "#2718 retention prunes all but the newest N commit backups" \
+  '[ "$rc" = 0 ] && jq -e ".changed == 0 and .backups_pruned == 19" >/dev/null <<<"$out" && [ "$(find "$CHURN_STATE/backups" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex ".*/[0-9a-f]{40}" | wc -l)" = 3 ]'
+ok "#2718 retention keeps the current ref even when it is the oldest" \
+  '[ -f "$CHURN_STATE/backups/$REF_CONTENT/claude-release-checklist/SKILL.md" ] && [ -d "$CHURN_STATE/backups/$(printf "%040x" 20)" ] && [ -d "$CHURN_STATE/backups/$(printf "%040x" 19)" ] && [ ! -e "$CHURN_STATE/backups/$(printf "%040x" 18)" ]'
+ok "#2718 retention ignores non-commit names and symlinks" \
+  '[ -d "$CHURN_STATE/backups/manual-keep" ] && [ -L "$CHURN_STATE/backups/$(printf "%040x" 99)" ] && [ -f "$TMP/outside-target/sentinel" ]'
+out="$(env "${churn_env[@]}" python3 "$SYNC" plan --ref "$REF_CONTENT")"; rc=$?
+ok "#2718 plan never prunes backups" \
+  '[ "$rc" = 0 ] && jq -e "has(\"backups_pruned\") | not" >/dev/null <<<"$out" && [ -d "$CHURN_STATE/backups/$(printf "%040x" 20)" ]'
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+out="$(env "${churn_env[@]}" CCC_FLEET_SKILLS_BACKUP_KEEP=abc python3 "$SYNC" apply --ref "$REF_CONTENT")"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2718 invalid keep falls back to the default of 14 (nothing more to prune)" \
+  '[ "$rc" = 0 ] && jq -e ".backups_pruned == 0" >/dev/null <<<"$out" && [ -d "$CHURN_STATE/backups/$(printf "%040x" 19)" ]'
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
