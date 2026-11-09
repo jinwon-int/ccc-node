@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -152,3 +153,37 @@ def test_runtime_error_codes_stay_distill_named() -> None:
     # The shared runner keeps the historical distill_* namespace; the relabel
     # belongs to the skill backend boundary only.
     assert RuntimeDistillBackendError("distill_timeout").code == "distill_timeout"
+
+
+def test_claude_skill_extractor_receives_the_inherited_model(tmp_path: Path) -> None:
+    """#2723: the skill-candidate lane shares the isolated runner, same rule."""
+
+    record = tmp_path / "argv.json"
+    executable = tmp_path / "argv-skill-stub"
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+with open({str(record)!r}, "w", encoding="utf-8") as handle:
+    json.dump(sys.argv[1:], handle)
+sys.exit(3)
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    backend = RuntimeCliSkillCandidateBackend(
+        "claude",
+        executable=str(executable),
+        environment={
+            "PATH": str(Path(sys.executable).parent),
+            "HOME": str(tmp_path),
+            "ANTHROPIC_MODEL": "claude-opus-5-5",
+        },
+        temp_root=tmp_path,
+    )
+    with pytest.raises(SkillCandidateBackendError):
+        asyncio.run(
+            backend.extract(snapshot=_snapshot(), provenance=_provenance("claude"))
+        )
+    argv = json.loads(record.read_text(encoding="utf-8"))
+    assert argv[argv.index("--model") + 1] == "claude-opus-5-5"

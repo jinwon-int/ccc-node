@@ -26,6 +26,14 @@ from telegram_bot.memory.distill_guard import (
         ("claude", b"Authentication failed: login required", "distill_auth_unavailable"),
         ("codex", b"HTTP 429: too many requests", "distill_rate_limited"),
         ("piri", b"usage limit reached for this account", "distill_quota_exhausted"),
+        # #2723: Claude CLI per-model / plan limit wording, measured verbatim.
+        (
+            "claude",
+            b"You've reached your Fable limit. Switch to another model, or manage usage",
+            "distill_quota_exhausted",
+        ),
+        ("claude", b"You've hit your limit \xc2\xb7 resets 3pm", "distill_quota_exhausted"),
+        ("claude", b"you have reached your weekly Opus 5.5 limit", "distill_quota_exhausted"),
         ("piri", b"unknown model kimi-private", "distill_model_unavailable"),
         ("danso", b"HTTP 401 unauthorized", "distill_auth_unavailable"),
     ],
@@ -117,3 +125,17 @@ def test_unsafe_cooldown_state_fails_closed_without_exposing_body(tmp_path: Path
     assert decision.allowed is False
     assert decision.code == COOLDOWN_UNSAFE_CODE
     assert "PRIVATE" not in repr(decision)
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        b"You've reached your destination",
+        b"the limit of this test is 10",
+        b"hit your target",
+    ],
+)
+def test_limit_wording_does_not_capture_unrelated_text(diagnostic: bytes) -> None:
+    """#2723 patterns need 'your ... limit'; ordinary prose stays unclassified."""
+
+    assert classify_provider_failure("claude", diagnostic) is None

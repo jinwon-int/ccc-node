@@ -15,7 +15,6 @@
 1 bridge/core/session_isolation.py
 1 bridge/core/usage.py
 1 bridge/memory/distill_extraction.py
-1 bridge/memory/runtime_cli_backend.py
 1 bridge/restart.test.sh
 2 bridge/service-install.test.sh
 1 bridge/service-systemd-matrix.service.example
