@@ -82,6 +82,7 @@ ok "distill check lists every channel journal outside a bridge session (#2720)" 
 ok "distill check splits terminal failures by owner (#2720)" 'jq -e ".provider_neutral.live_terminal == 1 and .provider_neutral.orphaned_terminal == 1 and .provider_neutral.live_threshold_seconds == 60" <<<"$out" >/dev/null'
 ok "distill check owner comes from health.json age (#2720)" 'jq -e "(.provider_neutral.journals | map({(.channel): [.owner, .health_age_seconds]}) | add) == {\"telegram_bot\": [\"orphaned\", -1], \"ccc-hande\": [\"live\", 10], \"ccc-hande/danso\": [\"live\", 10], \"ccc-matrix\": [\"orphaned\", 9900]}" <<<"$out" >/dev/null'
 ok "distill check keeps the single-journal fields unchanged (#2720)" 'jq -e ".provider_neutral.journal | endswith(\"/.telegram_bot/distill-journal\")" <<<"$out" >/dev/null && jq -e ".provider_neutral.total == 1 and .provider_neutral.terminal == 1" <<<"$out" >/dev/null'
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
 out="$(mc_check)"; rc=$?
 ok "distill check text lists each channel journal (#2720)" '[ "$rc" = 0 ] && grep -q "^- journals:   live_terminal=1 orphaned_terminal=1" <<<"$out" && grep -q "^  - ccc-hande: owner=live jobs=2 .*terminal=1" <<<"$out" && grep -q "^  - telegram_bot: owner=orphaned" <<<"$out"'
 echo "----"; echo "PASS=$pass FAIL=$fail"
