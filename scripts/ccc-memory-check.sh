@@ -356,24 +356,7 @@ fi
 JOURNAL_LIVE_SEC="${CCC_CHECK_JOURNAL_LIVE_SEC:-3600}"
 case "$JOURNAL_LIVE_SEC" in ''|*[!0-9]*|0) JOURNAL_LIVE_SEC=3600 ;; esac
 journal_owner() { # <journal> -> "<owner> <health_age_seconds>"
-  local health ts age
-  if [ -n "${CCC_DISTILL_JOURNAL_DIR:-}" ]; then
-    printf 'override -1'
-    return 0
-  fi
-  health="$(dirname "$1")/health.json"
-  ts="$(file_epoch "$health")"
-  if [ "$ts" = 0 ]; then
-    printf 'orphaned -1'
-    return 0
-  fi
-  age=$(( $(now_epoch) - ts ))
-  [ "$age" -ge 0 ] || age=0
-  if [ "$age" -le "$JOURNAL_LIVE_SEC" ]; then
-    printf 'live %s' "$age"
-  else
-    printf 'orphaned %s' "$age"
-  fi
+  ccc_check_distill_journal_owner "$1" "$(now_epoch)" "$JOURNAL_LIVE_SEC"
 }
 # Status as seen by an operator: queue leftovers in an orphaned journal are not
 # a live write-back failure. `empty`/`missing` stay as they are.

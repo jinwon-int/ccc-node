@@ -674,6 +674,13 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   `.writeback_journals.status`. Clear orphaned leftovers with
   `DistillJournal.prune_terminal_jobs` after a backup; the diagnostic itself
   never writes.
+  `scripts/ccc-distill-check.sh` uses the same candidate list and owner rule
+  (shared `ccc_check_distill_journal_owner` in `distill-journal.sh`):
+  `.provider_neutral.journals[]` carries per-journal `owner`,
+  `health_age_seconds` and `total`/`ready`/`retryable`/`done`/`terminal`, and
+  `.provider_neutral.live_terminal` / `.orphaned_terminal` split terminal
+  extraction failures into real write-back loss and orphaned leftovers. The
+  single-journal fields (`journal`, `total`, `terminal`, …) are unchanged.
 
 ## Useful commands
 

@@ -57,5 +57,32 @@ out="$(bash "$CHECK" 2>&1)"
 rc=$?
 ok "text output exits 0" '[ "$rc" = 0 ]'
 ok "text output shows dry-run" 'grep -q "mode:" <<<"$out" && grep -q "DRY-RUN" <<<"$out"'
+
+# #2720 follow-up: outside a bridge session the selector falls back to the
+# Telegram data dir, so a failing live hande journal was invisible. Every
+# channel journal is listed with its owner and terminal failures are split
+# into live (real loss) and orphaned (leftover nobody will retry).
+out="$(bash "$CHECK" --json 2>&1)"; rc=$?
+ok "override scope lists only the chosen journal (#2720)" '[ "$rc" = 0 ] && jq -e ".provider_neutral.journals | length == 1 and .[0].owner == \"override\"" <<<"$out" >/dev/null'
+mc="$TMP/multi-home"
+for d in .telegram_bot .ccc-hande .ccc-matrix; do mkdir -p "$mc/$d/distill-journal"; done
+mkdir -p "$mc/.ccc-hande/danso-distill-journal"
+printf '{"status":"extraction_terminal_failed"}\n' > "$mc/.telegram_bot/distill-journal/$(printf 'a%.0s' {1..64}).json"
+printf '{"status":"extraction_terminal_failed"}\n' > "$mc/.ccc-hande/distill-journal/$(printf 'b%.0s' {1..64}).json"
+printf '{"status":"extraction_done"}\n' > "$mc/.ccc-hande/distill-journal/$(printf 'c%.0s' {1..64}).json"
+printf '{"status":"extraction_done"}\n' > "$mc/.ccc-matrix/distill-journal/$(printf 'd%.0s' {1..64}).json"
+printf '{}\n' > "$mc/.ccc-hande/health.json"; touch -d @9990 "$mc/.ccc-hande/health.json"
+printf '{}\n' > "$mc/.ccc-matrix/health.json"; touch -d @100 "$mc/.ccc-matrix/health.json"
+mc_check() {
+  (cd "$mc" && env -u CCC_DISTILL_JOURNAL_DIR -u BOT_DATA_DIR -u PROJECT_ROOT HOME="$mc" \
+    CCC_DISTILL_CHECK_NOW_EPOCH=10000 CCC_CHECK_JOURNAL_LIVE_SEC=60 bash "$CHECK" "$@" 2>&1)
+}
+out="$(mc_check --json)"; rc=$?
+ok "distill check lists every channel journal outside a bridge session (#2720)" '[ "$rc" = 0 ] && jq -e "[.provider_neutral.journals[].channel] | sort == [\"ccc-hande\", \"ccc-hande/danso\", \"ccc-matrix\", \"telegram_bot\"]" <<<"$out" >/dev/null'
+ok "distill check splits terminal failures by owner (#2720)" 'jq -e ".provider_neutral.live_terminal == 1 and .provider_neutral.orphaned_terminal == 1 and .provider_neutral.live_threshold_seconds == 60" <<<"$out" >/dev/null'
+ok "distill check owner comes from health.json age (#2720)" 'jq -e "(.provider_neutral.journals | map({(.channel): [.owner, .health_age_seconds]}) | add) == {\"telegram_bot\": [\"orphaned\", -1], \"ccc-hande\": [\"live\", 10], \"ccc-hande/danso\": [\"live\", 10], \"ccc-matrix\": [\"orphaned\", 9900]}" <<<"$out" >/dev/null'
+ok "distill check keeps the single-journal fields unchanged (#2720)" 'jq -e ".provider_neutral.journal | endswith(\"/.telegram_bot/distill-journal\")" <<<"$out" >/dev/null && jq -e ".provider_neutral.total == 1 and .provider_neutral.terminal == 1" <<<"$out" >/dev/null'
+out="$(mc_check)"; rc=$?
+ok "distill check text lists each channel journal (#2720)" '[ "$rc" = 0 ] && grep -q "^- journals:   live_terminal=1 orphaned_terminal=1" <<<"$out" && grep -q "^  - ccc-hande: owner=live jobs=2 .*terminal=1" <<<"$out" && grep -q "^  - telegram_bot: owner=orphaned" <<<"$out"'
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
