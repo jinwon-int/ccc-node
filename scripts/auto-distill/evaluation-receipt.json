@@ -3,7 +3,7 @@
  "pipeline": 6,
  "subject": {
   "path": "scripts/auto-distill/auto-distill.py",
-  "sha256": "bf16022640bfd7146408dea1db1841ffe33d010c67c1c65c405159f577903c1a",
+  "sha256": "a9c89b13bbf0fe1e52ceb1a8998c85edf4a5003a20729f96f6bd8751233a5cc2",
   "surface_schema": "ccc.auto-distill.canon-surface.v1",
   "surface_sha256": "be987eac04cc4bbc1429ebbf9eae6e4c7243e189e17ef34de7ae1214cc25297c",
   "surface_members": [
@@ -28,16 +28,16 @@
   ]
  },
  "evaluation": {
-  "id": "TM-3657",
-  "evaluated_source_sha256": "bf16022640bfd7146408dea1db1841ffe33d010c67c1c65c405159f577903c1a",
-  "completed_at": "2026-10-05T12:30:22Z",
+  "id": "TM-4475",
+  "evaluated_source_sha256": "a9c89b13bbf0fe1e52ceb1a8998c85edf4a5003a20729f96f6bd8751233a5cc2",
+  "completed_at": "2026-11-09T09:51:29Z",
   "provider": "claude-code-oauth",
   "model": "claude-haiku-4-5-20251001",
   "model_resolution": {
    "alias": "claude-haiku-4-5-20251001",
    "resolved_id": "claude-haiku-4-5-20251001",
    "resolved_by": "claude-json-modelUsage:envelopes (47/47 calls)",
-   "resolved_at": "2026-10-05T12:30:22Z"
+   "resolved_at": "2026-11-09T09:51:29Z"
   },
   "corpus": {
    "sample": "sample-v4.json",
@@ -49,28 +49,28 @@
    "cases": 47
   },
   "harness": {
-   "eval_canon_sha256": "fb6a49d72e003254c3f0ddf093f6864d5e40c6f03ae04b83349c520ee4321716",
+   "eval_canon_sha256": "f6c35b9d16dc5a85c5a72c456b4b37b7bc57272a5c066ff8544266e6b88239e8",
    "recheck_addr_sha256": "698599263790d4826416b6a6474d2a572d6791178488773990ecc433d011df5e"
   },
   "artifacts": {
-   "eval_log_sha256": "360a16ec7cc18b27866be6212374e89da67c7d832f241712d698f9766e6bc693",
-   "eval_result_sha256": "aa5fbf2b8ff4da34c59c4a7a4233dabf753219f11b8a7c7f35d05a02a1421cae",
-   "recheck_log_sha256": "643f9ab824e204cad2437fe8dc57c8d1189efaa27da5991dc53acb60c1a95fb2"
+   "eval_log_sha256": "927bb1089d9091b80ea22bda820bd40d968f80e56c78566a65a03286ebd55a70",
+   "eval_result_sha256": "4e9eb2aa914aa3edbd1e4230d327e97cf1f32bdae59347b73e16e29e33607471",
+   "recheck_log_sha256": "5874aa83432f6a85e87cfb8cc40c7252072a8eaf1e2fec6ace659811c9dbda6b"
   },
   "recheck": {
    "baseline_duplicates": 1,
-   "duplicates": 7,
+   "duplicates": 4,
    "cases": 12,
    "suspect": 0
   },
   "confusion": {
-   "tp": 13,
-   "fp": 2,
-   "fn": 10,
-   "tn": 22
+   "tp": 14,
+   "fp": 1,
+   "fn": 9,
+   "tn": 23
   },
   "collateral_damage": 0,
   "passed": true
  },
- "issued_at": "2026-10-05T21:31:54+09:00"
+ "issued_at": "2026-11-09T18:51:52+09:00"
 }
