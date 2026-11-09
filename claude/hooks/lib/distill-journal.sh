@@ -75,3 +75,33 @@ ccc_check_distill_journal_candidates() {
     done
   done
 }
+
+# Ownership of one channel journal (#2720), shared by the memory and distill
+# checks. A channel frontend rewrites health.json in its own data dir every
+# watchdog tick; a journal whose health.json is missing or older than
+# <live_sec> has no live bridge to retry or prune it. An explicit
+# CCC_DISTILL_JOURNAL_DIR is the operator's chosen scope: `override`.
+# Usage: ccc_check_distill_journal_owner <journal> <now_epoch> <live_sec>
+# Prints "<live|orphaned|override> <health_age_seconds|-1>". Read-only.
+ccc_check_distill_journal_owner() {
+  local health ts age
+  if [ -n "${CCC_DISTILL_JOURNAL_DIR:-}" ]; then
+    printf 'override -1'
+    return 0
+  fi
+  health="$(dirname "$1")/health.json"
+  ts=0
+  [ -f "$health" ] && ts="$(date -u -r "$health" +%s 2>/dev/null || printf '0')"
+  case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+  if [ "$ts" = 0 ]; then
+    printf 'orphaned -1'
+    return 0
+  fi
+  age=$(( $2 - ts ))
+  [ "$age" -ge 0 ] || age=0
+  if [ "$age" -le "$3" ]; then
+    printf 'live %s' "$age"
+  else
+    printf 'orphaned %s' "$age"
+  fi
+}

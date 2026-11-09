@@ -39,20 +39,56 @@ fi
 
 # ---- queue counts -----------------------------------------------------------
 # ---- provider-neutral journal/circuit counts (body-free) -------------------
+# One body-free count pass per journal: "<total> <ready> <retryable> <done> <terminal>".
+count_journal() {
+  local dir="$1" job status total=0 ready=0 retryable=0 done_n=0 terminal=0
+  if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+    for job in "$dir"/*.json; do
+      [ -f "$job" ] && [ ! -L "$job" ] || continue
+      total=$((total + 1))
+      status="$(jq -r '.status // "unknown"' "$job" 2>/dev/null || printf 'invalid')"
+      case "$status" in
+        snapshot_done) ready=$((ready + 1)) ;;
+        extraction_retryable_failed) retryable=$((retryable + 1)) ;;
+        extraction_done) done_n=$((done_n + 1)) ;;
+        extraction_terminal_failed) terminal=$((terminal + 1)) ;;
+      esac
+    done
+  fi
+  printf '%s %s %s %s %s' "$total" "$ready" "$retryable" "$done_n" "$terminal"
+}
 common_total=0; common_ready=0; common_retryable=0; common_done=0; common_terminal=0
 if [ "$CCC_CHECK_JOURNAL_STATUS" = present ]; then
-  for common_job in "$COMMON_JOURNAL"/*.json; do
-    [ -f "$common_job" ] && [ ! -L "$common_job" ] || continue
-    common_total=$((common_total + 1))
-    common_status="$(jq -r '.status // "unknown"' "$common_job" 2>/dev/null || printf 'invalid')"
-    case "$common_status" in
-      snapshot_done) common_ready=$((common_ready + 1)) ;;
-      extraction_retryable_failed) common_retryable=$((common_retryable + 1)) ;;
-      extraction_done) common_done=$((common_done + 1)) ;;
-      extraction_terminal_failed) common_terminal=$((common_terminal + 1)) ;;
-    esac
-  done
+  read -r common_total common_ready common_retryable common_done common_terminal \
+    <<<"$(count_journal "$COMMON_JOURNAL")"
 fi
+
+# Every channel journal with its owner (#2720 follow-up). The selector above
+# sees the one journal BOT_DATA_DIR names; outside a bridge session that is the
+# Telegram data dir even on nodes that retired Telegram, so a failing hande or
+# Matrix journal went unseen. Terminal failures are split by owner: a live (or
+# override) journal is a real write-back loss, an orphaned one is a leftover no
+# bridge will retry or prune.
+DC_NOW="${CCC_DISTILL_CHECK_NOW_EPOCH:-}"
+case "$DC_NOW" in ''|*[!0-9]*) DC_NOW="$(date -u +%s)" ;; esac
+DC_LIVE_SEC="${CCC_CHECK_JOURNAL_LIVE_SEC:-3600}"
+case "$DC_LIVE_SEC" in ''|*[!0-9]*|0) DC_LIVE_SEC=3600 ;; esac
+journals_json='[]'
+while IFS= read -r journal_path; do
+  [ -n "$journal_path" ] || continue
+  read -r j_total j_ready j_retryable j_done j_terminal <<<"$(count_journal "$journal_path")"
+  read -r j_owner j_health_age <<<"$(ccc_check_distill_journal_owner "$journal_path" "$DC_NOW" "$DC_LIVE_SEC")"
+  j_channel="$(basename "$(dirname "$journal_path")")"
+  j_channel="${j_channel#.}"
+  case "$journal_path" in */danso-distill-journal) j_channel="$j_channel/danso" ;; esac
+  journals_json="$(jq -c --arg path "$journal_path" --arg channel "$j_channel" --arg owner "$j_owner" \
+    --argjson health_age "$j_health_age" --argjson total "$j_total" --argjson ready "$j_ready" \
+    --argjson retryable "$j_retryable" --argjson done_n "$j_done" --argjson terminal "$j_terminal" '
+    . + [{path:$path, channel:$channel, owner:$owner, health_age_seconds:$health_age,
+          total:$total, ready:$ready, retryable:$retryable, done:$done_n, terminal:$terminal}]' <<<"$journals_json")"
+done < <(ccc_check_distill_journal_candidates)
+live_terminal="$(jq '[.[] | select(.owner == "live" or .owner == "override") | .terminal] | add // 0' <<<"$journals_json")"
+orphaned_terminal="$(jq '[.[] | select(.owner == "orphaned") | .terminal] | add // 0' <<<"$journals_json")"
 cooldown_files=0
 if [ -d "$COOLDOWN_DIR" ]; then
   cooldown_files="$(find "$COOLDOWN_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')"
@@ -126,6 +162,10 @@ if [ "$OUTPUT" = "--json" ]; then
     --argjson common_done "$common_done" \
     --argjson common_terminal "$common_terminal" \
     --argjson cooldown_files "$cooldown_files" \
+    --argjson journals "$journals_json" \
+    --argjson live_terminal "$live_terminal" \
+    --argjson orphaned_terminal "$orphaned_terminal" \
+    --argjson live_sec "$DC_LIVE_SEC" \
     '{mode:$mode, last:$last, state_dir:$state_dir, state_dir_ok:$state_dir_ok,
       checkpoint:{dir:$ckpt_dir, snapshots:$ckpt_snapshots, last:$ckpt_last},
       triggers:{manual:$manual, sessionend:$sessionend, precompact:$precompact},
@@ -133,7 +173,9 @@ if [ "$OUTPUT" = "--json" ]; then
       provider_neutral:{journal:$common_journal, journal_status:$journal_status,
         reason:$journal_reason, source:$journal_source, provider:$journal_provider, total:$common_total,
         ready:$common_ready, retryable:$common_retryable, done:$common_done,
-        terminal:$common_terminal, cooldown_files:$cooldown_files}}'
+        terminal:$common_terminal, cooldown_files:$cooldown_files,
+        journals:$journals, live_terminal:$live_terminal, orphaned_terminal:$orphaned_terminal,
+        live_threshold_seconds:$live_sec}}'
 else
   printf '# ccc distill check\n\n'
   printf -- '- state dir:  `%s` (%s)\n' "$STATE_DIR" "$state_dir_ok"
@@ -141,6 +183,8 @@ else
   printf -- '- last:       %s\n' "$last_summary"
   printf -- '- journal:    `%s` (%s; %s)\n' "$COMMON_JOURNAL" "$CCC_CHECK_JOURNAL_STATUS" "$CCC_CHECK_JOURNAL_REASON"
   printf -- '- common:     %s jobs (ready: %s, retryable: %s, done: %s, terminal: %s, cooldown files: %s)\n' "$common_total" "$common_ready" "$common_retryable" "$common_done" "$common_terminal" "$cooldown_files"
+  printf -- '- journals:   live_terminal=%s orphaned_terminal=%s live_threshold=%ss\n' "$live_terminal" "$orphaned_terminal" "$DC_LIVE_SEC"
+  jq -r '.[] | "  - \(.channel): owner=\(.owner) jobs=\(.total) ready=\(.ready) retryable=\(.retryable) done=\(.done) terminal=\(.terminal) health_age=\(.health_age_seconds)s"' <<<"$journals_json" 2>/dev/null || :
   printf -- '- checkpoint: %s snapshots (last: %s)\n' "$checkpoint_snapshots" "$checkpoint_last"
   printf '\n## triggers (14d)\n\n'
   printf -- '- manual:     %s\n' "$manual_c"
