@@ -845,7 +845,7 @@ ok "memory check reports a completed write-back queue as settled" '[ "$rc" = 0 ]
 
 # #2720: outside a bridge session (ssh/cron/fleet sweep) BOT_DATA_DIR is unset
 # and the single selected journal falls back to the Telegram data dir. On a
-# node that retired Telegram this hid a failing live hande journal (seoseo,
+# node that retired Telegram this hid a failing live hande journal (a fleet node,
 # 2026-11-09) and reported Telegram leftovers nothing will prune as degraded.
 # Every channel journal is now reported; ownership comes from the frontend's
 # health.json freshness.

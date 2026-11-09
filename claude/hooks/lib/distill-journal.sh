@@ -50,7 +50,7 @@ ccc_check_distill_journal() {
 # ccc_check_distill_journal picks ONE journal from BOT_DATA_DIR, which only a
 # bridge session inherits. Run from ssh/cron/a fleet sweep it falls back to the
 # Telegram data dir, so on a node that retired Telegram a failing hande/Matrix
-# journal was never inspected (seoseo, 2026-11-09). These are the locations
+# journal was never inspected (fleet sweep, 2026-11-09). These are the locations
 # ccc_doctor.py and nunchi ingest-cron.sh already scan. An explicit
 # CCC_DISTILL_JOURNAL_DIR keeps the old single-journal scope. Call after
 # ccc_check_distill_journal (it settles BOT_DATA_DIR). Read-only: nothing is
