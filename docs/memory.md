@@ -646,6 +646,27 @@ bounded by `CCC_MEMORY_DISTILL_MAX_JOBS_PER_SWEEP` (1).
   Its `.writeback_queue.accounting` aggregate reports accounted attempts,
   turn bytes, duration, conservative maximum-token estimates, and safe model
   counts without emitting transcript, extraction, route, or error bodies.
+- **Every channel journal, and orphaned ones (#2720).** The selector above
+  sees one journal, and `BOT_DATA_DIR` exists only inside a bridge session. Run
+  from ssh, cron or a fleet sweep it falls back to `~/.telegram_bot`, so on a
+  node that retired Telegram a failing hande/Matrix journal went unseen.
+  `.writeback_journals` therefore lists every `distill-journal` /
+  `danso-distill-journal` under `BOT_DATA_DIR`, `~/.telegram_bot`,
+  `~/.ccc-matrix`, `~/.ccc-hande` and `$PROJECT_ROOT/.telegram_bot` (the
+  locations `ccc_doctor.py` and nunchi `ingest-cron.sh` scan). Each entry has
+  `owner`: `live` when the frontend's `health.json` in that data dir is at most
+  `CCC_CHECK_JOURNAL_LIVE_SEC` (default 3600) seconds old, `orphaned` when it is
+  older or missing, `override` under `CCC_DISTILL_JOURNAL_DIR` (judged like
+  live). No bridge retries or prunes an orphaned journal, so its leftovers show
+  `status: orphaned` (the raw queue verdict stays in `queue_status`) instead of
+  `degraded`; `.writeback_queue` carries the same `owner`/`queue_status`/
+  `health_age_seconds` fields. The rollup `.writeback_journals.status` is
+  `degraded`/`active` from live journals first, then `orphaned`, `settled`,
+  `empty`, `missing`, with `live`, `orphaned`, `live_degraded` and
+  `orphaned_with_jobs` counts. Fleet checks should read
+  `.writeback_journals.status`. Clear orphaned leftovers with
+  `DistillJournal.prune_terminal_jobs` after a backup; the diagnostic itself
+  never writes.
 
 ## Useful commands
 

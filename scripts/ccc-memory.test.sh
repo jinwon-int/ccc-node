@@ -767,7 +767,10 @@ ok "memory check flags legacy injection and an empty palace" '[ "$rc" = 0 ] && j
 missing_journal="$TMP/missing-distill-journal"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$missing_journal" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports a missing write-back queue without creating it" '[ "$rc" = 0 ] && jq -e '\''
-  .writeback_queue == {
+  .writeback_queue.owner == "override" and .writeback_queue.queue_status == "missing"
+  and .writeback_queue.health_age_seconds == -1
+  and .writeback_journals.status == "missing" and .writeback_journals.live == 1
+  and (.writeback_queue | del(.owner, .queue_status, .health_age_seconds)) == {
     status:"missing", jobs:0, pending_jobs:0, invalid_records:0,
     record_bytes:0, snapshot_bytes:0,
     oldest_age_seconds:-1, oldest_pending_age_seconds:-1,
@@ -839,6 +842,66 @@ mkdir -m 700 "$settled_journal"
 cp "$journal/$done_id.json" "$settled_journal/$done_id.json"
 out="$(CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_DISTILL_JOURNAL_DIR="$settled_journal" CCC_MEMORY_CHECK_NOW_EPOCH=200 bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
 ok "memory check reports a completed write-back queue as settled" '[ "$rc" = 0 ] && jq -e '\''.writeback_queue.status == "settled" and .writeback_queue.jobs == 1 and .writeback_queue.pending_jobs == 0'\'' >/dev/null <<<"$out"'
+
+# #2720: outside a bridge session (ssh/cron/fleet sweep) BOT_DATA_DIR is unset
+# and the single selected journal falls back to the Telegram data dir. On a
+# node that retired Telegram this hid a failing live hande journal (a fleet node,
+# 2026-11-09) and reported Telegram leftovers nothing will prune as degraded.
+# Every channel journal is now reported; ownership comes from the frontend's
+# health.json freshness.
+mc_home="$TMP/multi-channel-home"
+for mc_dir in .telegram_bot .ccc-hande .ccc-matrix; do
+  mkdir -p "$mc_home/$mc_dir"
+  mkdir -m 700 "$mc_home/$mc_dir/distill-journal"
+done
+mkdir -m 700 "$mc_home/.ccc-hande/danso-distill-journal"
+cp "$journal/$retry_id.json" "$mc_home/.telegram_bot/distill-journal/$retry_id.json"
+cp "$journal/$retry_id.json" "$mc_home/.ccc-hande/distill-journal/$retry_id.json"
+cp "$journal/$done_id.json" "$mc_home/.ccc-matrix/distill-journal/$done_id.json"
+# hande: live frontend (health 10s old); matrix: retired (9,900s old);
+# telegram: no health.json at all.
+printf '{}\n' > "$mc_home/.ccc-hande/health.json"
+touch -d @9990 "$mc_home/.ccc-hande/health.json"
+printf '{}\n' > "$mc_home/.ccc-matrix/health.json"
+touch -d @100 "$mc_home/.ccc-matrix/health.json"
+mc_check() { # <output-mode>
+  (cd "$mc_home" && env -u CCC_DISTILL_JOURNAL_DIR -u BOT_DATA_DIR -u PROJECT_ROOT \
+    HOME="$mc_home" CCC_STATE_DIR="$state" CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
+    CCC_MEMORY_CHECK_NOW_EPOCH=10000 CCC_CHECK_JOURNAL_LIVE_SEC=60 \
+    bash "$ROOT/scripts/ccc-memory-check.sh" "$1" 2>&1)
+}
+out="$(mc_check --json)"; rc=$?
+ok "memory check inspects every channel journal outside a bridge session (#2720)" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_journals.status == "degraded"
+  and .writeback_journals.live == 2
+  and .writeback_journals.orphaned == 2
+  and .writeback_journals.live_degraded == 1
+  and .writeback_journals.orphaned_with_jobs == 2
+  and .writeback_journals.live_threshold_seconds == 60
+  and ([.writeback_journals.journals[].channel] | sort) == ["ccc-hande", "ccc-hande/danso", "ccc-matrix", "telegram_bot"]
+'\'' >/dev/null <<<"$out"'
+ok "memory check reports a failing live hande journal as degraded (#2720)" 'jq -e '\''
+  .writeback_journals.journals[] | select(.channel == "ccc-hande")
+  | .owner == "live" and .status == "degraded" and .queue_status == "degraded" and .health_age_seconds == 10
+'\'' >/dev/null <<<"$out"'
+ok "memory check reports retired-channel leftovers as orphaned, not degraded (#2720)" 'jq -e '\''
+  (.writeback_journals.journals[] | select(.channel == "telegram_bot")
+    | .owner == "orphaned" and .status == "orphaned" and .queue_status == "degraded" and .health_age_seconds == -1)
+  and (.writeback_journals.journals[] | select(.channel == "ccc-matrix")
+    | .owner == "orphaned" and .status == "orphaned" and .queue_status == "settled" and .health_age_seconds == 9900)
+  and .journal_selection.path == "'"$mc_home"'/.telegram_bot/distill-journal"
+  and .writeback_queue.owner == "orphaned" and .writeback_queue.status == "orphaned"
+  and .writeback_queue.queue_status == "degraded"
+'\'' >/dev/null <<<"$out"'
+# shellcheck disable=SC2034  # text_out is read via eval inside ok()
+text_out="$(mc_check text)"; rc=$?
+ok "memory check text lists each channel journal body-free (#2720)" '[ "$rc" = 0 ] && grep -q "^- writeback_journals: status=degraded live=2 orphaned=2 live_degraded=1" <<<"$text_out" && grep -q "^  - ccc-hande: owner=live status=degraded" <<<"$text_out" && grep -q "^  - telegram_bot: owner=orphaned status=orphaned queue=degraded" <<<"$text_out" && [ "$(grep -c "^- writeback:" <<<"$text_out")" = 1 ] && ! grep -q "$secret_thread\|$secret_message\|$secret_output\|private-deadbeef\|private-feedface" <<<"$text_out"'
+rm -f "$mc_home/.ccc-hande/distill-journal/$retry_id.json"
+out="$(mc_check --json)"; rc=$?
+ok "memory check does not degrade a node whose only failures are orphaned (#2720)" '[ "$rc" = 0 ] && jq -e '\''
+  .writeback_journals.status == "orphaned" and .writeback_journals.live_degraded == 0
+  and .writeback_queue.status == "orphaned"
+'\'' >/dev/null <<<"$out"'
 
 # #2333: audience work closed as superseded after a switch to off/curated
 # (terminal_failed + error_code=local_sink_superseded_route) is counted on its

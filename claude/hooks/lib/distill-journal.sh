@@ -45,3 +45,33 @@ ccc_check_distill_journal() {
     CCC_CHECK_JOURNAL_REASON=journal_unreadable
   fi
 }
+
+# Every channel journal present on this node (#2720), one path per line.
+# ccc_check_distill_journal picks ONE journal from BOT_DATA_DIR, which only a
+# bridge session inherits. Run from ssh/cron/a fleet sweep it falls back to the
+# Telegram data dir, so on a node that retired Telegram a failing hande/Matrix
+# journal was never inspected (fleet sweep, 2026-11-09). These are the locations
+# ccc_doctor.py and nunchi ingest-cron.sh already scan. An explicit
+# CCC_DISTILL_JOURNAL_DIR keeps the old single-journal scope. Call after
+# ccc_check_distill_journal (it settles BOT_DATA_DIR). Read-only: nothing is
+# created, and a symlinked root is listed so the caller can report it unsafe.
+ccc_check_distill_journal_candidates() {
+  local home dir name path seen=$'\n'
+  if [ -n "${CCC_DISTILL_JOURNAL_DIR:-}" ]; then
+    printf '%s\n' "$CCC_DISTILL_JOURNAL_DIR"
+    return 0
+  fi
+  home="${HOME:-/root}"
+  for dir in "${BOT_DATA_DIR:-}" "$home/.telegram_bot" "$home/.ccc-matrix" \
+      "$home/.ccc-hande" "${PROJECT_ROOT:+$PROJECT_ROOT/.telegram_bot}"; do
+    [ -n "$dir" ] || continue
+    for name in distill-journal danso-distill-journal; do
+      path="${dir%/}/$name"
+      case "$seen" in *$'\n'"$path"$'\n'*) continue ;; esac
+      seen="$seen$path"$'\n'
+      if [ -d "$path" ] || [ -L "$path" ]; then
+        printf '%s\n' "$path"
+      fi
+    done
+  done
+}
