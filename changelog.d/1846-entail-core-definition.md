@@ -10,4 +10,7 @@
   executed). The 3-branch core/full gate was measured and rejected, so the
   verdict stays binary and the output format and parsing are unchanged.
   `auto-distill.py`'s full SHA changes (canon `surface_sha256` does not), so
-  the exact-source evaluation receipt must be re-issued before this deploys.
+  the exact-source evaluation receipt is re-issued as TM-4475 (isolated
+  snapshot re-evaluation, same frozen corpus and `claude-haiku-4-5-20251001`
+  as TM-3657: TP/FP/FN/TN 14/1/9/23, address recheck 4/12 vs baseline 1,
+  collateral damage 0, `passed=true`).
