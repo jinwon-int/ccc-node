@@ -4,7 +4,7 @@
   repeatedly during exact search; retry the query", chroma "Error sending
   backfill request to compactor". `_mp_search()` returned `[]` on the first
   attempt, so `dialectic` silently lost its verbatim layer for the whole sweep
-  (daegyo: 22.5 min every hour, 9/13 single attempts failed, 2026-11-09). Only
+  (a Termux node: 22.5 min every hour, 9/13 single attempts failed, 2026-11-09). Only
   those two shapes are now retried, up to `CCC_NUNCHI_MEMPALACE_SEARCH_RETRIES`
   times (default 2, max 5) with a linear backoff of
   `CCC_NUNCHI_MEMPALACE_RETRY_DELAY_SEC` (default 3 s), never past

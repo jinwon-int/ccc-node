@@ -1935,7 +1935,7 @@ def _keywords(query, max_terms=6):
 # #2722 — MemPalace answers a search that overlaps a refresh/sweep write with a
 # transient error that names its own remedy ("retry the query"): sqlite_exact
 # raises after three internal snapshot retries, chroma surfaces a compactor
-# backfill failure. On daegyo a no-new-data sweep rewrites ~512 drawers for
+# backfill failure. On a Termux node a no-new-data sweep rewrote ~512 drawers for
 # 22 minutes every hour, so a single attempt failed 9/13 times inside that
 # window and dialectic silently lost its verbatim layer. Only these transient
 # shapes are retried; every other failure keeps the old immediate [] result.
