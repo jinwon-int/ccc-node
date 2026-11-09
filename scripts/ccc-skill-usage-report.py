@@ -57,8 +57,9 @@ DEFAULT_DWELL_DAYS = 14
 # used on any of at least this many nodes is a retirement candidate for the
 # fleet-skills `retired/` lane. The age rule (>= N days since `approved_at`)
 # lives in scripts/ccc-skill-retire.py, which reads the canon repo: a node's
-# `installed_at` is the fleet marker mtime, rewritten by every sync ref change,
-# so it cannot anchor "days since distribution started".
+# `installed_at` is the fleet marker mtime — the current version's install
+# (kept across commit-only refreshes since #2718), not the first
+# distribution, so it cannot anchor "days since distribution started".
 DEFAULT_RETIRE_MIN_NODES = 3
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 # #2283 lifecycle table: cap the per-node dwell sample list (body-free ints).
@@ -221,9 +222,10 @@ def _provider_context(curator: ModuleType, provider: str) -> Any:
 def _installed_at(context: Any, name: str, base: str) -> str | None:
     """Install time of the current copy: the fleet marker's mtime.
 
-    The fleet-skills sync rewrites the marker on every install/update, so this
-    is the CURRENT version's install time — an upper bound for the first
-    install. Other origins carry no install stamp here.
+    The fleet-skills sync rewrites the marker on every install/update and
+    keeps its mtime on a commit-only refresh (#2718), so this is the CURRENT
+    version's install time — an upper bound for the first install. Other
+    origins carry no install stamp here.
     """
     if base != "fleet-managed":
         return None
@@ -621,9 +623,9 @@ def _retire_candidate(
     of a different kind and keeps the name out. The caller has already
     required ``evidence_ok`` on every holder, so a telemetry gap never reads
     as non-use (#1739). Usage facts only: the node ``installed_at`` is the
-    fleet marker's mtime, rewritten by every sync ref change, so the "days
-    since distribution" rule is judged by ccc-skill-retire.py from the canon
-    repo's ``approval.json`` ``approved_at``.
+    fleet marker's mtime, i.e. the current version's install (a content
+    update resets it), so the "days since distribution" rule is judged by
+    ccc-skill-retire.py from the canon repo's ``approval.json`` ``approved_at``.
     """
     if len(nodes) < min_nodes:
         return None
