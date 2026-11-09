@@ -65,6 +65,12 @@ _FAILURE_PATTERNS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
             for pattern in (
                 r"\bquota (?:exceeded|exhausted)\b",
                 r"\busage limit (?:reached|exceeded)\b",
+                # Claude CLI per-model / plan limit wording (#2723), e.g.
+                # "You've reached your Fable limit. Switch to another model".
+                # Unclassified it was a plain distill_nonzero_exit: five
+                # attempts burned and the job went terminal instead of
+                # waiting out a provider cooldown.
+                r"\b(?:reached|hit) your (?:[\w.-]+ ){0,3}limit\b",
                 r"\binsufficient (?:credit|credits|balance|quota)\b",
                 r"\b(?:credit|billing) limit\b",
             )

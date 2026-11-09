@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 
@@ -382,4 +383,105 @@ def test_effective_model_falls_back_to_the_sentinel_for_unusable_values(inherite
 def test_effective_model_keeps_the_sentinel_when_nothing_is_inherited() -> None:
     backend = _backend("claude", "provider-default", {"PATH": "/usr/bin"})
 
+    assert backend.effective_model == "provider-default"
+
+
+def _argv_recording_stub(tmp_path: Path) -> tuple[Path, Path]:
+    """A Claude-lane stub that records its argv and inherited model env."""
+
+    record = tmp_path / "argv.json"
+    executable = tmp_path / "argv-recording-stub"
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+value = json.load(sys.stdin)
+with open({str(record)!r}, "w", encoding="utf-8") as handle:
+    json.dump({{"argv": sys.argv[1:], "env_model": os.environ.get("ANTHROPIC_MODEL")}}, handle)
+json.dump({{
+    "schema_version": 1,
+    "provenance": {{
+        "provider": value["provider"],
+        "source_thread_hash": value["source_thread_hash"],
+        "trigger": value["trigger"],
+        "distilled_at": "2026-08-05T00:00:01Z"
+    }},
+    "honcho": [],
+    "wiki_candidates": [],
+    "resume": {{
+        "last_activity": "",
+        "pending_action": "",
+        "awaiting_user": False,
+        "open_question": "",
+        "next_step": "",
+        "evidence": []
+    }}
+}}, sys.stdout)
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    return executable, record
+
+
+def _recorded_model(record: Path) -> str | None:
+    argv = json.loads(record.read_text(encoding="utf-8"))["argv"]
+    if "--model" not in argv:
+        return None
+    return argv[argv.index("--model") + 1]
+
+
+async def _extract_with(tmp_path: Path, model: str, env: dict[str, str]) -> tuple[RuntimeCliDistillBackend, Path]:
+    executable, record = _argv_recording_stub(tmp_path)
+    backend = RuntimeCliDistillBackend(
+        "claude",
+        executable=str(executable),
+        model=model,
+        environment={"PATH": str(Path(sys.executable).parent), **env},
+        temp_root=tmp_path,
+    )
+    await backend.extract(
+        build_extraction_input(_snapshot(), trigger=DistillTrigger.EXPLICIT, provider="claude")
+    )
+    return backend, record
+
+
+@pytest.mark.anyio
+async def test_claude_extractor_runs_the_model_the_receipt_reports(tmp_path: Path) -> None:
+    """#2723: the receipt said Opus while the child ran settings.json's Fable.
+
+    `provider-default` passed no --model and the minimal environment drops
+    ANTHROPIC_MODEL, so the child CLI fell back to its own settings model.
+    The inherited selector must reach the child as --model, and the receipt
+    must name exactly that value.
+    """
+
+    backend, record = await _extract_with(
+        tmp_path, "provider-default", {"ANTHROPIC_MODEL": "claude-opus-5-5"}
+    )
+
+    assert _recorded_model(record) == "claude-opus-5-5"
+    assert backend.effective_model == _recorded_model(record)
+    # The model travels as an argument, not through the trimmed environment.
+    assert json.loads(record.read_text(encoding="utf-8"))["env_model"] is None
+
+
+@pytest.mark.anyio
+async def test_claude_extractor_keeps_an_explicit_configured_model(tmp_path: Path) -> None:
+    backend, record = await _extract_with(
+        tmp_path, "claude-haiku-5-5", {"ANTHROPIC_MODEL": "claude-opus-5-5"}
+    )
+
+    assert _recorded_model(record) == "claude-haiku-5-5"
+    assert backend.effective_model == "claude-haiku-5-5"
+
+
+@pytest.mark.anyio
+async def test_claude_extractor_passes_no_model_without_a_usable_selector(tmp_path: Path) -> None:
+    backend, record = await _extract_with(
+        tmp_path, "provider-default", {"ANTHROPIC_MODEL": "bad model name"}
+    )
+
+    assert _recorded_model(record) is None
     assert backend.effective_model == "provider-default"

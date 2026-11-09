@@ -526,6 +526,13 @@ journal job. Snapshot and extraction work remain asynchronous. The older
 
 `CCC_MEMORY_DISTILL_MODEL` (default `provider-default`) identifies the isolated
 extractor model; for Piri this preserves the node's configured Kimi/GLM default.
+For Claude, `provider-default` resolves to the bridge's `ANTHROPIC_MODEL` and
+is passed to the extractor as an explicit `--model` (#2723): the extractor's
+trimmed environment drops `ANTHROPIC_MODEL`, so without the argument it ran on
+`~/.claude/settings.json`'s `model` while the accounting receipt named the
+bridge model. Per-model limit wording such as "You've reached your <model>
+limit" is classified as `distill_quota_exhausted`, which trips the provider
+cooldown instead of spending every attempt as `distill_nonzero_exit`.
 `CCC_MEMORY_DISTILL_TIMEOUT_SEC` defaults to 120 seconds and is hard-bounded to
 1–600. The older `CCC_CODEX_DISTILL_MODEL` and
 `CCC_CODEX_DISTILL_TIMEOUT_SEC` values remain compatibility fallbacks when the

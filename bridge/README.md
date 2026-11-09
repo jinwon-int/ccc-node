@@ -404,7 +404,7 @@ a provider turn or reads transcript/credential files.
 | `CCC_CODEX_DISTILL_CHECKPOINT_BYTES` | Codex only | `0` | UTF-8 user + assistant byte checkpoint gate; 0 disables |
 | `CCC_CODEX_DISTILL_CHECKPOINT_AGE_SECONDS` | Codex only | `0` | Runtime-age checkpoint gate, evaluated after a completed turn; 0 disables |
 | `CCC_MEMORY_DISTILL_PROVIDER` | Claude/Codex/Piri | `auto` | Extractor backend: `auto` follows `CCC_AGENT_PROVIDER`; explicit `claude`/`codex`/`piri` overrides; `off` disables shared distill workers |
-| `CCC_MEMORY_DISTILL_MODEL` | Claude/Codex/Piri | `provider-default` | Isolated extractor model; provider-default follows the selected runtime configuration and accepts provider-qualified Piri model IDs |
+| `CCC_MEMORY_DISTILL_MODEL` | Claude/Codex/Piri | `provider-default` | Isolated extractor model; provider-default follows the selected runtime configuration (Claude: the bridge's `ANTHROPIC_MODEL`, passed as `--model`, #2723) and accepts provider-qualified Piri model IDs |
 | `CCC_MEMORY_DISTILL_TIMEOUT_SEC` | Claude/Codex/Piri | `120` | Per-attempt provider-neutral extraction timeout, bounded to 1–600 seconds |
 | `CCC_MEMORY_DISTILL_ALLOW_UNBOUNDED` | Claude/Codex/Piri/Danso | `false` | Explicit escape hatch for extraction without a finite autonomous provider budget; default fails closed. Also the opt-in for the Codex/Piri/Danso skill-candidate collector, which is not composed without a finite budget |
 | `CCC_MEMORY_DISTILL_MAX_ATTEMPTS` | Claude/Codex/Piri | `5` | Maximum extraction attempts retained per journal job |

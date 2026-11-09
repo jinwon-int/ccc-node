@@ -151,6 +151,34 @@ def _trusted_prefix_bin(source: Mapping[str, str]) -> str | None:
     return str(path)
 
 
+def _effective_model(
+    provider: Literal["claude", "piri"],
+    model: str,
+    environment: Mapping[str, str],
+) -> str:
+    """Resolve the model the isolated extractor is launched with (#2723).
+
+    ``provider-default`` used to mean "pass no ``--model``", while
+    ``_minimal_environment`` drops ``ANTHROPIC_MODEL``. The child CLI then ran
+    on ``~/.claude/settings.json``'s ``model`` instead of the bridge's model,
+    and the accounting receipt still reported the bridge's ``ANTHROPIC_MODEL``.
+    Measured 2026-11-03..06: a node whose bridge was moved to Opus after a
+    Fable usage limit kept extracting on Fable (settings.json), failed every
+    attempt with the Fable limit, and every receipt read Opus.
+
+    For the Claude lane a valid inherited ``ANTHROPIC_MODEL`` therefore becomes
+    the explicit ``--model``; the same value is what the receipt reports. An
+    explicit configured model always wins. Piri keeps the sentinel.
+    """
+
+    if model != _PROVIDER_DEFAULT_MODEL or provider != "claude":
+        return model
+    inherited = str(environment.get("ANTHROPIC_MODEL") or "").strip()
+    if not inherited or _MODEL_RE.fullmatch(inherited) is None:
+        return model
+    return inherited
+
+
 def _minimal_environment(
     source: Mapping[str, str],
     *,
@@ -486,36 +514,17 @@ class RuntimeCliDistillBackend:
 
     @property
     def effective_model(self) -> str:
-        """The model selector the extraction process actually receives.
+        """The model selector the extraction process is given (#2723).
 
-        ``provider-default`` is a sentinel, not a model: it means "pass no
-        ``--model`` and let the runtime decide". Recording that sentinel in the
-        accounting receipt leaves a reader unable to tell which model ran --
-        measured on yukson, where the bridge's distill lane inherited
-        ``ANTHROPIC_MODEL=claude-opus-5`` from its systemd unit and every
-        journal entry still read ``provider-default``. Reconstructing it meant
-        reading the unit file and the live process argv.
-
-        For the Claude lane the governing value is `ANTHROPIC_MODEL` in the
-        environment handed to the child, so report that instead of the
-        sentinel. This is the selector the process was given, NOT a
-        provider-confirmed identity -- the runtime's own config could still
-        override it, so treat it as "what we asked for".
-
-        The Piri lane keeps the sentinel on purpose: its model is pinned by the
-        per-node launcher's own arguments, which the bridge never sees (the
-        same reason `CCC_USAGE_PIRI_SERVICE` has to be stated by the operator).
-        Guessing there would be worse than saying "unspecified".
+        ``provider-default`` is a sentinel, not a model. For the Claude lane
+        the bridge's ``ANTHROPIC_MODEL`` is resolved here AND passed to the
+        child as ``--model`` (see :func:`_effective_model`), so the accounting
+        receipt names the model that actually ran. The Piri lane keeps the
+        sentinel: its model is pinned by the per-node launcher, which the
+        bridge never sees.
         """
 
-        if self._model != _PROVIDER_DEFAULT_MODEL:
-            return self._model
-        if self.provider != "claude":
-            return self._model
-        inherited = str(self._environment.get("ANTHROPIC_MODEL") or "").strip()
-        if not inherited or _MODEL_RE.fullmatch(inherited) is None:
-            return self._model
-        return inherited
+        return _effective_model(self.provider, self._model, self._environment)
 
     async def extract(self, extraction_input: DistillExtractionInput) -> DistillExtractionOutput:
         if not isinstance(extraction_input, DistillExtractionInput):
@@ -526,7 +535,7 @@ class RuntimeCliDistillBackend:
         payload = await _run_isolated_cli(
             provider=self.provider,
             executable=executable,
-            model=self._model,
+            model=self.effective_model,
             schema_text=schema_text,
             prompt=DISTILL_EXTRACTION_PROMPT,
             stdin_bytes=stdin_bytes,
@@ -628,7 +637,7 @@ class RuntimeCliSkillCandidateBackend:
             output_payload = await _run_isolated_cli(
                 provider=self.provider,
                 executable=_resolve_executable(self._executable, self._environment),
-                model=self._model,
+                model=_effective_model(self.provider, self._model, self._environment),
                 schema_text=_load_schema_text(self._schema_path),
                 prompt=SKILL_CANDIDATE_PROMPT,
                 stdin_bytes=payload,
