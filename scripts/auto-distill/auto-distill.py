@@ -158,6 +158,42 @@ TRANSPORT_STDERR_RE = re.compile(
     r"|EAI_AGAIN|network error|connection (error|refused|reset)",
     re.I,
 )
+# 인증 실패도 모델에 닿지 못한 실패다(#2714). 2026-10-28 소교: piri → xAI OAuth
+# `invalid_grant` 로 rc=3 이 12일간 이어졌는데, 위 정규식에 인증 패턴이 없어 품질
+# 실패(model_exit_3)로 세어져 세션이 3회 만에 dead-letter 됐다. 순서가 곧 우선순위다
+# — 가장 구체적인 토큰이 먼저 잡힌다. 원문은 남기지 않고 아래 고정 토큰만 남긴다.
+FAILURE_CAUSES = (
+    ("auth_invalid_grant", re.compile(r"invalid_grant", re.I)),
+    ("auth_oauth_refresh", re.compile(r"oauth[^\n]{0,60}refresh[^\n]{0,40}fail", re.I)),
+    ("auth_401", re.compile(r"\b(HTTP|status|code)[ /:=]{0,3}(1\.[01] )?401\b", re.I)),
+    ("auth_403", re.compile(r"\b(HTTP|status|code)[ /:=]{0,3}(1\.[01] )?403\b", re.I)),
+    ("auth_invalid_key", re.compile(
+        r"invalid[ _-]?(api[ _-]?key|x-api-key|bearer token|access token|credentials?)"
+        r"|authentication_error|not logged in|please run /login", re.I)),
+    ("auth_unauthorized", re.compile(
+        r"\bunauthori[sz]ed\b|authentication (failed|error|required)"
+        r"|(oauth|access|refresh) token (has )?expired", re.I)),
+    ("limit", re.compile(
+        r"(usage|session|rate|weekly)[ _-]?limit|hit your .{0,40}limit|overloaded"
+        r"|credit balance|\b(429|529)\b", re.I)),
+    ("network", re.compile(
+        r"ECONNRE(SET|FUSED)|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network error"
+        r"|connection (error|refused|reset)", re.I)),
+)
+CAUSE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,47}$")
+# 회차 전체가 실패만 내면 알린다(#2714 C). */30 크론 기준 6회차 ≈ 3시간.
+DISTILL_ALERT_RUNS_DEFAULT = 6
+HEALTH_STATE = os.path.join(HOME, ".hermes/state/auto-distill-health.json")
+ALERT_EVENT = "AutoDistill"
+
+
+def classify_failure_text(text):
+    """Map CLI stderr/stdout to one fixed, body-free cause token (or None)."""
+    blob = str(text or "")
+    for token, pattern in FAILURE_CAUSES:
+        if pattern.search(blob):
+            return token
+    return None
 
 
 def utc_ts():
@@ -466,6 +502,21 @@ def extract_failure_reason(error):
     return reason[:80] or "extract_fail"
 
 
+def extract_failure_cause(error):
+    """Fixed cause token behind a transport reason (#2714 B), else None.
+
+    Only the ``model_unavailable:<token>`` / ``model_spawn_error:<ExcName>``
+    suffixes are fixed vocabulary we produced ourselves; a ``model_exit_N:``
+    or ``bad_json:`` suffix is model/CLI text and is never kept.
+    """
+    text = str(error or "")
+    head, sep, tail = text.partition(":")
+    if not sep or head.strip() not in ("model_unavailable", "model_spawn_error"):
+        return None
+    tail = tail.strip()
+    return tail if CAUSE_TOKEN_RE.match(tail) else None
+
+
 def extract_failure_state(entry):
     """Read the optional retry state without trusting malformed watermark data."""
     if not isinstance(entry, dict):
@@ -528,6 +579,7 @@ def record_extract_failure(
         "transport_budget": transport_limit,
         "transport": transport,
         "reason": extract_failure_reason(error),
+        "cause": extract_failure_cause(error),
         "snapshot_size": int(snapshot_size),
         "snapshot_mtime": float(snapshot_mtime),
         "dead_lettered": attempts >= limit or transport_attempts >= transport_limit,
@@ -634,7 +686,8 @@ def unwrap_claude_envelope(out):
     if not isinstance(env, dict) or "result" not in env or env.get("type") != "result":
         return None, None, None
     if env.get("is_error"):
-        return None, None, "error_envelope"
+        cause = classify_failure_text(env.get("result"))
+        return None, None, (cause if cause and cause.startswith("auth_") else "error_envelope")
     if not (env.get("modelUsage") or {}) and not (env.get("total_cost_usd") or 0):
         return None, None, "no_model_usage"
     u = env.get("usage") or {}
@@ -683,9 +736,12 @@ def extract_json(prompt, model_cmd, timeout):
         # the engine_selected audit event.
         return None, ("model_spawn_error:%s" % type(exc).__name__, {}, "")
     if p.returncode != 0:
-        if TRANSPORT_STDERR_RE.search((p.stderr or "") + "\n" + (p.stdout or "")[-2000:]):
-            # 한도·전송 장애로 비정상 종료 — 모델 품질 실패와 섞지 않는다(#1831).
-            return None, ("model_unavailable:exit_%d" % p.returncode, {}, "")
+        blob = (p.stderr or "") + "\n" + (p.stdout or "")[-2000:]
+        cause = classify_failure_text(blob)
+        if cause or TRANSPORT_STDERR_RE.search(blob):
+            # 한도·전송·인증 장애로 비정상 종료 — 모델 품질 실패와 섞지 않는다
+            # (#1831, #2714). 사유 접미사는 고정 토큰뿐이다(원문 비보존).
+            return None, ("model_unavailable:%s" % (cause or "exit_%d" % p.returncode), {}, "")
         return None, ("model_exit_%d: %s" % (p.returncode, p.stderr.strip()[:200]), {}, "")
     out = p.stdout
     usage = {}
@@ -1379,6 +1435,118 @@ def verify(items, valid_ids):
     return kept, dropped
 
 
+def _push_spool_dir():
+    """Bridge PushNotifier spool — same resolution as detached_jobs/notify.sh."""
+    explicit = os.environ.get("CCC_PUSH_SPOOL", "").strip()
+    if explicit:
+        return explicit
+    state = os.environ.get("CCC_STATE_DIR", "").strip() or os.path.join(HOME, ".claude", "state")
+    return os.path.join(state, "telegram-spool")
+
+
+def queue_owner_notice(node, text, dedup, *, tier="notice", spool=None):
+    """Queue one body-free owner notice (#2714 C). Returns the path or ''.
+
+    ``notice`` (#2628) is delivered at once and mirrored to 「한데」 without
+    re-notification — one alert per outage, one per recovery.
+    """
+    spool = spool or _push_spool_dir()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    record = {"ts": ts, "event": ALERT_EVENT, "node": node, "text": text,
+              "dedup": dedup, "tier": tier}
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", dedup)[:80]
+    final = os.path.join(spool, "%s-%s-%s.json" % (ts.replace(":", "-"), ALERT_EVENT, safe))
+    tmp = final + ".%d.tmp" % os.getpid()
+    try:
+        os.makedirs(spool, mode=0o700, exist_ok=True)
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
+                  encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(tmp, final)
+    except OSError as exc:
+        print("      ⚠ 오너 알림 적재 실패: %s" % type(exc).__name__, file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return ""
+    return final
+
+
+def _alert_threshold():
+    raw = os.environ.get("CCC_AUTO_DISTILL_ALERT_RUNS", "").strip()
+    if not raw:
+        return DISTILL_ALERT_RUNS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DISTILL_ALERT_RUNS_DEFAULT
+
+
+def _cause_summary(causes):
+    top = sorted(causes.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    return ", ".join("%s×%d" % kv for kv in top) or "원인 미분류"
+
+
+def update_run_health(*, ok, failed, causes, node, engine, path=None,
+                      threshold=None, spool=None):
+    """Track consecutive all-failure runs and alert once (#2714 C).
+
+    A run with at least one successful extraction resets the streak (and sends
+    a recovery notice if an alert went out). A run that tried and only failed
+    extends it; a run with nothing to do leaves it untouched, so an idle node
+    never alerts. Returns ``"alert"``, ``"recovered"`` or ``None``.
+    """
+    path = path or HEALTH_STATE
+    threshold = _alert_threshold() if threshold is None else max(0, int(threshold))
+    try:
+        with open(path) as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    action = None
+    now = utc_ts()
+    if ok > 0:
+        if state.get("alerted"):
+            text = ("✅ auto-distill 추출 회복 — 연속 실패 %s회차 뒤 성공 %d건 (엔진 %s, 첫 실패 %s)"
+                    % (state.get("fail_runs", "?"), ok, engine, state.get("first_fail_ts", "?")))
+            queue_owner_notice(node, text, "%s:recovered:%s" % (
+                ALERT_EVENT, state.get("first_fail_ts", "")), spool=spool)
+            log_audit({"event": "distill_recovered", "fail_runs": state.get("fail_runs"),
+                       "first_fail_ts": state.get("first_fail_ts")})
+            action = "recovered"
+        state = {"fail_runs": 0, "last_ok_ts": now}
+    elif failed > 0:
+        merged = dict(state.get("causes") or {})
+        for cause, count in (causes or {}).items():
+            merged[cause] = int(merged.get(cause, 0)) + int(count)
+        state["fail_runs"] = int(state.get("fail_runs", 0) or 0) + 1
+        state.setdefault("first_fail_ts", now)
+        state["last_fail_ts"] = now
+        state["causes"] = merged
+        if threshold and state["fail_runs"] >= threshold and not state.get("alerted"):
+            text = ("⚠ auto-distill 추출 정지 의심 — 연속 %d회차 추출 성공 0건 "
+                    "(엔진 %s, 원인 %s, 첫 실패 %s). 엔진 인증·한도를 확인하세요. "
+                    "복구 뒤 보류 세션은 --revive-dead-letters 로 재처리합니다."
+                    % (state["fail_runs"], engine, _cause_summary(merged),
+                       state["first_fail_ts"]))
+            queued = queue_owner_notice(node, text, "%s:stalled:%s" % (
+                ALERT_EVENT, state["first_fail_ts"]), spool=spool)
+            state["alerted"] = bool(queued)
+            log_audit({"event": "distill_alert", "fail_runs": state["fail_runs"],
+                       "causes": merged, "queued": bool(queued)})
+            action = "alert"
+    else:
+        return None
+    try:
+        _atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=1))
+    except OSError:
+        pass
+    return action
+
+
 def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -1428,6 +1596,9 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
         message = str(exc)
         print("FATAL: 모델 엔진 선택 실패 — %s" % message, file=sys.stderr)
         log_audit({"event": "engine_unavailable", "reason": message})
+        if not args.dry_run:
+            update_run_health(ok=0, failed=1, causes={"engine_unavailable": 1},
+                              node=args.node, engine="none")
         return 2
     model_cmd = list(selected_model.argv)
     ENGINE_ENV.update(dict(getattr(selected_model, "env_overrides", ())))
@@ -1549,6 +1720,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 dead_letters.append({
                     "session": os.path.basename(f)[:24],
                     "reason": failure.get("reason", "extract_fail"),
+                    "cause": failure.get("cause"),
                     "attempts": failure.get("attempts", EXTRACT_FAIL_BUDGET),
                     "state": "held",
                 })
@@ -1598,6 +1770,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     rendered_add = rendered_dup = 0
     results = []
     transport_streak = 0
+    run_ok = run_failed = 0
+    fail_causes = {}
     for index, (f, key, since, reactivated) in enumerate(todo):
         t0 = time.time()
         digest, ids, total = digest_session(f, since)
@@ -1636,9 +1810,15 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 snapshot_mtime=snapshots[f].st_mtime,
                 error=err,
             )
-            print("실패 (%s, %.1fs)" % (failure["reason"], dt))
+            run_failed += 1
+            if failure["cause"]:
+                fail_causes[failure["cause"]] = fail_causes.get(failure["cause"], 0) + 1
+            print("실패 (%s%s, %.1fs)" % (
+                failure["reason"],
+                " · %s" % failure["cause"] if failure["cause"] else "", dt))
             log_audit({"event": "extract_fail", "session": name,
                        "reason": failure["reason"],
+                       "cause": failure["cause"],
                        "attempt": failure["attempts"],
                        "budget": failure["budget"],
                        "transport": failure["transport"],
@@ -1651,6 +1831,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                     dead_letters.append({
                         "session": name,
                         "reason": failure["reason"],
+                        "cause": failure["cause"],
                         "attempts": failure["attempts"],
                         "state": "new",
                     })
@@ -1658,6 +1839,7 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                         "event": "dead_letter",
                         "session": name,
                         "reason": failure["reason"],
+                        "cause": failure["cause"],
                         "attempts": failure["attempts"],
                         "budget": failure["budget"],
                         "snapshot_size": failure["snapshot_size"],
@@ -1678,7 +1860,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
                 transport_streak = 0
             continue
         transport_streak = 0
-        items = data.get("items", []) if isinstance(data, dict) else []
+        run_ok += 1
+        items =data.get("items", []) if isinstance(data, dict) else []
         kept, dropped = verify(items, ids)
         n_struct = len(kept)
         # V2 선결조건 #1: 구조 검증(id 실재)만으로는 무관·환각·모순이 통과한다.
@@ -1814,8 +1997,10 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
     if dead_letters:
         print("추출 실패 dead-letter %d개 (파일 증가 시 자동 재시도)" % len(dead_letters))
         for dead in dead_letters:
-            print("  - %s reason=%s attempts=%s state=%s" % (
-                dead["session"], dead["reason"], dead["attempts"], dead["state"]))
+            print("  - %s reason=%s%s attempts=%s state=%s" % (
+                dead["session"], dead["reason"],
+                " cause=%s" % dead["cause"] if dead.get("cause") else "",
+                dead["attempts"], dead["state"]))
     if tot_quar:
         print("격리 레인: %s (검토 대기 — 폐기 아님)" % args.quarantine)
     if results:
@@ -1861,6 +2046,8 @@ def main():  # noqa: C901 - orchestration kept aligned with deployed v6
             print("\n[DRY-RUN] 워터마크 미갱신 · PR 미생성 · AUTO.md 미작성")
     if not args.dry_run:
         save_watermark(wm)
+        update_run_health(ok=run_ok, failed=run_failed, causes=fail_causes,
+                          node=args.node, engine=selected_model.engine)
     return 0
 
 

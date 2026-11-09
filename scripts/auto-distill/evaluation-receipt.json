@@ -3,9 +3,9 @@
  "pipeline": 6,
  "subject": {
   "path": "scripts/auto-distill/auto-distill.py",
-  "sha256": "a9c89b13bbf0fe1e52ceb1a8998c85edf4a5003a20729f96f6bd8751233a5cc2",
+  "sha256": "b46ae0e6e7efdcb5790fddaa1a18e88856acc3cfc7fafe104fa4dfc2344a6d2e",
   "surface_schema": "ccc.auto-distill.canon-surface.v1",
-  "surface_sha256": "be987eac04cc4bbc1429ebbf9eae6e4c7243e189e17ef34de7ae1214cc25297c",
+  "surface_sha256": "b0f79318c5182717f452f45a7d6a4e444a2bebe38ae37369403d3404c2c44a41",
   "surface_members": [
    "assign:PIPELINE",
    "assign:CANON_PROMPT",
@@ -28,16 +28,16 @@
   ]
  },
  "evaluation": {
-  "id": "TM-4475",
-  "evaluated_source_sha256": "a9c89b13bbf0fe1e52ceb1a8998c85edf4a5003a20729f96f6bd8751233a5cc2",
-  "completed_at": "2026-11-09T09:51:29Z",
+  "id": "TM-4477",
+  "evaluated_source_sha256": "b46ae0e6e7efdcb5790fddaa1a18e88856acc3cfc7fafe104fa4dfc2344a6d2e",
+  "completed_at": "2026-11-09T11:13:55Z",
   "provider": "claude-code-oauth",
   "model": "claude-haiku-4-5-20251001",
   "model_resolution": {
    "alias": "claude-haiku-4-5-20251001",
    "resolved_id": "claude-haiku-4-5-20251001",
    "resolved_by": "claude-json-modelUsage:envelopes (47/47 calls)",
-   "resolved_at": "2026-11-09T09:51:29Z"
+   "resolved_at": "2026-11-09T11:13:55Z"
   },
   "corpus": {
    "sample": "sample-v4.json",
@@ -49,17 +49,17 @@
    "cases": 47
   },
   "harness": {
-   "eval_canon_sha256": "f6c35b9d16dc5a85c5a72c456b4b37b7bc57272a5c066ff8544266e6b88239e8",
+   "eval_canon_sha256": "da487276b12eaef2bb5ec212512f90c56fa48f3f048549a6c24bb8e9f08fd32e",
    "recheck_addr_sha256": "698599263790d4826416b6a6474d2a572d6791178488773990ecc433d011df5e"
   },
   "artifacts": {
-   "eval_log_sha256": "927bb1089d9091b80ea22bda820bd40d968f80e56c78566a65a03286ebd55a70",
-   "eval_result_sha256": "4e9eb2aa914aa3edbd1e4230d327e97cf1f32bdae59347b73e16e29e33607471",
-   "recheck_log_sha256": "5874aa83432f6a85e87cfb8cc40c7252072a8eaf1e2fec6ace659811c9dbda6b"
+   "eval_log_sha256": "03fc2381ff357c49e818dd49a21a7a1554a6c0d7599a1114b18f593235f68032",
+   "eval_result_sha256": "004dc2e0dd688dcb6574c1dc021df188265c211c519854496d7ca69e29fb06bf",
+   "recheck_log_sha256": "b1ab6c53e9d3cef62ea0a587ede91ceb42c96b03ddc1ce557812422e63aaef12"
   },
   "recheck": {
    "baseline_duplicates": 1,
-   "duplicates": 4,
+   "duplicates": 5,
    "cases": 12,
    "suspect": 0
   },
@@ -72,5 +72,5 @@
   "collateral_damage": 0,
   "passed": true
  },
- "issued_at": "2026-11-09T18:51:52+09:00"
+ "issued_at": "2026-11-09T20:14:55+09:00"
 }

@@ -773,7 +773,7 @@ class CodexUsageWrapperTest(unittest.TestCase):
         with patch.dict(os.environ, {"FAKE_CODEX_MODE": "limit"}):
             parsed, (err, usage, _raw) = AUTO_DISTILL.extract_json("PROMPT", argv, 30)
         self.assertIsNone(parsed)
-        self.assertEqual(err, "model_unavailable:exit_1")
+        self.assertEqual(err, "model_unavailable:limit")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-only")
     def test_timeout_kills_codex_grandchild(self) -> None:
