@@ -73,10 +73,16 @@ hand-written units.
 Usage::
 
     detached_jobs.py register --unit U --log P [--summary S] [--workdir W]
-                              [--expect 90m | --until "YYYY-MM-DD HH:MM"] [--no-wait]
+                              [--expect 90m | --until "YYYY-MM-DD HH:MM"] [--no-wait] [--user]
     detached_jobs.py schedule --unit U --at "<systemd calendar>" --log P
-                              [--summary S] [--workdir W] [--print] -- <cmd…>
+                              [--summary S] [--workdir W] [--tier T] [--fail-tier T]
+                              [--result-file P] [--user] [--print] -- <cmd…>
     detached_jobs.py notify   --unit U --exit N [--summary S] [--log P]
+                              [--tier T] [--fail-tier T] [--result-file P]
+
+Tiers (#2710) are the fleet-alert tiers ``info|notice|action|critical``.
+``notify`` defaults to ``info`` (held for the 09:00 KST digest);
+``schedule`` defaults to ``notice`` (delivered at once, mirrored to 「한데」).
     detached_jobs.py sweep [<registry path>] [--max-bytes N]
     detached_jobs.py ack --unit U [--all]
     detached_jobs.py list [--json]
@@ -129,6 +135,17 @@ DEFAULT_WAIT_BUDGET_SECONDS = 6 * 3600
 WAIT_MARGIN_SECONDS = 30 * 60
 # Spool event name for completion notices (read by the bridge PushNotifier).
 NOTIFY_EVENT = "DetachedJob"
+# Fleet-alert tiers (#2413/#2628, ``fleet_alert_relay.TIERS``). ``info`` is
+# held for the next 09:00 KST digest and never mirrored to 「한데」 on its own;
+# ``notice`` is delivered at once and mirrored, without re-notification (#2710).
+TIERS = ("info", "notice", "action", "critical")
+NOTIFY_DEFAULT_TIER = "info"      # bare ``notify``: unchanged for compatibility
+SCHEDULE_DEFAULT_TIER = "notice"  # ``schedule`` exists to say "it finished"
+# ``--result-file``: the job's own one-line result, capped like a summary.
+RESULT_MAX_CHARS = 280
+RESULT_READ_BYTES = 8192
+SCOPE_USER = "user"
+SCOPE_SYSTEM = "system"
 
 # Longest alternatives first: ``m`` must not swallow the start of ``min``.
 _DURATION_RE = re.compile(r"(\d+)\s*(hours|hour|hrs|hr|days|day|secs|sec|min|d|h|m|s)?", re.IGNORECASE)
@@ -333,19 +350,23 @@ def _log_age(log_path: str) -> Optional[float]:
         return None
 
 
-def unit_is_active(unit: str, *, suffix: str = ".service") -> bool:
+def unit_is_active(unit: str, *, suffix: str = ".service", user: bool = False) -> bool:
     """Best-effort systemd liveness. Absent systemctl means 'cannot tell'.
 
     Returns False rather than raising on non-systemd nodes (Termux), where the
     mtime signal carries the classification on its own. ``suffix=".timer"``
-    asks about a ``schedule``d job that has not fired yet.
+    asks about a ``schedule``d job that has not fired yet. ``user=True``
+    (#2710) asks the caller's user manager: a ``systemd-run --user`` unit is
+    invisible to the system manager, and asking there called an armed user
+    timer ``lost``.
     """
     if not unit:
         return False
     name = unit if unit.endswith(suffix) else unit + suffix
+    argv = ["systemctl", "--user", "is-active", name] if user else ["systemctl", "is-active", name]
     try:
         proc = subprocess.run(
-            ["systemctl", "is-active", name],
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -362,19 +383,20 @@ def classify_one(rec: Dict[str, Any], *, now: Optional[float] = None) -> Tuple[s
     if code is not None:
         return STATE_DONE, code
     age = _log_age(log_path)
+    user = rec.get("scope") == SCOPE_USER
     if age is None:
         # No log at all. If the unit is up the job simply has not written yet;
         # otherwise there is no evidence anywhere and it must be investigated.
         # A scheduled job (#2636) is "running" while its timer is still armed.
         unit = str(rec.get("unit") or "")
-        if unit_is_active(unit):
+        if unit_is_active(unit, user=user):
             return STATE_RUNNING, None
-        if rec.get("scheduled_at") and unit_is_active(unit, suffix=".timer"):
+        if rec.get("scheduled_at") and unit_is_active(unit, suffix=".timer", user=user):
             return STATE_RUNNING, None
         return STATE_LOST, None
     if age < STALE_SECONDS:
         return STATE_RUNNING, None
-    if unit_is_active(str(rec.get("unit") or "")):
+    if unit_is_active(str(rec.get("unit") or ""), user=user):
         return STATE_RUNNING, None
     return STATE_LOST, None
 
@@ -514,7 +536,7 @@ def _max_bytes(argv: List[str]) -> int:
 
 _REGISTER_USAGE = (
     "usage: detached_jobs.py register --unit U --log PATH [--summary S] [--workdir W]"
-    " [--expect <duration> | --until <time>] [--no-wait]\n"
+    " [--expect <duration> | --until <time>] [--no-wait] [--user]\n"
 )
 
 
@@ -556,6 +578,10 @@ def cmd_register(argv: List[str]) -> int:
     workdir = _opt(argv, "workdir").strip()
     if workdir:
         rec["workdir"] = workdir
+    if "--user" in argv:
+        # A hand-made ``systemd-run --user`` unit (#2710): liveness must be
+        # asked of the user manager, or the sweep calls it lost.
+        rec["scope"] = SCOPE_USER
     plan = wait_plan(expect_seconds)
     if expect_seconds is not None:
         rec["expect_seconds"] = int(expect_seconds)
@@ -586,24 +612,55 @@ def _spool_dir() -> str:
     return os.path.join(state, "telegram-spool")
 
 
-def write_notice(unit: str, exit_code: int, *, summary: str = "", log_path: str = "", spool: str = "") -> str:
+def read_result_line(path: str) -> str:
+    """The job's own result line from ``--result-file`` (#2710), or ''.
+
+    The last non-empty line of the file's head, whitespace-collapsed and capped
+    at ``RESULT_MAX_CHARS`` — the job chose to write it, the same discipline as
+    ``--summary``. Missing or unreadable files yield '' (never raises).
+    """
+    if not path:
+        return ""
+    try:
+        with open(os.path.expanduser(path), "rb") as handle:
+            raw = handle.read(RESULT_READ_BYTES).decode("utf-8", "ignore")
+    except OSError:
+        return ""
+    lines = [" ".join(line.split()) for line in raw.splitlines()]
+    lines = [line for line in lines if line]
+    return lines[-1][:RESULT_MAX_CHARS] if lines else ""
+
+
+def write_notice(
+    unit: str, exit_code: int, *, summary: str = "", log_path: str = "", spool: str = "",
+    tier: str = NOTIFY_DEFAULT_TIER, result: str = "",
+) -> str:
     """Queue one body-free completion notice for the bridge PushNotifier (#2636).
 
-    Same record shape as ``claude/hooks/notify.sh`` (``ts/event/node/text/dedup``);
-    the notifier dedups on ``dedup`` and never reads anything else. Returns the
-    spool file path, or '' when the spool is unwritable (never raises).
+    Same record shape as ``claude/hooks/notify.sh`` (``ts/event/node/text/dedup``)
+    plus ``tier`` (#2710), which the fleet relay forwards (``RAW_KEYS``) and
+    the receiver routes on — without it every notice was ``info`` and waited
+    for the 09:00 digest. Returns the spool file path, or '' when the spool is
+    unwritable (never raises).
     """
     spool = spool or _spool_dir()
+    tier = tier if tier in TIERS else NOTIFY_DEFAULT_TIER
     mark = "✅" if exit_code == 0 else "❌"
     text = f"{mark} 분리 작업 `{unit}` 종료 EXIT={exit_code}"
     summary = " ".join((summary or "").split())[:200]
     if summary:
         text += f" — {summary}"
+    result = " ".join((result or "").split())[:RESULT_MAX_CHARS]
+    if result:
+        text += f" · 결과: {result}"
     if log_path:
         text += f" · 로그 {log_path}"
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     node = os.environ.get("CCC_NODE", "").strip() or (os.uname().nodename.split(".")[0] if hasattr(os, "uname") else "node")
-    record = {"ts": ts, "event": NOTIFY_EVENT, "node": node, "text": text, "dedup": f"{NOTIFY_EVENT}:{unit}:{exit_code}"}
+    record = {
+        "ts": ts, "event": NOTIFY_EVENT, "node": node, "text": text,
+        "dedup": f"{NOTIFY_EVENT}:{unit}:{exit_code}", "tier": tier,
+    }
     safe_unit = re.sub(r"[^A-Za-z0-9_.-]", "_", unit)[:80]
     # Exit code and pid keep two notices for one unit in the same second apart
     # (a retry after failure); the notifier dedups on ``dedup``, not the name.
@@ -624,18 +681,44 @@ def write_notice(unit: str, exit_code: int, *, summary: str = "", log_path: str 
     return final
 
 
+_NOTIFY_USAGE = (
+    "usage: detached_jobs.py notify --unit U --exit N [--summary S] [--log P]"
+    " [--tier info|notice|action|critical] [--fail-tier T] [--result-file P]\n"
+    "  default --tier info: held for the next 09:00 KST digest, not sent at once;"
+    " use --tier notice for an immediate notice (schedule's default)\n"
+)
+
+
+def _tier_opt(argv: List[str], name: str, default: str) -> Tuple[str, Optional[str]]:
+    raw = _opt(argv, name).strip().lower()
+    if not raw:
+        return default, None
+    if raw not in TIERS:
+        return default, f"--{name} must be one of {', '.join(TIERS)} (got {raw!r})"
+    return raw, None
+
+
 def cmd_notify(argv: List[str]) -> int:
     unit = _opt(argv, "unit").strip()
     raw_exit = _opt(argv, "exit").strip()
     if not unit or not raw_exit:
-        sys.stderr.write("usage: detached_jobs.py notify --unit U --exit N [--summary S] [--log P]\n")
+        sys.stderr.write(_NOTIFY_USAGE)
         return 2
     try:
         exit_code = int(raw_exit)
     except ValueError:
         sys.stderr.write("detached_jobs: --exit must be an integer\n")
         return 2
-    path = write_notice(unit, exit_code, summary=_opt(argv, "summary"), log_path=_opt(argv, "log").strip())
+    tier, err = _tier_opt(argv, "tier", NOTIFY_DEFAULT_TIER)
+    fail_tier, fail_err = _tier_opt(argv, "fail-tier", tier)
+    if err or fail_err:
+        sys.stderr.write(f"detached_jobs: {err or fail_err}\n")
+        return 2
+    path = write_notice(
+        unit, exit_code, summary=_opt(argv, "summary"), log_path=_opt(argv, "log").strip(),
+        tier=tier if exit_code == 0 else fail_tier,
+        result=read_result_line(_opt(argv, "result-file").strip()),
+    )
     if path:
         sys.stdout.write(f"notice queued: {path}\n")
     return 0 if path else 1
@@ -643,12 +726,14 @@ def cmd_notify(argv: List[str]) -> int:
 
 _SCHEDULE_USAGE = (
     "usage: detached_jobs.py schedule --unit U --at \"<systemd calendar>\" --log PATH"
-    " [--summary S] [--workdir W] [--print] -- <command…>\n"
+    " [--summary S] [--workdir W] [--tier T (default notice)] [--fail-tier T]"
+    " [--result-file P] [--user] [--print] -- <command…>\n"
 )
 
 
 def build_schedule_command(
     *, unit: str, at: str, log_path: str, command: List[str], summary: str = "", workdir: str = "", module: str = "",
+    tier: str = SCHEDULE_DEFAULT_TIER, fail_tier: str = "", result_file: str = "", user: bool = False,
 ) -> List[str]:
     """The exact ``systemd-run`` argv for a scheduled, self-announcing job.
 
@@ -656,12 +741,18 @@ def build_schedule_command(
     notice: command output appended to the log, ``EXIT=<rc>`` as the last
     line, then ``notify`` with the same unit/exit so the owner hears the
     result without a ⏳ wait. HOME/PATH are injected because transient units
-    inherit neither.
+    inherit neither. The notice carries ``tier`` (default ``notice``, #2710)
+    so it is delivered at once instead of in the next morning's digest;
+    ``user=True`` launches on the caller's user manager (non-root nodes).
     """
     module = module or os.path.abspath(__file__)
     home = os.environ.get("HOME", "/root")
     path_env = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    notify = [sys.executable or "python3", module, "notify", "--unit", unit, "--log", log_path]
+    notify = [sys.executable or "python3", module, "notify", "--unit", unit, "--log", log_path, "--tier", tier]
+    if fail_tier:
+        notify += ["--fail-tier", fail_tier]
+    if result_file:
+        notify += ["--result-file", result_file]
     if summary:
         notify += ["--summary", summary]
     script = (
@@ -669,8 +760,8 @@ def build_schedule_command(
         f"echo \"EXIT=$rc\" >> {shlex.quote(log_path)}; "
         f"{shlex.join(notify)} --exit \"$rc\" >/dev/null 2>&1 || true; exit \"$rc\""
     )
-    argv = [
-        "systemd-run", "--unit", unit, "--collect",
+    argv = ["systemd-run"] + (["--user"] if user else []) + [
+        "--unit", unit, "--collect",
         "--on-calendar", at, "--timer-property=AccuracySec=1min",
         f"--property=Environment=HOME={home}",
         f"--property=Environment=PATH={path_env}",
@@ -699,8 +790,18 @@ def cmd_schedule(argv: List[str]) -> int:
     log_path = os.path.abspath(os.path.expanduser(log_path))
     summary = " ".join(_opt(opts, "summary").split())[:200]
     workdir = _opt(opts, "workdir").strip()
+    tier, err = _tier_opt(opts, "tier", SCHEDULE_DEFAULT_TIER)
+    fail_tier, fail_err = _tier_opt(opts, "fail-tier", "")
+    if err or fail_err:
+        sys.stderr.write(f"detached_jobs: {err or fail_err}\n")
+        return 2
+    result_file = _opt(opts, "result-file").strip()
+    if result_file:
+        result_file = os.path.abspath(os.path.expanduser(result_file))
+    user = "--user" in opts
     cmd = build_schedule_command(
         unit=unit, at=at, log_path=log_path, command=command, summary=summary, workdir=workdir,
+        tier=tier, fail_tier=fail_tier, result_file=result_file, user=user,
     )
     if "--print" in opts or "--dry-run" in opts:
         sys.stdout.write(shlex.join(cmd) + "\n")
@@ -715,23 +816,67 @@ def cmd_schedule(argv: List[str]) -> int:
         return 3
     if proc.returncode != 0:
         tail = proc.stderr.decode("utf-8", "ignore").strip().splitlines()
-        sys.stderr.write(f"detached_jobs: systemd-run rc={proc.returncode}: {tail[-1] if tail else ''}\n")
+        last = tail[-1] if tail else ""
+        sys.stderr.write(f"detached_jobs: systemd-run rc={proc.returncode}: {last}\n")
+        if not user and _geteuid() != 0 and "authentication required" in last.lower():
+            # Non-root harness account (#2710): the system manager wants polkit.
+            sys.stderr.write(
+                "detached_jobs: this account cannot start system units — retry with"
+                " `schedule --user ...` (a user timer; see `loginctl enable-linger` to"
+                " keep it running after logout)\n"
+            )
         return 3
+    if user and _linger_enabled() is False:
+        sys.stderr.write(
+            "detached_jobs: warning: Linger=no for this user — the user timer stops when"
+            " the last session logs out; `loginctl enable-linger` keeps it armed\n"
+        )
     rec: Dict[str, Any] = {
         "unit": unit,
         "log": log_path,
         "started_at": int(time.time()),
         "scheduled_at": at[:80],
         "notify_on_exit": True,
+        "tier": tier,
     }
+    if user:
+        rec["scope"] = SCOPE_USER
     if summary:
         rec["summary"] = summary
     if workdir:
         rec["workdir"] = workdir
     rc = _append(registry_path(_opt(opts, "registry")), rec)
     if rc == 0:
-        sys.stdout.write(f"scheduled: unit={unit} at={at!r} (no ⏳ wait; completion arrives as a spool notice)\n")
+        sys.stdout.write(
+            f"scheduled: unit={unit} at={at!r} scope={SCOPE_USER if user else SCOPE_SYSTEM} tier={tier}"
+            " (no ⏳ wait; completion arrives as a spool notice)\n"
+        )
     return rc
+
+
+def _geteuid() -> int:
+    try:
+        return os.geteuid()
+    except AttributeError:  # pragma: no cover - non-POSIX
+        return 0
+
+
+def _linger_enabled() -> Optional[bool]:
+    """``loginctl`` Linger for the current user: True/False, None when unknown."""
+    user = os.environ.get("USER", "").strip() or str(_geteuid())
+    try:
+        proc = subprocess.run(
+            ["loginctl", "show-user", user, "--property=Linger"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = proc.stdout.decode("utf-8", "ignore").strip()
+    if value == "Linger=yes":
+        return True
+    if value == "Linger=no":
+        return False
+    return None
 
 
 def _bridge_python() -> str:

@@ -272,8 +272,8 @@ export CCC_PUSH_SPOOL="$TMP/spool2636"
 out="$(CCC_NODE=testnode python3 "$MOD" notify --unit sched1 --exit 0 --summary "verify rollout" --log "$TMP/s.log")"
 # shellcheck disable=SC2034  # f is read via eval inside ok()
 f="$(ls "$CCC_PUSH_SPOOL"/*DetachedJob-sched1-*.json 2>/dev/null | head -1)"
-ok "#2636: notify queues one spool record with the notify.sh field contract" \
-  '[ -n "$f" ] && python3 -c "import json,sys; r=json.load(open(sys.argv[1])); assert r[\"event\"]==\"DetachedJob\" and r[\"node\"]==\"testnode\" and r[\"dedup\"]==\"DetachedJob:sched1:0\" and \"EXIT=0\" in r[\"text\"] and \"verify rollout\" in r[\"text\"] and set(r)=={\"ts\",\"event\",\"node\",\"text\",\"dedup\"}" "$f"'
+ok "#2636/#2710: notify queues one spool record with the notify.sh field contract plus tier (default info)" \
+  '[ -n "$f" ] && python3 -c "import json,sys; r=json.load(open(sys.argv[1])); assert r[\"event\"]==\"DetachedJob\" and r[\"node\"]==\"testnode\" and r[\"dedup\"]==\"DetachedJob:sched1:0\" and \"EXIT=0\" in r[\"text\"] and \"verify rollout\" in r[\"text\"] and set(r)=={\"ts\",\"event\",\"node\",\"text\",\"dedup\",\"tier\"} and r[\"tier\"]==\"info\"" "$f"'
 ok "#2636: the spool record is owner-only" '[ "$(stat -c %a "$f")" = "600" ]'
 out="$(python3 "$MOD" notify --unit sched1 --exit 7 --summary "$(python3 -c 'print("y"*3000)')")"
 # shellcheck disable=SC2034  # f7 is read via eval inside ok()
@@ -325,6 +325,89 @@ out="$(python3 "$MOD" schedule --unit sched3 --at 05:00 --log "$TMP/s3.log" 2>&1
 ok "#2636: schedule without -- <command> is a usage error" 'grep -q "rc=2" <<<"$out"'
 out="$(python3 "$MOD" schedule --unit 'bad unit;rm' --at 05:00 --log "$TMP/s3.log" --print -- true 2>&1; echo "rc=$?")"
 ok "#2636: a unit name that is not a plain systemd name is rejected" 'grep -q "rc=2" <<<"$out"'
+
+# ---- #2710: tier, --user scope, --result-file -------------------------------
+spool_rec() { python3 -c "import json,sys,glob; rs=[json.load(open(p)) for p in sorted(glob.glob(sys.argv[1]+'/*DetachedJob-'+sys.argv[2]+'-*.json'))]; r=rs[-1]; print(r['tier']+'|'+r['text'])" "$CCC_PUSH_SPOOL" "$1"; }
+rm -f "$CCC_PUSH_SPOOL"/*.json
+python3 "$MOD" notify --unit t1 --exit 0 --tier notice >/dev/null
+ok "#2710: notify --tier notice writes tier=notice" '[ "$(spool_rec t1 | cut -d"|" -f1)" = notice ]'
+python3 "$MOD" notify --unit t2 --exit 4 --tier notice --fail-tier action >/dev/null
+ok "#2710: a failing exit uses --fail-tier" '[ "$(spool_rec t2 | cut -d"|" -f1)" = action ]'
+python3 "$MOD" notify --unit t3 --exit 0 --tier notice --fail-tier action >/dev/null
+ok "#2710: a successful exit keeps --tier when --fail-tier is set" '[ "$(spool_rec t3 | cut -d"|" -f1)" = notice ]'
+out="$(python3 "$MOD" notify --unit t4 --exit 0 --tier loud 2>&1; echo "rc=$?")"
+ok "#2710: an unknown tier is a usage error and queues nothing" 'grep -q "rc=2" <<<"$out" && ! ls "$CCC_PUSH_SPOOL"/*DetachedJob-t4-*.json >/dev/null 2>&1'
+out="$(python3 "$MOD" notify 2>&1)"
+ok "#2710: notify usage says the default info tier waits for the 09:00 digest" 'grep -q "09:00" <<<"$out" && grep -q -- "--tier notice" <<<"$out"'
+printf 'progress 1\n\n  7일 중   6일   통과  \n\n' > "$TMP/r.result"
+python3 "$MOD" notify --unit t5 --exit 0 --result-file "$TMP/r.result" >/dev/null
+ok "#2710: --result-file injects the last non-empty line, whitespace-collapsed" 'spool_rec t5 | grep -q "· 결과: 7일 중 6일 통과$"'
+python3 -c 'print("z"*5000)' > "$TMP/big.result"
+python3 "$MOD" notify --unit t6 --exit 0 --result-file "$TMP/big.result" >/dev/null
+ok "#2710: the result is capped at 280 chars" '[ "$(spool_rec t6 | grep -o "z*" | awk "{ if (length > m) m = length } END { print m }")" = 280 ]'
+python3 "$MOD" notify --unit t7 --exit 0 --result-file "$TMP/missing.result" >/dev/null
+ok "#2710: a missing result file still queues the notice, without a result" 'spool_rec t7 | grep -q "EXIT=0" && ! spool_rec t7 | grep -q "결과:"'
+
+out="$(python3 "$MOD" schedule --unit s10 --at 05:00 --log "$TMP/s10.log" --print -- true)"
+ok "#2710: schedule defaults the notice to tier notice" 'grep -q -- "--tier notice" <<<"$out" && ! grep -q -- "--user" <<<"$out"'
+out="$(python3 "$MOD" schedule --unit s11 --at 05:00 --log "$TMP/s11.log" --user --tier action --fail-tier critical --result-file "$TMP/s11.result" --print -- true)"
+ok "#2710: schedule --user builds systemd-run --user and passes tier/fail-tier/result-file to notify" \
+  'grep -q "^systemd-run --user --unit s11 --collect" <<<"$out" && grep -q -- "--tier action --fail-tier critical --result-file $TMP/s11.result" <<<"$out"'
+out="$(python3 "$MOD" schedule --unit s12 --at 05:00 --log "$TMP/s12.log" --tier nope --print -- true 2>&1; echo "rc=$?")"
+ok "#2710: schedule rejects an unknown tier" 'grep -q "rc=2" <<<"$out"'
+
+# Launch path with stubs: systemctl answers only for --user, loginctl says Linger=no.
+SDR2="$TMP/sdr2.log"
+write_exec_stub "$TMP/bin/systemd-run" <<'SH'
+printf '%s\n' "$*" >> "${SDR_LOG:?}"
+SH
+write_exec_stub "$TMP/bin/loginctl" <<'SH'
+echo "Linger=no"
+SH
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+[ "$1" = "--user" ] && [ "$3" = "s13.timer" ] && { echo active; exit 0; }
+exit 3
+SH
+reg2636
+out="$(SDR_LOG="$SDR2" python3 "$MOD" schedule --unit s13 --at 05:00 --log "$TMP/s13.log" --user -- true 2>&1)"
+ok "#2710: schedule --user launches with --user, warns on Linger=no, and records scope=user tier=notice" \
+  'grep -q "^--user --unit s13 --collect" "$SDR2" && grep -q "Linger=no" <<<"$out" && grep -q "scope=user tier=notice" <<<"$out" && python3 -c "import json,sys; r=[json.loads(l) for l in open(sys.argv[1]) if l.strip()][-1]; assert r[\"scope\"]==\"user\" and r[\"tier\"]==\"notice\"" "$CCC_DETACHED_JOBS_REGISTRY"'
+out="$(python3 "$MOD" sweep "$CCC_DETACHED_JOBS_REGISTRY")"
+ok "#2710: an armed user timer sweeps as running (asked with systemctl --user), not lost" \
+  'grep -q "진행 중" <<<"$out" && grep -q "⏰ 05:00" <<<"$out" && ! grep -q "소식 없음" <<<"$out"'
+printf 'ran\nEXIT=0\n' > "$TMP/s13.log"
+out="$(python3 "$MOD" sweep "$CCC_DETACHED_JOBS_REGISTRY")"
+ok "#2710: after it fires, the EXIT marker makes it done" 'grep -q "완료됨" <<<"$out" && grep -q "EXIT=0" <<<"$out"'
+
+reg2636
+python3 "$MOD" register --unit hand --log "$TMP/hand.log" --user --no-wait >/dev/null
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+[ "$1" = "--user" ] && [ "$3" = "hand.service" ] && { echo active; exit 0; }
+exit 3
+SH
+out="$(python3 "$MOD" sweep "$CCC_DETACHED_JOBS_REGISTRY")"
+ok "#2710: register --user records scope=user and a live user unit is running, not lost" \
+  'grep -q "진행 중" <<<"$out" && ! grep -q "소식 없음" <<<"$out"'
+
+# Non-root + system manager auth error → hint to use --user.
+write_exec_stub "$TMP/bin/systemd-run" <<'SH'
+echo "Failed to start transient timer unit: Interactive authentication required." >&2
+exit 1
+SH
+out="$(cd "$HERE" && python3 -c "
+import sys, detached_jobs as d
+d._geteuid = lambda: 1000
+sys.exit(d.main(['schedule','--unit','s14','--at','05:00','--log','$TMP/s14.log','--','true']))" 2>&1; echo "rc=$?")"
+ok "#2710: a non-root system systemd-run auth failure suggests schedule --user" 'grep -q "rc=3" <<<"$out" && grep -q "schedule --user" <<<"$out"'
+out="$(cd "$HERE" && python3 -c "
+import sys, detached_jobs as d
+d._geteuid = lambda: 0
+sys.exit(d.main(['schedule','--unit','s15','--at','05:00','--log','$TMP/s15.log','--','true']))" 2>&1; echo "rc=$?")"
+ok "#2710: root gets no --user hint for the same failure" 'grep -q "rc=3" <<<"$out" && ! grep -q "schedule --user" <<<"$out"'
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+exit 3
+SH
+rm -f "$TMP/bin/loginctl"
 unset ARMS_LOG CCC_BRIDGE_PYTHON CCC_DETACHED_JOBS_REGISTRY CCC_PUSH_SPOOL
 
 # The summary line format is load-bearing: validate-harness.sh's

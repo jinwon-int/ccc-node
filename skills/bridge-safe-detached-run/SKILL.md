@@ -184,9 +184,33 @@ body-free spool record the bridge delivers to the owner as `🔔 ccc-node
 lists the job as running with its ⏰ time (timer active, no log yet), not lost.
 `--at` takes any systemd calendar spec (`systemd-analyze calendar "<spec>"` to
 check it). Hand-written units get the same announcement by appending
-`python3 ~/.claude/hooks/lib/detached_jobs.py notify --unit <job> --exit "$rc"`
+`python3 ~/.claude/hooks/lib/detached_jobs.py notify --unit <job> --exit "$rc" --tier notice`
 after their `EXIT=` line. Non-systemd nodes (Termux): `schedule` exits 3 —
 use the `setsid`/`nohup` fallback with a sleep-until and the same `notify`.
+
+Two traps, both silent (#2710):
+
+- **Tier.** A notice without a tier is `info`: the fleet receiver holds it for
+  the next 09:00 KST digest and never mirrors it to 「한데」 on its own, so a
+  job that ends at 09:30 is read the next morning. `schedule` therefore
+  defaults to `--tier notice` (delivered at once, mirrored, not re-notified);
+  bare `notify` keeps `info` for compatibility — pass `--tier notice` yourself.
+  `--fail-tier action` raises only a non-zero exit. Tiers:
+  `info|notice|action|critical`.
+- **Non-root harness account.** System `systemd-run` fails with
+  `Interactive authentication required`; `schedule` then says to retry with
+  `--user`. `schedule --user` launches `systemd-run --user …`, records
+  `scope=user`, and the sweep asks `systemctl --user` — without that an armed
+  user timer reads as **lost** and invites a needless re-run. It warns when
+  `loginctl` reports `Linger=no` (the timer dies at logout; `loginctl
+  enable-linger` keeps it). A hand-made `systemd-run --user` unit is
+  registered with `register --user` for the same reason.
+
+To put the job's actual outcome in the notice ("7일 중 6일 통과", "설치 완료",
+the abort reason), have it write one line to a file and pass
+`--result-file <path>`: the last non-empty line is appended as `· 결과: …`,
+whitespace-collapsed and capped at 280 characters. Write a result, not a
+body — no secrets, no log dumps.
 
 ## Receiving `<task-notification status=stopped>` — classify first
 
