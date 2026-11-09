@@ -1932,20 +1932,94 @@ def _keywords(query, max_terms=6):
     return out[:max_terms]
 
 
-def _mp_search(mp, query, n):
-    """One MemPalace CLI search, cleaned to excerpt lines. [] on any failure."""
+# #2722 — MemPalace answers a search that overlaps a refresh/sweep write with a
+# transient error that names its own remedy ("retry the query"): sqlite_exact
+# raises after three internal snapshot retries, chroma surfaces a compactor
+# backfill failure. On a Termux node a no-new-data sweep rewrote ~512 drawers for
+# 22 minutes every hour, so a single attempt failed 9/13 times inside that
+# window and dialectic silently lost its verbatim layer. Only these transient
+# shapes are retried; every other failure keeps the old immediate [] result.
+_MP_TRANSIENT_RE = re.compile(r"Palace changed repeatedly|compactor", re.I)
+_MP_SEARCH_STATUS_FILE = "mempalace-search.status.json"
+
+
+def _mp_env_int(name, default, lo, hi):
     try:
-        child_env = os.environ.copy()
-        palace_home = os.environ.get("CCC_NUNCHI_MEMPALACE_HOME")
-        if palace_home:
-            child_env["HOME"] = palace_home
-        out = subprocess.run([mp, "search", query, "--results", str(n)],
-                             capture_output=True, text=True, timeout=30,
-                             env=child_env)
+        value = int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+    return min(max(value, lo), hi)
+
+
+def _mp_record_search(result, reason, attempts):
+    """Body-free outcome of a non-trivial search (failure or retried success).
+
+    The query and excerpts never leave the process; only the outcome, a reason
+    token and the attempt count are written, atomically and owner-only. A
+    write failure never changes the search result (dialectic degrades, it does
+    not break). stderr is deliberately not used: bench.sh captures dialectic
+    with 2>&1 and would score the note as part of the answer.
+    """
+    try:
+        home = os.environ.get("NUNCHI_HOME") or os.path.expanduser("~/.nunchi")
+        _atomic_write_text(os.path.join(home, _MP_SEARCH_STATUS_FILE), json.dumps({
+            "schema": "ccc.nunchi.mempalace-search.v1",
+            "result": result,
+            "reason": reason,
+            "attempts": attempts,
+            "at": int(time.time()),
+        }, sort_keys=True) + "\n")
     except Exception:
-        return []
-    if out.returncode != 0:
-        return []
+        pass
+
+
+def _mp_search(mp, query, n):
+    """One MemPalace CLI search, cleaned to excerpt lines. [] on any failure.
+
+    #2722: a transient "palace changed / compactor" failure is retried up to
+    CCC_NUNCHI_MEMPALACE_SEARCH_RETRIES times (default 2, max 5) with a
+    linear backoff of CCC_NUNCHI_MEMPALACE_RETRY_DELAY_SEC (default 3 s), and
+    never past CCC_NUNCHI_MEMPALACE_SEARCH_BUDGET_SEC (default 60 s) of wall
+    time for the whole call.
+    """
+    child_env = os.environ.copy()
+    palace_home = os.environ.get("CCC_NUNCHI_MEMPALACE_HOME")
+    if palace_home:
+        child_env["HOME"] = palace_home
+    retries = _mp_env_int("CCC_NUNCHI_MEMPALACE_SEARCH_RETRIES", 2, 0, 5)
+    delay = _mp_env_int("CCC_NUNCHI_MEMPALACE_RETRY_DELAY_SEC", 3, 0, 30)
+    budget = _mp_env_int("CCC_NUNCHI_MEMPALACE_SEARCH_BUDGET_SEC", 60, 1, 300)
+    started = time.monotonic()
+    attempts = 0
+    reason = ""
+    while True:
+        attempts += 1
+        remaining = budget - (time.monotonic() - started)
+        try:
+            out = subprocess.run([mp, "search", query, "--results", str(n)],
+                                 capture_output=True, text=True,
+                                 timeout=max(1, min(30, remaining)),
+                                 env=child_env)
+        except subprocess.TimeoutExpired:
+            _mp_record_search("fail", "timeout", attempts)
+            return []
+        except Exception:
+            _mp_record_search("fail", "spawn_error", attempts)
+            return []
+        if out.returncode == 0:
+            break
+        transient = _MP_TRANSIENT_RE.search((out.stdout or "") + "\n" + (out.stderr or ""))
+        if not transient:
+            _mp_record_search("fail", "exit_%d" % out.returncode, attempts)
+            return []
+        reason = "compactor" if "compactor" in transient.group(0).lower() else "palace_changed"
+        wait = delay * attempts
+        if attempts > retries or time.monotonic() - started + wait >= budget:
+            _mp_record_search("fail", reason, attempts)
+            return []
+        time.sleep(wait)
+    if attempts > 1:
+        _mp_record_search("ok_after_retry", reason, attempts)
     keep = []
     for ln in out.stdout.splitlines():
         s = ln.strip()

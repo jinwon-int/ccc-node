@@ -233,5 +233,32 @@ SH
 ok "unknown backend falls back to mempalace" 'out="$(v bogus)"; grep -q MP-STUB-LINE <<<"$out"'
 ok "gotgan backend with absent db is empty" 'out="$(GOTGAN_DB="$TMP/none.db" v gotgan)"; [ -z "$out" ]'
 
+# ---- 9. #2722 transient MemPalace search retry ---------------------------------
+# Stub: fail the first MP_FAILS calls with MP_ERR (on stdout, like `mempalace
+# search` prints "Search error: ..."), exit MP_RC; then succeed. Calls are
+# counted in $MP_COUNT so the retry budget is observable.
+cat > "$TMP/bin/mempalace" <<'SH'
+#!/usr/bin/env bash
+c=$(( $(cat "$MP_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$MP_COUNT"
+if [ "$c" -le "${MP_FAILS:-0}" ]; then echo "  Search error: ${MP_ERR:-Palace changed repeatedly during exact search; retry the query}"; exit "${MP_RC:-1}"; fi
+echo "MP-STUB-LINE"
+SH
+chmod +x "$TMP/bin/mempalace"
+mps() { rm -f "$TMP/mpcount" "$TMP/nh/mempalace-search.status.json"
+  PATH="$TMP/bin:$PATH" MP_COUNT="$TMP/mpcount" NUNCHI_HOME="$TMP/nh" CCC_NUNCHI_MEMPALACE_RETRY_DELAY_SEC=0 "$@" python3 -c \
+  "import sys; sys.path.insert(0, '$HERE'); import nunchi; print('\n'.join(nunchi._mp_search('mempalace', 'SECRET-QUERY-TEXT', 3)))"; }
+st() { python3 -c "import json,sys; d=json.load(open('$TMP/nh/mempalace-search.status.json')); print(d['result'], d['reason'], d['attempts'])"; }
+mkdir -p "$TMP/nh"
+ok "#2722 palace-changed twice then ok: result returned after 3 calls" 'out="$(mps env MP_FAILS=2)"; grep -q MP-STUB-LINE <<<"$out" && [ "$(cat "$TMP/mpcount")" = 3 ]'
+ok "#2722 retried success is recorded body-free" '[ "$(st)" = "ok_after_retry palace_changed 3" ] && ! grep -q SECRET-QUERY-TEXT "$TMP/nh/mempalace-search.status.json"'
+ok "#2722 status file is owner-only" '[ "$(stat -c %a "$TMP/nh/mempalace-search.status.json" 2>/dev/null || stat -f %Lp "$TMP/nh/mempalace-search.status.json")" = 600 ]'
+ok "#2722 compactor error exhausts 1+2 attempts then empty" 'out="$(mps env MP_FAILS=9 MP_ERR="Error executing plan: Error sending backfill request to compactor")"; [ -z "$out" ] && [ "$(cat "$TMP/mpcount")" = 3 ] && [ "$(st)" = "fail compactor 3" ]'
+ok "#2722 non-transient failure is not retried" 'out="$(mps env MP_FAILS=9 MP_ERR="no palace found" MP_RC=2)"; [ -z "$out" ] && [ "$(cat "$TMP/mpcount")" = 1 ] && [ "$(st)" = "fail exit_2 1" ]'
+ok "#2722 RETRIES=0 disables retry" 'out="$(mps env MP_FAILS=9 CCC_NUNCHI_MEMPALACE_SEARCH_RETRIES=0)"; [ -z "$out" ] && [ "$(cat "$TMP/mpcount")" = 1 ]'
+ok "#2722 budget stops retries before the wait would overrun it" 'out="$(mps env MP_FAILS=9 CCC_NUNCHI_MEMPALACE_SEARCH_BUDGET_SEC=2 CCC_NUNCHI_MEMPALACE_RETRY_DELAY_SEC=5)"; [ -z "$out" ] && [ "$(cat "$TMP/mpcount")" = 1 ]'
+ok "#2722 plain success writes no status file" 'out="$(mps env MP_FAILS=0)"; grep -q MP-STUB-LINE <<<"$out" && [ ! -e "$TMP/nh/mempalace-search.status.json" ]'
+ok "#2722 failure path prints nothing on stderr (bench captures 2>&1)" 'err="$(mps env MP_FAILS=9 2>&1 >/dev/null)"; [ -z "$err" ]'
+ok "#2722 unwritable NUNCHI_HOME never breaks the search" 'out="$(PATH="$TMP/bin:$PATH" MP_COUNT="$TMP/mpc2" MP_FAILS=1 NUNCHI_HOME=/proc/nonexistent/nh CCC_NUNCHI_MEMPALACE_RETRY_DELAY_SEC=0 python3 -c "import sys; sys.path.insert(0, \"$HERE\"); import nunchi; print(chr(10).join(nunchi._mp_search(\"mempalace\", \"q\", 3)))")"; grep -q MP-STUB-LINE <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
