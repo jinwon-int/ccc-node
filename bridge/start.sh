@@ -1198,12 +1198,28 @@ _token_lock_refuse() {
     return 1
 }
 
+# Exclusive create through bash's noclobber (open O_CREAT|O_EXCL), a builtin.
+# mkdir(1) is not a lock on every system: Ubuntu 26.04's uutils mkdir let
+# several concurrent creators of one path all succeed (11 of 200 rounds of 20
+# creators on a GitHub runner; GNU mkdir and noclobber 0 of 200), which let two
+# token-lock contenders win (#2738). A directory left at the path by an older
+# start.sh also makes the create fail, so it is reclaimed like a stale claim.
+_token_lock_create() { # <path>
+    ( set -C; : > "$1" ) 2>/dev/null
+}
+
+# Inode + ctime of the last-resort claim; empty when it is missing or find
+# lacks -printf. ctime tells a recreated claim apart even if the inode is reused.
+_token_lock_claim_id() { # <path>
+    find "$1" -maxdepth 0 -printf '%i:%C@' 2>/dev/null || true
+}
+
 # Atomically claim the token lock for <pid> (the process that will serve the
 # token: the foreground bot after exec, or the daemon supervisor). Returns 0
 # with the claim held for this process's lifetime, 1 (after printing why) when
 # another live instance holds it. Never falls through to a shared claim.
 acquire_token_lock() { # <pid>
-    local pid="$1" flock_bin lock_dir reclaim
+    local pid="$1" flock_bin claim reclaim seen
     init_token_lock
     flock_bin="${CCC_FLOCK_CLI:-$(command -v flock || true)}"
     if [ -n "$flock_bin" ] && [ -f "$flock_bin" ] && [ -x "$flock_bin" ]; then
@@ -1236,39 +1252,47 @@ acquire_token_lock() { # <pid>
         return 0
     fi
     # Last resort (no flock, no python3 — the bot itself cannot start then):
-    # mkdir is atomic (same fallback as refresh-memory.sh, #1487). A directory
-    # outlives a dead holder, so the pid file keeps deciding liveness — the
-    # stale-pid recovery the old check had. The short wait covers a winner
-    # that owns the dir but has not recorded its pid yet. Removing a dead
-    # holder's dir goes through a sole-reclaimer token so two reclaimers can
-    # never delete each other's fresh claim; a token abandoned by a reclaimer
-    # killed mid-step is dropped after a minute.
-    lock_dir="$TOKEN_LOCK_FILE.d"
-    reclaim="$lock_dir.reclaim"
-    if ! mkdir "$lock_dir" 2>/dev/null; then
+    # an exclusive create of the claim path (historically a mkdir, hence the
+    # tier name and the ".d" suffix kept for compatibility). The claim outlives
+    # a dead holder, so the pid file keeps deciding liveness — the stale-pid
+    # recovery the old check had. The short wait covers a winner that owns the
+    # claim but has not recorded its pid yet. Removing a dead holder's claim
+    # goes through a sole-reclaimer token so two reclaimers can never delete
+    # each other's fresh claim; a token abandoned by a reclaimer killed mid-step
+    # is dropped after a minute.
+    claim="$TOKEN_LOCK_FILE.d"
+    reclaim="$claim.reclaim"
+    if ! _token_lock_create "$claim"; then
+        # Identity of the claim we lost to. If it is replaced while we wait, a
+        # new claimant owns it and may not have recorded its pid yet, so the
+        # pid file still names the dead holder; reclaiming it then would let
+        # two contenders win (#2738). An unknown identity (no find -printf)
+        # keeps the previous behaviour.
+        seen="$(_token_lock_claim_id "$claim")"
         sleep 1
         is_token_locked && { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
-        if [ -d "$reclaim" ] && [ -n "$(find "$reclaim" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-            rmdir "$reclaim" 2>/dev/null || true
+        if [ -e "$reclaim" ] && [ -n "$(find "$reclaim" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rm -rf "$reclaim"
         fi
-        mkdir "$reclaim" 2>/dev/null || { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
+        _token_lock_create "$reclaim" || { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
         # Re-check under the token: a reclaimer that finished between our
-        # first check and this point recorded its pid before releasing it.
-        if is_token_locked; then
-            rmdir "$reclaim" 2>/dev/null || true
+        # first check and this point recorded its pid before releasing it,
+        # and a replaced claim belongs to someone else.
+        if is_token_locked || [ "$(_token_lock_claim_id "$claim")" != "$seen" ]; then
+            rm -f "$reclaim"
             TOKEN_LOCK_HELD=""
             _token_lock_refuse
             return 1
         fi
-        rm -rf "$lock_dir"
-        if ! mkdir "$lock_dir" 2>/dev/null; then
-            rmdir "$reclaim" 2>/dev/null || true
+        rm -rf "$claim"
+        if ! _token_lock_create "$claim"; then
+            rm -f "$reclaim"
             TOKEN_LOCK_HELD=""
             _token_lock_refuse
             return 1
         fi
         write_token_lock "$pid"
-        rmdir "$reclaim" 2>/dev/null || true
+        rm -f "$reclaim"
         echo "🔒 token lock: flock unavailable; using mkdir fallback"
         return 0
     fi
