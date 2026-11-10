@@ -617,6 +617,12 @@ else
   err "doctor push spool dwell verdict tests failed (an orphaned notification spool may go unseen)"
   tail -10 "$TMP/doctor-push-spool-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_hande_bot_health_test.py >"$TMP/doctor-hande-bot-health-test.out" 2>&1; then
+  say "  ok doctor hande bot health verdict tests (#2380)"
+else
+  err "doctor hande bot health verdict tests failed (a halted hande room or a relay outage may go unseen)"
+  tail -10 "$TMP/doctor-hande-bot-health-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_doctor_stale_memory_test.py >"$TMP/doctor-stale-memory-test.out" 2>&1; then
   say "  ok doctor stale-memory-guidance verdict tests (#2238)"
 else
