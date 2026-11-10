@@ -43,6 +43,6 @@ jobs:
             sum="$(grep -E 'PASS=' <<<"$out" | tail -1)"
             bad="$(grep -E '^FAIL: \[mkdir\] concurrent' <<<"$out")"
             echo "run $i: $sum"
-            if [ -n "$bad" ]; then fails=$((fails+1)); grep -E '^FAIL|^diag r-mkdir' <<<"$out" | cut -c1-3000; fi
+            if [ -n "$bad" ]; then fails=$((fails+1)); grep -E '^FAIL|^diag [rq]-mkdir' <<<"$out" | cut -c1-3000; fi
           done
           echo "VARIANT=${{ matrix.variant }} race-fail-runs=$fails/10"

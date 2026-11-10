@@ -239,16 +239,18 @@ race() { # <name> <n> — n contenders released together; winners append their p
   done
   sleep 0.3; touch "$TMP/$name.go"; wait
 }
+# Bash builtins only: in the mkdir tier PATH is the minimal tool dir (no tr).
 race_diag() { # <name> — on a miscount, print who won and what each contender saw (#2738)
-  local name="$1" n
+  local name="$1" n f text winners="" pidfile=""
   n="$(wc -l < "$TMP/$name.winners" 2>/dev/null || echo 0)"
   [ "$n" -eq 1 ] && return 0
-  printf 'diag %s: winners=[%s] pidfile=[%s]\n' "$name" \
-    "$(tr '\n' ' ' < "$TMP/$name.winners" 2>/dev/null)" "$(cat "$TOKEN_LOCK_FILE" 2>/dev/null)" >&2
-  local f
+  [ -e "$TMP/$name.winners" ] && winners="$(< "$TMP/$name.winners")"
+  [ -e "$TOKEN_LOCK_FILE" ] && pidfile="$(< "$TOKEN_LOCK_FILE")"
+  printf 'diag %s: winners=[%s] pidfile=[%s]\n' "$name" "${winners//$'\n'/ }" "$pidfile" >&2
   for f in "$TMP/$name".*.out; do
     [ -e "$f" ] || continue
-    printf 'diag %s: %s: %s\n' "$name" "${f##*/}" "$(tr '\n' ' ' < "$f")" >&2
+    text="$(< "$f")"
+    printf 'diag %s: %s: %s\n' "$name" "${f##*/}" "${text//$'\n'/ | }" >&2
   done
 }
 
