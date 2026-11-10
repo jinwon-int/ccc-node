@@ -1200,6 +1200,7 @@ class Doctor:
         self.check_overlay_parity()
         self.check_bridge_runtime_config()
         self.check_bridge_status()
+        self.check_hande_bot_health()
         self.check_bridge_boot_path()
         self.check_bridge_memory_guard()
         self.check_continuation_state()
@@ -3906,6 +3907,135 @@ class Doctor:
             "writers' dir (or symlink the orphan dir to the consumed one), and move stale "
             "records into sent/ instead of delivering outdated notices (ccc-node#2223)",
         )
+
+    # family-messenger#739: the native relay bot (steward) writes
+    # <rooms-dir>/health.json, schema v1. Defaults: the systemd unit's rooms dir
+    # and the Termux runit layout under $HOME.
+    _HANDE_BOT_HEALTH_DEFAULTS = (
+        "/var/lib/native-relay-bot/rooms/health.json",
+        "~/.native-relay-bot/rooms/health.json",
+    )
+    _HANDE_BOT_HEALTH_READ_LIMIT = 1 << 18
+    _HANDE_BOT_STALE_SECONDS_DEFAULT = 300
+    _HANDE_BOT_UNREACHABLE_SECONDS = 60
+    _HANDE_BOT_403_RECENT_SECONDS = 3600
+
+    def _hande_bot_health_paths(self) -> list[Path]:
+        raw = os.environ.get("CCC_DOCTOR_HANDE_BOT_HEALTH", "").strip()
+        names = [n for n in re.split(r"[\s,:]+", raw) if n] if raw else list(self._HANDE_BOT_HEALTH_DEFAULTS)
+        return [Path(n).expanduser() for n in names]
+
+    @classmethod
+    def hande_bot_health_verdict(
+        cls, data: Any, now: float, stale_seconds: int
+    ) -> tuple[str, str, str]:
+        """(klass, status, action) for one parsed bot health file (schema v1).
+
+        Order of severity: a halted room needs the operator (a restart never
+        clears the halt marker); then a stale or foreign file, a relay outage
+        past one minute and a 403 within the hour warn. A one-retry blip of the
+        relay (the bot backs off from 0.5 s) never warns.
+        """
+        if not isinstance(data, dict) or data.get("version") != 1:
+            version = data.get("version") if isinstance(data, dict) else None
+            return ("경고", f"unknown schema (version={_printable(str(version), 20)})",
+                    "the bot binary and this doctor disagree on health.json; update both to current main")
+        updated = data.get("updated")
+        relay = data.get("relay") if isinstance(data.get("relay"), dict) else {}
+        rooms = [r for r in data.get("rooms", []) if isinstance(r, dict)] if isinstance(data.get("rooms"), list) else []
+        last_403 = (data.get("access") or {}).get("last_403") if isinstance(data.get("access"), dict) else None
+        age = int(now - updated) if isinstance(updated, (int, float)) else None
+        # No clock-derived value in the 정상 line: doctor output stays the same
+        # between two runs on a healthy node; the age appears only in a finding.
+        summary = (
+            f"relay={_printable(str(relay.get('state')), 20)} outages={relay.get('outages')} "
+            f"last_error={_printable(str(relay.get('last_error_class')), 20)} rooms={len(rooms)}"
+        )
+        aged = f"{summary} age={'?' if age is None else f'{age}s'}"
+        halted = [r for r in rooms if r.get("halted") is True]
+        if halted:
+            shown = ", ".join(
+                f"{_printable(str(r.get('room')), 64)}({_printable(str(r.get('halt_reason')), 40)})" for r in halted[:5]
+            )
+            return ("수동필요", f"halted={len(halted)}: {shown}; {aged}",
+                    "a halted room stays halted across restarts: check the reason, delete "
+                    "<rooms-dir>/<room>.state.refused and re-add the device to the room "
+                    "(family-messenger STEWARD.md)")
+        if age is None or age > stale_seconds:
+            return ("경고", f"stale (threshold={stale_seconds}s); {aged}",
+                    "the bot's loop stopped writing health.json: check the native-relay-bot "
+                    "unit (journal, restarts); a binary older than family-messenger#739 writes none")
+        since = relay.get("since")
+        if relay.get("state") == "unreachable" and isinstance(since, (int, float)) and now - since >= cls._HANDE_BOT_UNREACHABLE_SECONDS:
+            return ("경고", f"relay unreachable for {int(now - since)}s; {aged}",
+                    "the bot cannot reach the relay: check the relay host and this node's tailnet path "
+                    "(last_error_class tells refused/timeout/read_timeout apart)")
+        at = last_403.get("at") if isinstance(last_403, dict) else None
+        if isinstance(at, (int, float)) and now - at < cls._HANDE_BOT_403_RECENT_SECONDS:
+            code = _printable(str(last_403.get("code")), 40)
+            return ("경고", f"403 {code} {int(now - at)}s ago; {aged}",
+                    "the relay refused this device (Access token or device policy): check the "
+                    "bot's access token rotation and its enrollment")
+        return ("정상", summary, "none")
+
+    def check_hande_bot_health(self) -> None:
+        """Read the native relay bot's ``health.json`` (family-messenger#739, #2380).
+
+        Node-local diagnostics only (no alerting: relay outages are announced
+        once, off-host, by the relay watchdog). Applies where the file exists
+        or ``hande`` is a declared frontend. ``CCC_DOCTOR_HANDE_BOT_HEALTH``
+        overrides the paths; ``CCC_DOCTOR_HANDE_BOT_STALE_SECONDS`` the staleness
+        threshold (default 300).
+        """
+        item = "hande bot health"
+        declared = self.frontends()
+        expected = declared is not None and "hande" in declared
+        raw = os.environ.get("CCC_DOCTOR_HANDE_BOT_STALE_SECONDS", "").strip()
+        stale = int(raw) if raw.isdigit() and int(raw) > 0 else self._HANDE_BOT_STALE_SECONDS_DEFAULT
+        found: list[tuple[Path, bytes | None, str | None]] = []
+        for path in self._hande_bot_health_paths():
+            try:
+                payload = _read_regular_bounded(path, self._HANDE_BOT_HEALTH_READ_LIMIT)
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                found.append((path, None, "permission"))
+                continue
+            except OSError as error:
+                found.append((path, None, errno.errorcode.get(error.errno or 0, "error")))
+                continue
+            if payload is None:
+                found.append((path, None, "not a regular file"))
+            else:
+                found.append((path, payload, None))
+        if not found:
+            if expected:
+                self.add("경고", item, "missing (no bot health.json)",
+                         "hande is a declared frontend but no bot health file was found: the bot binary "
+                         "predates family-messenger#739, or its --rooms-dir is elsewhere "
+                         "(set CCC_DOCTOR_HANDE_BOT_HEALTH)")
+            else:
+                self.add("정상", item, "해당 없음 (no bot health.json)", "none")
+            return
+        now = time.time()
+        for path, payload, problem in found:
+            label = item if len(found) == 1 else f"{item} ({_printable(str(path), 120)})"
+            if problem is not None:
+                if problem == "permission" and not expected:
+                    self.add("정상", label, "해당 없음 (unreadable: permission)", "none")
+                else:
+                    self.add("경고", label, f"unreadable ({problem})",
+                             "run the doctor as root, or add this account to the file's group "
+                             "(the bot writes it 0640)")
+                continue
+            try:
+                data = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self.add("경고", label, "unparsable json",
+                         "the bot writes health.json by rename, so a torn file means another writer; inspect it")
+                continue
+            klass, status, action = self.hande_bot_health_verdict(data, now, stale)
+            self.add(klass, label, status, action)
 
     def check_dns_resolver_mode(self) -> None:
         """Warn when a reboot would leave tailscaled with no upstream DNS (#2207).
