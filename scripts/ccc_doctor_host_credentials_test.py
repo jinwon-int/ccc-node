@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -208,6 +209,23 @@ class HostCredentialsCheck(unittest.TestCase):
         target.chmod(0o600)
         self.path.symlink_to(target)
         row = self.run_check()
+        self.assertEqual(row.klass, "경고")
+        self.assertIn("확인 불가", row.status)
+
+    def test_uninspectable_path_is_unverifiable_not_absent(self) -> None:
+        # #2734: Python 3.14's Path.exists() returns False on PermissionError,
+        # so an uninspectable path must not read as 해당 없음. Patch lstat so
+        # the case holds under root and on every Python version.
+        target = self.path
+        real_lstat = Path.lstat
+
+        def denied(path: Path, *args: object, **kwargs: object) -> object:
+            if path == target:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", denied):
+            row = self.run_check()
         self.assertEqual(row.klass, "경고")
         self.assertIn("확인 불가", row.status)
 

@@ -567,7 +567,10 @@ rm -f "$fake_bin/flock"
 
 noflock_bin="$TMP/no-flock-bin"
 mkdir -p "$noflock_bin"
-for tool in cat date mkdir python3 timeout; do
+# dirname too: without it script_dir becomes `cd ""`, a no-op on bash 5.2 but an
+# error ("null directory") on Ubuntu 26.04's bash, which exited 1 before the
+# flock check this case is about (#2734).
+for tool in cat date dirname mkdir python3 timeout; do
   ln -s "$(command -v "$tool")" "$noflock_bin/$tool"
 done
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":1,"finished_at":2}' > "$edge_status"

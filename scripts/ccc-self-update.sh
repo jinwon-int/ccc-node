@@ -633,12 +633,25 @@ report_pending_activation() {
 
 # Commands run in timeout's process group; kill a TERM-resistant probe after
 # one additional second. Never fall back to an unbounded operator command.
+# GNU timeout signals that whole group on expiry; uutils timeout (Ubuntu 26.04)
+# signals only its direct child, so a TERM-resistant descendant kept running
+# (#2734). After an expiry, kill what is left of the group timeout leads. A
+# command that finishes in time keeps its background children, as before.
 run_bounded_operator_cmd() { # <seconds> <command>
+  local pid rc
   if ! command -v timeout >/dev/null 2>&1; then
     log "operator-command unavailable=timeout"
     return 125
   fi
-  timeout --kill-after=1 "$1" bash -c "$2" >>"$LOG" 2>&1
+  # Explicit <&0: a background job would otherwise get /dev/null as stdin.
+  timeout --kill-after=1 "$1" bash -c "$2" >>"$LOG" 2>&1 <&0 &
+  pid=$!
+  wait "$pid"
+  rc=$?
+  case "$rc" in
+    124|137) kill -KILL -- "-$pid" 2>/dev/null || : ;;
+  esac
+  return "$rc"
 }
 
 RESTART_FAILURE_JSON=""

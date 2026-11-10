@@ -50,7 +50,7 @@ jobs:
   # its name and keeps gating main without a branch-protection change.
   validate-harness-static:
     name: validate-harness-static
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -89,7 +89,7 @@ jobs:
 
   validate-harness-shard:
     name: validate-harness-shard (${{ matrix.shard }})
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -128,7 +128,7 @@ jobs:
 
   validate-harness:
     name: validate-harness
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [validate-harness-static, validate-harness-shard]
     # Run even when a leg failed/was cancelled/was skipped, and fail unless
@@ -152,7 +152,7 @@ jobs:
 
   python-lint:
     name: python-lint
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -249,7 +249,7 @@ jobs:
 
   secret-scan:
     name: secret-scan
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -268,7 +268,7 @@ jobs:
 
   bridge-tests:
     name: bridge-tests (${{ matrix.python-version }})
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -325,7 +325,7 @@ jobs:
 
   wheel-smoke:
     name: wheel-smoke
-    runs-on: ubuntu-24.04  # pinned: ubuntu-latest -> 26.04 breaks harness shards (#2734)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
