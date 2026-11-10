@@ -347,3 +347,37 @@ def test_cli_check(tmp_path):
     result = subprocess.run([*run, str(binary)], env=env, capture_output=True, text=True)
     assert (result.returncode, result.stdout) == (1, "skill_not_utf8\n")
     assert subprocess.run([*run, str(tmp_path / "missing")], env=env).returncode == 2
+
+
+def test_character_classes_are_written_as_ascii_escapes():
+    """#2744: the printable/line-break classes must stay reviewable in source.
+
+    They used to hold the code points themselves (line/paragraph separators,
+    private-use and near-noncharacter range ends), which no diff or terminal
+    shows and which a static analyser misread as an overlapping range. The
+    ranges are pinned here from integers so a re-encoded literal cannot move
+    them silently.
+    """
+    definitions = [
+        line
+        for line in MODULE_PATH.read_text(encoding="utf-8").splitlines()
+        if line.startswith(("_LINE_BREAK_RE", "_PRINTABLE_RE"))
+    ]
+    assert len(definitions) == 2
+    assert all(line.isascii() for line in definitions)
+
+    printable = (
+        [(0x20, 0x7E), (0x85, 0x85), (0xA0, 0xD7FF), (0xE000, 0xFEFE)]
+        + [(0xFF00, 0xFFFD), (0x10000, 0x10FFFF)]
+    )
+    expected = "[" + "".join(
+        chr(lo) if lo == hi else f"{chr(lo)}-{chr(hi)}" for lo, hi in printable
+    ) + "]"
+    assert sf._PRINTABLE_RE.pattern == expected
+    # Boundaries: C1 controls, surrogates, the BOM and U+FFFE/U+FFFF stay out.
+    for inside in (0x20, 0x7E, 0x85, 0xA0, 0xD7FF, 0xE000, 0xFEFE, 0xFF00, 0xFFFD, 0x10000):
+        assert sf._PRINTABLE_RE.fullmatch(chr(inside)), hex(inside)
+    for outside in (0x1F, 0x7F, 0x84, 0x9F, 0xFEFF, 0xFFFE, 0xFFFF):
+        assert not sf._PRINTABLE_RE.fullmatch(chr(outside)), hex(outside)
+    for separator in ("\n", "\r", "\r\n", "\x85", chr(0x2028), chr(0x2029)):
+        assert sf._LINE_BREAK_RE.fullmatch(separator), repr(separator)
