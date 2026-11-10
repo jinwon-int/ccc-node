@@ -1,0 +1,57 @@
+# TEMPORARY (#2734): ubuntu-26.04 diagnostics. Removed before merge.
+name: diag-2734
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install jq + shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq shellcheck
+      - name: Environment facts
+        run: |
+          set +e
+          cat /etc/os-release | head -3; id; python3 -VV
+          for t in readlink stat id timeout cat date mkdir yes sleep flock python3 kill ps; do
+            p="$(command -v "$t")"; printf '%-9s %s -> %s\n' "$t" "$(ls -l "$p" | awk '{print $1, $NF}')" "$(readlink -f "$p")"
+          done
+          ls -l /usr/bin/readlink /bin/readlink; [ -L /usr/bin/readlink ] && echo "READLINK IS SYMLINK"
+          timeout --version | head -1; cat --version | head -1
+          ls /usr/bin/gnu* 2>/dev/null | head -20
+      - name: H1 timeout kills TERM-resistant grandchild
+        run: |
+          set +e
+          timeout --kill-after=1 1 bash -c 'trap "" TERM; sleep 20 & echo $! > /tmp/gc.pid; wait' ; echo "rc=$?"
+          sleep 1; ps -o pid,pgid,stat,cmd -p "$(cat /tmp/gc.pid)" || echo "grandchild gone"
+      - name: H2 symlinked coreutils in a restricted PATH
+        run: |
+          set +e
+          nb=$(mktemp -d); for t in cat date mkdir python3 timeout; do ln -s "$(command -v $t)" "$nb/$t"; done
+          echo on > /tmp/mode; PATH="$nb" /bin/bash -c 'cat /tmp/mode; echo "cat rc=$?"; date +%s; echo "date rc=$?"; mkdir -p /tmp/x1; echo "mkdir rc=$?"; timeout 1 true; echo "timeout rc=$?"; command -v flock; echo "flock lookup rc=$?"'
+      - name: H3 copied yes renamed to bash
+        run: |
+          set +e
+          fb=$(mktemp -d); cp "$(command -v yes)" "$fb/bash"; ls -l "$fb/bash"
+          "$fb/bash" x y | head -2; echo "rc=${PIPESTATUS[0]}"
+      - name: H4 Path.exists on EACCES (non-root)
+        run: |
+          set +e
+          d=$(mktemp -d); mkdir "$d/locked"; : > "$d/locked/s"; chmod 000 "$d/locked"
+          python3 -c 'import sys,pathlib;p=pathlib.Path(sys.argv[1])
+          try: print("exists:",p.exists())
+          except OSError as e: print("exists raised",type(e).__name__)
+          try: p.stat(); print("stat ok")
+          except OSError as e: print("stat raised",type(e).__name__)' "$d/locked/s"
+          chmod 700 "$d/locked"
+      - name: Run the five failing suites
+        env:
+          TMPDIR: ${{ runner.temp }}/ccc-tmp
+        run: |
+          mkdir -p "$TMPDIR"; set +e
+          for t in setup install-nunchi ccc-doctor ccc-self-update a2a-termux-native-worker; do
+            echo "::group::$t"; bash "scripts/$t.test.sh" 2>&1 | grep -E "FAIL|PASS=|cond:|skip" | head -40; echo "::endgroup::"
+          done
