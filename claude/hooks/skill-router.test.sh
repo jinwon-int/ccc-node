@@ -172,5 +172,109 @@ ok "report lists suggested-never-used and used-never-suggested" \
 out="$(python3 "$MOD" report --days 7)"
 ok "text report renders the headline lines" 'grep -q "followed a suggestion" <<<"$out" && grep -q "prompts with suggestions" <<<"$out"'
 
+# ---- #2748: match precision ------------------------------------------------------------
+# Synthetic fixtures only. A four-member family (relay/sync/mirror are generic:
+# in more than GENERIC_DF_FLOOR skills) and one skill that a single Korean
+# word used to reach through four synonym targets.
+skill "$SKILLS" relay-sync-kestrel-rotate "Use when the relay sync mirror for the kestrel shard needs a rotate pass before the nightly window."
+skill "$SKILLS" relay-sync-puffin-prune "Use when the relay sync mirror for the puffin shard needs a prune pass before the nightly window."
+skill "$SKILLS" relay-sync-gannet-replay "Use when the relay sync mirror for the gannet shard needs a replay pass before the nightly window."
+skill "$SKILLS" relay-sync-curlew-export "Use when the relay sync mirror for the curlew shard needs an export pass before the nightly window."
+skill "$SKILLS" counter-audit-check "Use when somebody must check and verify the tally counters, audit the totals and diagnose any gap."
+sleep 1; touch "$SKILLS"
+python3 "$MOD" index --json >/dev/null
+filler() { # filler <n> -> n distinct letter-only words no skill mentions
+  python3 -c 'import sys; print(" ".join("zq" + chr(97 + i // 26) + chr(97 + i % 26) + "x" for i in range(int(sys.argv[1]))))' "$1"
+}
+
+run_hook "그거 한번 점검 좀 해줘 부탁해" sess-p1
+ok "#2748: one prompt word is one concept — a synonym line with four targets cannot match alone" '[ "$rc" = 0 ] && [ -z "$out" ]'
+run_hook "relay sync mirror 쪽 좀 봐줘 지금" sess-p1
+ok "#2748: family (generic) tokens alone are not evidence" '[ -z "$out" ]'
+run_hook "kestrel 쪽 relay sync rotate 한번 돌려줘" sess-p2
+ok "#2748: two distinctive name words pick the one family member, not its siblings" '[ "$(names | tr "\n" " ")" = "relay-sync-kestrel-rotate " ]'
+run_hook "kestrel 쪽 relay sync 좀 봐줘 지금" sess-p1
+ok "#2748: one distinctive name word plus family words is not enough" '[ -z "$out" ]'
+
+run_hook "cve advisory 나온 뒤에 ufw allow rules 정리해줘" sess-p3
+ok "#2748: a focused prompt in the description's own words still routes without name words" '[ "$(names | head -1)" = firewall-port-audit ]'
+run_hook "cve advisory 나온 뒤에 ufw allow rules 정리해줘 $(filler 60)" sess-p1
+ok "#2748: the same few description words inside a pasted block do not" '[ -z "$out" ]'
+run_hook "텔레그램 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘 $(filler 60)" sess-p4
+ok "#2748: a name-anchored request is still found in a long prompt (coverage window)" '[ "$(names | head -1)" = bridge-restart-detached ]'
+run_hook "텔레그램 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘 $(filler 600)" sess-p1
+ok "#2748: a prompt over MAX_PROMPT_CHARS is a pasted document — skipped" '[ "$rc" = 0 ] && [ -z "$out" ]'
+
+run_hook "브리지 재시작 지금 바로 해줘" sess-p5
+ok "#2748: a two-word request routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
+run_hook "브리지 재시작은 누가 하는 거야?" sess-p1
+ok "#2748: the same two words in a pure question do not" '[ -z "$out" ]'
+run_hook "브리지 재시작 지금 할 수 있을까?" sess-p6
+ok "#2748: a request in question form (…할 수 있을까?) still routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
+run_hook "브리지 재시작은 분리 유닛으로 하는 거야?" sess-p7
+ok "#2748: a pure question with one more shared concept routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
+
+for p in "Reply with the single word PONG." "Name two tools you can call." "Answer in one line: which bridge restart unit are you?" "respond with exactly: bridge restart detached"; do
+  run_hook "$p" sess-p1
+  ok "#2748: no suggestion for probe '$p'" '[ "$rc" = 0 ] && [ -z "$out" ]'
+done
+ok "#2748: silent precision cases leave no last-session file" '[ ! -e "$CCC_STATE_DIR/skill-router/last-sess-p1.json" ]'
+
+# Unit level: surface matching, concepts, the pruned synonym lines, skip reasons.
+out="$(python3 - "$MOD" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("skill_router", sys.argv[1])
+R = importlib.util.module_from_spec(spec); spec.loader.exec_module(R)
+syn = R.load_synonyms()
+bad = []
+def check(label, cond):
+    if not cond:
+        bad.append(label)
+def toks(text):
+    return set(R.prompt_concepts(text, syn)[0])
+# ASCII surfaces are whole tokens.
+check("pr inside provider", not R.surface_matches("the provider approval probe", "pr"))
+check("ci inside decision", not R.surface_matches("an explicit decision", "ci"))
+check("pr as a token", R.surface_matches("open a pr now", "pr") and R.surface_matches("pr-first flow", "pr"))
+check("no pull/request from english prose", not {"pull", "request"} & toks("the provider procedure is explicit about approval"))
+# Short Korean surfaces start a word; longer ones match anywhere.
+check("머지 inside 나머지", not R.surface_matches("나머지는 내일 하자", "머지"))
+check("워드 inside 키워드", not R.surface_matches("검색 키워드 목록", "워드"))
+check("머지 with an ending", R.surface_matches("바로 머지해줘", "머지") and R.surface_matches("검토·머지", "머지"))
+check("long surface inside a compound", R.surface_matches("팀파일보관함에 올려줘", "파일보관함"))
+# One surface is one concept; a phrase still counts per word.
+tokens, concept_of = R.prompt_concepts("테스트 다시 돌려줘", syn)
+check("테스트 is one concept", {"test", "tests"} <= set(tokens) and concept_of["test"] == concept_of["tests"])
+tokens, concept_of = R.prompt_concepts("머지 큐에 넣어줘", syn)
+check("머지 큐 is two concepts", concept_of["merge"] != concept_of["queue"])
+# Pruned lines: a common word no longer reaches a domain it does not name.
+check("문제 is not a quiz item", not {"question", "nclex", "item"} & toks("빌드가 느려지는 문제 좀 봐줘"))
+check("감사합니다 is not an audit", "audit" not in toks("감사합니다 덕분에 잘 끝났어요"))
+check("체크박스 is not ci checks", not {"checks", "ci"} & toks("설정 화면에 체크박스 하나 추가해줘"))
+check("키우다/키워드 is not a credential", not {"key", "credential"} & toks("아이콘을 키우고 검색 키워드 칸도 넣어줘"))
+check("승인 is not review", "review" not in toks("이번 변경은 승인해도 돼"))
+check("브리지 is not telegram", "telegram" not in toks("브리지 로그 좀 보여줘"))
+check("한글 alone is not hwp", not {"hwp", "hwpx"} & toks("한글로 답해줘") and {"hwp", "hwpx"} <= toks("한글 파일로 만들어줘"))
+# Numbers and ids are not content words; generic needs a real family.
+ranker = R.Ranker(R.load_index().get("docs") or [])
+check("numbers are noise", ranker.is_noise("2026") and ranker.is_noise("10.14") and ranker.is_noise("913e077e"))
+check("words are not noise", not ranker.is_noise("ufw") and not ranker.is_noise("unknownword"))
+check("family tokens are generic", ranker.is_generic("relay") and ranker.is_generic("sync"))
+check("member tokens are not", not ranker.is_generic("kestrel") and not ranker.is_generic("bridge"))
+# Questions and probes.
+check("pure question (ko)", R.is_pure_question("백업은 매일 밤에 도는 거야? 아니면 주말에만 돌아?"))
+check("pure question (en)", R.is_pure_question("Does the nightly backup run on every node?"))
+check("question + request", not R.is_pure_question("로그가 제일 큰 노드가 어디야? 거기부터 정리하자"))
+check("proposal question", not R.is_pure_question("다음부터 자동으로 알려줄 방법 없을까?"))
+check("can-you question", not R.is_pure_question("Can you restart the bridge detached?"))
+check("statement", not R.is_pure_question("run.py 를 v1.2 로 올려줘"))
+check("probe", R._skip_reason("Reply with exactly: pong") == "probe" and R._skip_reason("List two tools you can call.") == "probe")
+check("korean request is not a probe", R._skip_reason("브리지 재시작 지금 바로 해줘") is None)
+check("long", R._skip_reason("브리지 재시작 " + "가" * R.MAX_PROMPT_CHARS) == "long")
+print("bad: " + "; ".join(bad) if bad else "unit-ok")
+PY
+)"
+ok "#2748: surface matching, concept grouping, pruned synonyms, noise/generic, question and probe rules ($out)" '[ "$out" = unit-ok ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
