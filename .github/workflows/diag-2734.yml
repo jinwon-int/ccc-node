@@ -27,6 +27,8 @@ jobs:
           set +e
           timeout --kill-after=1 1 bash -c 'trap "" TERM; sleep 20 & echo $! > /tmp/gc.pid; wait' ; echo "rc=$?"
           sleep 1; ps -o pid,pgid,stat,cmd -p "$(cat /tmp/gc.pid)" || echo "grandchild gone"
+          timeout 3 sleep 2 & tp=$!; sleep 0.5; ps -o pid,pgid,cmd -p "$tp"; wait $tp
+          pkill -f "sleep 20" || true
       - name: H2 symlinked coreutils in a restricted PATH
         run: |
           set +e
@@ -47,6 +49,14 @@ jobs:
           try: p.stat(); print("stat ok")
           except OSError as e: print("stat raised",type(e).__name__)' "$d/locked/s"
           chmod 700 "$d/locked"
+      - name: H5 install-nunchi noflock stderr
+        env:
+          TMPDIR: ${{ runner.temp }}/ccc-tmp
+        run: |
+          mkdir -p "$TMPDIR"; set +e
+          sed '577s|>/dev/null 2>&1; rc=\$?|>/dev/null 2>"$TMP/noflock.err"; rc=$?; echo "NOFLOCK rc=$rc" >\&2; sed "s/^/NOFLOCK err: /" "$TMP/noflock.err" >\&2; ls -l "$noflock_bin" >\&2; cat "$edge_status" >\&2|' scripts/install-nunchi.test.sh > scripts/install-nunchi.diag.test.sh
+          sed -n 577p scripts/install-nunchi.diag.test.sh
+          bash scripts/install-nunchi.diag.test.sh 2>&1 | grep -E "NOFLOCK|no-flock-bin|->|schema|FAIL" | head -30
       - name: Run the five failing suites
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp

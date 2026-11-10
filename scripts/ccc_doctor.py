@@ -1407,8 +1407,14 @@ class Doctor:
             "re-authenticate: `claude setup-token` on the node, replace claudeAiOauth.accessToken "
             "(+1y expiresAt), then idle-restart the bridge (Wiki TM-3899, ccc-node#2397)"
         )
+        # lstat(), not exists()/is_symlink(): on Python 3.14 those return False
+        # on PermissionError, which would report an uninspectable path as
+        # 해당 없음 instead of 확인 불가 (#2734).
         try:
-            present = path.exists() or path.is_symlink()
+            path.lstat()
+            present = True
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
         except OSError:
             self.add("경고", item, "확인 불가 (credentials path not inspectable)",
                      "rerun ccc-doctor as the account that runs claude")
@@ -3943,9 +3949,15 @@ class Doctor:
         # That aborted the whole doctor run (#2268). Unknown presence keeps
         # evaluating the world-readable resolv.conf so the #2207 shape is still
         # caught; a clean verdict is downgraded to 경고 "확인 불가".
+        # Use stat(), not exists(): Python 3.14's Path.exists() is
+        # os.path.exists(), which returns False on PermissionError, so the
+        # unreadable state read as "no tailscale state" on ubuntu-26.04 (#2734).
         state_unreadable = ""
         try:
-            state_present = state.exists()
+            state.stat()
+            state_present = True
+        except (FileNotFoundError, NotADirectoryError):
+            state_present = False
         except OSError as exc:
             state_present = True
             state_unreadable = f"{type(exc).__name__}: {exc.strerror or exc}"

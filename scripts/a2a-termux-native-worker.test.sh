@@ -457,12 +457,17 @@ rm -f "$SUP_PIDFILE"
 # the executable is not the verifier's Bash (or its exact dpkg-deleted path).
 # Acquire the configured lock with a different binary named `bash` and verify
 # the process still survives.
-mkdir -p "$SUP_TMP/fake-bin"
-cp "$(command -v yes)" "$SUP_TMP/fake-bin/bash"
+# The stand-in is python3 reached through a link named `bash`, parked by a
+# sitecustomize before it ever reads "$TOOL". A copied coreutil no longer works:
+# uutils (Ubuntu 26.04) is one multicall binary that exits at once when started
+# under the unknown name `bash` (#2734).
+mkdir -p "$SUP_TMP/fake-bin" "$SUP_TMP/fake-site"
+ln -s "$(command -v python3)" "$SUP_TMP/fake-bin/bash"
+printf 'import time\ntime.sleep(3600)\n' > "$SUP_TMP/fake-site/sitecustomize.py"
 (
     exec 200>"$A2A_SUPERVISOR_LOCK"
     flock -n 200
-    exec "$SUP_TMP/fake-bin/bash" "$TOOL" supervise
+    PYTHONPATH="$SUP_TMP/fake-site" exec "$SUP_TMP/fake-bin/bash" "$TOOL" supervise
 ) >/dev/null 2>&1 &
 FAKE_BASH_PID=$!
 printf '%s\n' "$FAKE_BASH_PID" > "$SUP_PIDFILE"

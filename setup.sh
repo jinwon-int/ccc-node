@@ -59,12 +59,14 @@ note() { printf '  - %s\n' "$*"; }
 # because distro layouts may place coreutils in /bin or /usr/bin; never trust
 # PATH for this security boundary. A production install target (e.g.
 # /root/.claude) never resolves under TMPDIR, so no seam can activate outside
-# tests.
+# tests. The fixed candidate may be a symlink: Ubuntu 26.04's uutils coreutils
+# ships /usr/bin/readlink -> ../lib/cargo/bin/coreutils/readlink, and only
+# root can place an entry in /usr/bin or /bin (#2734).
 _ccc_setup_test_seam_ok() {
   local readlink_bin="" candidate test_root="" test_target=""
   [ -n "${CCC_CLAUDE_DIR:-}" ] || return 1
   for candidate in /usr/bin/readlink /bin/readlink; do
-    if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
       readlink_bin="$candidate"
       break
     fi
@@ -97,29 +99,13 @@ _ccc_sysbin() { # <name> — prints the first candidate path; rc 1 when none res
   return 1
 }
 _ccc_is_root() {
-  local uid="" test_root="" test_target="" readlink_bin="" candidate
+  local uid=""
   # Deterministic CI seam for the root-aware bypassPermissions neutralization,
-  # accepted only when the install target resolves beneath the caller's existing
-  # writable temp root. Resolve readlink only from exact system paths because
-  # distro layouts may place coreutils in /bin or /usr/bin; never trust PATH for
-  # this security boundary. A production install target (e.g. /root/.claude)
-  # never resolves under TMPDIR, so the seam cannot activate outside tests.
-  if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && [ -n "${CCC_CLAUDE_DIR:-}" ]; then
-    for candidate in /usr/bin/readlink /bin/readlink; do
-      if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
-        readlink_bin="$candidate"
-        break
-      fi
-    done
-    if [ -n "$readlink_bin" ]; then
-      test_root="$("$readlink_bin" -m -- "${TMPDIR:-/tmp}" 2>/dev/null || true)"
-      test_target="$("$readlink_bin" -m -- "$CCC_CLAUDE_DIR" 2>/dev/null || true)"
-    fi
-    if [ -n "$test_root" ] && [ -d "$test_root" ] && [ -w "$test_root" ]; then
-      case "$test_target" in
-        "$test_root"/*) uid="$CCC_SETUP_TEST_EUID" ;;
-      esac
-    fi
+  # behind the same gate as every other setup seam (_ccc_setup_test_seam_ok):
+  # the install target must resolve beneath the caller's existing writable temp
+  # root, so the seam cannot activate outside tests.
+  if [ -n "${CCC_SETUP_TEST_EUID:-}" ] && _ccc_setup_test_seam_ok; then
+    uid="$CCC_SETUP_TEST_EUID"
   fi
   if [ -z "$uid" ]; then
     local id_bin=""
