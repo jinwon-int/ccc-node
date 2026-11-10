@@ -1,0 +1,20 @@
+# TEMPORARY (#2738): does a failing mkdir touch an existing dir on ubuntu-26.04? Removed before merge.
+name: diag-2738
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: mkdir on an existing dir vs ctime/mtime
+        run: |
+          set +e
+          find --version | head -1; mkdir --version | head -1
+          d=$(mktemp -d)/x; mkdir "$d"
+          show() { printf '%s  find=%s  stat=%s\n' "$1" "$(find "$d" -maxdepth 0 -printf '%i:%C@:%T@')" "$(stat -c 'ino=%i ctime=%z mtime=%y' "$d")"; }
+          show before; sleep 1.1
+          mkdir "$d" 2>/dev/null; echo "mkdir rc=$?"; show after-uutils-mkdir; sleep 1.1
+          /usr/bin/gnumkdir "$d" 2>/dev/null; echo "gnumkdir rc=$?"; show after-gnu-mkdir
