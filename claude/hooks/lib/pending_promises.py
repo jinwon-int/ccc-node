@@ -140,9 +140,10 @@ def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     """Split into (still monitoring, promise dropped).
 
     Mirrors ``ExternalWaitRegistry.dropped_promises``: delivered notification
-    (``wake.state == "done"``) plus ``resumed is False``. ``resumed`` missing
-    is *not* a drop -- older records predate the field and guessing would
-    manufacture alarms.
+    (``wake.state == "done"``) plus ``resumed is False``, or a wake whose
+    delivery gave up (``"failed"``, #2740 -- the owner was never told, so this
+    block is the only place it surfaces). ``resumed`` missing is *not* a drop
+    -- older records predate the field and guessing would manufacture alarms.
     """
     monitoring: List[Dict] = []
     dropped: List[Dict] = []
@@ -191,7 +192,7 @@ def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
             skey = _summary_key(rec)
             if skey is not None and str(rec.get("created_at") or "") < latest_fulfilled.get(skey, ""):
                 continue
-        if wake.get("state") == "done" and wake.get("resumed") is False:
+        if wake.get("state") in ("done", "failed") and wake.get("resumed") is False:
             dropped.append(rec)
     key = lambda r: str(r.get("created_at") or "")  # noqa: E731
     return sorted(monitoring, key=key), sorted(dropped, key=key)
@@ -254,10 +255,22 @@ def render(records: List[Dict[str, Any]]) -> str:
     )
     if monitoring and dropped:
         lines.append("")
+    # #2740: a wake whose delivery gave up never reached the owner at all, so
+    # it gets its own heading -- "the notice went out" would be untrue for it.
+    undelivered = [rec for rec in dropped if (rec.get("wake") or {}).get("state") == "failed"]
+    delivered = [rec for rec in dropped if (rec.get("wake") or {}).get("state") != "failed"]
     lines += _section(
         "⚠ 알림은 갔으나 이어가지 못한 약속 — 아무도 대신 처리하지 않는다. 직접 확인할 것"
         " (이미 이행했으면 `external_wait_cli ack <wait_id>`로 닫는다):",
-        dropped,
+        delivered,
+        with_reason=True,
+    )
+    if delivered and undelivered:
+        lines.append("")
+    lines += _section(
+        "⚠ 알림조차 전달되지 못한 약속 — 결과가 나왔지만 전달을 포기했다. 지금 상태를 직접 확인할 것"
+        " (확인했으면 `external_wait_cli ack <wait_id>`로 닫는다):",
+        undelivered,
         with_reason=True,
     )
     return "\n".join(lines)

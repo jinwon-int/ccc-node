@@ -127,6 +127,16 @@ TERMINAL_RETENTION_SECONDS = 24 * 60 * 60
 #: Give up delivering a wake after this many attempts (Telegram outages must
 #: not pin a record forever; the wait itself already terminated).
 MAX_WAKE_ATTEMPTS = 10
+#: Delay before retrying a wake whose notification did not land: doubles from
+#: the base up to the cap (#2740). The monitor drains wakes on every 5 s tick,
+#: so without a delay the ten attempts above were spent in under a minute and
+#: a one-minute network outage silently dropped the wake. With it they span
+#: about 36 minutes (5+10+…+640+900 s).
+WAKE_RETRY_BASE_SECONDS = 5.0
+WAKE_RETRY_MAX_DELAY_SECONDS = 900.0
+#: ``wake.skip_reason`` recorded when delivery gave up (unless the wake already
+#: carried one): the owner was never told and nothing continued.
+SKIP_NOTIFY_FAILED = "notify_failed"
 #: An active-turn route entry older than this is stale. Turns clear their
 #: entry on exit; the TTL is only a crash backstop.
 ACTIVE_ROUTE_TTL_SECONDS = 6 * 60 * 60
@@ -263,6 +273,19 @@ def validate_unit_name(unit: Any) -> str:
     if not _UNIT_RE.fullmatch(candidate):
         raise ExternalWaitValidationError("unit must be 1-200 chars of [A-Za-z0-9_.:@-]")
     return candidate
+
+
+def validate_log_offset(log_offset: Any) -> int:
+    """A detached wait's marker baseline (#2740): a non-negative byte count, None = 0."""
+    if log_offset is None:
+        return 0
+    try:
+        offset = int(log_offset)
+    except (TypeError, ValueError):
+        raise ExternalWaitValidationError("log_offset must be a non-negative integer") from None
+    if isinstance(log_offset, bool) or offset < 0:
+        raise ExternalWaitValidationError("log_offset must be a non-negative integer")
+    return offset
 
 
 def validate_log_path(log_path: Any) -> str:
@@ -440,8 +463,13 @@ class ExternalWaitRegistry:
         unit: Any = None,
         log_path: Any = None,
         notify_only: bool = False,
+        log_offset: Any = None,
     ) -> str:
         """Register one wait; returns its id (idempotent per natural key).
+
+        ``log_offset`` (#2740, detached jobs) is the log size below which an
+        ``EXIT=`` marker belongs to an earlier run of the same unit and log;
+        the monitor only accepts markers written after it.
 
         ``notify_only`` (#2636, detached jobs) records a watch that never
         wakes the conversation and never shows on the ⏳ status line: its
@@ -476,6 +504,10 @@ class ExternalWaitRegistry:
             extra = {"unit": unit, "log_path": log_path}
             if notify_only:
                 extra["notify_only"] = True
+            offset = validate_log_offset(log_offset)
+            # Stored only when there is history to skip, so records without it
+            # keep their pre-#2740 shape.
+            extra.update({"log_offset": offset} if offset else {})
             natural = (source, unit, log_path, int(user_id), int(chat_id))
         elif source == SOURCE_GITHUB_ACTIONS_RUN:
             repo = validate_repo(repo)
@@ -805,6 +837,30 @@ class ExternalWaitRegistry:
             if isinstance(rec.get("wake"), dict) and rec["wake"].get("state") == "pending"
         ]
 
+    def due_wakes(self, *, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Pending wakes whose retry delay has passed (#2740).
+
+        A wake that has not been attempted yet carries no ``next_attempt_epoch``
+        and is always due; a failed attempt schedules the next one (see
+        ``mark_wake``).
+        """
+        now_value = self._clock() if now is None else float(now)
+        due = []
+        for rec in self.pending_wakes():
+            try:
+                next_attempt = float(rec["wake"].get("next_attempt_epoch") or 0)
+            except (TypeError, ValueError):
+                next_attempt = 0.0
+            if next_attempt <= now_value:
+                due.append(rec)
+        return due
+
+    @staticmethod
+    def wake_retry_delay(attempts: int) -> float:
+        """Seconds to wait after the ``attempts``-th failed delivery."""
+        exponent = max(0, int(attempts) - 1)
+        return float(min(WAKE_RETRY_MAX_DELAY_SECONDS, WAKE_RETRY_BASE_SECONDS * (2 ** min(exponent, 30))))
+
     def mark_wake(
         self,
         wait_id: str,
@@ -812,6 +868,7 @@ class ExternalWaitRegistry:
         delivered: bool,
         resumed: Optional[bool] = None,
         skip_reason: Optional[str] = None,
+        now: Optional[float] = None,
     ) -> None:
         """Record one wake outcome; retry-bounded, purges only the journal.
 
@@ -821,7 +878,15 @@ class ExternalWaitRegistry:
         one (both ``wake.state == "done"``), so a dropped promise left no trace
         for the owner or for a later drain. Recording them separately is what
         makes ``dropped_promises`` possible.
+
+        An undelivered attempt schedules the next one ``wake_retry_delay``
+        later (``next_attempt_epoch``, read by ``due_wakes``). When the attempts
+        run out the wake ends ``failed`` with ``resumed: False`` and a
+        ``skip_reason`` (``notify_failed`` unless one was already recorded), so
+        it is a dropped promise like any other instead of a state nobody reads
+        (#2740).
         """
+        now_value = self._clock() if now is None else float(now)
 
         def _do(records):
             rec = records.get(wait_id)
@@ -846,27 +911,41 @@ class ExternalWaitRegistry:
                         attempts,
                         wait_id,
                     )
-                    rec["wake"] = {"state": "failed", "attempts": attempts, **outcome}
+                    prior_reason = rec["wake"].get("skip_reason")
+                    rec["wake"] = {
+                        "state": "failed",
+                        "attempts": attempts,
+                        **outcome,
+                        "resumed": False,
+                        "skip_reason": outcome.get("skip_reason") or prior_reason or SKIP_NOTIFY_FAILED,
+                    }
                 else:
-                    rec["wake"] = {"state": "pending", "attempts": attempts, **outcome}
+                    rec["wake"] = {
+                        "state": "pending",
+                        "attempts": attempts,
+                        "next_attempt_epoch": now_value + self.wake_retry_delay(attempts),
+                        **outcome,
+                    }
             rec["updated_at"] = _utc_now_iso()
 
         self._mutate(_do)
 
     def dropped_promises(self) -> List[Dict[str, Any]]:
-        """Terminal records whose wake landed but whose promise never continued.
+        """Terminal records whose promise never continued.
 
         A promise is dropped when the notification was delivered (``wake.state``
-        is ``done``) while the continuation did not run. These are the ones an
-        owner still has to act on by hand, so they must be enumerable rather
-        than merely inferable from a missing notification line.
+        is ``done``) while the continuation did not run, or when delivery gave
+        up altogether (``failed``, #2740: the owner was not even told). These
+        are the ones an owner still has to act on by hand, so they must be
+        enumerable rather than merely inferable from a missing notification
+        line.
         """
         with self._lock:
             records = self._read()
         out = []
         for rec in records.values():
             wake = rec.get("wake")
-            if not isinstance(wake, dict) or wake.get("state") != "done":
+            if not isinstance(wake, dict) or wake.get("state") not in ("done", "failed"):
                 continue
             if wake.get("resumed") is False:
                 out.append(rec)
@@ -927,6 +1006,12 @@ class ExternalWaitRegistry:
             count = 0
             for rec in records.values():
                 if rec.get("state") != STATE_MONITORING:
+                    # A wake still owed is retried at once by the new process
+                    # rather than sitting out a delay the old one scheduled
+                    # (#2740): a restart is often what fixes delivery.
+                    wake = rec.get("wake")
+                    if isinstance(wake, dict) and wake.get("state") == "pending":
+                        wake.pop("next_attempt_epoch", None)
                     continue
                 if rec.get("source") == SOURCE_LOCAL_TASK:
                     # No provider session survives a restart, so the task's

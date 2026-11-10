@@ -449,19 +449,24 @@ class DetachedJobState:
     unit_active: bool
 
 
-def read_exit_marker(log_path: str) -> Optional[int]:
+def read_exit_marker(log_path: str, start_offset: int = 0) -> Optional[int]:
     """Exit code from the last ``EXIT=<n>`` line of the log's tail, else None.
 
     Mirrors ``claude/hooks/lib/detached_jobs.py``: a malformed marker still
     proves the job stopped and is reported as ``-1`` rather than swallowed.
+
+    ``start_offset`` (#2740) is the log size recorded at registration when the
+    log already held a marker from an earlier run: only bytes written after it
+    are read, so that old marker is not taken for the new run's result. A log
+    now shorter than the offset was truncated or replaced, and is read whole.
     """
     try:
         size = os.path.getsize(log_path)
+        start = int(start_offset) if 0 < int(start_offset or 0) <= size else 0
         with open(log_path, "rb") as handle:
-            if size > _DETACHED_LOG_TAIL_BYTES:
-                handle.seek(-_DETACHED_LOG_TAIL_BYTES, os.SEEK_END)
+            handle.seek(max(start, size - _DETACHED_LOG_TAIL_BYTES, 0))
             tail = handle.read().decode("utf-8", "ignore")
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
     code: Optional[int] = None
     for line in tail.splitlines():
@@ -493,9 +498,26 @@ def unit_is_active(unit: str) -> bool:
     return proc.stdout.decode("utf-8", "ignore").strip() == "active"
 
 
-def inspect_detached_job(log_path: str, unit: str) -> DetachedJobState:
+def detached_log_baseline(log_path: str, unit: str) -> int:
+    """Offset to record at registration so an earlier run's marker is ignored (#2740).
+
+    Non-zero only when the log already ends a run (it holds an ``EXIT=`` marker)
+    **and** the unit is running right now: then that marker cannot be this
+    run's, and everything up to the current size is history. With the unit not
+    running the marker may well be this run's own — a job that finished before
+    it was registered — so it is accepted as before (0).
+    """
+    if read_exit_marker(log_path) is None or not unit_is_active(unit):
+        return 0
+    try:
+        return int(os.path.getsize(log_path))
+    except OSError:
+        return 0
+
+
+def inspect_detached_job(log_path: str, unit: str, log_offset: int = 0) -> DetachedJobState:
     """Synchronous probe (run it in a worker thread): marker, log age, unit liveness."""
-    code = read_exit_marker(log_path)
+    code = read_exit_marker(log_path, log_offset)
     try:
         age: Optional[float] = max(0.0, time.time() - os.path.getmtime(log_path))
         exists = True
@@ -835,7 +857,9 @@ class ExternalWaitMonitor:
                 return
         for record in self._registry.due(now=self._clock()):
             await self._poll_one(record)
-        for record in self._registry.pending_wakes():
+        # Only wakes whose retry delay has passed (#2740): draining every
+        # pending wake on every tick spent all attempts within a minute.
+        for record in self._registry.due_wakes(now=self._clock()):
             await self._deliver_wake(record)
         self._idle_identity = idle() if idle is not None else None
 
@@ -1040,7 +1064,10 @@ class ExternalWaitMonitor:
         expired = now >= float(record.get("expires_epoch") or 0)
         try:
             state = await asyncio.to_thread(
-                self._inspect_detached_job, str(record.get("log_path") or ""), str(record.get("unit") or "")
+                self._inspect_detached_job,
+                str(record.get("log_path") or ""),
+                str(record.get("unit") or ""),
+                int(record.get("log_offset") or 0),
             )
         except Exception:
             if notify_only and self._transport_errors.get(wait_id, 0) + 1 >= MAX_TRANSPORT_ERRORS:
@@ -1131,6 +1158,7 @@ class ExternalWaitMonitor:
                 delivered=delivered,
                 resumed=False,
                 skip_reason=skip_reason,
+                now=self._clock(),
             )
             await self._sync_status(record)
             return
@@ -1145,7 +1173,7 @@ class ExternalWaitMonitor:
             # Do not run a continuation whose terminal notification did not
             # land.  Leave the wake pending so the next drain retries the
             # notification, then resumes exactly once after delivery.
-            self._registry.mark_wake(wait_id, delivered=False)
+            self._registry.mark_wake(wait_id, delivered=False, now=self._clock())
             return
 
         resumed = await self._run_resume(record)

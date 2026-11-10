@@ -410,6 +410,69 @@ SH
 rm -f "$TMP/bin/loginctl"
 unset ARMS_LOG CCC_BRIDGE_PYTHON CCC_DETACHED_JOBS_REGISTRY CCC_PUSH_SPOOL
 
+# ---- #2740: a re-run of the same unit must stand on its own -----------------
+# The recipe appends to the log and Step 4 re-uses the unit name, so the
+# previous run's EXIT= line is still in the tail and its ack is still in the
+# registry. Both used to carry over to the new run.
+R2740="$TMP/reg2740.jsonl"; : > "$R2740"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+exit 3
+SH
+printf 'run 1\nEXIT=1\n' > "$TMP/rerun.log"
+python3 "$MOD" register --unit rerun --log "$TMP/rerun.log" --registry "$R2740" >/dev/null
+out="$(python3 "$MOD" sweep "$R2740")"
+ok "#2740 setup: the first run sweeps as done with its own exit code" 'grep -q "rerun" <<<"$out" && grep -q "EXIT=1" <<<"$out"'
+ok "#2740 a finished job registered while its unit is gone keeps no offset (its marker is its own)" \
+  '! grep -q "log_offset" "$R2740"'
+python3 "$MOD" ack --unit rerun --registry "$R2740" >/dev/null
+out="$(python3 "$MOD" sweep "$R2740")"
+ok "#2740 setup: the acknowledged first run is silent" '[ -z "$out" ]'
+# Run 2: same unit, same log, unit active again, nothing new written yet.
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+case "$*" in *rerun.service*) echo active; exit 0;; *) exit 3;; esac
+SH
+python3 "$MOD" register --unit rerun --log "$TMP/rerun.log" --registry "$R2740" >/dev/null
+out="$(python3 "$MOD" sweep "$R2740")"
+ok "#2740 the earlier ack does not hide the re-registered run" 'grep -q "rerun" <<<"$out"'
+ok "#2740 the re-run is running, not done with the previous run's exit code" \
+  'grep -q "진행 중" <<<"$out" && ! grep -q "완료" <<<"$out"'
+ok "#2740 the registration recorded where this run's output starts" \
+  '[ "$(tail -n 1 "$R2740" | python3 -c "import json,sys; print(json.load(sys.stdin).get(\"log_offset\"))")" = "$(stat -c %s "$TMP/rerun.log" 2>/dev/null || stat -f %z "$TMP/rerun.log")" ]'
+printf 'run 2\nEXIT=0\n' >> "$TMP/rerun.log"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+exit 3
+SH
+out="$(python3 "$MOD" sweep "$R2740")"
+ok "#2740 the re-run's own marker ends it with its own exit code" 'grep -q "rerun" <<<"$out" && grep -q "EXIT=0" <<<"$out" && ! grep -q "EXIT=1" <<<"$out"'
+# scope / scheduled_at / notify_on_exit must not leak into a plain re-registration.
+: > "$R2740"
+printf '{"unit":"leak","log":"%s","started_at":%s,"scope":"user","scheduled_at":"05:00","notify_on_exit":true,"acked":true}\n' "$TMP/leak.log" "$(date +%s)" > "$R2740"
+printf 'fresh\n' > "$TMP/leak.log"
+python3 "$MOD" register --unit leak --log "$TMP/leak.log" --registry "$R2740" >/dev/null
+# shellcheck disable=SC2034  # read via eval inside ok()
+merged="$(python3 - "$MOD" "$R2740" <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("dj", sys.argv[1]); dj = importlib.util.module_from_spec(spec); spec.loader.exec_module(dj)
+print(json.dumps(dj.load_records(sys.argv[2])[0], sort_keys=True))
+PY
+)"
+ok "#2740 a new registration drops the previous run's acked/scope/scheduled_at/notify_on_exit" \
+  '! grep -q "acked\|scope\|scheduled_at\|notify_on_exit" <<<"$merged" && grep -q "leak.log" <<<"$merged"'
+# An ack is still a partial record merged over the registration.
+python3 "$MOD" ack --unit leak --registry "$R2740" >/dev/null
+out="$(python3 "$MOD" sweep "$R2740")"
+ok "#2740 an ack after the new registration still closes it" '[ -z "$out" ]'
+# A truncated or replaced log is read whole again.
+printf 'EXIT=7\n' > "$TMP/short.log"
+# shellcheck disable=SC2034  # read via eval inside ok()
+code="$(python3 - "$MOD" "$TMP/short.log" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("dj", sys.argv[1]); dj = importlib.util.module_from_spec(spec); spec.loader.exec_module(dj)
+print(dj.read_exit_marker(sys.argv[2], 5000), dj.read_exit_marker(sys.argv[2], 7), dj.read_exit_marker(sys.argv[2], "x"))
+PY
+)"
+ok "#2740 read_exit_marker: shorter-than-offset log read whole, marker before the offset ignored, bad offset fails closed" '[ "$code" = "7 None None" ]'
+
 # The summary line format is load-bearing: validate-harness.sh's
 # suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
 # reads as a suite that asserted nothing.

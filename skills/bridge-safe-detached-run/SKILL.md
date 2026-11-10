@@ -257,6 +257,14 @@ systemctl reset-failed <job>.service 2>/dev/null || true   # clear a failed unit
 systemctl stop <job>.service                               # abort a running job (approval-gated if the job is destructive)
 ```
 
+Re-running under the same unit name **and the same log** is safe as long as you
+`register` again right after the launch (#2740): a registration starts a new
+record (the earlier run's `ack` no longer hides it), and when the log already
+ends with the previous run's `EXIT=` line while the unit is running, that line
+is recorded as history (`log_offset`) and only a marker written after it ends
+the new run. A fresh log per run (`<job>-<date>.log`) is still the simplest way
+to keep the evidence of each run apart.
+
 ## Safety
 
 - This skill detaches *execution*, not *authority*: destructive or approval-gated

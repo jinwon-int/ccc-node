@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from telegram_bot.core import external_wait_cli
+from telegram_bot.core import external_wait_cli, external_wait_monitor
 from telegram_bot.core.external_wait import (
     SOURCE_DETACHED_JOB,
     STATE_MONITORING,
@@ -27,6 +27,7 @@ from telegram_bot.core.external_wait_monitor import (
     DetachedJobState,
     ExternalWaitMonitor,
     detached_job_terminal,
+    detached_log_baseline,
     inspect_detached_job,
     read_exit_marker,
     resume_prompt_text,
@@ -100,8 +101,8 @@ def _monitor(registry, recorder, clock, *, unit_active: bool = False) -> Externa
         session_lookup=_session_of, clock=clock, status_syncer=recorder.sync,
     )
 
-    def probe(log_path: str, unit: str) -> DetachedJobState:
-        real = inspect_detached_job(log_path, unit)
+    def probe(log_path: str, unit: str, log_offset: int = 0) -> DetachedJobState:
+        real = inspect_detached_job(log_path, unit, log_offset)
         return DetachedJobState(real.exit_code, real.log_exists, real.log_age_seconds, unit_active and real.exit_code is None)
 
     monitor._inspect_detached_job = staticmethod(probe)  # type: ignore[assignment]
@@ -150,6 +151,107 @@ def test_exit_marker_reads_only_the_tail_and_tolerates_garbage(tmp_path: Path) -
     log.write_text("still running\n")
     assert read_exit_marker(str(log)) is None
     assert read_exit_marker(str(tmp_path / "missing.log")) is None
+
+
+def test_exit_marker_before_the_registration_offset_is_ignored(tmp_path: Path) -> None:
+    """#2740: a re-run appends to the same log; the previous run's marker is still in the tail."""
+    log = tmp_path / "rerun.log"
+    log.write_text("run 1\nEXIT=1\n")
+    offset = log.stat().st_size
+    assert read_exit_marker(str(log)) == 1  # without an offset: the old marker
+    assert read_exit_marker(str(log), offset) is None
+    with log.open("a") as handle:
+        handle.write("run 2 working\n")
+    assert read_exit_marker(str(log), offset) is None
+    with log.open("a") as handle:
+        handle.write("EXIT=0\n")
+    assert read_exit_marker(str(log), offset) == 0
+    # A log shorter than the offset was truncated or replaced: read it whole.
+    log.write_text("EXIT=7\n")
+    assert read_exit_marker(str(log), offset) == 7
+    assert read_exit_marker(str(log), "not a number") is None  # type: ignore[arg-type]
+
+
+def test_log_baseline_only_when_the_marker_cannot_be_this_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log = tmp_path / "base.log"
+    log.write_text("run 1\nEXIT=1\n")
+    monkeypatch.setattr(external_wait_monitor, "unit_is_active", lambda unit: True)
+    assert detached_log_baseline(str(log), "job") == log.stat().st_size
+    # Unit not running: the marker may be this run's own (finished before it was registered).
+    monkeypatch.setattr(external_wait_monitor, "unit_is_active", lambda unit: False)
+    assert detached_log_baseline(str(log), "job") == 0
+    log.write_text("no marker yet\n")
+    monkeypatch.setattr(external_wait_monitor, "unit_is_active", lambda unit: True)
+    assert detached_log_baseline(str(log), "job") == 0
+    assert detached_log_baseline(str(tmp_path / "missing.log"), "job") == 0
+
+
+@pytest.mark.anyio
+async def test_monitor_ignores_the_marker_an_earlier_run_left_in_the_log(tmp_path: Path) -> None:
+    clock = _Clock()
+    registry = _registry(tmp_path, clock)
+    log = tmp_path / "job.log"
+    log.write_text("run 1\nEXIT=1\n")
+    wait_id = _register(registry, log, log_offset=log.stat().st_size)
+    assert registry.get(wait_id)["log_offset"] == log.stat().st_size
+    recorder = _Recorder()
+    monitor = _monitor(registry, recorder, clock, unit_active=True)
+
+    await monitor._tick()  # the re-run is still going: run 1's EXIT=1 is not its result
+    assert registry.get(wait_id)["state"] == STATE_MONITORING
+    assert recorder.notifications == [] and recorder.resumes == []
+
+    with log.open("a") as handle:
+        handle.write("run 2\nEXIT=0\n")
+    clock.now += 120
+    await monitor._tick()
+    rec = registry.get(wait_id)
+    assert rec["terminal_status"] == TERMINAL_SUCCESS and rec["terminal_detail"] == {"exit_code": 0}
+    assert len(recorder.notifications) == 1 and len(recorder.resumes) == 1
+
+
+def test_registry_rejects_a_bad_log_offset_and_omits_zero(tmp_path: Path) -> None:
+    registry = _registry(tmp_path, _Clock())
+    log = tmp_path / "job.log"
+    assert "log_offset" not in registry.get(_register(registry, log, unit="plain"))
+    assert "log_offset" not in registry.get(_register(registry, log, unit="zero", log_offset=0))
+    for bad in (-1, "abc"):
+        with pytest.raises(ExternalWaitValidationError):
+            _register(registry, log, unit="bad", log_offset=bad)
+
+
+def test_cli_records_the_log_offset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    monkeypatch.setenv("CCC_EXTERNAL_WAIT_HOME", str(tmp_path))
+    publish_active_turn(tmp_path, user_id=7, chat_id=70, session_id="sess-1")
+    log = tmp_path / "state" / "job.log"
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+
+    # The caller measured it (detached_jobs.py does, it knows the unit's scope).
+    rc = external_wait_cli.main([
+        "register", "--source", "detached-job", "--unit", "passed", "--log", str(log), "--log-offset", "42",
+    ])
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert rc == 0 and payload["log_offset"] == 42
+    assert registry.get(payload["wait_id"])["log_offset"] == 42
+
+    # Not passed: measured here.
+    monkeypatch.setattr(external_wait_cli, "detached_log_baseline", lambda log_path, unit: 99)
+    rc = external_wait_cli.main(["register", "--source", "detached-job", "--unit", "measured", "--log", str(log)])
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert rc == 0 and registry.get(payload["wait_id"])["log_offset"] == 99
+
+    # An explicit 0 is honoured (the caller measured "no earlier marker") — not re-measured.
+    rc = external_wait_cli.main([
+        "register", "--source", "detached-job", "--unit", "explicit-zero", "--log", str(log), "--log-offset", "0",
+    ])
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert rc == 0 and "log_offset" not in registry.get(payload["wait_id"])
+
+    for bad in ("-5", "abc"):
+        rc = external_wait_cli.main([
+            "register", "--source", "detached-job", "--unit", "bad", "--log", str(log), "--log-offset", bad,
+        ])
+        assert rc == 2 and json.loads(capsys.readouterr().out.strip())["code"] == "validation"
 
 
 def test_detached_job_terminal_matrix() -> None:
