@@ -813,14 +813,17 @@ printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *.lock) exit 0 ;; es
   "$(command -v mkdir)" > "$mkst/mkdir"
 chmod 700 "$mkst/mkdir"
 rm -rf "$lk"; : > "$lk"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_auto env PATH="$mkst:$PATH" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "#2749: a held lock skips the run even if mkdir(1) always succeeds" \
   'jq -e ".skipped == \"locked\"" >/dev/null <<<"$out" && [ -f "$lk" ]'
 touch -d '-10 minutes' "$lk"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "#2749: a stale lock file is reclaimed and released" \
   'jq -e ".skipped != \"locked\"" >/dev/null <<<"$out" && [ ! -e "$lk" ]'
 rm -rf "$lk"; mkdir "$lk"; touch -d '-10 minutes' "$lk"
+# shellcheck disable=SC2034  # out is read via eval inside ok()
 out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
 ok "#2749: a stale legacy lock dir is reclaimed" \
   'jq -e ".skipped != \"locked\"" >/dev/null <<<"$out" && [ ! -e "$lk" ]'

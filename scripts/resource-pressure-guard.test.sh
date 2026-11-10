@@ -82,7 +82,7 @@ out="$(run_guard_lock "$lk")"
 ok "lock: a free lock runs and is released as no file is left" '[ -n "$out" ] && [ ! -e "$lk" ]'
 printf '%s\n' "$$" > "$lk"
 # shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
-out="$(run_guard_lock "$lk" "$mkstub")"; rc=$?
+{ out="$(run_guard_lock "$lk" "$mkstub")"; rc=$?; }
 ok "lock: a live holder's lock yields, even if mkdir(1) always succeeds" \
   '[ "$rc" = 0 ] && [ -z "$out" ] && [ "$(cat "$lk")" = "$$" ]'
 printf '%s\n' "$dead_pid" > "$lk"
