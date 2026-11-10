@@ -233,11 +233,25 @@ race() { # <name> <n> — n contenders released together; winners append their p
   rm -f "$TMP/$name.go" "$TMP/$name.winners"
   for _ in $(seq 1 "$n"); do
     ( while [ ! -e "$TMP/$name.go" ]; do sleep 0.05; done
-      if acquire_token_lock "$BASHPID" >/dev/null 2>&1; then
+      if acquire_token_lock "$BASHPID" >"$TMP/$name.$BASHPID.out" 2>&1; then
         echo "$BASHPID" >> "$TMP/$name.winners"; sleep 3
       fi ) &
   done
   sleep 0.3; touch "$TMP/$name.go"; wait
+}
+# Bash builtins only: in the mkdir tier PATH is the minimal tool dir (no tr).
+race_diag() { # <name> — on a miscount, print who won and what each contender saw (#2738)
+  local name="$1" n f text winners="" pidfile=""
+  n="$(wc -l < "$TMP/$name.winners" 2>/dev/null || echo 0)"
+  [ "$n" -eq 1 ] && return 0
+  [ -e "$TMP/$name.winners" ] && winners="$(< "$TMP/$name.winners")"
+  [ -e "$TOKEN_LOCK_FILE" ] && pidfile="$(< "$TOKEN_LOCK_FILE")"
+  printf 'diag %s: winners=[%s] pidfile=[%s]\n' "$name" "${winners//$'\n'/ }" "$pidfile" >&2
+  for f in "$TMP/$name".*.out; do
+    [ -e "$f" ] || continue
+    text="$(< "$f")"
+    printf 'diag %s: %s: %s\n' "$name" "${f##*/}" "${text//$'\n'/ | }" >&2
+  done
 }
 
 # Tiers: util-linux flock(1); python fcntl on the same inherited fd (Termux
@@ -281,12 +295,93 @@ for lock_mode in flock python mkdir; do
     '[ "$(wc -l < "$TMP/r-$lock_mode.winners")" -eq 1 ]'
   ok "[$lock_mode] the recorded pid is the winner's" \
     '[ "$(cat "$TOKEN_LOCK_FILE")" = "$(cat "$TMP/r-$lock_mode.winners")" ]'
+  race_diag "r-$lock_mode"
   ( cleanup_token_lock )
   race "q-$lock_mode" 5
   ok "[$lock_mode] concurrent launch from a clean state: exactly one of five wins" \
     '[ "$(wc -l < "$TMP/q-$lock_mode.winners")" -eq 1 ]'
+  race_diag "q-$lock_mode"
 done
 PATH="$LOCK_TEST_PATH"
+
+# #2738: a contender that lost its first create to a dead holder's claim must
+# not reclaim a claim that was REPLACED while it waited. The replacement belongs
+# to a new claimant that may not have recorded its pid yet, so the pid file
+# still names the dead holder; deleting it would let two contenders win. A
+# `sleep` stub parks the contender inside its wait so the swap happens at
+# exactly that point, without timing margins.
+swap_bin="$TMP/bin-swap"; mkdir -p "$swap_bin"
+for tool in cat mkdir rm mv rmdir find seq touch wc grep; do
+  ln -s "$(command -v "$tool")" "$swap_bin/$tool"
+done
+write_exec_stub "$swap_bin/sleep" <<'STUB'
+if [ "$1" = 1 ] && [ ! -e "$CCC_TEST_SWAP_SIGNAL" ]; then
+  : > "$CCC_TEST_SWAP_SIGNAL"
+  while [ ! -e "$CCC_TEST_SWAP_GO" ]; do "$CCC_TEST_REAL_SLEEP" 0.05; done
+  exit 0
+fi
+exec "$CCC_TEST_REAL_SLEEP" "$@"
+STUB
+export CCC_TEST_SWAP_SIGNAL="$TMP/swap.waiting" CCC_TEST_SWAP_GO="$TMP/swap.go"
+export CCC_TEST_REAL_SLEEP; CCC_TEST_REAL_SLEEP="$(command -v sleep)"
+rm -rf "$lock_root"; mkdir -p "$lock_root"
+: > "$TOKEN_LOCK_FILE.d"
+( exit 0 ) & swap_dead_pid=$!; wait "$swap_dead_pid"
+printf '%s\n' "$swap_dead_pid" > "$TOKEN_LOCK_FILE"
+export CCC_FLOCK_CLI="$TMP/no-such-flock"
+PATH="$swap_bin"
+( acquire_token_lock "$BASHPID" >"$TMP/swap.out" 2>&1; echo $? > "$TMP/swap.rc" ) &
+swap_contender=$!
+PATH="$LOCK_TEST_PATH"
+wait_for_file "$CCC_TEST_SWAP_SIGNAL"
+rm -f "$TOKEN_LOCK_FILE.d"; : > "$TOKEN_LOCK_FILE.d"  # new claimant, pid not yet written
+touch "$CCC_TEST_SWAP_GO"
+wait "$swap_contender"
+ok "[mkdir] a claim replaced during the wait is not reclaimed (#2738)" \
+  '[ "$(cat "$TMP/swap.rc")" = 1 ] && [ "$(cat "$TOKEN_LOCK_FILE")" = "$swap_dead_pid" ] && [ ! -e "$TOKEN_LOCK_FILE.d.reclaim" ]'
+rm -f "$CCC_TEST_SWAP_SIGNAL" "$CCC_TEST_SWAP_GO"
+# The same unchanged stale claim is still reclaimed (no false refusal).
+PATH="$swap_bin"
+( acquire_token_lock "$BASHPID" >"$TMP/swap2.out" 2>&1; echo $? > "$TMP/swap2.rc" ) &
+swap_contender=$!
+PATH="$LOCK_TEST_PATH"
+wait_for_file "$CCC_TEST_SWAP_SIGNAL"
+touch "$CCC_TEST_SWAP_GO"
+wait "$swap_contender"
+ok "[mkdir] an unchanged stale claim is still reclaimed after the wait" \
+  '[ "$(cat "$TMP/swap2.rc")" = 0 ] && [ "$(cat "$TOKEN_LOCK_FILE")" != "$swap_dead_pid" ]'
+unset CCC_TEST_SWAP_SIGNAL CCC_TEST_SWAP_GO CCC_TEST_REAL_SLEEP
+
+# A claim left as a DIRECTORY by an older start.sh (the tier used mkdir) with a
+# dead pid is still reclaimed, and the new claim is a regular file.
+rm -rf "$lock_root"; mkdir -p "$lock_root" "$TOKEN_LOCK_FILE.d"
+printf '%s\n' "$swap_dead_pid" > "$TOKEN_LOCK_FILE"
+PATH="$lock_bin_min"
+contend "legacy-mkdir"
+PATH="$LOCK_TEST_PATH"
+ok "[mkdir] a legacy directory claim of a dead holder is reclaimed as a file" \
+  '[ "$(cat "$TMP/legacy-mkdir.rc")" = 0 ] && [ -f "$TOKEN_LOCK_FILE.d" ] && [ ! -e "$TOKEN_LOCK_FILE.d.reclaim" ]'
+
+# #2738 root cause: Ubuntu 26.04's uutils mkdir(1) let several concurrent
+# creators of one path all succeed, so the tier must not use mkdir(1) as its
+# lock. Prove it with a mkdir that always reports success: a live holder must
+# still refuse a second contender.
+nomkdir_bin="$TMP/bin-nomkdir"; mkdir -p "$nomkdir_bin"
+for tool in sleep cat rm mv rmdir find seq touch wc grep; do
+  ln -s "$(command -v "$tool")" "$nomkdir_bin/$tool"
+done
+write_exec_stub "$nomkdir_bin/mkdir" <<'STUB'
+exit 0
+STUB
+rm -rf "$lock_root"; mkdir -p "$lock_root"
+PATH="$nomkdir_bin"
+hold_lock "x-nomkdir"
+contend "y-nomkdir"
+PATH="$LOCK_TEST_PATH"
+ok "[mkdir] the claim does not trust mkdir(1): one holder even if mkdir always succeeds (#2738)" \
+  '[ "$(cat "$TMP/y-nomkdir.rc")" = 1 ] && [ "$(cat "$TOKEN_LOCK_FILE")" = "$(cat "$TMP/x-nomkdir.pid")" ]'
+release_lock "x-nomkdir"
+unset CCC_FLOCK_CLI
 ok "mkdir tier announces itself" 'grep -q "flock unavailable; using mkdir fallback" "$TMP/h-mkdir.out"'
 ok "flock and python tiers are silent about the fallback" \
   '! grep -q "mkdir fallback" "$TMP/h-flock.out" "$TMP/h-python.out"'
