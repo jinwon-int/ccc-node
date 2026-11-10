@@ -1438,7 +1438,9 @@ fi
 # deleted). Only entries the policy owns are touched; operator entries win.
 # Best-effort: a policy failure must never roll back the harness install.
 # Opt out per node with CCC_SKILL_LISTING_POLICY=0 or
-# $CLAUDE_DIR/skill-listing-policy.disabled.
+# $CLAUDE_DIR/skill-listing-policy.disabled. Fill mode (#2748, default off) is
+# a per-node opt-in read by the policy itself: $CLAUDE_DIR/skill-listing-policy.fill
+# or CCC_SKILL_LISTING_FILL_FRACTION (docs/skill-listing-budget.md).
 if [ "$DRY" = 1 ]; then
   CCC_CLAUDE_DIR="$CLAUDE_DIR" python3 "$SRC/scripts/ccc-skill-listing-policy.py" plan --summary \
     --core "$SRC/claude/skill-listing-core.txt" 2>&1 | sed 's/^/[dry-run] /' || true
