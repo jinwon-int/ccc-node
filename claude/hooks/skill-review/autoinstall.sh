@@ -91,6 +91,11 @@ OWNERSHIP_TOOL="$AUTOINSTALL_LIB_DIR/ownership.py"
 SKILL_FM_TOOL="$AUTOINSTALL_LIB_DIR/../ccc_skill_frontmatter.py"
 [ -r "$SKILL_FM_TOOL" ] || SKILL_FM_TOOL="$AUTOINSTALL_LIB_DIR/../../../bridge/utils/skill_frontmatter.py"
 ts_id() { date -u +%Y%m%d%H%M%S; }
+# Single-runner lock primitive: an exclusive create (bash noclobber,
+# O_CREAT|O_EXCL). Not mkdir(1): Ubuntu 26.04's uutils mkdir let concurrent
+# creators of one path all succeed (#2749). A directory left at the path by an
+# older autoinstall also makes the create fail, so it counts as held.
+autoinstall_lock_create() { ( set -C; : > "$1" ) 2>/dev/null; }
 
 # Provider-neutral install target (#643): the gate/ledger/rollback pipeline is
 # identical across providers; only the skills directory and a compatibility
@@ -601,17 +606,17 @@ do_run() {
     fi
   fi
 
-  # Atomic single-runner lock (#643 concurrency safety): mkdir is atomic, so at
-  # most one runner installs at a time. Concurrent runners no-op (drafts stay
+  # Atomic single-runner lock (#643 concurrency safety): an exclusive create
+  # (autoinstall_lock_create), so at most one runner installs at a time. Concurrent runners no-op (drafts stay
   # pending and are retried), which keeps candidates/ledger/installs duplicate
   # free even when the same checkpoint is processed many times at once. A stale
   # lock (>5 min, e.g. a killed runner) is reclaimed.
   local LOCKDIR="$STATE_DIR/.autoinstall.lock" locked=0
-  if mkdir "$LOCKDIR" 2>/dev/null; then
+  if autoinstall_lock_create "$LOCKDIR"; then
     locked=1
   elif find "$LOCKDIR" -maxdepth 0 -mmin +5 2>/dev/null | grep -q .; then
     rm -rf "$LOCKDIR" 2>/dev/null
-    mkdir "$LOCKDIR" 2>/dev/null && locked=1
+    autoinstall_lock_create "$LOCKDIR" && locked=1
   fi
   if [ "$locked" != 1 ]; then
     log "skip reason=locked trigger=$TRIGGER"
@@ -626,7 +631,7 @@ do_run() {
   local deferred=0 failed=0 unscreened=0 today_used legacy_used incremental_used incremental_cap ps_verdict ps_status
   work="$(mktemp -d 2>/dev/null)" || work="$STATE_DIR/.autoinstall-work.$$"
   mkdir -p "$work" 2>/dev/null
-  trap 'rm -rf "$work" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null' RETURN
+  trap 'rm -rf "$work" 2>/dev/null; rm -f "$LOCKDIR" 2>/dev/null' RETURN
   legacy_used="$(installs_today)"
   case "$legacy_used" in ''|*[!0-9]*) legacy_used=0 ;; esac
   if ! incremental_used="$(incremental_installs_today)"; then
@@ -1153,11 +1158,11 @@ do_apply() {
       ;;
     create)
       lockdir="$STATE_DIR/.autoinstall.lock"
-      mkdir "$lockdir" 2>/dev/null || {
+      autoinstall_lock_create "$lockdir" || {
         echo '{"ok":false,"code":"autoinstall_locked"}'
         return 2
       }
-      trap 'rmdir "$lockdir" 2>/dev/null' RETURN
+      trap 'rm -f "$lockdir" 2>/dev/null' RETURN
       f="$dir/.approved-SKILL.md"
       jq -j '.proposal.skill_md' "$proposal" > "$f" 2>/dev/null || {
         rm -f "$f"

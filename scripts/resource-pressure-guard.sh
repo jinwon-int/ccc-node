@@ -40,17 +40,24 @@ provider_max_age_sec="${CCC_RESOURCE_PROVIDER_MAX_AGE_SEC:-1800}"
 mkdir -p "$state_dir" "$log_dir"
 chmod 700 "$watch_root" "$state_dir" "$log_dir" 2>/dev/null || true
 
-if ! mkdir "$lock_dir" 2>/dev/null; then
-  old_pid="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)"
+# Single-run lock: an exclusive create (bash noclobber, O_CREAT|O_EXCL) of the
+# lock path holding our pid. Not mkdir(1): Ubuntu 26.04's uutils mkdir let
+# concurrent creators of one path all succeed (#2749). A directory left by an
+# older guard (pid in <lock>/pid) is read the same way and reclaimed when dead.
+lock_create() { ( set -C; printf '%s\n' "$$" >"$lock_dir" ) 2>/dev/null; }
+if ! lock_create; then
+  if [ -d "$lock_dir" ]; then
+    old_pid="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)"
+  else
+    old_pid="$(sed -n '1p' "$lock_dir" 2>/dev/null || true)"
+  fi
   if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
     exit 0
   fi
-  rm -f "$lock_dir/pid"
-  rmdir "$lock_dir" 2>/dev/null || exit 0
-  mkdir "$lock_dir" 2>/dev/null || exit 0
+  rm -rf "$lock_dir"
+  lock_create || exit 0
 fi
-printf '%s\n' "$$" >"$lock_dir/pid"
-trap 'rm -f "$lock_dir/pid"; rmdir "$lock_dir" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -f "$lock_dir"' EXIT INT TERM
 
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 for value in "$mem_warn_kb" "$mem_critical_kb" "$mem_emergency_kb" \

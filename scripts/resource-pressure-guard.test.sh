@@ -59,5 +59,44 @@ out="$(run_guard 600000 50000 60)"
 ok "emergency: action=terminate-provider" 'grep -q "\"action\":\"terminate-provider\"" <<<"$out"'
 ok "emergency: terminated=1" 'grep -q "\"terminated\":1" <<<"$out"'
 
+# ---- single-run lock (#2749) --------------------------------------------------
+# The lock is an exclusive create, not mkdir(1): Ubuntu 26.04's uutils mkdir let
+# concurrent creators of one path all succeed. `mkstub` models that with a
+# mkdir that reports success for the lock path; a held lock must still win.
+mkstub="$TMP/mkdir-always-ok"; mkdir -p "$mkstub"
+real_mkdir="$(command -v mkdir)"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *.lock) exit 0 ;; esac; done\nexec %q "$@"\n' \
+  "$real_mkdir" > "$mkstub/mkdir"
+chmod 700 "$mkstub/mkdir"
+( exit 0 ) & dead_pid=$!; wait "$dead_pid"
+run_guard_lock() { # <lock-path> [PATH prefix] -> the guard's stdout (empty when it yielded)
+  PATH="${2:+$2:}$PATH" \
+  CCC_RESOURCE_GUARD_DRY_RUN=1 CCC_RESOURCE_TEST_PIDS="99999" \
+  CCC_RESOURCE_TEST_PROVIDER_AGE_SEC=60 CCC_RESOURCE_SAMPLE_MEM_KB=2200000 \
+  CCC_RESOURCE_SAMPLE_THERMAL_MC=50000 CCC_RESOURCE_GUARD_ROOT="$TMP/root-lock-$RANDOM" \
+  CCC_RESOURCE_GUARD_LOCK_DIR="$1" bash "$G" test
+}
+lk="$TMP/guard-a.lock"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+out="$(run_guard_lock "$lk")"
+ok "lock: a free lock runs and is released as no file is left" '[ -n "$out" ] && [ ! -e "$lk" ]'
+printf '%s\n' "$$" > "$lk"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+{ out="$(run_guard_lock "$lk" "$mkstub")"; rc=$?; }
+ok "lock: a live holder's lock yields, even if mkdir(1) always succeeds" \
+  '[ "$rc" = 0 ] && [ -z "$out" ] && [ "$(cat "$lk")" = "$$" ]'
+printf '%s\n' "$dead_pid" > "$lk"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+out="$(run_guard_lock "$lk" "$mkstub")"
+ok "lock: a dead holder's lock file is reclaimed" '[ -n "$out" ] && [ ! -e "$lk" ]'
+lk="$TMP/guard-b.lock"; mkdir -p "$lk"; printf '%s\n' "$$" > "$lk/pid"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+out="$(run_guard_lock "$lk")"
+ok "lock: a legacy lock dir of a live holder yields" '[ -z "$out" ] && [ -d "$lk" ]'
+printf '%s\n' "$dead_pid" > "$lk/pid"
+# shellcheck disable=SC2034  # consumed inside the quoted ok() assertions below
+out="$(run_guard_lock "$lk")"
+ok "lock: a legacy lock dir of a dead holder is reclaimed" '[ -n "$out" ] && [ ! -e "$lk" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
