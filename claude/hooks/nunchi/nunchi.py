@@ -899,10 +899,11 @@ def ingest(path):
     skipped_reasonless_decisions = 0
     flagged_unknown_kind = 0
     for it in items:
-        # Gate order matters (#890): normalize → rank-verify → update/close →
-        # conflict-review → dedup. Normalizing first is what lets the same
-        # fact spelled through an alias land on one observed peer before the
-        # duplicate check runs.
+        # Gate order matters (#890): normalize → rank-verify → dedup →
+        # update/close → conflict-review → insert. Normalizing first is what
+        # lets the same fact spelled through an alias land on one observed
+        # peer before the duplicate check runs; the duplicate check comes
+        # before update/close so a re-fed item cannot close anything (#2739).
         text = (it.get("text") or "").strip()
         if not text:
             continue
@@ -915,11 +916,16 @@ def ingest(path):
         rank, review = _verify_rank(it, transcript)
         because = (it.get("because") or "").strip() or None
         dedup = hashlib.sha1(f"{OBSERVER}|{it.get('subject')}|{text}".encode()).hexdigest()
-        if evidence_source and c.execute(
-                "SELECT 1 FROM peer_facts WHERE dedup=?", (dedup,)).fetchone():
-            # #2186 review P1-a: a re-fed machine row must be a no-op. Checked
-            # BEFORE G1, which would otherwise close a newer conversation fact
-            # even though the INSERT below then fails on the dedup UNIQUE.
+        if c.execute("SELECT 1 FROM peer_facts WHERE dedup=?", (dedup,)).fetchone():
+            # A re-fed item is a no-op, whatever lane it came from. Checked
+            # BEFORE G1/B2, which would otherwise close an open fact even
+            # though the INSERT below then fails on the dedup UNIQUE — a
+            # close with no successor row and no evidence. #2186 review P1-a
+            # guarded machine rows only; conversation payloads need it just
+            # as much (#2739): ingest-cron re-feeds a payload every tick
+            # until one run exits 0, and each retry of an already-stored
+            # correction closed the next best-overlap open fact (the stored
+            # correction itself first, at ratio 1.0).
             continue
         # G5 (#1264): legacy payloads remain flag-not-reject. Producers that
         # declare the live required-v1 contract have already promised a

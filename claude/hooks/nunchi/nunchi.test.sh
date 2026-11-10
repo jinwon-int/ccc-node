@@ -1556,5 +1556,54 @@ out="$(NUNCHI_DB="$G5_DB" python3 "$NP" g5-legacy-close --apply 2>&1)"
 ok "#2221 second apply is a no-op" \
   'grep -q "g5_open=3 retag=0 close=0 kept_user_stated=1 kept_not_legacy=2" <<<"$out" && [ "$(g5_dump 1,2,3,4,5,6,7,8,9,10)" = "$g5_after_first" ] && [ "$(g5_q "SELECT COUNT(*) FROM g5_legacy_close")" = 3 ]'
 
+# ---- #2739: a re-fed conversation item never closes anything -----------------
+# The dedup check used to run only for tagged machine feeds (#2186 P1-a), so a
+# conversation item that was already stored still ran G1/B2 first: the close
+# was committed, the INSERT failed on the dedup UNIQUE, and an open fact
+# disappeared with no successor row. ingest-cron re-feeds a payload on every
+# tick until one run exits 0, so one stuck payload closed a fact per tick.
+RDB="$TMP/nunchi-home/refeed.db"
+rq() { python3 -c "
+import sqlite3, sys
+print(sqlite3.connect('$RDB').execute(sys.argv[1]).fetchall())" "$1"; }
+rin() { NUNCHI_DB="$RDB" python3 "$NP" ingest - 2>&1; }
+# B2: fact -> correction (closes it) -> a newer overlapping fact -> same correction again
+gpayload r1 fact user "배포 채널은 알파 릴리스 채널 이다" | rin >/dev/null
+gpayload r2 correction user "배포 채널은 알파 아니라 베타 릴리스 채널 이다" | rin >/dev/null
+gpayload r3 fact user "배포 채널은 베타 릴리스 채널 이다 확정" | rin >/dev/null
+ok "#2739 setup: the correction closed exactly the fact it replaced" \
+  '[ "$(rq "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NOT NULL" | tr -dc 0-9)" = 1 ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(gpayload r2 correction user "배포 채널은 알파 아니라 베타 릴리스 채널 이다" | rin)"
+ok "#2739 re-fed correction stores nothing" 'grep -q "ingested 0/1" <<<"$out"'
+ok "#2739 re-fed correction closes nothing (B2)" \
+  '[ "$(rq "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NOT NULL" | tr -dc 0-9)" = 1 ]'
+ok "#2739 the stored correction and the newer fact stay open" \
+  '[ "$(rq "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND (kind = \"correction\" OR fact LIKE \"%확정\")" | tr -dc 0-9)" = 2 ]'
+# a third and fourth feed of the same payload (the cron retry loop) stay no-ops
+gpayload r2 correction user "배포 채널은 알파 아니라 베타 릴리스 채널 이다" | rin >/dev/null
+gpayload r2 correction user "배포 채널은 알파 아니라 베타 릴리스 채널 이다" | rin >/dev/null
+ok "#2739 repeated retries never drain the open set" \
+  '[ "$(rq "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL" | tr -dc 0-9)" = 2 ]'
+# G1: in-flight -> completion (closes it) -> a NEW in-flight fact -> same completion again
+gpayload r4 context session "PR #31 리뷰 진행 중, CI 대기" | rin >/dev/null
+gpayload r4 observation session "PR #31 머지 완료" | rin >/dev/null
+gpayload r5 context session "PR #31 후속 배포 진행 중, CI 대기" | rin >/dev/null
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(gpayload r4 observation session "PR #31 머지 완료" | rin)"
+ok "#2739 re-fed completion stores nothing" 'grep -q "ingested 0/1" <<<"$out"'
+ok "#2739 re-fed completion does not close the newer in-flight fact (G1)" \
+  'rq "SELECT valid_to IS NULL FROM peer_facts WHERE fact LIKE \"%후속 배포 진행 중%\"" | grep -q "(1,)"'
+# one payload carrying the same item twice: the second copy is a no-op too
+python3 - <<'PY' | rin >/dev/null
+import json
+it = {"kind": "correction", "subject": "user", "text": "기본 브랜치는 master 아니라 main 이다"}
+print(json.dumps({"session_id": "r6", "distilled_at": "2026-08-03T00:00:00+00:00",
+                  "honcho": [{"kind": "fact", "subject": "user", "text": "기본 브랜치는 master 이다"}, it, it]},
+                 ensure_ascii=False))
+PY
+ok "#2739 a duplicate inside one payload closes only the intended fact" \
+  'rq "SELECT valid_to IS NULL FROM peer_facts WHERE fact LIKE \"%master 아니라 main%\"" | grep -q "(1,)" && rq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact = \"기본 브랜치는 master 이다\"" | grep -q "(1,)"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
