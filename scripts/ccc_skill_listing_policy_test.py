@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic tests for ccc-skill-listing-policy.py (ccc-node#2011 A).
+"""Hermetic tests for ccc-skill-listing-policy.py (ccc-node#2011 A, fill mode #2748).
 
 Every case builds a private CCC_CLAUDE_DIR under a temp dir and drives the
 real CLI through a subprocess, so the live ~/.claude is never read or written.
@@ -416,6 +416,349 @@ class BudgetFitTests(PolicyCase):
         proc = self.run_cli("release", "--context-tokens", str(budget), core=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("skillOverrides", self.settings())
+
+
+class FillModeTests(PolicyCase):
+    """Fill mode (#2748): describe more skills within F x budget; default off."""
+
+    FILL_FILE = "skill-listing-policy.fill"
+    FILL_ENV = "CCC_SKILL_LISTING_FILL_FRACTION"
+    # Expected fill order: tier 1 (autosave, never used), tier 2 (fleet, newest
+    # install first), tier 3 (everything else, by name). The names are chosen
+    # so that plain name order would give a different result.
+    ORDER = ("z-auto-new", "n-fleet-new", "m-fleet-old", "a-auto-used",
+             "codex-lane-only", "stale-one", "stale-two")
+    DESCRIBED = ("core-flow", "r-big", "recent-autosave", "recent-jsonl")
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Budget = 0.25 x ctx x 4 = ctx chars exactly, so a test can pick it.
+        self.write_settings({"skillListingBudgetFraction": 0.25, "theme": "dark"})
+        self.skill("r-big", "d" * 1000)
+        self.usage({"ts": RECENT, "skill": "r-big", "tool": "Skill"})
+        for name in ("z-auto-new", "a-auto-used"):
+            self.skill(name, f"Autosave draft {name} " + "x" * 80)
+            self.marker(name, ".autosave-meta.json", {
+                "schema_version": 2, "manager": "ccc-node-skill-autosave",
+                "ownership": "autosave-managed", "provider": "claude", "name": name})
+        self.skill("m-fleet-old", "Fleet skill installed long ago " + "y" * 70)
+        self.skill("n-fleet-new", "Fleet skill installed yesterday " + "y" * 70)
+        fleet = {"schema_version": 1, "manager": "ccc-node-fleet-skills", "provider": "claude"}
+        self.marker("m-fleet-old", ".ccc-fleet-skill.json", dict(fleet, name="m-fleet-old"),
+                    mtime=1_780_000_000)
+        self.marker("n-fleet-new", ".ccc-fleet-skill.json", dict(fleet, name="n-fleet-new"),
+                    mtime=1_790_000_000)
+        # A Skill-tool use outside the recent window: a-auto-used is not
+        # waiting for its first use, so it belongs to the last tier.
+        self.usage({"ts": STALE, "skill": "a-auto-used", "tool": "Skill"})
+        # A Read of SKILL.md is a view, not a use: z-auto-new stays in tier 1.
+        self.usage({"ts": STALE, "skill": "z-auto-new", "tool": "Read"})
+
+    # -- helpers ----------------------------------------------------------
+    def marker(self, name: str, filename: str, doc: dict, mtime: int | None = None) -> None:
+        path = self.claude / "skills" / name / filename
+        path.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+
+    def chars(self, described: tuple[str, ...]) -> int:
+        return sum(described_cost(n, d) if n in described else name_only_cost(n)
+                   for n, d in self.descs.items())
+
+    def limit_for(self, n_filled: int) -> int:
+        """Estimated listing chars with exactly the first ``n_filled`` candidates described."""
+        return self.chars(self.DESCRIBED + self.ORDER[:n_filled])
+
+    def plan(self, *args: str, env: dict | None = None) -> dict:
+        proc = self.run_cli("plan", "--json", *args, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def filled(self, plan: dict) -> list[str]:
+        return [d["skill"] for d in plan["decisions"] if d["reason"].startswith("fill: ")]
+
+    def baseline_bytes(self) -> bytes:
+        """settings.json after a plain apply (no fill switch anywhere)."""
+        self.apply("--context-tokens", str(self.limit_for(len(self.ORDER))))
+        return self.settings_path.read_bytes()
+
+    # -- default off ------------------------------------------------------
+    def test_default_off_is_the_pre_fill_result(self) -> None:
+        ctx = str(self.limit_for(len(self.ORDER)))
+        proc = self.apply("--context-tokens", ctx)
+        self.assertNotIn("fill", proc.stdout)
+        ov = self.settings()["skillOverrides"]
+        # Exactly the pre-fill rule: core + recent described, the rest name-only,
+        # whatever markers the skill directories carry and however much fits.
+        self.assertEqual(ov, {name: "name-only" for name in sorted(self.ORDER)})
+        self.assertEqual(self.state()["owned_overrides"], ov)
+        plan = self.plan("--context-tokens", ctx)
+        self.assertEqual(plan["fill"], {"enabled": False, "fraction": None, "source": None, "note": None})
+        self.assertEqual({d["reason"] for d in plan["decisions"] if d["skill"] in self.ORDER},
+                         {"not core, not recently used"})
+        text = self.run_cli("plan", "--context-tokens", ctx).stdout
+        self.assertNotIn("fill", text)
+
+    def test_turning_fill_off_again_restores_the_baseline_entries(self) -> None:
+        ctx = str(self.limit_for(len(self.ORDER)))
+        baseline = json.loads(self.baseline_bytes())
+        owned = self.state()
+        # Partial fill, then off: the same entries come back (re-added entries
+        # are appended, so only the key order inside skillOverrides may differ).
+        self.apply("--context-tokens", str(self.limit_for(3)), "--fill-budget-fraction", "1")
+        self.assertNotEqual(self.settings(), baseline)
+        self.apply("--context-tokens", ctx)
+        self.assertEqual(self.settings(), baseline)
+        self.assertEqual(self.state(), owned)
+        # Full fill (no entry left), then off: the same entries again.
+        self.apply("--context-tokens", ctx, "--fill-budget-fraction", "1")
+        self.assertNotIn("skillOverrides", self.settings())
+        self.apply("--context-tokens", ctx)
+        self.assertEqual(self.settings(), baseline)
+
+    # -- order ------------------------------------------------------------
+    def test_tiers_fill_in_order_autosave_unused_then_fleet_newest_then_name(self) -> None:
+        for n in range(len(self.ORDER) + 1):
+            plan = self.plan("--context-tokens", str(self.limit_for(n)), "--fill-budget-fraction", "1")
+            with self.subTest(filled=n):
+                self.assertEqual(sorted(self.filled(plan)), sorted(self.ORDER[:n]))
+                self.assertEqual(plan["after"]["listing_chars"], self.limit_for(n))
+                self.assertFalse(plan["after"]["over_budget"])
+                self.assertEqual(plan["fill"]["promoted_total"], n)
+        reasons = {d["skill"]: d["reason"] for d in plan["decisions"]}
+        self.assertEqual(reasons["z-auto-new"], "fill: autosave-unused")
+        self.assertEqual(reasons["n-fleet-new"], "fill: fleet")
+        self.assertEqual(reasons["a-auto-used"], "fill: other")
+        self.assertEqual(plan["fill"]["promoted"], {"autosave-unused": 1, "fleet": 2, "other": 4})
+        self.assertEqual(plan["fill"]["candidates"], {"autosave-unused": 1, "fleet": 2, "other": 4})
+
+    def test_fleet_tier_ties_break_on_name_and_a_fleet_marker_outranks_autosave(self) -> None:
+        fleet = {"schema_version": 1, "manager": "ccc-node-fleet-skills", "provider": "claude"}
+        for name in ("m-fleet-old", "n-fleet-new"):
+            self.marker(name, ".ccc-fleet-skill.json", dict(fleet, name=name), mtime=1_790_000_000)
+        # A fleet-adopted draft is fleet-managed, not "waiting for a first use".
+        self.marker("z-auto-new", ".ccc-fleet-skill.json", dict(fleet, name="z-auto-new"),
+                    mtime=1_700_000_000)
+        order = ("m-fleet-old", "n-fleet-new", "z-auto-new")
+        for n in (1, 2, 3):
+            limit = self.chars(self.DESCRIBED + order[:n])
+            plan = self.plan("--context-tokens", str(limit), "--fill-budget-fraction", "1")
+            with self.subTest(filled=n):
+                self.assertEqual(sorted(self.filled(plan)), sorted(order[:n]))
+        self.assertEqual(plan["fill"]["candidates"]["autosave-unused"], 0)
+
+    def test_malformed_or_foreign_markers_fall_back_to_the_last_tier(self) -> None:
+        (self.claude / "skills" / "n-fleet-new" / ".ccc-fleet-skill.json").write_text("{not json")
+        self.marker("m-fleet-old", ".ccc-fleet-skill.json", {"manager": "someone-else"})
+        self.marker("z-auto-new", ".autosave-meta.json", {
+            "manager": "ccc-node-skill-autosave", "ownership": "autosave-managed", "name": "other-dir"})
+        plan = self.plan("--context-tokens", str(self.limit_for(len(self.ORDER))),
+                         "--fill-budget-fraction", "1")
+        self.assertEqual(plan["fill"]["candidates"], {"autosave-unused": 0, "fleet": 0, "other": 7})
+        self.assertEqual(sorted(self.filled(plan)), sorted(self.ORDER))
+
+    def test_autosave_use_count_counts_as_a_recorded_use(self) -> None:
+        self.autosave({"claude:z-auto-new": {"use_count": 2, "last_used_at": STALE},
+                       "codex:z-auto-new": {"use_count": 9}})
+        plan = self.plan("--context-tokens", str(self.limit_for(len(self.ORDER))),
+                         "--fill-budget-fraction", "1")
+        self.assertEqual(plan["fill"]["candidates"]["autosave-unused"], 0)
+        self.autosave({"codex:z-auto-new": {"use_count": 9}, "claude:z-auto-new": {"use_count": 0}})
+        plan = self.plan("--context-tokens", str(self.limit_for(len(self.ORDER))),
+                         "--fill-budget-fraction", "1")
+        self.assertEqual(plan["fill"]["candidates"]["autosave-unused"], 1)
+
+    # -- budget boundary --------------------------------------------------
+    def test_fraction_limit_is_inclusive_and_one_char_less_stops_the_fill(self) -> None:
+        limit = self.limit_for(2)
+        # F = 0.5 of a budget of 2 x limit: the second candidate lands exactly on the limit.
+        plan = self.plan("--context-tokens", str(2 * limit), "--fill-budget-fraction", "0.5")
+        self.assertEqual(sorted(self.filled(plan)), ["n-fleet-new", "z-auto-new"])
+        self.assertEqual(plan["fill"]["limit_chars"], limit)
+        self.assertEqual(plan["after"]["listing_chars"], limit)
+        self.assertEqual(plan["after"]["budget_chars"], 2 * limit)
+        plan = self.plan("--context-tokens", str(2 * limit - 1), "--fill-budget-fraction", "0.5")
+        self.assertEqual(self.filled(plan), ["z-auto-new"])
+        self.assertEqual(plan["fill"]["limit_chars"], limit - 1)
+        self.assertLessEqual(plan["after"]["listing_chars"], limit - 1)
+
+    def test_fill_stops_at_the_first_candidate_that_does_not_fit(self) -> None:
+        self.skill("n-fleet-new", "y" * 900)
+        # Room for every candidate except the big second one: nothing after it is described.
+        limit = self.chars(self.DESCRIBED + self.ORDER) - extra_cost("n-fleet-new", "y" * 900)
+        plan = self.plan("--context-tokens", str(limit), "--fill-budget-fraction", "1")
+        self.assertEqual(self.filled(plan), ["z-auto-new"])
+
+    def test_no_fill_while_a_recent_skill_is_over_budget(self) -> None:
+        # Budget below what the recent skills need: r-big is name-only'd, and
+        # fill must not describe a never-used skill in the room that leaves.
+        budget = self.limit_for(0) - 1
+        plan = self.plan("--context-tokens", str(budget), "--fill-budget-fraction", "1")
+        self.assertEqual(self.filled(plan), [])
+        self.assertTrue(any(d["reason"].startswith("recent, over budget") for d in plan["decisions"]))
+        self.assertEqual(plan["fill"]["promoted_total"], 0)
+
+    # -- ownership and writes ---------------------------------------------
+    def test_fill_only_removes_owned_entries_and_never_writes_another_value(self) -> None:
+        ctx = str(self.limit_for(3))
+        self.baseline_bytes()
+        self.assertEqual(self.settings()["skillOverrides"]["z-auto-new"], "name-only")
+        self.apply("--context-tokens", ctx, "--fill-budget-fraction", "1")
+        ov = self.settings()["skillOverrides"]
+        owned = self.state()["owned_overrides"]
+        for name in self.ORDER[:3]:
+            self.assertNotIn(name, ov)
+            self.assertNotIn(name, owned)
+        self.assertEqual(ov, {name: "name-only" for name in sorted(self.ORDER[3:])})
+        self.assertEqual(owned, ov)
+        self.assertEqual(self.settings()["theme"], "dark")
+
+    def test_operator_entries_are_untouched_and_never_fill_candidates(self) -> None:
+        operator = {"z-auto-new": "name-only", "n-fleet-new": "off", "stale-one": "on",
+                    "not-installed": "user-invocable-only"}
+        self.write_settings({"skillListingBudgetFraction": 0.25, "skillOverrides": dict(operator)})
+        self.apply("--context-tokens", "100000", "--fill-budget-fraction", "1")
+        ov = self.settings()["skillOverrides"]
+        for name, value in operator.items():
+            self.assertEqual(ov[name], value, name)
+            self.assertNotIn(name, self.state()["owned_overrides"])
+        # Everything else fits a 100000-char budget and is described by fill.
+        self.assertEqual(ov, operator)
+        plan = self.plan("--context-tokens", "100000", "--fill-budget-fraction", "1")
+        self.assertEqual(sorted(self.filled(plan)),
+                         ["a-auto-used", "codex-lane-only", "m-fleet-old", "stale-two"])
+        self.assertEqual(plan["fill"]["candidates"], {"autosave-unused": 0, "fleet": 1, "other": 3})
+        self.assertFalse(plan["changed"])
+
+    def test_idempotent_second_apply_with_fill(self) -> None:
+        args = ("--context-tokens", str(self.limit_for(4)), "--fill-budget-fraction", "1")
+        self.apply(*args)
+        first = self.settings_path.read_bytes()
+        n_backups = len(self.backups())
+        self.assertEqual(self.backups()[0].read_bytes(),
+                         (json.dumps({"skillListingBudgetFraction": 0.25, "theme": "dark"}, indent=2)
+                          + "\n").encode())
+        proc = self.apply(*args)
+        self.assertIn("no change", proc.stdout)
+        self.assertEqual(self.settings_path.read_bytes(), first)
+        self.assertEqual(len(self.backups()), n_backups)
+
+    def test_release_removes_everything_owned_and_ignores_the_fill_switch(self) -> None:
+        self.write_settings({"theme": "dark", "skillOverrides": {"stale-one": "off"}})
+        (self.claude / self.FILL_FILE).write_text("not-a-number\n", encoding="utf-8")
+        # The policy sets the budget key itself here (0.02 -> 0.08 x ctx chars);
+        # pick a window where fill describes some candidates but not all.
+        ctx = str(round(self.limit_for(2) / 0.08))
+        self.apply("--context-tokens", ctx, "--fill-budget-fraction", "1")
+        owned = self.state()["owned_overrides"]
+        self.assertTrue(owned)
+        self.assertNotIn("z-auto-new", owned)  # described by fill
+        self.assertEqual(self.settings()["skillListingBudgetFraction"], 0.02)
+        proc = self.run_cli("release", core=False, env={self.FILL_ENV: "bogus"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        doc = self.settings()
+        self.assertEqual(doc, {"theme": "dark", "skillOverrides": {"stale-one": "off"}})
+        self.assertEqual(self.state()["owned_overrides"], {})
+        proc = self.run_cli("release", "--fill-budget-fraction", "0.5", core=False)
+        self.assertEqual(proc.returncode, 2)  # not a release option
+
+    def test_kill_switch_wins_over_fill(self) -> None:
+        before = self.settings_path.read_bytes()
+        (self.claude / self.FILL_FILE).write_text("1\n", encoding="utf-8")
+        proc = self.apply(env={"CCC_SKILL_LISTING_POLICY": "0"})
+        self.assertIn("disabled", proc.stdout)
+        self.assertEqual(self.settings_path.read_bytes(), before)
+
+    # -- the switch -------------------------------------------------------
+    def test_node_local_file_is_picked_up_by_the_scheduled_quiet_apply(self) -> None:
+        ctx = str(self.limit_for(len(self.ORDER)))
+        (self.claude / self.FILL_FILE).write_text("# experiment A (#2748)\n\n1.0  # all of it\n",
+                                                  encoding="utf-8")
+        proc = self.apply("--quiet", "--context-tokens", ctx)
+        self.assertEqual(proc.stdout.count("\n"), 1)
+        self.assertEqual(proc.stderr, "")
+        self.assertNotIn("skillOverrides", self.settings())
+        plan = self.plan("--context-tokens", ctx)
+        self.assertEqual((plan["fill"]["enabled"], plan["fill"]["fraction"]), (True, 1.0))
+        self.assertEqual(plan["fill"]["source"], f"file {self.claude / self.FILL_FILE}")
+        self.assertFalse(plan["changed"])
+
+    def test_switch_precedence_flag_then_env_then_file(self) -> None:
+        ctx = str(2 * self.limit_for(2))
+        (self.claude / self.FILL_FILE).write_text("1\n", encoding="utf-8")
+        plan = self.plan("--context-tokens", ctx)
+        self.assertEqual(len(self.filled(plan)), len(self.ORDER))
+        plan = self.plan("--context-tokens", ctx, env={self.FILL_ENV: "0.5"})
+        self.assertEqual(sorted(self.filled(plan)), ["n-fleet-new", "z-auto-new"])
+        self.assertEqual(plan["fill"]["source"], f"env {self.FILL_ENV}")
+        plan = self.plan("--context-tokens", ctx, "--fill-budget-fraction", "1", env={self.FILL_ENV: "0.5"})
+        self.assertEqual(len(self.filled(plan)), len(self.ORDER))
+        self.assertEqual(plan["fill"]["source"], "--fill-budget-fraction")
+        # An explicit off in the env beats an enabling file, for one run.
+        for word in ("0", "off", "OFF", "false", "no"):
+            proc = self.run_cli("plan", "--json", "--context-tokens", ctx, env={self.FILL_ENV: word})
+            self.assertEqual(proc.stderr, "", word)
+            plan = json.loads(proc.stdout)
+            self.assertEqual((plan["fill"]["enabled"], plan["fill"]["note"]), (False, "off"), word)
+            self.assertEqual(self.filled(plan), [], word)
+
+    def test_invalid_flag_value_is_rejected_before_anything_is_written(self) -> None:
+        before = self.settings_path.read_bytes()
+        for bad in ("0", "-0.5", "1.01", "2", "nan", "inf", "abc", ""):
+            proc = self.run_cli("apply", f"--fill-budget-fraction={bad}")
+            with self.subTest(value=bad):
+                self.assertEqual(proc.returncode, 2)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(self.settings_path.read_bytes(), before)
+                self.assertFalse((self.claude / "state" / "skill-listing-policy.json").exists())
+
+    def test_invalid_env_or_file_value_means_fill_off_with_a_warning(self) -> None:
+        ctx = str(self.limit_for(len(self.ORDER)))
+        baseline = self.baseline_bytes()
+        n_backups = len(self.backups())
+        for bad in ("abc", "1.5", "-1", "nan", "inf", "50%"):
+            proc = self.apply("--quiet", "--context-tokens", ctx, env={self.FILL_ENV: bad})
+            with self.subTest(env=bad):
+                self.assertEqual(self.settings_path.read_bytes(), baseline)
+                self.assertIn("no change", proc.stdout)
+                self.assertIn(f"fill mode off — env {self.FILL_ENV}: invalid value ignored", proc.stderr)
+                self.assertNotIn(bad, proc.stderr)
+        for bad in ("", "\n# only a comment\n", "abc\n", "7\n", "0.5 0.6\n", "x" * 5000):
+            (self.claude / self.FILL_FILE).write_text(bad, encoding="utf-8")
+            proc = self.apply("--quiet", "--context-tokens", ctx)
+            with self.subTest(file=bad[:12]):
+                self.assertEqual(self.settings_path.read_bytes(), baseline)
+                self.assertIn("invalid value ignored", proc.stderr)
+        self.assertEqual(len(self.backups()), n_backups)
+        # An invalid env value does not fall through to a valid file.
+        (self.claude / self.FILL_FILE).write_text("1\n", encoding="utf-8")
+        plan = self.plan("--context-tokens", ctx, env={self.FILL_ENV: "abc"})
+        self.assertEqual((plan["fill"]["enabled"], self.filled(plan)), (False, []))
+        text = self.run_cli("plan", "--summary", "--context-tokens", ctx, env={self.FILL_ENV: "abc"}).stdout
+        self.assertIn(f"fill: off (env {self.FILL_ENV}: invalid value ignored", text)
+
+    # -- reporting --------------------------------------------------------
+    def test_plan_reports_fraction_tiers_and_estimate_and_stays_read_only(self) -> None:
+        limit = self.limit_for(4)
+        before = self.settings_path.read_bytes()
+        proc = self.run_cli("plan", "--context-tokens", str(2 * limit), "--fill-budget-fraction", "0.5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("keep      z-auto-new  [fill: autosave-unused]", proc.stdout)
+        self.assertIn("keep      n-fleet-new  [fill: fleet]", proc.stdout)
+        self.assertIn("name-only stale-two  [not core, not recently used]", proc.stdout)
+        self.assertIn("keep=8 (core=1 recent<30d=3 fill=4) name-only=3 (recent over budget=0)", proc.stdout)
+        self.assertIn(
+            f"  fill: fraction=0.5 (--fill-budget-fraction) limit={limit} chars; "
+            "described by fill=4 (autosave-unused=1/1 fleet=2/2 other=1/4); "
+            f"estimated listing={limit}/{2 * limit} chars (50.0% of budget)", proc.stdout)
+        self.assertIn("over_budget=false", proc.stdout)
+        self.assertEqual(self.settings_path.read_bytes(), before)
+        self.assertFalse((self.claude / "state" / "skill-listing-policy.json").exists())
+        self.assertEqual(self.backups(), [])
+        proc = self.apply("--context-tokens", str(2 * limit), "--fill-budget-fraction", "0.5")
+        self.assertIn("described by fill=4", proc.stdout)
 
 
 class OverBudgetReportTests(PolicyCase):

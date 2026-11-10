@@ -22,14 +22,44 @@ This tool makes the choice explicit:
 * every other skill gets ``skillOverrides[<name>] = "name-only"`` — still
   listed, still invocable by name.
 
+Fill mode (ccc-node#2748, default OFF). The rules above leave most of the
+budget unused on a node with a large window (measured: 21 of 310 skills
+described, 24% of the budget), and a name-only skill is rarely picked, so it
+never becomes "recently used". With a fill fraction ``F`` (0 < F <= 1) the
+policy describes more of the "every other skill" group while the estimated
+listing stays within ``F x budget``. Candidates are taken in this order, and
+filling stops at the first one that would cross the limit (no skipping):
+
+1. ``autosave-unused`` — node-local autosave-managed skills
+   (``.autosave-meta.json``) with no recorded Skill-tool use (``use_count`` in
+   ``state/skill-autosave-usage.json``, ``Skill`` rows in ``usage.jsonl``):
+   they need a first use to pass the promotion usage gate; by name;
+2. ``fleet`` — fleet-managed skills (``.ccc-fleet-skill.json``), most recently
+   installed/updated first. The proxy is the fleet marker's mtime, which the
+   fleet-skills sync keeps as the current version's install time (a
+   commit-only refresh does not move it); ties by name;
+3. ``other`` — everything else, by name.
+
+Fill never displaces a recently used skill: it runs only after every recent
+skill fitted the full budget. The switch is, first present wins,
+``--fill-budget-fraction F`` > env ``CCC_SKILL_LISTING_FILL_FRACTION`` > the
+node-local file ``<claude-dir>/skill-listing-policy.fill`` (first non-comment
+line is ``F``), so the scheduled ``apply --quiet`` picks the file up without a
+cron change. ``0``/``off`` in the env or file means off; an invalid value there
+is ignored with a warning on stderr (fill off). Without a switch the decisions
+and the written ``settings.json`` are exactly the pre-fill ones.
+
 Safety contract:
 
 * it only ever writes ``"name-only"``; never ``"off"``, never deletes or moves
-  a skill (owner decision in ccc-node#1739);
+  a skill (owner decision in ccc-node#1739). Fill mode writes nothing new: a
+  filled skill simply gets no entry, and an entry this tool owns for it is
+  removed — never ``"on"``, never any other value;
 * it only manages override entries it created itself, tracked in
   ``state/skill-listing-policy.json``; an operator-written entry (any key it
   does not own, or an owned key whose value an operator changed) always wins
-  and is never modified;
+  and is never modified — fill mode included: an operator-pinned skill is
+  never a fill candidate;
 * ``skillListingBudgetFraction`` is set to 0.02 only when the key is absent;
 * the budget is computed for the context window from ``--context-tokens``,
   env ``CCC_SKILL_LISTING_CONTEXT_TOKENS``, else the ``settings.json`` ``model``
@@ -38,10 +68,11 @@ Safety contract:
   (process env, then the bridge systemd unit's environment; #2358) is used
   before the 200k default;
 * ``settings.json`` is backed up and replaced atomically, only when the
-  rendered result differs (a second ``apply`` is a no-op).
+  rendered result differs (a second ``apply`` is a no-op, with or without
+  fill: the decision depends only on the inputs and no fill state is stored).
 
 Subcommands: ``plan`` (read-only), ``apply``, ``release`` (remove every entry
-this tool owns). Kill switch: ``CCC_SKILL_LISTING_POLICY=0`` or the file
+this tool owns; it ignores the fill switch). Kill switch: ``CCC_SKILL_LISTING_POLICY=0`` or the file
 ``<claude-dir>/skill-listing-policy.disabled`` makes ``apply`` a no-op.
 Stdlib only.
 """
@@ -56,6 +87,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -115,6 +147,25 @@ SYSTEMCTL_TIMEOUT_SECONDS = 5
 MAX_ENV_FILE_BYTES = 256 * 1024
 _ENV_FILE_SUFFIX_RE = re.compile(r"\s+\(ignore_errors=(?:yes|no)\)$")
 REASON_OVER_BUDGET = "recent, over budget"
+REASON_DEFAULT = "not core, not recently used"
+
+# Fill mode (#2748): default off. See the module docstring for the contract.
+FILL_FILE = "skill-listing-policy.fill"
+FILL_ENV = "CCC_SKILL_LISTING_FILL_FRACTION"
+FILL_FLAG = "--fill-budget-fraction"
+FILL_OFF_WORDS = frozenset({"0", "off", "false", "no"})
+FILL_TIERS = ("autosave-unused", "fleet", "other")
+REASON_FILL_PREFIX = "fill: "
+MAX_FILL_FILE_BYTES = 4 * 1024
+# Provenance markers written by the autosave layer (skill-review/ownership.py)
+# and the fleet-skills sync (ccc-fleet-skills-sync.py). Read-only here, and
+# only to order fill candidates — never used for authority.
+AUTOSAVE_MARKER = ".autosave-meta.json"
+AUTOSAVE_MANAGER = "ccc-node-skill-autosave"
+AUTOSAVE_OWNERSHIP = "autosave-managed"
+FLEET_MARKER = ".ccc-fleet-skill.json"
+FLEET_MANAGER = "ccc-node-fleet-skills"
+MAX_MARKER_BYTES = 16 * 1024
 
 MAX_SETTINGS_BYTES = 4 * 1024 * 1024
 MAX_SKILL_MD_BYTES = 256 * 1024
@@ -247,7 +298,7 @@ def parse_frontmatter(text: str) -> dict[str, str]:
 
 
 def discover_skills(skills_dir: Path) -> dict[str, dict[str, Any]]:
-    """name -> {desc_chars, listed} for every <skills>/<dir>/SKILL.md."""
+    """name -> {desc_chars, listed, dir} for every <skills>/<dir>/SKILL.md."""
     found: dict[str, dict[str, Any]] = {}
     if not skills_dir.is_dir():
         return found
@@ -269,7 +320,7 @@ def discover_skills(skills_dir: Path) -> dict[str, dict[str, Any]]:
         when = fm.get("when_to_use", "")
         text_len = len(desc) + (len(when) + 1 if when else 0)
         listed = fm.get("disable-model-invocation", "").strip().lower() not in TRUE_WORDS
-        found[name] = {"desc_chars": text_len, "listed": listed}
+        found[name] = {"desc_chars": text_len, "listed": listed, "dir": entry}
     return found
 
 
@@ -285,6 +336,25 @@ def _read_bounded(path: Path, limit: int) -> bytes | None:
             return fh.read()
     except OSError:
         return None
+
+
+def claude_autosave_records(state_dir: Path) -> Iterator[tuple[str, dict[str, Any]]]:
+    """(skill, record) for each Claude-lane row of ``skill-autosave-usage.json``."""
+    raw = _read_bounded(state_dir / "skill-autosave-usage.json", MAX_AUTOSAVE_USAGE_BYTES)
+    try:
+        doc = json.loads(raw) if raw else {}
+    except ValueError:
+        doc = {}
+    records = doc.get("records") if isinstance(doc, dict) else None
+    if not isinstance(records, dict):
+        return
+    for key, rec in records.items():
+        if not isinstance(key, str) or not isinstance(rec, dict):
+            continue
+        provider, sep, name = key.partition(":")
+        if sep and provider != "claude":
+            continue  # codex/piri/danso lanes list their own skills
+        yield (name if sep else key), rec
 
 
 def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, dict[str, Any]]:
@@ -315,24 +385,125 @@ def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, dict[str, Any]]
         if isinstance(row, dict):
             note(row.get("skill"), row.get("ts"))
 
-    raw = _read_bounded(state_dir / "skill-autosave-usage.json", MAX_AUTOSAVE_USAGE_BYTES)
-    try:
-        doc = json.loads(raw) if raw else {}
-    except ValueError:
-        doc = {}
-    records = doc.get("records") if isinstance(doc, dict) else None
-    if isinstance(records, dict):
-        for key, rec in records.items():
-            if not isinstance(key, str) or not isinstance(rec, dict):
-                continue
-            provider, sep, name = key.partition(":")
-            if sep and provider != "claude":
-                continue  # codex/piri/danso lanes list their own skills
-            skill = name if sep else key
-            stamps = [t for t in (parse_ts(rec.get(f)) for f in ("last_used_at", "last_viewed_at")) if t]
-            if stamps:
-                note(skill, max(stamps).isoformat())
+    for skill, rec in claude_autosave_records(state_dir):
+        stamps = [t for t in (parse_ts(rec.get(f)) for f in ("last_used_at", "last_viewed_at")) if t]
+        if stamps:
+            note(skill, max(stamps).isoformat())
     return {k: {"ts": v.strftime("%Y-%m-%dT%H:%M:%SZ"), "count": counts[k]} for k, v in latest.items()}
+
+
+def skill_tool_used(state_dir: Path) -> set[str]:
+    """Skills with any recorded Skill-tool use on this node, at any time.
+
+    The same evidence the promotion usage gate counts (``use_count`` in
+    ``skill-autosave-usage.json``, ``Skill`` rows in ``usage.jsonl``); a Read
+    of the SKILL.md is a view, not a use. Not limited to the recent window.
+    """
+    used: set[str] = set()
+    raw = _read_bounded(state_dir / "skill-usage" / "usage.jsonl", MAX_LEDGER_BYTES)
+    for line in (raw or b"").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("tool") != "Skill":
+            continue
+        skill = row.get("skill")
+        if isinstance(skill, str) and NAME_RE.match(skill):
+            used.add(skill)
+    for skill, rec in claude_autosave_records(state_dir):
+        uses = rec.get("use_count")
+        if isinstance(uses, int) and not isinstance(uses, bool) and uses > 0:
+            used.add(skill)
+    return used
+
+
+def read_marker(path: Path) -> tuple[dict[str, Any], int] | None:
+    """(JSON object, mtime_ns) of a provenance marker, or None.
+
+    A missing, symlinked, non-regular, oversized or malformed marker is None,
+    which only moves the skill to the last fill tier.
+    """
+    try:
+        meta = path.lstat()
+        if not stat.S_ISREG(meta.st_mode) or meta.st_size > MAX_MARKER_BYTES:
+            return None
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return (doc, meta.st_mtime_ns) if isinstance(doc, dict) else None
+
+
+def fill_rank(name: str, skill_dir: Path, used: set[str]) -> tuple[int, int, str]:
+    """Sort key (tier index, -install time, name) of one fill candidate.
+
+    A fleet marker outranks an autosave marker (repo-managed > fleet-approved
+    > autosave-owned > user-owned): a fleet-adopted draft is no longer waiting
+    for the promotion gate.
+    """
+    fleet = read_marker(skill_dir / FLEET_MARKER)
+    if fleet is not None and fleet[0].get("manager") == FLEET_MANAGER:
+        return FILL_TIERS.index("fleet"), -fleet[1], name
+    autosave = read_marker(skill_dir / AUTOSAVE_MARKER)
+    if (autosave is not None and name not in used
+            and autosave[0].get("manager") == AUTOSAVE_MANAGER
+            and autosave[0].get("ownership") == AUTOSAVE_OWNERSHIP
+            and autosave[0].get("name") == skill_dir.name):
+        return FILL_TIERS.index("autosave-unused"), 0, name
+    return FILL_TIERS.index("other"), 0, name
+
+
+def fill_order(skills: dict[str, dict[str, Any]], state_dir: Path) -> list[tuple[str, str]]:
+    """Every listed skill as (name, tier), in the order fill mode takes them."""
+    used = skill_tool_used(state_dir)
+    ranked = sorted(fill_rank(name, info["dir"], used)
+                    for name, info in skills.items() if info["listed"])
+    return [(name, FILL_TIERS[tier]) for tier, _, name in ranked]
+
+
+def parse_fill_fraction(raw: str) -> float | None:
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if 0 < value <= 1 else None  # NaN and inf fail the comparison
+
+
+def _fill_setting(raw: str, source: str) -> dict[str, Any]:
+    if raw.strip().lower() in FILL_OFF_WORDS:
+        return {"fraction": None, "source": source, "note": "off"}
+    value = parse_fill_fraction(raw)
+    if value is None:
+        return {"fraction": None, "source": source,
+                "note": "invalid value ignored (expected a number in (0, 1])"}
+    return {"fraction": value, "source": source, "note": None}
+
+
+def resolve_fill(flag: float | None, claude_dir: Path) -> dict[str, Any]:
+    """The fill switch: {"fraction": F or None, "source", "note"}.
+
+    The first PRESENT source decides — flag, then env, then the node-local
+    file — so ``CCC_SKILL_LISTING_FILL_FRACTION=0`` turns a file-enabled fill
+    off for one run. A present but unusable value never falls through to the
+    next source: fill is off and ``note`` says why.
+    """
+    if flag is not None:
+        return {"fraction": flag, "source": FILL_FLAG, "note": None}
+    raw = os.environ.get(FILL_ENV, "").strip()
+    if raw:
+        return _fill_setting(raw, f"env {FILL_ENV}")
+    path = claude_dir / FILL_FILE
+    source = f"file {path}"
+    try:
+        if path.stat().st_size > MAX_FILL_FILE_BYTES:
+            return _fill_setting("", source)
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return {"fraction": None, "source": None, "note": None}
+    except OSError:
+        return _fill_setting("", source)
+    values = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+    return _fill_setting(next((v for v in values if v), ""), source)
 
 
 def load_settings(path: Path) -> tuple[bytes | None, dict[str, Any] | None]:
@@ -573,6 +744,36 @@ def override_mode(value: Any) -> str:
     return value if isinstance(value, str) else "on"
 
 
+def place_fill(
+    skills: dict[str, dict[str, Any]],
+    fillable: set[str],
+    used: int,
+    fill: dict[str, Any] | None,
+    max_desc: int,
+) -> dict[str, str]:
+    """name -> tier for the fill candidates that get a description (#2748).
+
+    ``fill["order"]`` is every listed skill as (name, tier) in fill order;
+    only ``fillable`` ones (not operator, core or recent) are candidates. A
+    candidate is described while the running estimate stays at or below
+    ``fill["limit"]``; the first one that does not fit ends the fill, so a
+    lower-ranked skill is never described while a higher-ranked one is not.
+    """
+    promoted: dict[str, str] = {}
+    if fill is None:
+        return promoted
+    for name, tier in fill["order"]:
+        if name not in fillable:
+            continue
+        desc_chars = skills[name]["desc_chars"]
+        used += (entry_chars(name, desc_chars, "on", max_desc)
+                 - entry_chars(name, desc_chars, MANAGED_VALUE, max_desc))
+        if used > fill["limit"]:
+            break
+        promoted[name] = tier
+    return promoted
+
+
 def decide(
     skills: dict[str, dict[str, Any]],
     operator: dict[str, Any],
@@ -581,6 +782,7 @@ def decide(
     release: bool,
     max_desc: int = DEFAULT_MAX_DESC_CHARS,
     budget_chars: int | None = None,
+    fill: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
     """Per-skill decisions and the override entries this tool wants to own.
 
@@ -591,10 +793,16 @@ def decide(
     recent skill is name-only (``recent, over budget``), so a less recently
     used skill is never described while a more recent one is not.
     ``budget_chars=None`` (release) keeps every recent skill described.
+
+    With ``fill`` ({"limit": chars, "order": [(name, tier), ...]}) the skills
+    that would otherwise be plain name-only are then offered to ``place_fill``
+    — only when every recent skill fitted, so fill never describes an unused
+    skill while a recently used one is over budget.
     """
     decisions: dict[str, dict[str, str]] = {}
     desired: dict[str, str] = {}
     pending: list[str] = []
+    fillable: set[str] = set()
     used = 0
 
     def put(name: str, decision: str, reason: str) -> None:
@@ -620,7 +828,7 @@ def decide(
         elif release:
             put(name, "keep", "release")
         else:
-            put(name, MANAGED_VALUE, "not core, not recently used")
+            fillable.add(name)  # provisionally name-only; placed below
             used += entry_chars(name, desc_chars, MANAGED_VALUE, max_desc)
 
     # Stable two-key sort: name ascending, then latest use / count descending.
@@ -636,6 +844,13 @@ def decide(
         else:
             fits = False
             put(name, MANAGED_VALUE, f"{REASON_OVER_BUDGET} (used {recent[name]['ts']})")
+
+    promoted = place_fill(skills, fillable, used, fill if fits else None, max_desc)
+    for name in sorted(fillable):
+        if name in promoted:
+            put(name, "keep", REASON_FILL_PREFIX + promoted[name])
+        else:
+            put(name, MANAGED_VALUE, REASON_DEFAULT)
     return [decisions[name] for name in sorted(decisions)], desired
 
 
@@ -669,7 +884,9 @@ def compute(
     budget_fraction: float,
     release: bool = False,
     context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    fill: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """``fill`` is {"fraction": F, "order": fill_order(...)} or None (off)."""
     current: dict[str, Any] = dict(settings.get(OVERRIDES_KEY) or {})
     owned_before: dict[str, str] = state["owned_overrides"]
     # An owned key is still ours only while its value is exactly what we wrote.
@@ -680,8 +897,11 @@ def compute(
     probe = dict(settings)
     apply_budget(settings, probe, state.get("owned_budget_fraction"), budget_fraction, release)
     budget_chars = None if release else budget_chars_for(effective_fraction(probe), context_tokens)
+    fill_plan = None
+    if fill is not None and budget_chars is not None:
+        fill_plan = {"limit": int(fill["fraction"] * budget_chars), "order": fill["order"]}
     decisions, desired_ours = decide(skills, operator, set(core), recent, release,
-                                     effective_max_desc(probe), budget_chars)
+                                     effective_max_desc(probe), budget_chars, fill_plan)
     if any(v != MANAGED_VALUE for v in desired_ours.values()):
         raise PolicyError("internal: refusing to write a value other than name-only")
 
@@ -718,7 +938,25 @@ def compute(
         "added": sorted(k for k in desired_ours if k not in ours_now),
         "removed": sorted(k for k in ours_now if k not in desired_ours),
         "budget_action": budget_action,
+        "fill": fill_report(fill_plan, decisions),
     }
+
+
+def fill_report(fill_plan: dict[str, Any] | None, decisions: list[dict[str, str]]) -> dict[str, Any] | None:
+    """What fill mode did: per tier, described by fill / candidates offered."""
+    if fill_plan is None:
+        return None
+    tier_of = dict(fill_plan["order"])
+    promoted = dict.fromkeys(FILL_TIERS, 0)
+    candidates = dict.fromkeys(FILL_TIERS, 0)
+    for d in decisions:
+        if d["reason"].startswith(REASON_FILL_PREFIX):
+            promoted[tier_of[d["skill"]]] += 1
+            candidates[tier_of[d["skill"]]] += 1
+        elif d["reason"] == REASON_DEFAULT:
+            candidates[tier_of[d["skill"]]] += 1
+    return {"limit_chars": fill_plan["limit"], "promoted": promoted, "candidates": candidates,
+            "promoted_total": sum(promoted.values())}
 
 
 def estimate(settings: dict[str, Any], skills: dict[str, dict[str, Any]], context_tokens: int,
@@ -855,19 +1093,39 @@ def disabled(claude_dir: Path) -> str | None:
     return None
 
 
+def keep_kind(reason: str) -> str:
+    if reason == "core":
+        return "core"
+    return "fill" if reason.startswith(REASON_FILL_PREFIX) else "recent"
+
+
+def fill_line(fill: dict[str, Any], report: dict[str, Any] | None, after: dict[str, Any]) -> str | None:
+    """The plan/apply line for fill mode; None when no switch is present."""
+    if report is None:
+        return f"  fill: off ({fill['source']}: {fill['note']})" if fill["source"] else None
+    tiers = " ".join(f"{t}={report['promoted'][t]}/{report['candidates'][t]}" for t in FILL_TIERS)
+    share = 100 * after["listing_chars"] / after["budget_chars"] if after["budget_chars"] else 0.0
+    return (f"  fill: fraction={fill['fraction']} ({fill['source']}) limit={report['limit_chars']} chars; "
+            f"described by fill={report['promoted_total']} ({tiers}); "
+            f"estimated listing={after['listing_chars']}/{after['budget_chars']} chars "
+            f"({share:.1f}% of budget)")
+
+
 def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: dict[str, Any],
-              recent_days: int, context_tokens: int) -> list[str]:
+              recent_days: int, context_tokens: int, fill: dict[str, Any] | None = None) -> list[str]:
     counts: dict[str, int] = {}
-    reasons = {"core": 0, "recent": 0, "over": 0}
+    reasons = {"core": 0, "recent": 0, "fill": 0, "over": 0}
     for d in result["decisions"]:
         counts[d["decision"]] = counts.get(d["decision"], 0) + 1
         if d["decision"] == "keep":
-            reasons["core" if d["reason"] == "core" else "recent"] += 1
+            reasons[keep_kind(d["reason"])] += 1
         elif d["reason"].startswith(REASON_OVER_BUDGET):
             reasons["over"] += 1
+    report = result.get("fill")
+    filled = f" fill={reasons['fill']}" if report is not None else ""
     lines = [
         f"skill-listing-policy {cmd}: skills={len(result['decisions'])} "
-        f"keep={counts.get('keep', 0)} (core={reasons['core']} recent<{recent_days}d={reasons['recent']}) "
+        f"keep={counts.get('keep', 0)} (core={reasons['core']} recent<{recent_days}d={reasons['recent']}{filled}) "
         f"name-only={counts.get(MANAGED_VALUE, 0)} (recent over budget={reasons['over']}) "
         f"operator={counts.get('operator', 0)} unlisted={counts.get('unlisted', 0)}",
         f"  owned entries: +{len(result['added'])} -{len(result['removed'])}; "
@@ -881,6 +1139,9 @@ def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: d
         f"  after: described chars={after['described_chars']} (core={after['core_desc_chars']}) "
         f"name-only chars={after['name_only_chars']} over_budget={str(after['over_budget']).lower()}",
     ]
+    line = fill_line(fill, report, after) if fill is not None else None
+    if line:
+        lines.append(line)
     warning = budget_warning(after)
     if warning:
         lines.append(f"  WARNING: {warning}")
@@ -900,13 +1161,16 @@ def print_plan(args: argparse.Namespace, claude_dir: Path, raw: bytes | None,
             "removed": result["removed"], "operator": sorted(result["operator"]),
             "budget_action": result["budget_action"], "before": before, "after": after,
             "warning": budget_warning(after),
+            "fill": {"enabled": result["fill"] is not None, "fraction": args.fill["fraction"],
+                     "source": args.fill["source"], "note": args.fill["note"],
+                     **(result["fill"] or {})},
             "changed": render(result["settings"]) != raw,
         }, indent=2, ensure_ascii=False))
         return
     if not args.summary:
         for d in result["decisions"]:
             print(f"{d['decision']:<9} {d['skill']}  [{d['reason']}]")
-    for line in summarize("plan", result, before, after, args.days, args.context_tokens):
+    for line in summarize("plan", result, before, after, args.days, args.context_tokens, args.fill):
         print(line)
     print(f"  context window: {args.context_tokens // 1000}k ({args.context_source})")
 
@@ -949,12 +1213,21 @@ def run(args: argparse.Namespace) -> int:
         print(f"skill-listing-policy: disabled by {why}; nothing changed")
         return 0
     resolve_context_tokens(args, settings_path)
+    # release only removes what this tool owns; the fill switch is not consulted.
+    off = {"fraction": None, "source": None, "note": None}
+    args.fill = off if cmd == "release" else resolve_fill(args.fill_budget_fraction, claude_dir)
+    if args.fill["note"] and args.fill["note"] != "off":
+        print(f"skill-listing-policy: fill mode off — {args.fill['source']}: {args.fill['note']}",
+              file=sys.stderr)
 
     # release needs no core list: it only removes what this tool owns.
     core = [] if cmd == "release" else load_core(resolve_core_path(args.core))
     now = now_utc()
     recent = recent_usage(state_dir, now - timedelta(days=args.days))
     skills = discover_skills(claude_dir / "skills")
+    fill = None
+    if args.fill["fraction"] is not None:
+        fill = {"fraction": args.fill["fraction"], "order": fill_order(skills, state_dir)}
 
     def evaluate() -> tuple[bytes | None, dict[str, Any] | None, dict[str, Any] | None]:
         raw, settings = load_settings(settings_path)
@@ -962,7 +1235,7 @@ def run(args: argparse.Namespace) -> int:
             return None, None, None
         result = compute(settings, load_state(state_dir / STATE_FILE), skills, core, recent,
                          args.budget_fraction, release=(cmd == "release"),
-                         context_tokens=args.context_tokens)
+                         context_tokens=args.context_tokens, fill=fill)
         return raw, settings, result
 
     if cmd == "plan":
@@ -983,7 +1256,7 @@ def run(args: argparse.Namespace) -> int:
     if not args.quiet:
         before = estimate(settings, skills, args.context_tokens, set(core))
         after = estimate(result["settings"], skills, args.context_tokens, set(core))
-        for line in summarize(cmd, result, before, after, args.days, args.context_tokens):
+        for line in summarize(cmd, result, before, after, args.days, args.context_tokens, args.fill):
             print(line)
         print(f"  context window: {args.context_tokens // 1000}k ({args.context_source})")
     return 0
@@ -1041,10 +1314,17 @@ def main(argv: list[str] | None = None) -> int:
                             "4.6+ — else from the bridge ANTHROPIC_MODEL (env, then the bridge "
                             "systemd unit), else 200000)")
         p.add_argument("--quiet", action="store_true", help="apply/release: one status line only")
+        if name != "release":
+            p.add_argument(FILL_FLAG, type=fraction, default=None, metavar="F",
+                           help="fill mode (#2748, default off): also describe not-recently-used "
+                                "skills while the estimated listing stays within F x budget, "
+                                f"0 < F <= 1 (default: env {FILL_ENV}, else the first non-comment line of "
+                                f"<claude-dir>/{FILL_FILE}, else off)")
         if name == "plan":
             p.add_argument("--summary", action="store_true", help="omit per-skill decision lines")
             p.add_argument("--json", action="store_true", help="machine-readable plan")
     args = parser.parse_args(argv)
+    args.fill_budget_fraction = getattr(args, "fill_budget_fraction", None)
     args.env_context_tokens = defaults["context_tokens"]
     args.context_source = "--context-tokens"
     try:

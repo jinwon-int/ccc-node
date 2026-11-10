@@ -24,6 +24,7 @@ For every `~/.claude/skills/<dir>/SKILL.md` (skills with
 | name in the core list (`claude/skill-listing-core.txt`) | description kept (no entry) |
 | used within the last 30 days (`--days`, `CCC_SKILL_LISTING_RECENT_DAYS`) and it fits the budget | description kept (no entry) |
 | used within the last 30 days but does not fit (`recent, over budget`) | `skillOverrides[<name>] = "name-only"` |
+| anything else, fill mode on and it fits `F × budget` ([fill mode](#fill-mode-2748-default-off)) | description kept (no entry) |
 | anything else | `skillOverrides[<name>] = "name-only"` |
 
 "Used" means a record in `state/skill-usage/usage.jsonl` (Skill tool or a Read
@@ -71,6 +72,100 @@ recent skills name-only'd that would have fit. The decision depends only on the 
 budget grew, a more recent skill aged out) gets its policy-owned entry removed.
 `release` removes every policy-owned entry, including these.
 
+### Fill mode (#2748, default off)
+
+The rules above describe only core and recently used skills, however much of
+the budget is left. On a node with a 1M window that is most of it (measured
+2026-11-10: 310 skills, 21 described, 19,321 of 80,000 chars — 24%). A
+name-only skill is rarely picked, so it never becomes "recently used" and
+stays name-only; a freshly installed skill never gets its first use.
+
+Fill mode spends part of the free budget on the "anything else" group. With a
+fill fraction `F` (`0 < F ≤ 1`) the policy, after the recent-skill fit,
+describes more skills while the estimated listing stays at or below
+`F × budget` (`int(F × budget chars)`). Candidates are taken in this order:
+
+| Tier | Which skills | Order inside the tier |
+|---|---|---|
+| 1 `autosave-unused` | node-local autosave-managed skills (`.autosave-meta.json` naming the autosave manager and the skill's directory) with no recorded Skill-tool use | name |
+| 2 `fleet` | fleet-managed skills (`.ccc-fleet-skill.json` written by the fleet-skills sync) | most recently installed/updated first, then name |
+| 3 `other` | everything else | name |
+
+- "No recorded use" is the evidence the promotion usage gate counts: a
+  `use_count` above 0 in the `claude:` lane of `state/skill-autosave-usage.json`
+  or a `Skill` row in `state/skill-usage/usage.jsonl`, at any time. A Read of
+  the `SKILL.md` is a view, not a use. These drafts need a first use before
+  they can be promoted, which is why they go first.
+- "Installed/updated" is a proxy: the mtime of the skill's fleet marker. The
+  fleet-skills sync writes the marker when it installs or updates a skill and
+  keeps the mtime on a commit-only refresh, so it is the install time of the
+  current version on this node (the same reading `ccc-skill-usage-report.py`
+  uses). It is not the fleet approval date; after a full reinstall every
+  marker is equally new and the tier falls back to name order.
+- A skill that carries both markers is `fleet` (a fleet-adopted draft is no
+  longer waiting for the promotion gate). A missing, malformed or foreign
+  marker only moves a skill to tier 3.
+- Filling stops at the first candidate that would cross the limit; it does not
+  skip ahead to a smaller one, so a lower-ranked skill is never described
+  while a higher-ranked one is not.
+- Fill never competes with recently used skills: they are fitted against the
+  full budget first, and when any of them is `recent, over budget`, fill
+  describes nothing.
+- Operator entries are never candidates and are never modified.
+
+Fill mode writes nothing new into `settings.json`. A filled skill simply gets
+no `skillOverrides` entry, and a policy-owned `"name-only"` entry for it is
+removed; the policy still never writes `"on"`, `"off"` or any other value. No
+fill state is stored — the decision depends only on the inputs, so a second
+`apply` is a no-op, and `release` works exactly as before (it does not read
+the fill switch).
+
+**Turning it on.** The first source that is present decides:
+
+1. `--fill-budget-fraction F` (`plan` / `apply`);
+2. env `CCC_SKILL_LISTING_FILL_FRACTION=F`;
+3. the node-local file `~/.claude/skill-listing-policy.fill`, whose first
+   non-empty, non-comment (`#`) line is `F`. This is the persistent per-node
+   switch: `setup.sh` and the daily cron entry run `apply --quiet` unchanged
+   and pick it up.
+
+```bash
+python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --summary --fill-budget-fraction 0.5   # preview, read-only
+echo 0.5 > ~/.claude/skill-listing-policy.fill                                                  # enable on this node
+python3 ~/.claude/hooks/ccc-skill-listing-policy.py apply
+rm ~/.claude/skill-listing-policy.fill && python3 ~/.claude/hooks/ccc-skill-listing-policy.py apply   # back to the default
+```
+
+`0` / `off` / `false` / `no` in the env or the file means off (the env value
+turns a file-enabled fill off for one run). Any other unusable value there —
+not a number, outside `(0, 1]`, an empty or oversized file — is ignored: fill
+is off, the result is exactly the default one, and a warning goes to stderr
+(`fill mode off — <source>: invalid value ignored …`); it does not fall
+through to the next source. An invalid `--fill-budget-fraction` is a usage
+error (exit 2, nothing written). With no switch present the decisions, the
+written `settings.json` and the text output are the same as before fill mode
+existed. Turning fill off brings back the same entries; the ones that are
+re-added are appended, so only the key order inside `skillOverrides` may
+differ from before.
+
+When fill is on, `plan` / `apply` add `fill=<n>` to the `keep=` breakdown and
+print one more line (illustrative numbers):
+
+```
+  fill: fraction=0.5 (file ~/.claude/skill-listing-policy.fill) limit=40000 chars; described by fill=70 (autosave-unused=4/4 fleet=66/250 other=0/15); estimated listing=39817/80000 chars (49.8% of budget)
+```
+
+Each tier shows `described by fill / candidates`. Per-skill lines read
+`keep <name> [fill: <tier>]`. `plan --json` carries the same under `fill`
+(`enabled`, `fraction`, `source`, `note`, and when enabled `limit_chars`,
+`promoted`, `candidates`, `promoted_total`).
+
+**Cost.** Every description is injected into every session. At an average of
+~325 chars a description, 50% of an 80,000-char budget is about 70 more
+described skills and roughly 5K more tokens per session; 80% is about 11K
+more. Start low, and compare first uses of non-core skills with the mode on
+and off before raising it.
+
 A `name-only` skill is still listed and still invocable by name
 (`/<name>` or the Skill tool); it just costs no description budget. The policy
 **never writes `"off"`** and never deletes or moves a skill — retirement stays
@@ -109,6 +204,7 @@ keys would win, as for `model`/`env`), then runs the policy.
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan            # read-only, per-skill decisions + estimate
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --json
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py apply           # idempotent
+python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --summary --fill-budget-fraction 0.5   # preview fill mode (#2748)
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py release         # remove every policy-owned entry
 ```
 
@@ -142,7 +238,7 @@ closed (exit 2, nothing written).
 
 Kill switch: `CCC_SKILL_LISTING_POLICY=0` or the file
 `~/.claude/skill-listing-policy.disabled` makes `apply` a no-op; follow with
-`release` to undo what it wrote.
+`release` to undo what it wrote. The kill switch wins over the fill switch.
 
 ## Core list
 
