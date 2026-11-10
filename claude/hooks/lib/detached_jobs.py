@@ -302,33 +302,43 @@ def load_records(path: str) -> List[Dict[str, Any]]:
         if not unit:
             continue
         prior = merged.get(unit)
-        if prior:
+        if prior and "log" not in rec:
             # An ack is a partial record; merge so it cannot erase the log path.
             merged_rec = dict(prior)
             merged_rec.update(rec)
             merged[unit] = merged_rec
         else:
+            # A registration (it names the log) starts a new run of the unit:
+            # nothing from the previous run carries over (#2740). Merging it
+            # left the earlier ``acked: true`` in place, so a re-run of an
+            # acknowledged unit was hidden from every sweep, and ``scope``,
+            # ``scheduled_at`` and ``notify_on_exit`` leaked the same way.
             merged[unit] = rec
     return list(merged.values())
 
 
-def read_exit_marker(log_path: str) -> Optional[int]:
+def read_exit_marker(log_path: str, start_offset: int = 0) -> Optional[int]:
     """Return the exit code from the last ``EXIT=<n>`` line, else None.
 
     Only the tail is read: these logs can be large, and the marker the skill
     writes is always appended last. A non-integer payload counts as "a marker
     exists but its code is unreadable", reported as -1 rather than swallowed,
     because a malformed marker still proves the job stopped.
+
+    ``start_offset`` (#2740) is the ``log_offset`` a registration recorded
+    when the log already held a marker from an earlier run: only bytes written
+    after it are read. A log now shorter than the offset was truncated or
+    replaced and is read whole.
     """
     if not log_path:
         return None
     try:
         size = os.path.getsize(log_path)
+        start = int(start_offset) if 0 < int(start_offset or 0) <= size else 0
         with open(log_path, "rb") as handle:
-            if size > 8192:
-                handle.seek(-8192, os.SEEK_END)
+            handle.seek(max(start, size - 8192, 0))
             tail = handle.read().decode("utf-8", "ignore")
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
     code: Optional[int] = None
     for line in tail.splitlines():
@@ -376,10 +386,37 @@ def unit_is_active(unit: str, *, suffix: str = ".service", user: bool = False) -
     return proc.stdout.decode("utf-8", "ignore").strip() == "active"
 
 
+def marker_baseline(log_path: str, unit: str, *, user: bool = False, scheduled: bool = False) -> int:
+    """``log_offset`` for a new registration: where this run's output starts (#2740).
+
+    The recipe appends to the log, so a re-run under the same unit name and
+    log finds the previous run's ``EXIT=`` line still in the tail, and that
+    line used to be read as the new run's result. The offset is non-zero only
+    when that old marker provably is not this run's:
+
+    - a ``schedule``d job has not started yet, so any marker is older;
+    - otherwise the unit must be running right now. With the unit not running
+      the marker may be this run's own (a job that finished before it was
+      registered), so it is accepted as before.
+    """
+    if not log_path or read_exit_marker(log_path) is None:
+        return 0
+    if not scheduled and not unit_is_active(unit, user=user):
+        return 0
+    try:
+        return int(os.path.getsize(log_path))
+    except OSError:
+        return 0
+
+
 def classify_one(rec: Dict[str, Any], *, now: Optional[float] = None) -> Tuple[str, Optional[int]]:
     """Return (state, exit_code). exit_code is None unless state is done."""
     log_path = str(rec.get("log") or "")
-    code = read_exit_marker(log_path)
+    try:
+        offset = int(rec.get("log_offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    code = read_exit_marker(log_path, offset)
     if code is not None:
         return STATE_DONE, code
     age = _log_age(log_path)
@@ -582,6 +619,9 @@ def cmd_register(argv: List[str]) -> int:
         # A hand-made ``systemd-run --user`` unit (#2710): liveness must be
         # asked of the user manager, or the sweep calls it lost.
         rec["scope"] = SCOPE_USER
+    baseline = marker_baseline(rec["log"], unit, user=rec.get("scope") == SCOPE_USER)
+    if baseline:
+        rec["log_offset"] = baseline
     plan = wait_plan(expect_seconds)
     if expect_seconds is not None:
         rec["expect_seconds"] = int(expect_seconds)
@@ -598,7 +638,8 @@ def cmd_register(argv: List[str]) -> int:
         return 0
     if plan["timeout_seconds"] is None:
         sys.stdout.write(f"hint: {plan['reason']}\n")
-    _arm_bridge_wait(unit, rec["log"], summary, timeout_seconds=plan["timeout_seconds"])
+    _arm_bridge_wait(unit, rec["log"], summary, timeout_seconds=plan["timeout_seconds"],
+                     log_offset=baseline)
     return rc
 
 
@@ -806,6 +847,9 @@ def cmd_schedule(argv: List[str]) -> int:
     if "--print" in opts or "--dry-run" in opts:
         sys.stdout.write(shlex.join(cmd) + "\n")
         return 0
+    # Measured before the timer exists: whatever marker the log holds now is
+    # from an earlier run (#2740).
+    baseline = marker_baseline(log_path, unit, user=user, scheduled=True)
     if not _launch_schedule(cmd, user=user):
         return 3
     rec: Dict[str, Any] = {
@@ -816,6 +860,8 @@ def cmd_schedule(argv: List[str]) -> int:
         "notify_on_exit": True,
         "tier": tier,
     }
+    if baseline:
+        rec["log_offset"] = baseline
     if user:
         rec["scope"] = SCOPE_USER
     if summary:
@@ -897,7 +943,8 @@ def _bridge_python() -> str:
     return ""
 
 
-def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds: Optional[int] = None) -> None:
+def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds: Optional[int] = None,
+                     log_offset: int = 0) -> None:
     """Best-effort: register the job as a bridge ``detached-job`` wait (ccc-node #2605).
 
     Inside a bridge turn this puts ``⏳ Running detached · <unit>`` on the
@@ -907,7 +954,9 @@ def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds:
     or when ``CCC_DETACHED_JOBS_NO_WAIT=1`` / ``--no-wait`` / ``--registry``
     is given, it does nothing; the job registry above is never affected.
     ``timeout_seconds`` (#2636) sizes the wait to the caller's expectation;
-    None keeps the bridge default.
+    None keeps the bridge default. ``log_offset`` (#2740) is always passed, so
+    the wait ignores exactly the markers this registry entry ignores — the
+    bridge cannot measure it for a ``--user`` unit.
     """
     if os.environ.get("CCC_DETACHED_JOBS_NO_WAIT", "").strip() in {"1", "true", "yes", "on"}:
         return
@@ -922,6 +971,7 @@ def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds:
         cmd += ["--summary", summary]
     if timeout_seconds is not None:
         cmd += ["--timeout-seconds", str(int(timeout_seconds))]
+    cmd += ["--log-offset", str(max(0, int(log_offset)))]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):

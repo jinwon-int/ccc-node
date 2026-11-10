@@ -214,5 +214,34 @@ ok "manually acked promise is not reported" '[ -z "$out" ]'
 out="$(python3 "$MOD" "$TMP/dropped_only.json")"
 ok "dropped section names the ack command" 'grep -q "external_wait_cli ack" <<<"$out"'
 
+# ---- #2740: a wake whose delivery gave up -----------------------------------
+# wake.state == "failed" had no reader: the owner was never notified and the
+# record then vanished at retention. It must surface here, under its own
+# heading ("the notice went out" would be untrue for it).
+w failed '{"f1":{"wait_id":"f1","state":"success","repo":"o/r","pr_number":21,"head_sha":"dddddddd44",
+  "summary":"merge when green","created_at":"2026-11-10T01:00:00Z",
+  "wake":{"state":"failed","attempts":10,"resumed":false,"skip_reason":"notify_failed"}}}'
+out="$(python3 "$MOD" "$TMP/failed.json")"
+ok "#2740 a wake that gave up is reported" 'grep -q "o/r#21" <<<"$out" && grep -q "skip: notify_failed" <<<"$out"'
+ok "#2740 it is listed under the undelivered heading, not the delivered one" \
+  'grep -q "알림조차 전달되지 못한 약속" <<<"$out" && ! grep -q "알림은 갔으나" <<<"$out"'
+ok "#2740 the undelivered heading names the ack command" 'grep -q "external_wait_cli ack" <<<"$out"'
+w failed_acked '{"f1":{"wait_id":"f1","state":"success","repo":"o/r","pr_number":21,"head_sha":"dddddddd44",
+  "created_at":"2026-11-10T01:00:00Z",
+  "wake":{"state":"failed","attempts":10,"resumed":true,"skip_reason":"notify_failed","manual_ack":{"at":"2026-11-10T02:00:00Z"}}}}'
+out="$(python3 "$MOD" "$TMP/failed_acked.json")"
+ok "#2740 an acknowledged gave-up wake is silent" '[ -z "$out" ]'
+w failed_legacy '{"f1":{"wait_id":"f1","state":"success","repo":"o/r","pr_number":21,
+  "wake":{"state":"failed","attempts":10}}}'
+out="$(python3 "$MOD" "$TMP/failed_legacy.json")"
+ok "#2740 a pre-fix failed record without resumed= is not guessed into an alarm" '[ -z "$out" ]'
+w both '{"d1":{"wait_id":"d1","state":"success","repo":"o/r","pr_number":30,"created_at":"2026-11-10T01:00:00Z",
+  "wake":{"state":"done","resumed":false,"skip_reason":"session_moved"}},
+ "f1":{"wait_id":"f1","state":"success","repo":"o/r","pr_number":31,"created_at":"2026-11-10T01:05:00Z",
+  "wake":{"state":"failed","attempts":10,"resumed":false,"skip_reason":"notify_failed"}}}'
+out="$(python3 "$MOD" "$TMP/both.json")"
+ok "#2740 delivered and undelivered drops are listed under separate headings" \
+  '[ "$(grep -c "알림은 갔으나\|알림조차" <<<"$out")" = 2 ] && grep -q "o/r#30" <<<"$out" && grep -q "o/r#31" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

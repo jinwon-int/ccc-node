@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from telegram_bot.core.external_wait import (
+    ACK_ACKED,
     TERMINAL_EXPIRED,
     TERMINAL_OWNER_CANCEL,
     TERMINAL_SUCCESS,
@@ -107,6 +108,66 @@ def test_wake_journal_gives_up_after_bounded_attempts(tmp_path: Path) -> None:
 
     assert registry.pending_wakes() == []
     assert registry.get(wait_id)["wake"]["state"] == "failed"
+
+
+def test_failed_delivery_schedules_the_retry_with_a_growing_delay(tmp_path: Path) -> None:
+    """#2740: ten attempts used to be spent on ten consecutive 5 s ticks."""
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+    wait_id = _register(registry)
+    registry.finish(wait_id, TERMINAL_SUCCESS, now=1_100.0)
+    assert [rec["wait_id"] for rec in registry.due_wakes(now=1_100.0)] == [wait_id]  # never tried: due
+
+    registry.mark_wake(wait_id, delivered=False, now=1_100.0)
+    assert registry.get(wait_id)["wake"]["next_attempt_epoch"] == 1_105.0
+    assert registry.due_wakes(now=1_104.9) == []
+    assert [rec["wait_id"] for rec in registry.due_wakes(now=1_105.0)] == [wait_id]
+    assert registry.pending_wakes()  # still owed, just not due
+
+    delays = [ExternalWaitRegistry.wake_retry_delay(n) for n in range(1, 10)]
+    assert delays == [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0, 900.0]
+    assert sum(delays) > 30 * 60  # the nine retries span half an hour, not 50 seconds
+    assert ExternalWaitRegistry.wake_retry_delay(500) == 900.0
+
+
+def test_giving_up_on_delivery_is_a_dropped_promise(tmp_path: Path) -> None:
+    """#2740: ``failed`` had no reader, so the wake vanished without a trace."""
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+    wait_id = _register(registry)
+    registry.finish(wait_id, TERMINAL_SUCCESS, now=1_100.0)
+    for _ in range(10):
+        registry.mark_wake(wait_id, delivered=False, now=1_100.0)
+
+    wake = registry.get(wait_id)["wake"]
+    assert (wake["state"], wake["attempts"], wake["resumed"], wake["skip_reason"]) == (
+        "failed", 10, False, "notify_failed",
+    )
+    assert "next_attempt_epoch" not in wake
+    assert registry.due_wakes(now=10**10) == []
+    assert [rec["wait_id"] for rec in registry.dropped_promises()] == [wait_id]
+    assert registry.acknowledge(wait_id, note="checked the PR by hand") == ACK_ACKED
+    assert registry.dropped_promises() == []
+
+
+def test_giving_up_keeps_the_reason_the_wake_already_carried(tmp_path: Path) -> None:
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+    wait_id = _register(registry)
+    registry.finish(wait_id, TERMINAL_SUCCESS, now=1_100.0)
+    for _ in range(10):
+        registry.mark_wake(wait_id, delivered=False, resumed=False, skip_reason="session_moved", now=1_100.0)
+    assert registry.get(wait_id)["wake"]["skip_reason"] == "session_moved"
+
+
+def test_a_restart_makes_an_owed_wake_due_at_once(tmp_path: Path) -> None:
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path))
+    wait_id = _register(registry)
+    registry.finish(wait_id, TERMINAL_SUCCESS, now=1_100.0)
+    for _ in range(8):
+        registry.mark_wake(wait_id, delivered=False, now=1_100.0)
+    assert registry.due_wakes(now=1_200.0) == []  # sitting out a 640 s delay
+
+    registry.reconcile_on_start(now=1_200.0)
+    assert [rec["wait_id"] for rec in registry.due_wakes(now=1_200.0)] == [wait_id]
+    assert registry.get(wait_id)["wake"]["attempts"] == 8  # the budget is not refilled
 
 
 def test_due_filters_monitoring_records_by_schedule(tmp_path: Path) -> None:

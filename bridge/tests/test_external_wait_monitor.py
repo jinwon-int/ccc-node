@@ -323,9 +323,12 @@ async def test_restart_recovery_repolls_and_drains_pending_wake(tmp_path: Path) 
     wait_id = registry.records()[0]["wait_id"]
     registry.mark_wake(wait_id, delivered=False)
     assert registry.pending_wakes()
+    assert registry.due_wakes() == []  # the failed attempt scheduled a retry (#2740)
 
     recorder = Recorder()
     recovered = _monitor(registry, FakeTransport([]), recorder, clock)
+    # A fresh process retries at once instead of sitting out the old delay.
+    registry.reconcile_on_start()
     await recovered._tick()  # drains without re-polling GitHub
 
     assert len(recorder.notifications) == 1
@@ -482,10 +485,35 @@ async def test_notifier_failure_retries_until_delivered(tmp_path: Path) -> None:
     assert recorder.resumes == []
 
     recorder.fail_notify = False
+    await monitor._tick()  # same instant: the retry delay has not passed (#2740)
+    assert recorder.notifications == []
+    clock.advance(10)
     await monitor._tick()
     assert len(recorder.notifications) == 1
     assert len(recorder.resumes) == 1
     assert registry.pending_wakes() == []
+
+
+@pytest.mark.anyio
+async def test_a_one_minute_outage_does_not_use_up_the_wake(tmp_path: Path) -> None:
+    """#2740: 5 s ticks without a retry delay burned all ten attempts in under a minute."""
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    recorder = Recorder(fail_notify=True)
+    monitor = _monitor(registry, FakeTransport([PrState("abc1234", "success")]), recorder, clock)
+
+    for _ in range(13):  # a 60-second outage at the monitor's 5 s tick
+        await monitor._tick()
+        clock.advance(5)
+    wake = registry.records()[0]["wake"]
+    assert wake["state"] == "pending"
+    assert wake["attempts"] == 4  # at 0, 5, 15 and 35 s; the next is due at 75 s
+
+    recorder.fail_notify = False
+    clock.advance(60)
+    await monitor._tick()
+    assert len(recorder.notifications) == 1 and len(recorder.resumes) == 1
+    assert registry.pending_wakes() == [] and registry.dropped_promises() == []
 
 
 def test_notification_and_prompt_texts_are_body_free() -> None:

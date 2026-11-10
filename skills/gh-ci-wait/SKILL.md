@@ -182,6 +182,13 @@ continuation never ran. Each entry carries a `skip_reason`. Branch on it:
   blindly. Inspect the live registry with `... external_wait_cli list` and
   confirm the route metadata is restorable first. Re-registering onto a broken
   route reproduces the same drop.
+- `notify_failed` — listed under its own heading, **`⚠ 알림조차 전달되지 못한`**:
+  the result was known but the notification could not be delivered (about 36
+  minutes of retries with growing delays, then it gave up), so the owner saw
+  nothing and nothing continued. Treat it like `session_moved`: read the
+  **current** state of the PR, run or job, act on it, and tell the owner what
+  happened — they were never told. Then close the row with `ack`. Do not
+  re-register a wait for something that already finished.
 - **Already fulfilled** (an earlier session did the promised step by hand) —
   verify the evidence (merge commit, branch deleted, result comment), then close
   the row with `... external_wait_cli ack <wait_id> --note "<evidence id>"`. It

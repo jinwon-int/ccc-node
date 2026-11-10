@@ -131,7 +131,7 @@
       "name": "bridge-safe-detached-run",
       "source": "skills/bridge-safe-detached-run",
       "status": "active",
-      "tree_sha256": "cbc31448afcc2382718d5c45d1d2b7f15824344c0433fcaff1c2c09126a999df"
+      "tree_sha256": "98e612341b94e041049f37d6628e545cc67f1924a7c86b9ecec68f4fc5d28d33"
     },
     {
       "audience": "claude",
@@ -263,7 +263,7 @@
       "name": "gh-ci-wait",
       "source": "skills/gh-ci-wait",
       "status": "active",
-      "tree_sha256": "3a0f1e1b244a1e5680332766b93ebbc41149dd1e295c4769db5063d0519976cc"
+      "tree_sha256": "73a90ec9d89f27b3b1e679eb56a5c6babb44bdc28db9b788370456413d6fa124"
     },
     {
       "audience": "claude",

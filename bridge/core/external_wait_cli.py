@@ -128,6 +128,7 @@ from telegram_bot.core.external_wait import (
 from telegram_bot.core.external_wait_monitor import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
+    detached_log_baseline,
 )
 
 RC_OK = 0
@@ -328,6 +329,18 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
         log_path = validate_log_path(args.get("log") or args.get("log_path"))
         summary = validate_summary(args.get("summary"))
         timeout = float(args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        # #2740: an EXIT marker left by an earlier run of the same unit and
+        # log must not end this wait. The caller may pass the baseline it
+        # measured (detached_jobs.py knows the unit's scope); otherwise it is
+        # measured here: the current log size when the log already holds a
+        # marker while the unit is running, else 0.
+        raw_offset = args.get("log_offset")
+        if raw_offset is None:
+            log_offset = detached_log_baseline(log_path, unit)
+        else:
+            log_offset = int(raw_offset)
+            if log_offset < 0:
+                raise ValueError("log_offset")
     except ExternalWaitValidationError as exc:
         _emit({"ok": False, "code": "validation", "message": str(exc)})
         return RC_USAGE
@@ -353,6 +366,7 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
         unit=unit,
         log_path=log_path,
         notify_only=notify_only,
+        log_offset=log_offset,
     )
     if not wait_id:
         _emit({"ok": False, "code": "registry-error"})
@@ -373,6 +387,7 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
             "wait_id": wait_id,
             "unit": unit,
             "log_path": log_path,
+            "log_offset": log_offset,
             "timeout_seconds": int(timeout),
             "source": SOURCE_DETACHED_JOB,
             "notify_only": notify_only,
