@@ -23,16 +23,26 @@ jobs:
           if [ "${{ matrix.variant }}" = main ]; then git show origin/main:bridge/start.sh > bridge/start.sh; fi
           sed -i '/^_token_lock_refuse()/!s/_token_lock_refuse/{ echo "why@$LINENO pid=$(cat "$TOKEN_LOCK_FILE" 2>\/dev\/null) id=$(find "$TOKEN_LOCK_FILE.d" -maxdepth 0 -printf %i:%C@ 2>\/dev\/null) seen=${seen:-} self=$BASHPID"; _token_lock_refuse; }/' bridge/start.sh
           grep -c 'why@' bridge/start.sh; bash -n bridge/start.sh
+          bash --version | head -1
+          old='if acquire_token_lock "$BASHPID" >"$TMP/$name.$BASHPID.out" 2>&1; then'
+          new='if { PS4='"'"'+$BASHPID:$LINENO: '"'"'; set -x; acquire_token_lock "$BASHPID"; rc_=$?; set +x; echo "rc=$rc_"; [ "$rc_" = 0 ]; } >"$TMP/$name.$BASHPID.out" 2>\&1; then'
+          grep -cF "$old" bridge/start-lib.test.sh
+          python3 - "$old" "$new" <<'PY'
+          import sys
+          p='bridge/start-lib.test.sh'; s=open(p).read(); o,n=sys.argv[1],sys.argv[2].replace('\\&','&')
+          assert s.count(o)==1; open(p,'w').write(s.replace(o,n))
+          PY
+          grep -n 'PS4=' bridge/start-lib.test.sh
       - name: Loop start-lib.test.sh x15
         env:
           TMPDIR: ${{ runner.temp }}/ccc-tmp
         run: |
           mkdir -p "$TMPDIR"; set +e; fails=0
-          for i in $(seq 1 15); do
+          for i in $(seq 1 10); do
             out="$(TMPDIR=$(mktemp -d) bash bridge/start-lib.test.sh 2>&1)"
             sum="$(grep -E 'PASS=' <<<"$out" | tail -1)"
             bad="$(grep -E '^FAIL: \[mkdir\] concurrent' <<<"$out")"
             echo "run $i: $sum"
-            if [ -n "$bad" ]; then fails=$((fails+1)); grep -E '^FAIL|^diag ' <<<"$out"; fi
+            if [ -n "$bad" ]; then fails=$((fails+1)); grep -E '^FAIL|^diag r-mkdir' <<<"$out" | cut -c1-3000; fi
           done
-          echo "VARIANT=${{ matrix.variant }} race-fail-runs=$fails/15"
+          echo "VARIANT=${{ matrix.variant }} race-fail-runs=$fails/10"
