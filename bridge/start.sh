@@ -1202,8 +1202,14 @@ _token_lock_refuse() {
 # token: the foreground bot after exec, or the daemon supervisor). Returns 0
 # with the claim held for this process's lifetime, 1 (after printing why) when
 # another live instance holds it. Never falls through to a shared claim.
+# Inode + ctime of the mkdir-tier claim dir; empty when it is missing or find
+# lacks -printf. ctime tells a recreated dir apart even if the inode is reused.
+_token_lock_dir_id() { # <dir>
+    find "$1" -maxdepth 0 -printf '%i:%C@' 2>/dev/null || true
+}
+
 acquire_token_lock() { # <pid>
-    local pid="$1" flock_bin lock_dir reclaim
+    local pid="$1" flock_bin lock_dir reclaim seen
     init_token_lock
     flock_bin="${CCC_FLOCK_CLI:-$(command -v flock || true)}"
     if [ -n "$flock_bin" ] && [ -f "$flock_bin" ] && [ -x "$flock_bin" ]; then
@@ -1246,6 +1252,12 @@ acquire_token_lock() { # <pid>
     lock_dir="$TOKEN_LOCK_FILE.d"
     reclaim="$lock_dir.reclaim"
     if ! mkdir "$lock_dir" 2>/dev/null; then
+        # Identity of the claim we lost to. If it is replaced while we wait,
+        # a new claimant owns the fresh dir and may not have recorded its pid
+        # yet, so the pid file still names the dead holder; reclaiming then
+        # would let two contenders win (#2738). An unknown identity (no
+        # find -printf) keeps the previous behaviour.
+        seen="$(_token_lock_dir_id "$lock_dir")"
         sleep 1
         is_token_locked && { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
         if [ -d "$reclaim" ] && [ -n "$(find "$reclaim" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
@@ -1253,8 +1265,9 @@ acquire_token_lock() { # <pid>
         fi
         mkdir "$reclaim" 2>/dev/null || { TOKEN_LOCK_HELD=""; _token_lock_refuse; return 1; }
         # Re-check under the token: a reclaimer that finished between our
-        # first check and this point recorded its pid before releasing it.
-        if is_token_locked; then
+        # first check and this point recorded its pid before releasing it,
+        # and a replaced claim dir belongs to someone else.
+        if is_token_locked || [ "$(_token_lock_dir_id "$lock_dir")" != "$seen" ]; then
             rmdir "$reclaim" 2>/dev/null || true
             TOKEN_LOCK_HELD=""
             _token_lock_refuse

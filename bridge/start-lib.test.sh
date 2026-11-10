@@ -239,6 +239,13 @@ race() { # <name> <n> — n contenders released together; winners append their p
   done
   sleep 0.3; touch "$TMP/$name.go"; wait
 }
+race_diag() { # <name> — on a miscount, print who won and what each contender saw (#2738)
+  local name="$1" n
+  n="$(wc -l < "$TMP/$name.winners" 2>/dev/null || echo 0)"
+  [ "$n" -eq 1 ] && return 0
+  printf 'diag %s: winners=[%s] pidfile=[%s]\n' "$name" \
+    "$(tr '\n' ' ' < "$TMP/$name.winners" 2>/dev/null)" "$(cat "$TOKEN_LOCK_FILE" 2>/dev/null)" >&2
+}
 
 # Tiers: util-linux flock(1); python fcntl on the same inherited fd (Termux
 # without util-linux); mkdir claim dir (no flock AND no python3). The same seam
@@ -281,12 +288,62 @@ for lock_mode in flock python mkdir; do
     '[ "$(wc -l < "$TMP/r-$lock_mode.winners")" -eq 1 ]'
   ok "[$lock_mode] the recorded pid is the winner's" \
     '[ "$(cat "$TOKEN_LOCK_FILE")" = "$(cat "$TMP/r-$lock_mode.winners")" ]'
+  race_diag "r-$lock_mode"
   ( cleanup_token_lock )
   race "q-$lock_mode" 5
   ok "[$lock_mode] concurrent launch from a clean state: exactly one of five wins" \
     '[ "$(wc -l < "$TMP/q-$lock_mode.winners")" -eq 1 ]'
+  race_diag "q-$lock_mode"
 done
 PATH="$LOCK_TEST_PATH"
+
+# #2738: a contender that lost its first mkdir to a dead holder's claim must not
+# reclaim a claim dir that was REPLACED while it waited. The replacement belongs
+# to a new claimant that may not have recorded its pid yet, so the pid file
+# still names the dead holder; deleting the dir let two contenders win (seen
+# once in a 26.04 merge-group run). A `sleep` stub parks the contender inside
+# its wait so the swap happens at exactly that point, without timing margins.
+swap_bin="$TMP/bin-swap"; mkdir -p "$swap_bin"
+for tool in cat mkdir rm mv rmdir find seq touch wc grep; do
+  ln -s "$(command -v "$tool")" "$swap_bin/$tool"
+done
+write_exec_stub "$swap_bin/sleep" <<'STUB'
+if [ "$1" = 1 ] && [ ! -e "$CCC_TEST_SWAP_SIGNAL" ]; then
+  : > "$CCC_TEST_SWAP_SIGNAL"
+  while [ ! -e "$CCC_TEST_SWAP_GO" ]; do "$CCC_TEST_REAL_SLEEP" 0.05; done
+  exit 0
+fi
+exec "$CCC_TEST_REAL_SLEEP" "$@"
+STUB
+export CCC_TEST_SWAP_SIGNAL="$TMP/swap.waiting" CCC_TEST_SWAP_GO="$TMP/swap.go"
+export CCC_TEST_REAL_SLEEP; CCC_TEST_REAL_SLEEP="$(command -v sleep)"
+rm -rf "$lock_root"; mkdir -p "$lock_root"
+mkdir "$TOKEN_LOCK_FILE.d"
+( exit 0 ) & swap_dead_pid=$!; wait "$swap_dead_pid"
+printf '%s\n' "$swap_dead_pid" > "$TOKEN_LOCK_FILE"
+export CCC_FLOCK_CLI="$TMP/no-such-flock"
+PATH="$swap_bin"
+( acquire_token_lock "$BASHPID" >"$TMP/swap.out" 2>&1; echo $? > "$TMP/swap.rc" ) &
+swap_contender=$!
+PATH="$LOCK_TEST_PATH"
+wait_for_file "$CCC_TEST_SWAP_SIGNAL"
+rm -rf "$TOKEN_LOCK_FILE.d"; mkdir "$TOKEN_LOCK_FILE.d"  # new claimant, pid not yet written
+touch "$CCC_TEST_SWAP_GO"
+wait "$swap_contender"
+ok "[mkdir] a claim replaced during the wait is not reclaimed (#2738)" \
+  '[ "$(cat "$TMP/swap.rc")" = 1 ] && [ "$(cat "$TOKEN_LOCK_FILE")" = "$swap_dead_pid" ] && [ ! -e "$TOKEN_LOCK_FILE.d.reclaim" ]'
+rm -f "$CCC_TEST_SWAP_SIGNAL" "$CCC_TEST_SWAP_GO"
+# The same unchanged stale claim is still reclaimed (no false refusal).
+PATH="$swap_bin"
+( acquire_token_lock "$BASHPID" >"$TMP/swap2.out" 2>&1; echo $? > "$TMP/swap2.rc" ) &
+swap_contender=$!
+PATH="$LOCK_TEST_PATH"
+wait_for_file "$CCC_TEST_SWAP_SIGNAL"
+touch "$CCC_TEST_SWAP_GO"
+wait "$swap_contender"
+ok "[mkdir] an unchanged stale claim is still reclaimed after the wait" \
+  '[ "$(cat "$TMP/swap2.rc")" = 0 ] && [ "$(cat "$TOKEN_LOCK_FILE")" != "$swap_dead_pid" ]'
+unset CCC_FLOCK_CLI CCC_TEST_SWAP_SIGNAL CCC_TEST_SWAP_GO CCC_TEST_REAL_SLEEP
 ok "mkdir tier announces itself" 'grep -q "flock unavailable; using mkdir fallback" "$TMP/h-mkdir.out"'
 ok "flock and python tiers are silent about the fallback" \
   '! grep -q "mkdir fallback" "$TMP/h-flock.out" "$TMP/h-python.out"'
