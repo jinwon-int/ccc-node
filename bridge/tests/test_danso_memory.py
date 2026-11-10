@@ -275,7 +275,15 @@ async def test_loader_environment_does_not_inherit_credentials_or_native_home(me
 async def test_interrupt_reaps_real_materializer_and_loader(memory_settings,tmp_path,monkeypatch,cancel):
     pidfile=tmp_path/'loader-pid'
     loader=tmp_path/'hanging.py'
-    loader.write_text(f"import os,time\nfrom pathlib import Path\nPath({str(pidfile)!r}).write_text(str(os.getpid()))\ntime.sleep(30)\n")
+    # Publish the pid atomically (#2731): write_text creates the file before it
+    # writes the body, so a reader polling exists() could see an empty pidfile.
+    loader.write_text(
+        "import os,time\nfrom pathlib import Path\n"
+        f"tmp=Path({str(pidfile)+'.tmp'!r})\n"
+        "tmp.write_text(str(os.getpid()))\n"
+        f"os.replace(tmp,{str(pidfile)!r})\n"
+        "time.sleep(30)\n"
+    )
     monkeypatch.setenv('CCC_CODEX_MEMORY_LOADER',str(loader))
     session=await build_danso_runtime(memory_settings).start_or_resume(request(memory_settings,route(memory_settings)))
     async def collect(): return [e async for e in session.send_turn('synthetic')]
