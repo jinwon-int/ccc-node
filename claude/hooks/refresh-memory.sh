@@ -52,19 +52,23 @@ bytes_for() { [ -f "$1" ] && wc -c < "$1" | tr -d '[:space:]' || printf '0'; }
 # Non-blocking single-flight lock: if a refresh is already running, exit.
 # util-linux flock is absent on some nodes (Termux); a bare `flock` there
 # exits 127 and this hook never refreshed, pinning the cache stale (#1480).
-# Without it an atomic mkdir lock stands in: released on exit, reclaimed when
-# a dead holder left it behind (a kernel flock releases on death; a dir does not).
+# Without it an exclusive-create lock stands in: released on exit, reclaimed
+# when a dead holder left it behind (a kernel flock releases on death; a lock
+# file does not). The create is bash noclobber (O_CREAT|O_EXCL), not mkdir(1):
+# Ubuntu 26.04's uutils mkdir let concurrent creators of one path all succeed
+# (#2749). The ".d" path is kept; a directory left by an older hook blocks the
+# create until it is stale, like any held lock.
 FLOCK_BIN="${CCC_FLOCK_CLI:-$(command -v flock || true)}"
 if [ -n "$FLOCK_BIN" ] && [ -f "$FLOCK_BIN" ] && [ -x "$FLOCK_BIN" ]; then
   exec 9>"$CACHE/.refresh.lock"
   "$FLOCK_BIN" -n 9 || exit 0
 else
   LOCK_DIR="$CACHE/.refresh.lock.d"
-  if [ -d "$LOCK_DIR" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [ -e "$LOCK_DIR" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+    rm -rf "$LOCK_DIR"
   fi
-  mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+  ( set -C; : > "$LOCK_DIR" ) 2>/dev/null || exit 0
+  trap 'rm -f "$LOCK_DIR"' EXIT
   printf 'refresh lock: flock unavailable; using mkdir fallback\n'
 fi
 

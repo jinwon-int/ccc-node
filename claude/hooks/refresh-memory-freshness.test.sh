@@ -147,8 +147,8 @@ lockdir="$cache/.refresh.lock.d"
 out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "no flock: refresh still runs its body via the mkdir fallback" \
   '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ]'
-ok "no flock: fallback is logged once and the lock dir is released on exit" \
-  '[ "$(grep -c "flock unavailable; using mkdir fallback" <<<"$out")" = 1 ] && [ ! -d "$lockdir" ]'
+ok "no flock: fallback is logged once and the lock is released on exit" \
+  '[ "$(grep -c "flock unavailable; using mkdir fallback" <<<"$out")" = 1 ] && [ ! -e "$lockdir" ]'
 mkdir -p "$lockdir"
 out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?
 ok "no flock: a live lock dir keeps the run single-flight" \
@@ -157,7 +157,34 @@ touch -d '-2 hours' "$lockdir"
 # shellcheck disable=SC2034  # out/rc are read via eval inside ok()
 { out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?; }
 ok "no flock: a stale lock dir from a dead holder is reclaimed" \
-  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ] && [ ! -d "$lockdir" ]'
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ] && [ ! -e "$lockdir" ]'
+# The lock is a file now (exclusive create); a held one keeps the run
+# single-flight, and a stale one is reclaimed like the legacy dir above.
+: > "$lockdir"
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+{ out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?; }
+ok "no flock: a held lock file keeps the run single-flight" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 0 ] && [ -f "$lockdir" ]'
+touch -d '-2 hours' "$lockdir"
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+{ out="$(CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?; }
+ok "no flock: a stale lock file is reclaimed" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 1 ] && [ ! -e "$lockdir" ]'
+# #2749: the fallback must not use mkdir(1) as its lock. Ubuntu 26.04's uutils
+# mkdir let concurrent creators of one path all succeed; model that with a
+# mkdir that reports success for the lock path: a held lock still wins.
+mkstub="$TMP/mkdir-always-ok"; mkdir -p "$mkstub"
+export CCC_TEST_REAL_MKDIR; CCC_TEST_REAL_MKDIR="$(command -v mkdir)"
+write_exec_stub "$mkstub/mkdir" <<'SH'
+for a in "$@"; do case "$a" in *.lock|*.lock.d) exit 0 ;; esac; done
+exec "$CCC_TEST_REAL_MKDIR" "$@"
+SH
+: > "$lockdir"
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+{ out="$(PATH="$mkstub:$PATH" CCC_FLOCK_CLI="$TMP/no-such-flock" CCC_WIKI_FORCE_REFRESH=1 run_refresh)"; rc=$?; }
+ok "no flock: a held lock wins even if mkdir(1) always succeeds (#2749)" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$WIKI_CALL_LOG")" = 0 ] && [ -f "$lockdir" ]'
+rm -f "$lockdir"
 
 echo "----"
 echo "PASS=$pass FAIL=$fail"

@@ -803,5 +803,27 @@ run_auto env CCC_SKILL_AUTOSAVE_MODE=auto CCC_SKILL_GATE_ROUTABLE=1 CCC_SKILL_AU
 ok "#2645: without a working python3 the gate reports unverifiable and the draft stays pending" \
   '[ -d "$PENDING/20260401-000004-route-unverif" ] && [ ! -e "$SKILLS/route-unverif/SKILL.md" ]'
 
+# --- #2749: the single-runner lock is an exclusive create, not mkdir(1) --------
+# Ubuntu 26.04's uutils mkdir let concurrent creators of one path all succeed.
+# `mkst` models that with a mkdir that reports success for the lock path; a
+# held lock must still make the run skip.
+lk="$STATE/.autoinstall.lock"
+mkst="$TMP/mkdir-always-ok"; mkdir -p "$mkst"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do case "$a" in *.lock) exit 0 ;; esac; done\nexec %q "$@"\n' \
+  "$(command -v mkdir)" > "$mkst/mkdir"
+chmod 700 "$mkst/mkdir"
+rm -rf "$lk"; : > "$lk"
+out="$(run_auto env PATH="$mkst:$PATH" CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "#2749: a held lock skips the run even if mkdir(1) always succeeds" \
+  'jq -e ".skipped == \"locked\"" >/dev/null <<<"$out" && [ -f "$lk" ]'
+touch -d '-10 minutes' "$lk"
+out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "#2749: a stale lock file is reclaimed and released" \
+  'jq -e ".skipped != \"locked\"" >/dev/null <<<"$out" && [ ! -e "$lk" ]'
+rm -rf "$lk"; mkdir "$lk"; touch -d '-10 minutes' "$lk"
+out="$(run_auto env CCC_SKILL_AUTOSAVE_MODE=auto bash "$AUTO" run)"
+ok "#2749: a stale legacy lock dir is reclaimed" \
+  'jq -e ".skipped != \"locked\"" >/dev/null <<<"$out" && [ ! -e "$lk" ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
