@@ -233,7 +233,7 @@ race() { # <name> <n> — n contenders released together; winners append their p
   rm -f "$TMP/$name.go" "$TMP/$name.winners"
   for _ in $(seq 1 "$n"); do
     ( while [ ! -e "$TMP/$name.go" ]; do sleep 0.05; done
-      if acquire_token_lock "$BASHPID" >/dev/null 2>&1; then
+      if acquire_token_lock "$BASHPID" >"$TMP/$name.$BASHPID.out" 2>&1; then
         echo "$BASHPID" >> "$TMP/$name.winners"; sleep 3
       fi ) &
   done
@@ -245,6 +245,11 @@ race_diag() { # <name> — on a miscount, print who won and what each contender 
   [ "$n" -eq 1 ] && return 0
   printf 'diag %s: winners=[%s] pidfile=[%s]\n' "$name" \
     "$(tr '\n' ' ' < "$TMP/$name.winners" 2>/dev/null)" "$(cat "$TOKEN_LOCK_FILE" 2>/dev/null)" >&2
+  local f
+  for f in "$TMP/$name".*.out; do
+    [ -e "$f" ] || continue
+    printf 'diag %s: %s: %s\n' "$name" "${f##*/}" "$(tr '\n' ' ' < "$f")" >&2
+  done
 }
 
 # Tiers: util-linux flock(1); python fcntl on the same inherited fd (Termux
