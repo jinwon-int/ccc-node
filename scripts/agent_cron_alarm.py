@@ -42,6 +42,13 @@ NODE_MIN_DISTINCT_TASKS = 2
 # check; CCC_AGENT_CRON_PROMPT_STALE_DAYS overrides, 0 disables.
 DEFAULT_PROMPT_STALE_DAYS = 7
 PROMPT_STALE_DAYS_MAX = 366
+# Dead-lock alarm, time trigger (#2741): a lock dead for this long alerts even
+# when fewer than DEFAULT_FAILURE_ALERT_AFTER distinct due runs were skipped —
+# the only way a one-shot or a daily task ever reaches the alarm. 30 minutes is
+# when a 15-minute watch reaches its third skipped run, so the two triggers
+# agree for the tasks the count rule was sized for.
+DEFAULT_DEAD_LOCK_ALERT_AFTER_SEC = 1800
+DEAD_LOCK_ALERT_AFTER_SEC_MAX = 7 * 86400
 NODE_TASK_IDS_MAX = 50
 
 # Provider/runner authentication failures, matched on stderr only. The model's
@@ -139,6 +146,14 @@ def resolve_threshold(task_value: Any, env_value: Any) -> int:
     if raw.isdigit():
         return min(int(raw), FAILURE_ALERT_AFTER_MAX)
     return DEFAULT_FAILURE_ALERT_AFTER
+
+
+def resolve_dead_lock_seconds(env_value: Any) -> int:
+    """``CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER_SEC``; default 1800, 0 disables, capped."""
+    raw = str(env_value or '').strip()
+    if raw.isdigit():
+        return min(int(raw), DEAD_LOCK_ALERT_AFTER_SEC_MAX)
+    return DEFAULT_DEAD_LOCK_ALERT_AFTER_SEC
 
 
 def resolve_stale_days(env_value: Any) -> int:
@@ -320,7 +335,8 @@ def node_transition(prev: Any, *, task_id: str, failed: bool, failure_class: str
 
 
 def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
-                         holder_run_id: str | None, threshold: int, at: str
+                         holder_run_id: str | None, threshold: int, at: str,
+                         max_blocked_seconds: int = 0,
                          ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Advance one task's dead-holder skip counter by one scheduler tick (#2669).
 
@@ -336,6 +352,14 @@ def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
     changes, alerts once per streak at ``threshold`` skipped runs, and sends one
     "cleared" notice when the task is no longer dead-locked. ``threshold`` 0
     disables it (node-wide CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER=0).
+
+    Counting distinct ``scheduled_at`` values alone never alerts for a one-shot
+    ``at`` task — it has a single occurrence, so the counter stops at 1 — and
+    takes two more days for a daily one (#2741). ``max_blocked_seconds`` > 0
+    adds a second trigger: the alarm also fires once the lock has been dead for
+    that long since the first skipped tick, whatever the skip count. It needs
+    both stamps in the ``…Z`` form to measure; ``threshold`` 0 still turns the
+    whole alarm off.
     """
     state = dict(prev) if isinstance(prev, dict) else {}
     alerted = state.get('alerted') is True
@@ -354,10 +378,15 @@ def dead_lock_transition(prev: Any, *, dead: bool, scheduled_at: str | None,
         state['lastScheduledAt'] = scheduled_at
     state.update({'skippedRuns': skipped, 'lastSkipAt': at})
     state.setdefault('firstSkipAt', at)
-    if alerted or threshold <= 0 or skipped < threshold:
+    first, current = _epoch(state.get('firstSkipAt')), _epoch(at)
+    blocked = max(0, int(current - first)) if first is not None and current is not None else None
+    by_count = skipped >= threshold
+    by_time = max_blocked_seconds > 0 and blocked is not None and blocked >= max_blocked_seconds
+    if alerted or threshold <= 0 or not (by_count or by_time):
         return state, None
     state.update({'alerted': True, 'alertedAt': at})
-    return state, {'reason': 'threshold', 'skippedRuns': skipped, 'holderRunId': holder_run_id,
+    return state, {'reason': 'threshold', 'trigger': 'skipped-runs' if by_count else 'blocked-time',
+                   'skippedRuns': skipped, 'blockedSeconds': blocked, 'holderRunId': holder_run_id,
                    'firstSkipAt': state.get('firstSkipAt'), 'alertedAt': at}
 
 
@@ -394,9 +423,13 @@ def dead_lock_text(task_id: str, event: dict[str, Any], holder: dict[str, Any] |
     if event['reason'] == 'recovered':
         return (f"agent-cron dead-lock alarm cleared: task {task_id} is no longer blocked by "
                 f"the dead holder lock {run_id} (it had skipped {event['skippedRuns']} due runs)")
+    blocked = _nonneg_int(event.get('blockedSeconds'))
+    since = f"since {event.get('firstSkipAt') or '?'}"
+    if blocked is not None:
+        since += f", blocked {blocked // 60} min"
     return '\n'.join([
         f"agent-cron dead-lock alarm: task {task_id} skipped {event['skippedRuns']} consecutive "
-        f"due runs (since {event.get('firstSkipAt') or '?'}) because its run lock is held by a "
+        f"due runs ({since}) because its run lock is held by a "
         f"process that no longer exists (runId {run_id}, pid {holder.get('pid', '?')}, "
         f"acquired {holder.get('acquiredAt', '?')})",
         "the lock is never stolen automatically on the same boot; after confirming no run is "

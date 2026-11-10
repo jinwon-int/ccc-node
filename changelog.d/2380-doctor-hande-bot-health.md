@@ -1,0 +1,1 @@
+- doctor: new `hande bot health` row reads the native relay bot's `health.json` (family-messenger#739, schema v1) — a halted room is 수동필요; a stale file, a relay outage of 60 s or more, a 403 within the hour, an unreadable/unknown/torn file, or a missing file on a `hande` node warn; a one-retry relay blip does not (#2380).

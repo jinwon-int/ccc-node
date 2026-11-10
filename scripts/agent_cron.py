@@ -71,6 +71,7 @@ import importlib.util
 import os
 import re
 import shlex
+import signal
 import socket
 import stat as _stat
 import subprocess
@@ -100,6 +101,7 @@ from agent_cron_alarm import (  # noqa: E402
     dead_lock_text,
     dead_lock_transition,
     node_transition,
+    resolve_dead_lock_seconds,
     resolve_stale_days,
     resolve_threshold,
     stale_transition,
@@ -836,6 +838,8 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
     any_lock = False
     any_task_write = False
     for action in selected:
+        if _TERMINATION['signum'] is not None:
+            break  # #2741: asked to stop; the remaining tasks stay due
         result, _json, _rc = run_execute(
             data, action['taskId'], at_value or plan.get('at'), True,
             plan_row=rows_by_id.get(action['taskId']), plan_at=plan.get('at'),
@@ -849,9 +853,11 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
         any_task_write = any_task_write or bool(m.get('taskStoreWrite'))
     dead_lock = record_dead_lock_skips(data, actions, plan.get('at') or at_value)
     any_spool = any_spool or bool(dead_lock.get('spooled'))
+    terminated = _TERMINATION['signum']
     return {
-        'ok': True,
+        'ok': terminated is None,
         'mode': 'scheduler-execute-one-shot',
+        **({'terminatedBySignal': terminated} if terminated is not None else {}),
         'deadLockAlarm': dead_lock,
         'store': str(store),
         'at': plan.get('at'),
@@ -863,7 +869,7 @@ def scheduler_execute(data, plan, actions, at_value, as_json, max_runs):
         'results': results,
         'errors': plan.get('errors', []),
         'mutations': mutation_flags(any_lock, any_task_write, any_headless, any_spool, any_history),
-    }, as_json, 0
+    }, as_json, 0 if terminated is None else 128 + terminated
 
 
 def emit_scheduler(result, as_json):
@@ -1180,6 +1186,68 @@ def _cap_bytes(text, cap):
     if len(raw) <= cap:
         return text or ''
     return raw[:cap].decode('utf-8', errors='ignore') + '\n… [truncated by outputMaxBytes]'
+
+
+class RunTerminated(BaseException):
+    """A termination signal arrived while a task's headless work was running (#2741).
+
+    A BaseException on purpose: the blanket ``except Exception`` handlers around
+    a run must not mistake it for a runner error.
+    """
+
+    def __init__(self, signum):
+        super().__init__(f'terminated by signal {signum}')
+        self.signum = signum
+
+
+# Sticky for the process: once a termination signal was seen no further task
+# is started. ``interruptible`` is True only while run_headless waits on its
+# child — the one place where waiting can outlive the service manager's stop
+# timeout; everywhere else (store commit, lock release, spool write) the signal
+# is only noted, so those writes finish instead of being torn in half.
+_TERMINATION = {'signum': None, 'interruptible': False}
+
+
+def _on_terminate(signum, _frame):
+    first = _TERMINATION['signum'] is None
+    _TERMINATION['signum'] = signum
+    if first and _TERMINATION['interruptible']:
+        raise RunTerminated(signum)
+
+
+def install_termination_handler():
+    """Handle SIGTERM for the span of one run; returns a restore callable (#2741).
+
+    Without it SIGTERM's default action killed the scheduler between
+    ``acquire_for_run`` and the ``finally`` that releases the lock. The unit's
+    ``TimeoutStartSec`` (1800 s by default, shorter than a prompt task's 3600 s
+    default) and a package upgrade restarting services both send exactly that,
+    and each left a dead run lock with no history entry and no notice — the
+    2026-11-05 incident (#2669). Installed only around a run, so every other
+    subcommand keeps the default action.
+    """
+    try:
+        previous = signal.signal(signal.SIGTERM, _on_terminate)
+    except (ValueError, OSError):  # not the main thread / no SIGTERM here
+        return lambda: None
+
+    def restore():
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError, TypeError):
+            pass
+    return restore
+
+
+def run_headless_interruptible(task):
+    """run_headless, abandoned with RunTerminated when SIGTERM arrives during it."""
+    _TERMINATION['interruptible'] = True
+    try:
+        if _TERMINATION['signum'] is not None:
+            raise RunTerminated(_TERMINATION['signum'])
+        return run_headless(task)
+    finally:
+        _TERMINATION['interruptible'] = False
 
 
 def run_headless(task):
@@ -2079,8 +2147,10 @@ def record_dead_lock_skips(data, actions, at):
     Runs once per ``scheduler --execute`` tick, after the tick's runs. A same-boot
     lock is never stolen (a wrong liveness guess must not double-run a task), so
     this only makes the stuck state visible: after N (default 3) skipped due runs
-    one alarm is spooled regardless of ``notify``, and one "cleared" notice
-    follows when the task stops being dead-locked. N is node-wide
+    — or once the lock has been dead for ``CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER_SEC``
+    (default 1800 s, 0 disables that trigger; #2741: a one-shot task has a single
+    due run and never reaches N) — one alarm is spooled regardless of ``notify``,
+    and one "cleared" notice follows when the task stops being dead-locked. N is node-wide
     ``CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER`` (0 disables) and deliberately NOT the
     task's ``failureAlertAfter``: the periodic watches set that to 0 because their
     own non-zero exit is the page, and they are exactly the tasks this catches. Counters live
@@ -2095,6 +2165,8 @@ def record_dead_lock_skips(data, actions, at):
         at_s = fmt_dt(at) if not isinstance(at, str) else at
         at_s = at_s or _secure_fs.utc_now_iso()
         threshold = resolve_threshold(None, os.environ.get('CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER', ''))
+        max_blocked = resolve_dead_lock_seconds(
+            os.environ.get('CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER_SEC', ''))
         events = []
         with store_lock():
             state = load_failure_alarm_state()
@@ -2110,7 +2182,7 @@ def record_dead_lock_skips(data, actions, at):
                 new, event = dead_lock_transition(
                     dead_state.get(task_id), dead=_is_dead_lock_skip(action),
                     scheduled_at=action.get('scheduledAt'), holder_run_id=holder.get('runId'),
-                    threshold=threshold, at=at_s)
+                    threshold=threshold, at=at_s, max_blocked_seconds=max_blocked)
                 if new:
                     dead_state[task_id] = new
                 else:
@@ -2143,7 +2215,9 @@ def record_dead_lock_skips(data, actions, at):
                                           [condition_marker('dead', task_id, event)])
             spooled = write_failure_alarm_spool(task_id, run_id, text, reasons, at_dt)
             out['events'].append({'taskId': task_id, 'reason': event['reason'],
+                                  'trigger': event.get('trigger'),
                                   'skippedRuns': event.get('skippedRuns'),
+                                  'blockedSeconds': event.get('blockedSeconds'),
                                   'delivery': spooled.get('delivery')})
             if spooled.get('delivery') == 'spooled':
                 out['spooled'] += 1
@@ -2245,9 +2319,26 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
     at = parse_dt(plan_at, '--at')
     scheduled_at = row.get('scheduledAt') or fmt_dt(at)
     run_id = f'{task_id}-{int(at.timestamp())}-{os.getpid()}'
-    acquired, lock = acquire_for_run(task_id, task, run_id, scheduled_at, at)
+    # #2741: from here until the lock is released SIGTERM must not kill the
+    # process outright — that is what left dead run locks behind.
+    restore_term = install_termination_handler()
+    try:
+        acquired, lock = acquire_for_run(task_id, task, run_id, scheduled_at, at)
+    except BaseException:
+        restore_term()
+        raise
     if not acquired:
+        restore_term()
         return {**base, 'ok': False, 'status': 'locked' if lock.get('state') in {'held','stale'} else lock.get('state','lock-error'), 'runId': run_id, 'lock': lock, 'mutations': mutation_flags(False, False, False)}, as_json, 1
+    if _TERMINATION['signum'] is not None:
+        # Asked to stop before this run started: nothing ran, so nothing is
+        # recorded and the occurrence stays due for the next tick.
+        early_release = release_for_run(task_id, run_id)
+        restore_term()
+        return {**base, 'ok': False, 'status': 'terminated', 'runId': run_id,
+                'terminatedBySignal': _TERMINATION['signum'],
+                'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': early_release},
+                'mutations': mutation_flags(True, False, False)}, as_json, 1
     headless = None
     release = {'ok': False, 'state': 'not-attempted'}
     notification = notification_base(task)
@@ -2258,9 +2349,10 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
     one_shot_disabled = False
     persist_error = None
     persisted = False
+    terminated = None
     try:
         try:
-            headless = run_headless(task)
+            headless = run_headless_interruptible(task)
             exit_code = headless.get('exitCode')
             ok = exit_code in success_exit_codes(task)
             # A timed-out run is never a success even if 124 were listed.
@@ -2273,6 +2365,23 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
             else:
                 status = 'failed'
             rc = 0 if ok else 1
+        except RunTerminated as e:
+            # The run was cut short. Record it as the failed run it is (exit
+            # 128+signal, like a shell) so history, the owner notice, retry
+            # backoff and the run limit all apply, then release the lock in
+            # the finally below instead of dying with it held (#2741).
+            terminated = e.signum
+            headless = {
+                **headless_metadata(task, execute=True),
+                'exitCode': 128 + e.signum,
+                'stdout': '',
+                'stderr': (f'run terminated by signal {e.signum} before it finished '
+                           '(the scheduler was stopped mid-run)'),
+                'failureClassHint': 'other',
+            }
+            ok = False
+            status = 'failed'
+            rc = 1
         except Exception as e:
             headless = {
                 **headless_metadata(task, execute=True),
@@ -2360,6 +2469,7 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
             release = release_for_run(task_id, run_id)
         else:
             release = quarantine_persist_failure(task_id, run_id, at)
+        restore_term()
     result = {
         **base,
         'ok': ok,
@@ -2380,6 +2490,8 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
             persisted,
         ),
     }
+    if terminated is not None:
+        result['terminatedBySignal'] = terminated
     if persist_error is not None:
         # The run really happened; only its durable record failed. Surface it
         # loudly (non-zero rc) so the operator repairs the store instead of

@@ -330,13 +330,21 @@ skipped for a lock whose same-boot holder is gone (`holderAlive=false`):
 - after **3** skipped due runs one owner alarm is spooled (`AgentCronFailureAlarm`,
   reason `dead-lock=threshold`, tier `action`) with the holder run id, pid, and
   the exact release command; a new holder run id restarts the count;
+- **or once the lock has been dead for 30 minutes** since the first skipped
+  tick, whatever the skip count (#2741). A one-shot `at` task has a single due
+  run, so its counter stops at 1 and the count rule alone never alerted for it;
+  a daily task needed two more days. The alarm event carries
+  `trigger` (`skipped-runs` or `blocked-time`) and `blockedSeconds`, and the
+  text says how long the task has been blocked;
 - when the task is no longer dead-locked, one `dead-lock=recovered` notice
   (tier `info`).
 
 The alarm ignores the task's `notify` **and** `failureAlertAfter`: the periodic
 watches set `failureAlertAfter=0` because their own non-zero exit is the page,
 and they are exactly the tasks this catches. Node-wide threshold:
-`CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER` (default 3, `0` disables). Counters live
+`CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER` (default 3, `0` disables the whole alarm);
+time trigger: `CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER_SEC` (default 1800, `0`
+disables only the time trigger). Counters live
 in `failure-alarm.json` under `deadLocks`, never in the task store; the dry-run
 modes only expose `holderAlive` and write nothing. Nothing is released
 automatically.
@@ -391,6 +399,30 @@ Two independent caps exist:
   only cap on Termux nodes, which have no systemd. agent-cron prompt tasks set
   it to their `timeoutSec` and wait `timeoutSec + 60s` themselves, so the
   runner's kill grace (`-k 30`) fires first and reports the timeout.
+
+The two caps interact: the unit cap (1800 s) is shorter than a prompt task's
+default `timeoutSec` (3600 s), and one tick runs its due tasks one after
+another, so a long prompt run — or several command tasks that each run to their
+own limit — can outlive the unit. systemd then sends SIGTERM. The same signal
+arrives when a package upgrade restarts services mid-run (the 2026-11-05
+incident above).
+
+Since #2741 a run handles that signal instead of dying with its lock held:
+
+- the task that was running is abandoned (its direct child is killed) and
+  recorded as a **failed** run with exit code `143` (128 + SIGTERM) — history
+  entry, owner notice per `notify`, retry backoff and `maxRuns` all apply as for
+  any failed run;
+- its run lock is released, so the next tick is not blocked;
+- tasks the tick had not started yet are not started and stay due;
+- the scheduler exits `143` and its JSON carries `terminatedBySignal`.
+
+A signal that arrives outside a task's own work (store commit, lock release,
+spool write) is only noted and acted on once that write has finished. SIGKILL —
+what systemd sends if the process is still there after `TimeoutStopSec` —
+cannot be handled; a lock left that way is what the dead-lock alarm is for.
+A task whose normal run time exceeds the unit cap should still get a
+`timeoutSec` below it, or the unit a larger `--timeout-start`.
 
 Task prompts must not instruct the agent to block on an external condition.
 An observed real failure: a task told the agent to wait for a PR to become
