@@ -2,7 +2,9 @@
 # Session Distiller — entry hook.
 # Fired by PreCompact / SessionEnd / manual `/distill`.
 # Pipeline: gather transcript -> redact -> Haiku extract (via `claude -p`, OAuth)
-#           -> Honcho push (auto) + wiki-candidates queue (human-gated review).
+#           -> local-memory commit (facts + resume) + wiki-candidates queue
+#              (human-gated review). Honcho was retired on 2026-09-01 (#1436);
+#              the `honcho` key in the extract contract is a historical name.
 #
 # Design / decision: pages/team/dungae/DECISIONS.md [TM-1058], log [LOG-1212].
 # Auth mode: OAuth via subprocess `claude -p` (Option B, no API key).
@@ -14,7 +16,7 @@
 #   - Always exit 0 (hook must never block parent).
 #   - All external sends pass through redact pipeline.
 #   - Off-switch: touch ~/.claude/state/distill.disabled
-#   - Dry-run:   touch ~/.claude/state/distill.dryrun (no Honcho/queue writes)
+#   - Dry-run:   touch ~/.claude/state/distill.dryrun (no local-memory/queue writes)
 set -uo pipefail
 
 DISTILL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || DISTILL_LIB_DIR="${HOME:-/root}/.claude/hooks"
@@ -64,7 +66,7 @@ fi
 # (foreground enqueue, bg re-entry, SessionStart pending-drain — all reach here).
 #   kill    -> skip the whole distill: no extract LLM call, no local/external write.
 #   dry-run -> force DRYRUN so the extract still stashes locally for debugging but
-#              no Honcho/wiki/local-facts write happens (report-only).
+#              no local-memory/wiki write happens (report-only).
 # Fail-open: undefined guard (missing lib) => "active" => unchanged behavior.
 AUTONOMY_STATE="active"
 if declare -f ccc_autonomy_state >/dev/null 2>&1; then

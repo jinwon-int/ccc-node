@@ -55,10 +55,10 @@ _RESOLVED_RE = re.compile(
 # Numbers, dates, and sexagesimal forms all start with a digit, or a sign/dot
 # followed by one. Quoting all of them is deliberately conservative.
 _NUMERIC_START_RE = re.compile(r"^[-+.]?[0-9]")
-_LINE_BREAK_RE = re.compile("[ \t]*(?:\r\n|[\r\n\x85  ])[ \t]*")
+_LINE_BREAK_RE = re.compile("[ \t]*(?:\r\n|[\r\n\x85\u2028\u2029])[ \t]*")
 # Characters PyYAML accepts in a stream (yaml.reader.Reader.NON_PRINTABLE
 # complement); anything else must be escaped inside double quotes.
-_PRINTABLE_RE = re.compile("[\x20-\x7e\x85\xa0-퟿-﻾＀-�\U00010000-\U0010ffff]")
+_PRINTABLE_RE = re.compile("[\x20-\x7e\x85\xa0-\ud7ff\ue000-\ufefe\uff00-\ufffd\U00010000-\U0010ffff]")
 _BLOCK_SCALAR_RE = re.compile(r"^[|>][-+0-9]*[ \t]*(?:#.*)?$")
 
 _SIMPLE_ESCAPES = {
@@ -74,8 +74,8 @@ _SIMPLE_ESCAPES = {
     "\r": "\\r",
     "\x1b": "\\e",
     "\x85": "\\N",
-    " ": "\\L",
-    " ": "\\P",
+    "\u2028": "\\L",
+    "\u2029": "\\P",
 }
 _DECODE_SIMPLE = {
     "0": "\0",
@@ -94,8 +94,8 @@ _DECODE_SIMPLE = {
     "\\": "\\",
     "N": "\x85",
     "_": "\xa0",
-    "L": " ",
-    "P": " ",
+    "L": "\u2028",
+    "P": "\u2029",
 }
 _DECODE_HEX = {"x": 2, "u": 4, "U": 8}
 _TRAILER_RE = re.compile(r"^(?:[ \t]+#.*)?[ \t]*$")

@@ -14,12 +14,12 @@ q12	관계선호	다른 노드에 일을 넘기려다 사용자에게 들은 말
 q13	관계선호	crush 전환 작업에서 반드시 지켜야 하는 순서는	전환 전 검증 → 스위치 → 전환 후 검증 (오너 직접 발화 제약)	nunchi	facts.db constraint id 198 (TM-2348 rank 복원 사례)
 q14	관계선호	스킬을 전 노드로 전파할 수 있게 만들 때 경로는 어떻게 처리하나	노드 고정 경로(/root/.telegram_bot/...)를 $HOME/...로 일반화, [[wikilink]] 제거	nunchi	facts.db preference id 643·636
 q15	노드사실	T2 브로커는 어느 노드인가	gwakga(곽가/VPS7) — T1은 seoseo	wiki	runbooks/a2a-broker-operating-rules [RB-32] / nodes/map
-q16	노드사실	곽가 노드의 Tailscale IP와 SSH 접속 대상은	100.102.203.64:22 (Tailscale 정본, 공인 IP 경로는 historical)	wiki	nodes/gwakga/README 빠른 정보 표
+q16	노드사실	곽가 노드의 Tailscale IP와 SSH 접속 대상은	tailnet 주소:22 — 값은 Wiki 표 참조(공개 레포에는 싣지 않음). Tailscale 정본, 공인 IP 경로는 historical	wiki	nodes/gwakga/README 빠른 정보 표
 q17	노드사실	공융과 대교는 어떤 플랫폼에서 도는 노드인가	Android/Termux 2대 (VPS와 서비스 관리 방식 다름)	wiki	aliases [AL-01] (android·termux·mobile) / nodes/map
 q18	노드사실	현재 active 노드는 몇 개고 주 런타임은 무엇인가	12노드, 전부 ccc-node Telegram bridge가 주 런타임	wiki	nodes/map [IDX-21]
 q19	노드사실	vps2라고 부르던 서버는 지금 이름이 뭐지	nosuk(노숙) — 현행 VPS2, yukson-historical과 혼동 금지	wiki	aliases [AL-01] / nodes/map [IDX-22] — 별칭·조사 변형 프로브
 q20	노드사실	곽가에서 a2a-nexus 로컬 게이트가 통과해도 CI 통과를 보장하지 못하는 이유는	로컬 Node v24.15.0 vs CI node 22 핀 — coverage parity·smoke가 로컬에서만 실패	wiki	nodes/gwakga/README [ND-2342]
-q21	노드사실	Honcho self-hosted API는 어디서 돌고 접근 제한은 어떻게 걸려 있나	gwakga 100.102.203.64:8000 Docker Compose + honcho-8000-acl.service tailnet allowlist	wiki	nodes/honcho-status / nodes/gwakga/README 운영 메모
+q21	노드사실	Honcho self-hosted API는 지금 어디서 돌고 있나	어느 노드에서도 돌지 않음 — 2026-09-01 플릿 전체 폐기(서버 스택 중단·백업 보존·전 노드 클라이언트 차단)	wiki	nodes/honcho-status [DOC-3295] / decisions/memory-system-mempalace-nunchi [TM-3297]
 q22	노드사실	무거운 작업을 맡기는 heavy worker 노드는 어디인가	bangtong(방통)	wiki	aliases [AL-04] 역할/capability 별칭
 q23	결정근거	MemPalace 채택 근거가 된 A/B 실측 수치는	Honcho 평균 ~33s·무응답 33% vs MemPalace ~2.0s·무응답 0, 완전 3자 비교 결합 6/8 vs Honcho 4/8	wiki	decisions/memory-system-mempalace-nunchi §TM-1330 A/B·§TM-1332 스코어보드
 q24	결정근거	2026Q3 플릿 로드맵에서 최대 공백으로 지목된 자산은	Code-Graph (서버가 아니라 skill 형태로 채우는 방향)	wiki	decisions/fleet-evolution-roadmap-2026q3 [TM-2370] 좌표표·P2

@@ -1,6 +1,6 @@
 ---
 name: distill
-description: Use when the operator says `/distill` or wants to run, inspect (`status`, `stats [days]`), toggle (`dryrun`/`live`, `disable`/`enable`) or `compact` the Session Distiller — the PreCompact+SessionEnd pipeline that distills transcripts via Haiku into Honcho and wiki-candidates.
+description: Use when the operator says `/distill` or wants to run, inspect (`status`, `stats [days]`), toggle (`dryrun`/`live`, `disable`/`enable`) or `compact` the Session Distiller — the PreCompact+SessionEnd pipeline that distills transcripts via Haiku into node-local memory and wiki-candidates.
 ---
 
 # distill — Session Distiller manual control
@@ -14,7 +14,7 @@ Wraps `~/.claude/hooks/distill.sh` with a single operator-facing UX. Design: see
 | (empty) / `manual` | Fire distill.sh on the current session, wait for the bg pipeline, summarize what was distilled. |
 | `status` | Show toggle state, last `distill-last.json`, last 5 log lines, wiki-candidates queue size. No fire. |
 | `stats [days]` | Read-only aggregate summary from `distill.log` for the last N days (default 7). |
-| `dryrun` | Enable DRY-RUN (extract only; no Honcho/Wiki writes). Idempotent. |
+| `dryrun` | Enable DRY-RUN (extract only; no local-memory/Wiki writes). Idempotent. |
 | `live` | Disable DRY-RUN. Idempotent. |
 | `disable` | Off-switch on (skip everything). |
 | `enable` | Off-switch off. |
@@ -115,13 +115,13 @@ wc -l ~/.claude/state/wiki-candidates.md
 
 3. **Report** in the structured style:
    - **Confirmed**: toggle state before/after, action taken, HTTP/exit codes if relevant.
-   - **Result**: number of honcho facts pushed, number of wiki candidates queued, any new `[CAND-N]` entries.
+   - **Result**: number of facts committed to local memory (the `honcho` key in `distill-last.json` and the `Honcho push` stats line are historical names — Honcho was retired on 2026-09-01 and nothing is pushed to it), number of wiki candidates queued, any new `[CAND-N]` entries.
    - **Risks/next**: if `extract failed` or timeout → suggest `CLAUDE_DISTILL_TIMEOUT=240` or smaller `MAX_TURNS`. If wiki queue grew → suggest reviewing via `/wiki-record`.
 
 ## Safety
 - Scope control: by default distill accepts every transcript visible to the node. To restrict a multi-tenant node, set `CCC_DISTILL_SCOPE_CWDS` to a comma/colon-separated allowlist of cwd paths, or write one cwd/project-encoded entry per line to `~/.claude/state/distill.scope`. Out-of-scope transcripts log `skip reason=cwd-out-of-scope` and do not extract, push, or queue.
 - Noise controls (issue #298): wiki-candidates are extracted only when reusable + new + settled (exclusion list in the extract prompt), capped at `CCC_DISTILL_MAX_WIKI_CANDS` (default 3) per session by wiki-queue, and deduped by topic through a permanent seen ledger (`CCC_DISTILL_SEEN_TTL_DAYS=<N>` opts into an N-day window; default 0 = permanent, #1885). `/distill compact` cleans pre-existing duplicate backlog.
-- All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, Honcho metadata, and wiki-candidates entries.
+- All outputs carry provenance: `source_cwd`/`source_project` in `distill-last.json`, local fact metadata, and wiki-candidates entries.
 - Re-enable by `mv`-ing `distill.disabled` / `distill.dryrun` to a timestamped archive name rather than deleting them, so the previous toggle state stays recoverable and the change is auditable. Choose `mv` for that reason — **not** to avoid the guard: if the guard blocks an action you believe is correct, stop and get approval instead of reaching for a verb it does not cover.
 - The foreground entry in `claude/hooks/distill.sh` reads `transcript_path` and cwd/workspace metadata from hook JSON on stdin. When the path is absent or is not a file, it looks for the newest `*.jsonl` in the current `PWD`'s encoded project directory under `CLAUDE_PROJECTS_DIR` (default `~/.claude/projects`). An ordinary manual invocation with empty stdin uses that fallback; no match logs `skip reason=no-transcript`.
 - Before foreground extraction is enqueued, `scope_allows_project` checks the selected transcript's parent-directory name and supplied or derived cwd against `CCC_DISTILL_SCOPE_CWDS` and the state directory's `distill.scope`. Any matching cwd, project name, or encoded scope path permits it; a nonempty scope with no match logs `skip reason=cwd-out-of-scope`. This is a metadata-based scope filter, not filesystem access control or proof of transcript ownership.

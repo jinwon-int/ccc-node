@@ -191,13 +191,13 @@
     {
       "audience": "claude",
       "classification": "claude-only",
-      "description": "Use when the operator says `/distill` or wants to run, inspect (`status`, `stats [days]`), toggle (`dryrun`/`live`, `disable`/`enable`) or `compact` the Session Distiller — the PreCompact+SessionEnd pipeline that distills transcripts via Haiku into Honcho and wiki-candidates.",
+      "description": "Use when the operator says `/distill` or wants to run, inspect (`status`, `stats [days]`), toggle (`dryrun`/`live`, `disable`/`enable`) or `compact` the Session Distiller — the PreCompact+SessionEnd pipeline that distills transcripts via Haiku into node-local memory and wiki-candidates.",
       "files": 3,
       "managed": false,
       "name": "distill",
       "source": "skills/distill",
       "status": "active",
-      "tree_sha256": "095ccccf0e5bcbe7dba94a2d6e93f74feab1a3de90c24ba2f62531b3cde0ef56"
+      "tree_sha256": "b8b3fb460ffd8a0a4435cfe3a4cd5dbe74bc61176e5361205f3471c5d0b715ba"
     },
     {
       "audience": "shared",
@@ -406,7 +406,7 @@
       "name": "self-update",
       "source": "skills/self-update",
       "status": "active",
-      "tree_sha256": "ec2cb67d4f26669c664ef9eb29702b0b6e27e15cfd479407fcf837fc1b5329e0"
+      "tree_sha256": "a85b00be0af27be80c20d4e5d18ad701d49b624fa8517acd33e89dc3010125ef"
     },
     {
       "audience": "claude",

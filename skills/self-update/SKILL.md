@@ -19,8 +19,9 @@ identity**:
   `hooks/*.sh`, `agents/`, `commands/`, `skills/`, `output-styles/`, `headless.sh`.
 - **Preserved** (seeded only if absent — never overwritten): `settings.local.json`
   (node-local approvals, seeded from `settings.local.template.json`; #454),
-  `CLAUDE.md`, `memories/MEMORY.md`, `memories/USER.md`, `~/.hermes/honcho.json`,
-  `hooks/tools-cheatsheet.md`.
+  `CLAUDE.md`, `memories/MEMORY.md`, `memories/USER.md`,
+  `hooks/tools-cheatsheet.md`. (`~/.hermes/honcho.json` is no longer seeded:
+  Honcho was retired on 2026-09-01, #1436.)
 - The old `~/.claude` is snapshotted to `~/.claude/backups/ccc-node-setup-<ts>.tar.gz`
   before anything is written (unless `--no-backup`, which self-update must NOT use).
 
