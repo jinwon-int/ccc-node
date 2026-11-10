@@ -32,6 +32,7 @@ from agent_cron_alarm import (  # noqa: E402
     condition_marker,
     dead_lock_text,
     dead_lock_transition,
+    resolve_dead_lock_seconds,
     node_transition,
     resolve_stale_days,
     resolve_threshold,
@@ -719,6 +720,74 @@ class DeadLockTransition(unittest.TestCase):
         for t in ('t1', 't2', 't3', 't4'):
             state, event = self.tick(state, t, threshold=0)
             self.assertIsNone(event)
+
+    # -- #2741: time trigger. A one-shot task has one due run, so the skip
+    # counter stops at 1 and the count rule alone never alerts for it.
+    def at_tick(self, prev, minute, *, scheduled='2026-01-01T09:00:00Z', threshold=3,
+                max_blocked=1800):
+        return dead_lock_transition(prev, dead=True, scheduled_at=scheduled, holder_run_id='r1',
+                                    threshold=threshold, at=f'2026-01-01T09:{minute:02d}:10Z',
+                                    max_blocked_seconds=max_blocked)
+
+    def test_one_shot_alerts_once_the_lock_has_been_dead_long_enough(self) -> None:
+        state, event = self.at_tick(None, 1)
+        self.assertEqual((state['skippedRuns'], event), (1, None))
+        for minute in (2, 15, 30):  # 29 minutes after the first skipped tick: not yet
+            state, event = self.at_tick(state, minute)
+            self.assertEqual((state['skippedRuns'], event), (1, None))
+        state, event = self.at_tick(state, 31)
+        self.assertEqual((event['reason'], event['trigger'], event['skippedRuns'],
+                          event['blockedSeconds'], event['firstSkipAt']),
+                         ('threshold', 'blocked-time', 1, 1800, '2026-01-01T09:01:10Z'))
+        state, event = self.at_tick(state, 45)
+        self.assertEqual((event, state['alerted']), (None, True))
+
+    def test_without_the_time_trigger_a_one_shot_never_alerts(self) -> None:
+        state = None
+        for minute in (1, 31, 59):
+            state, event = self.at_tick(state, minute, max_blocked=0)
+            self.assertEqual((state['skippedRuns'], event), (1, None))
+
+    def test_count_trigger_still_wins_and_is_labelled(self) -> None:
+        state = None
+        for minute, scheduled in ((1, 's1'), (2, 's2')):
+            state, event = self.at_tick(state, minute, scheduled=scheduled)
+            self.assertIsNone(event)
+        state, event = self.at_tick(state, 3, scheduled='s3')
+        self.assertEqual((event['trigger'], event['skippedRuns'], event['blockedSeconds']),
+                         ('skipped-runs', 3, 120))
+
+    def test_threshold_zero_disables_the_time_trigger_too(self) -> None:
+        state = None
+        for minute in (1, 31, 59):
+            state, event = self.at_tick(state, minute, threshold=0)
+            self.assertIsNone(event)
+
+    def test_time_trigger_needs_measurable_stamps_and_restarts_with_the_holder(self) -> None:
+        state, _ = self.tick(None, 't1')  # non-ISO stamps: age unknown, never fires on time
+        state, event = dead_lock_transition(state, dead=True, scheduled_at='t1', holder_run_id='r1',
+                                            threshold=3, at='t9', max_blocked_seconds=1)
+        self.assertIsNone(event)
+        state, _ = self.at_tick(None, 1)
+        state, event = dead_lock_transition(state, dead=True, scheduled_at='2026-01-01T09:00:00Z',
+                                            holder_run_id='r2', threshold=3,
+                                            at='2026-01-01T09:40:10Z', max_blocked_seconds=1800)
+        self.assertEqual((event, state['firstSkipAt'], state['holderRunId']),
+                         (None, '2026-01-01T09:40:10Z', 'r2'))
+
+    def test_dead_lock_seconds_env(self) -> None:
+        self.assertEqual(resolve_dead_lock_seconds(''), 1800)
+        self.assertEqual(resolve_dead_lock_seconds('0'), 0)
+        self.assertEqual(resolve_dead_lock_seconds('600'), 600)
+        self.assertEqual(resolve_dead_lock_seconds('nonsense'), 1800)
+        self.assertEqual(resolve_dead_lock_seconds('99999999'), 7 * 86400)
+
+    def test_text_reports_how_long_the_task_has_been_blocked(self) -> None:
+        text = dead_lock_text('once-task', {'reason': 'threshold', 'skippedRuns': 1,
+                                            'blockedSeconds': 1800, 'holderRunId': 'r1',
+                                            'firstSkipAt': '2026-01-01T09:01:10Z'}, {})
+        self.assertIn('skipped 1 consecutive due runs (since 2026-01-01T09:01:10Z, blocked 30 min)',
+                      text)
 
     def test_text_names_ids_counts_and_release_command_only(self) -> None:
         holder = {'runId': 'r1', 'pid': 4242, 'acquiredAt': '2026-11-04T21:20:00Z'}

@@ -1243,5 +1243,69 @@ out="$(CCC_AGENT_CRON_STORE="$ALARM_DIR/crud.json" bash "$CMD" add crud-quiet --
 rc=$?
 ok "add --failure-alert-after persists the per-task threshold" '[ "$rc" = 0 ] && jq -e ".ok == true" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"crud-quiet\") | .failureAlertAfter == 0" "$ALARM_DIR/crud.json" >/dev/null'
 
+# ── #2741: a one-shot task behind a dead lock alarms on elapsed time ──
+# An `at` task has a single due run, so the skipped-run counter stops at 1 and
+# the count rule (3 distinct due runs) could never alert for it.
+OS_DIR="$TMP/oneshot-dead-store"; OS_STORE="$OS_DIR/tasks.json"; OS_SPOOL="$TMP/oneshot-dead-spool"
+mkdir -p "$OS_DIR/locks" "$OS_SPOOL"
+printf '%s\n' '{"version":1,"tasks":[{"id":"os-once","schedule":"at 2026-01-01T00:01:00Z","prompt":"One shot","enabled":true,"notify":"none"}]}' > "$OS_STORE"
+os_lock() {  # os_lock <locks-dir>
+  python3 - "$1" "$dl_boot" <<'PY'
+import json, os, sys
+open(os.path.join(sys.argv[1], 'os-once.lock'), 'w', encoding='utf-8').write(json.dumps({"taskId": "os-once", "runId": "os-once-dead-run", "pid": 999999, "host": "test", "bootId": sys.argv[2], "acquiredAt": "2026-01-01T00:01:05Z", "scheduledAt": "2026-01-01T00:01:00Z"}) + chr(10))
+PY
+}
+os_lock "$OS_DIR/locks"
+os_tick() { CCC_AGENT_CRON_STORE="$OS_STORE" CCC_PUSH_SPOOL="$OS_SPOOL" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" scheduler --execute --json --at "$1"; }
+os_alarms() { local n=0 f; for f in "$OS_SPOOL"/*-alarm.json; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+os_tick 2026-01-01T00:01:10Z >/dev/null; os_tick 2026-01-01T00:15:10Z >/dev/null
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(os_tick 2026-01-01T00:30:10Z)"
+ok "#2741 one-shot dead lock: 29 minutes in, one skipped run, no alarm yet" 'jq -e ".deadLockAlarm.state == \"counting\"" <<<"$out" >/dev/null && jq -e ".deadLocks[\"os-once\"].skippedRuns == 1" "$OS_DIR/failure-alarm.json" >/dev/null && [ "$(os_alarms)" = 0 ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(os_tick 2026-01-01T00:31:10Z)"
+ok "#2741 one-shot dead lock: alarm once the lock has been dead for 30 minutes" 'jq -e ".deadLockAlarm.state == \"alerted\" and .deadLockAlarm.spooled == 1 and .deadLockAlarm.events[0].trigger == \"blocked-time\" and .deadLockAlarm.events[0].skippedRuns == 1" <<<"$out" >/dev/null && [ "$(os_alarms)" = 1 ] && grep -h "task os-once skipped 1 consecutive due runs (since 2026-01-01T00:01:00Z, blocked 30 min)" "$OS_SPOOL"/*-alarm.json >/dev/null && grep -h -- "--action release --run-id os-once-dead-run" "$OS_SPOOL"/*-alarm.json >/dev/null'
+os_tick 2026-01-01T00:45:10Z >/dev/null
+ok "#2741 one-shot dead lock: no second alarm" '[ "$(os_alarms)" = 1 ]'
+OS_OFF_DIR="$TMP/oneshot-dead-off"; mkdir -p "$OS_OFF_DIR/locks" "$TMP/oneshot-dead-off-spool"
+cp "$OS_STORE" "$OS_OFF_DIR/tasks.json"; os_lock "$OS_OFF_DIR/locks"
+for t in 01 31 59; do CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER_SEC=0 CCC_AGENT_CRON_STORE="$OS_OFF_DIR/tasks.json" CCC_PUSH_SPOOL="$TMP/oneshot-dead-off-spool" CCC_HEADLESS_CMD="$FAKE_HEADLESS" bash "$CMD" scheduler --execute --json --at "2026-01-01T00:${t}:10Z" >/dev/null; done
+ok "#2741 CCC_AGENT_CRON_DEAD_LOCK_ALERT_AFTER_SEC=0 turns the time trigger off" '[ -z "$(ls "$TMP/oneshot-dead-off-spool")" ]'
+
+# ── #2741: SIGTERM mid-run releases the lock and records the run ──
+# Before, SIGTERM's default action killed the scheduler between acquire and the
+# finally that releases the lock (unit TimeoutStartSec, a package upgrade
+# restarting services): a dead run lock, no history entry, later tasks unrun.
+TERM_DIR="$TMP/term-store"; TERM_STORE="$TERM_DIR/tasks.json"; TERM_SPOOL="$TMP/term-spool"
+mkdir -p "$TERM_DIR" "$TERM_SPOOL"
+python3 - "$TERM_STORE" "$TERM_DIR/started" <<'PY'
+import json, sys
+store, marker = sys.argv[1], sys.argv[2]
+tasks = [
+    {"id": "term-run", "schedule": "* * * * *", "prompt": "long command", "enabled": True, "notify": "none",
+     "lastRunAt": "2026-01-01T00:00:00Z",
+     "payload": {"kind": "command", "argv": ["sh", "-c", f"echo started > '{marker}'; exec sleep 120"]}},
+    {"id": "term-next", "schedule": "* * * * *", "prompt": "next command", "enabled": True, "notify": "none",
+     "lastRunAt": "2026-01-01T00:00:00Z",
+     "payload": {"kind": "command", "argv": ["sh", "-c", "echo next"]}},
+]
+open(store, "w", encoding="utf-8").write(json.dumps({"version": 1, "tasks": tasks}))
+PY
+CCC_AGENT_CRON_STORE="$TERM_STORE" CCC_PUSH_SPOOL="$TERM_SPOOL" bash "$CMD" scheduler --execute --json --at 2026-01-01T00:01:10Z > "$TERM_DIR/out.json" 2>"$TERM_DIR/err.txt" &
+TERM_PID=$!
+for _ in $(seq 1 100); do [ -s "$TERM_DIR/started" ] && break; sleep 0.1; done
+ok "#2741 SIGTERM: the long task is running and holds its lock" '[ -s "$TERM_DIR/started" ] && [ -e "$TERM_DIR/locks/term-run.lock" ]'
+term_t0=$(date +%s); kill -TERM "$TERM_PID" 2>/dev/null
+# shellcheck disable=SC2034  # read via eval inside ok()
+{ wait "$TERM_PID"; term_rc=$?; term_secs=$(( $(date +%s) - term_t0 )); }
+ok "#2741 SIGTERM: the scheduler stops promptly with 128+15" '[ "$term_rc" = 143 ] && [ "$term_secs" -lt 30 ]'
+ok "#2741 SIGTERM: the run lock is released, not left behind" '[ ! -e "$TERM_DIR/locks/term-run.lock" ]'
+ok "#2741 SIGTERM: the interrupted run is recorded as failed with exit 143" 'jq -e ".tasks[] | select(.id == \"term-run\") | .lastStatus == \"failed\" and .lastRunAt == \"2026-01-01T00:01:00Z\" and (.runHistory[-1].exitCode == 143) and (.runHistory[-1].status == \"failed\")" "$TERM_STORE" >/dev/null'
+ok "#2741 SIGTERM: the tick reports the signal and the interrupted run" 'jq -e ".ok == false and .terminatedBySignal == 15 and .executedActions == 1 and .results[0].taskId == \"term-run\" and .results[0].terminatedBySignal == 15 and .results[0].lock.release.state == \"released\"" "$TERM_DIR/out.json" >/dev/null'
+ok "#2741 SIGTERM: the next task is not started and stays due" 'jq -e ".tasks[] | select(.id == \"term-next\") | .lastRunAt == \"2026-01-01T00:00:00Z\" and ((.runHistory // []) | length) == 0" "$TERM_STORE" >/dev/null && [ ! -e "$TERM_DIR/locks/term-next.lock" ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+{ out="$(CCC_AGENT_CRON_STORE="$TERM_STORE" CCC_PUSH_SPOOL="$TERM_SPOOL" bash "$CMD" run term-next --json --at 2026-01-01T00:02:10Z)"; rc=$?; }
+ok "#2741 SIGTERM: a later run in a fresh process is unaffected" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and (has(\"terminatedBySignal\") | not)" <<<"$out" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
