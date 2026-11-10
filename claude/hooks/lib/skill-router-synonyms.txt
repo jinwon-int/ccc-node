@@ -1,33 +1,50 @@
-# skill-router synonym map (ccc-node #2645) — `surface => english tokens`.
+# skill-router synonym map (ccc-node #2645, #2748) — `surface => english tokens`.
 #
-# Skill descriptions are English; operator prompts are mostly Korean. Each
-# surface is matched as a substring of the lower-cased prompt (Korean is
-# agglutinative: "머지해줘" must hit "머지"), longest surface first. Keep
-# targets to the words that actually appear in skill descriptions. Lines
+# Skill descriptions are English; operator prompts are mostly Korean. Lines
 # starting with # are comments. One concept per line; order does not matter.
+#
+# How a surface matches (lib/skill_router.py, surface_matches):
+#   - ASCII surface: a whole token ("pr" is not inside "provider").
+#   - Korean surface of 1-2 syllables: only at the start of a word; particles
+#     and endings may follow ("머지해줘"), another word may not precede
+#     ("나머지" is not "머지").
+#   - longer Korean surface: anywhere (compounds written without spaces).
+#
+# What to put on the right (#2748 — the table was the largest source of wrong
+# suggestions):
+#   - translations and near-synonyms of the surface only. All targets of one
+#     line count as ONE shared concept, so listing several costs nothing and
+#     earns nothing: a line can never satisfy a match by itself.
+#   - no domain leap: never map a common word onto a product or a skill
+#     family it does not name ("문제" is not NCLEX, "브리지" is not Telegram,
+#     "승인" is not review). A leap hands the router evidence the operator
+#     never gave.
+#   - no surface that is mostly something else in everyday Korean ("문제",
+#     "체크", "키", "감사"): spell out the specific phrase instead.
+#   - keep targets to words that actually appear in skill descriptions.
 
 # --- git / GitHub -----------------------------------------------------------
 머지 => merge
 병합 => merge
 머지 큐 => merge queue
-승인 => approve approval review
+승인 => approve approval
 리뷰 => review
 커밋 => commit
 푸시 => push
 브랜치 => branch
 풀리퀘 => pull request pr
 pr => pull request pr
-이슈 => issue github
+이슈 => issue
 릴리즈 => release
 릴리스 => release
-태그 => tag release
+태그 => tag
 리베이스 => rebase
 충돌 => conflict
 체크아웃 => checkout worktree
 워크트리 => worktree
 ci => ci checks workflow
-체크 => checks ci
-액션 => actions workflow run
+액션 => actions
+깃허브 액션 => github actions workflow
 워크플로 => workflow actions
 외부 pr => external pull request contributor
 외부 기여 => external contributor
@@ -36,14 +53,14 @@ ci => ci checks workflow
 재시작 => restart service
 재기동 => restart service
 재부팅 => reboot restart
-브리지 => bridge telegram
+브리지 => bridge
 게이트웨이 => gateway
-브로커 => broker a2a
+브로커 => broker
 터널 => tunnel
-서비스 => service systemd
+서비스 => service
 systemd => systemd service unit
 유닛 => unit systemd
-타이머 => timer systemd schedule
+타이머 => timer schedule
 크론 => cron schedule
 스케줄 => schedule cron timer
 예약 => schedule timer
@@ -54,7 +71,7 @@ systemd => systemd service unit
 감시 => watch monitor
 모니터 => monitor
 헬스 => health
-상태 => status health
+상태 => status
 로그 => log logs
 포트 => port
 방화벽 => firewall ufw
@@ -75,7 +92,8 @@ systemd => systemd service unit
 드리프트 => drift
 점검 => check audit verify diagnose
 진단 => diagnose diagnostic
-감사 => audit
+보안 감사 => security audit
+감사 로그 => audit log
 검증 => verify validation
 테스트 => test tests
 플레이크 => flaky flake
@@ -86,7 +104,8 @@ systemd => systemd service unit
 비밀 => secret credential
 토큰 => token credential secret
 자격증명 => credential
-키 => key credential
+api 키 => api key credential
+ssh 키 => ssh key
 환경변수 => env environment variable
 설정 => config settings configuration
 구성 => config configuration
@@ -112,7 +131,7 @@ ssh => ssh remote
 재개 => resume
 중단 => interrupted stopped
 타임아웃 => timeout
-지연 => latency slow performance
+지연 => latency slow delay
 성능 => performance
 최적화 => optimize performance
 캐시 => cache
@@ -126,7 +145,7 @@ ssh => ssh remote
 
 # --- memory / wiki / docs -----------------------------------------------------
 위키 => wiki
-기록 => record log wiki
+기록 => record log
 운영 로그 => operating log wiki
 런북 => runbook
 결정 => decision
@@ -139,7 +158,9 @@ ssh => ssh remote
 보고서 => report document
 엑셀 => xlsx spreadsheet excel
 스프레드시트 => spreadsheet xlsx
-한글 => hwp hwpx korean document
+한글 => korean
+한글 문서 => hwp hwpx document
+한글 파일 => hwp hwpx
 hwp => hwp hwpx
 피디에프 => pdf
 pdf => pdf
@@ -150,14 +171,13 @@ pdf => pdf
 그래프 => chart graph visualization
 시각화 => visualization chart
 다이어그램 => diagram
-판례 => precedent legal korean
+판례 => precedent
 법률 => legal law
 법령 => legal law statute
 
 # --- A2A / agents ---------------------------------------------------------------
-a2a => a2a task worker broker
 에이전트 => agent
-워커 => worker a2a
+워커 => worker
 핸들러 => handler
 디스패치 => dispatch
 태스크 => task
@@ -165,23 +185,21 @@ a2a => a2a task worker broker
 계약 => contract
 서브에이전트 => subagent delegation
 위임 => delegate delegation subagent
-브라우저 => browser web
-웹 => web search
+브라우저 => browser
+웹 => web
 검색 => search
-크롤 => scrape crawl web
-스크랩 => scrape web
-번역 => translate bilingual
-용어 => terminology bilingual
+크롤 => scrape crawl
+스크랩 => scrape
+번역 => translate translation
+용어 => terminology
 
 # --- domain / apps -----------------------------------------------------------------
-한데 => hande messenger ios
+한데 => hande messenger
 메신저 => messenger
-텔레그램 => telegram bot
+텔레그램 => telegram
 매트릭스 => matrix
 봇 => bot
-문제 => question nclex item
-문항 => question item nclex
-nclex => nclex question
-시험 => exam question
+문항 => question item
+시험 => exam
 파일보관함 => filehub file storage
-윈도우 => windows remote
+윈도우 => windows

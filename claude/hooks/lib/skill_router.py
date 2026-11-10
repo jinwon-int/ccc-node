@@ -18,6 +18,20 @@ trimmed description — as ``additionalContext``. Nothing is executed or
 auto-invoked; the model still chooses. Core-listing skills are excluded
 because their descriptions are already in the listing.
 
+A suggestion that does not fit is worse than none (#2748: at the first
+thresholds 0 of 6 suggestions on 14 days of real prompts fitted), so a
+candidate has to earn its line:
+
+* evidence is counted per prompt *concept* — one word the operator wrote,
+  however many English tokens the synonym map gives it;
+* two distinctive concepts must be shared and hit the skill's name — or
+  four, in a prompt that is mostly about them (tokens common to a whole
+  skill family are not evidence);
+* the shared concepts must cover ``MIN_COVERAGE`` of the prompt's
+  ``COVERAGE_WINDOW`` heaviest concepts, so a long prompt is not out of reach;
+* pure questions need one more concept; probes, pasted documents,
+  approvals and option echoes are skipped.
+
 The index spans every runtime's skill root, but ``suggest`` only offers the
 skills the *calling* runtime can invoke (#2658): a Codex-only name suggested
 to Claude is a name the Skill tool cannot resolve. The hook is registered in
@@ -65,21 +79,73 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 #: not to crowd the turn.
 MAX_CANDIDATES = 3
 #: Sanity floor on the BM25 score (absolute scores scale with corpus size —
-#: IDF is ~3× larger on 280 skills than on 7 — so the real acceptance test
-#: is ``MIN_COVERAGE`` below).
+#: IDF is ~3× larger on 280 skills than on 7 — so the real acceptance tests
+#: are the concept and coverage rules below).
 MIN_SCORE = 2.0
 #: Fraction of the prompt's IDF mass a candidate must cover: how much of what
 #: the operator said is actually about this skill. 0.4 keeps "restart the
 #: bridge detached" → the restart skill and drops a prompt that merely shares
-#: two generic words with something.
+#: two words with something. The mass is measured over prompt *concepts* and
+#: capped by ``COVERAGE_WINDOW``.
 MIN_COVERAGE = 0.4
-#: A candidate must share this many distinct content tokens with the prompt;
-#: one lucky rare token is not a match.
-MIN_SHARED_TOKENS = 3
+#: Coverage is judged against the prompt's this-many heaviest concepts only.
+#: Without the cap coverage falls with prompt length: on 14 days of real
+#: prompts (#2748) 121 of 192 had a best candidate under 0.1 and long
+#: prompts could not reach ``MIN_COVERAGE`` at all. Six is the 90th
+#: percentile of concepts in a typed prompt (300 characters or less) on that
+#: set, so an ordinary request is scored as before and a longer one needs
+#: about as much shared evidence as a six-word one (three to five
+#: distinctive concepts on a ~320-skill index).
+COVERAGE_WINDOW = 6
+#: A candidate must share this many distinctive prompt *concepts*. A concept
+#: is one thing the operator wrote: an ASCII word, or one synonym surface
+#: with all of its English targets. Counting tokens instead let a single word
+#: pass alone ("테스트" → test + tests, "a2a" → four tokens): every suggestion
+#: made at the old thresholds on the #2748 set came from that, and none
+#: fitted. Distinctive means not generic (below): two family words ("issue" +
+#: "merge") name a topic, not a skill.
+MIN_SHARED_CONCEPTS = 2
+#: … and this many of them must hit the skill's *name* — one when the name
+#: has a single distinctive token; a name made of family words alone cannot
+#: be matched. The name is the skill's own summary: a prompt that shares only
+#: description vocabulary (status, failed, result, file …) is about something
+#: else. On the #2748 set every fitting suggestion named two such words
+#: (merge queue, legal precedent, deploy + web) and no wrong one on a short
+#: prompt did.
+MIN_NAME_CONCEPTS = 2
+#: Without the name, this many shared distinctive concepts are needed and
+#: ``MIN_COVERAGE`` must hold over the whole prompt, not the window: an
+#: operator describing the symptom in the description's own words ("ufw
+#: allow rules after the cve advisory") is still routed, a pasted report
+#: that happens to contain a few of them is not. Twice the name requirement;
+#: no prompt in the #2748 set matched this way, right or wrong.
+MIN_DESCRIPTION_CONCEPTS = 4
+#: A token found in more than this fraction of the installed skills is
+#: generic: it names a skill family (test, ci, a2a, merge, validation …; 5 %
+#: of ~320 skills is 16 documents), so it cannot be the reason to pick one
+#: member. ``GENERIC_DF_FLOOR`` keeps a small index (tests, a fresh node)
+#: from calling every token generic.
+GENERIC_DF_FRACTION = 0.05
+GENERIC_DF_FLOOR = 3
+#: A pure question names things without asking for work on them ("does the
+#: nightly backup run on every node?"), so it needs one more distinctive
+#: concept.
+QUESTION_EXTRA_CONCEPTS = 1
 #: Runners-up must reach this fraction of the best score.
 RELATIVE_FLOOR = 0.7
 #: Prompts shorter than this (after stripping) carry no routing signal.
 MIN_PROMPT_CHARS = 12
+#: Prompts longer than this are a pasted document or a generated instruction
+#: block (a reviewer brief, a skill body, a continuation summary), not a
+#: request: on the #2748 set every operator-typed prompt was under 2,600
+#: characters and every machine-written one over 3,900.
+MAX_PROMPT_CHARS = 3000
+#: Health probes are short ASCII one-liners; longer text is never one.
+PROBE_MAX_CHARS = 160
+#: Korean synonym surfaces up to this many syllables match only at the start
+#: of a word (stems lead, particles trail): "머지" must not fire inside
+#: "나머지", nor "워드" inside "키워드". Longer surfaces match anywhere.
+SHORT_SURFACE_CHARS = 2
 #: Hard cap on the injected context (characters).
 MAX_CONTEXT_CHARS = 720
 #: Description excerpt per candidate.
@@ -231,14 +297,72 @@ def tokenize(text: str) -> List[str]:
     return out
 
 
-def expand_prompt(text: str, synonyms: Iterable[Tuple[str, List[str]]]) -> List[str]:
-    """Prompt tokens plus English tokens for every synonym surface found in it."""
+def _is_hangul(char: str) -> bool:
+    return "가" <= char <= "힣"
+
+
+def _is_ascii_word(char: str) -> bool:
+    return char.isascii() and char.isalnum()
+
+
+def surface_matches(lowered: str, surface: str) -> bool:
+    """Whether ``surface`` occurs in the lower-cased prompt as a word of its own.
+
+    * an ASCII surface is a whole token: ``pr`` is not inside ``provider``,
+      ``ci`` not inside ``decision`` (substring matching made both fire on
+      most English text);
+    * a Korean surface of up to ``SHORT_SURFACE_CHARS`` syllables must start
+      a word — it may carry particles or endings (``머지해줘``) but not sit
+      inside another word (``나머지``, ``키워드``);
+    * longer surfaces match anywhere (compounds written without spaces).
+    """
+    ascii_surface = surface.isascii()
+    start = lowered.find(surface)
+    while start >= 0:
+        end = start + len(surface)
+        before = lowered[start - 1] if start else " "
+        after = lowered[end] if end < len(lowered) else " "
+        if ascii_surface:
+            if not _is_ascii_word(before) and not _is_ascii_word(after):
+                return True
+        elif len(surface) > SHORT_SURFACE_CHARS or not _is_hangul(before):
+            return True
+        start = lowered.find(surface, start + 1)
+    return False
+
+
+def prompt_concepts(text: str, synonyms: Iterable[Tuple[str, List[str]]]) -> Tuple[List[str], Dict[str, str]]:
+    """``(tokens, concept_of)`` — the prompt's tokens and the concept each belongs to.
+
+    A concept is one thing the operator wrote: an ASCII word is its own
+    concept, and the English targets of one synonym surface share that
+    surface's concept (``테스트 => test tests`` is one). A target offered by
+    several matched surfaces goes to the one holding the fewest so far, then
+    the shortest: two words the operator wrote stay two concepts when their
+    lines overlap (``머지 큐`` + ``머지`` + ``큐`` → merge, queue), and the
+    count never exceeds the number of surfaces or of tokens.
+    """
     lowered = (text or "").lower()
     tokens = tokenize(lowered)
+    concept_of: Dict[str, str] = {token: token for token in tokens}
+    offers: Dict[str, List[str]] = {}
     for surface, targets in synonyms:
-        if surface in lowered:
-            tokens.extend(targets)
-    return tokens
+        if surface_matches(lowered, surface):
+            for target in targets:
+                if target not in concept_of and surface not in offers.setdefault(target, []):
+                    offers[target].append(surface)
+    held: Dict[str, int] = {}
+    for target, surfaces in sorted(offers.items(), key=lambda item: len(item[1])):
+        surface = min(surfaces, key=lambda name: (held.get(name, 0), len(name)))
+        held[surface] = held.get(surface, 0) + 1
+        concept_of[target] = surface
+        tokens.append(target)
+    return tokens, concept_of
+
+
+def expand_prompt(text: str, synonyms: Iterable[Tuple[str, List[str]]]) -> List[str]:
+    """Prompt tokens plus English tokens for every synonym surface found in it."""
+    return prompt_concepts(text, synonyms)[0]
 
 
 # --- index -------------------------------------------------------------------------
@@ -427,46 +551,111 @@ class Ranker:
         df = self.df.get(token, 0)
         return math.log(1 + (self.n - df + 0.5) / (df + 0.5))
 
-    def score(self, query_tokens: List[str], doc: Dict[str, Any]) -> Tuple[float, int, float]:
-        """``(bm25, distinct shared tokens, coverage)``.
+    def is_generic(self, token: str) -> bool:
+        """A token so common across the installed skills that it names a family."""
+        return self.df.get(token, 0) > max(GENERIC_DF_FLOOR, GENERIC_DF_FRACTION * self.n)
 
-        ``coverage`` is the share of the query's IDF mass found in the
-        document (0..1): corpus-size independent, unlike the raw score.
+    def is_noise(self, token: str) -> bool:
+        """A number, or an id/date/hash no skill mentions: not a content word."""
+        if token.replace(".", "").isdigit():
+            return True
+        return token not in self.df and any(char.isdigit() for char in token)
+
+    def match(self, query_tokens: List[str], doc: Dict[str, Any], concept_of: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Score one document: ``score``, ``shared``, ``named``, ``name_size``, ``coverage``.
+
+        Evidence is counted per prompt concept (``prompt_concepts``), not per
+        token: a concept scores once, through its strongest token in the
+        document. ``shared`` is the number of concepts found through a
+        non-generic token (generic ones add score and coverage, never
+        evidence); ``named`` how many of those hit one of the ``name_size``
+        non-generic tokens of the skill's name. ``coverage`` is the IDF mass
+        of the found concepts over the mass of the prompt's
+        ``COVERAGE_WINDOW`` heaviest concepts (0..1): corpus-size independent
+        and, with the window, prompt-length independent.
         """
         tokens = doc.get("tokens") or []
         if not tokens:
-            return 0.0, 0, 0.0
+            return {"score": 0.0, "shared": 0, "named": 0, "name_size": 0, "coverage": 0.0, "focus": 0.0}
+        concept_of = concept_of or {}
+        name_tokens = {token for token in tokenize(str(doc.get("name") or "")) if not self.is_generic(token)}
         tf: Dict[str, int] = {}
         for token in tokens:
             tf[token] = tf.get(token, 0) + 1
-        dl = len(tokens)
-        score = 0.0
-        shared = 0
-        mass = 0.0
-        hit_mass = 0.0
+        norm = BM25_K1 * (1 - BM25_B + BM25_B * len(tokens) / self.avgdl)
+        weight: Dict[str, Tuple[bool, float]] = {}  # concept -> (known, idf) of its heaviest token
+        hit: Dict[str, Tuple[float, float]] = {}  # concept -> (bm25 part, idf) of its best hit
+        shared = set()
+        named = set()
         for token in set(query_tokens):
+            if self.is_noise(token):
+                continue
+            concept = concept_of.get(token, token)
             idf = self.idf(token)
-            mass += idf
+            # A translation that no skill uses must not outweigh one that some do.
+            known = token in self.df
+            seen = weight.get(concept)
+            if seen is None or (known, idf) > seen:
+                weight[concept] = (known, idf)
             freq = tf.get(token)
             if not freq:
                 continue
-            shared += 1
-            hit_mass += idf
-            denom = freq + BM25_K1 * (1 - BM25_B + BM25_B * dl / self.avgdl)
-            score += idf * freq * (BM25_K1 + 1) / denom
-        return score, shared, (hit_mass / mass if mass else 0.0)
+            part = idf * freq * (BM25_K1 + 1) / (freq + norm)
+            if concept not in hit or part > hit[concept][0]:
+                hit[concept] = (part, idf)
+            if not self.is_generic(token):
+                shared.add(concept)
+                if token in name_tokens:
+                    named.add(concept)
+        weights = sorted((idf for _, idf in weight.values()), reverse=True)
+        mass = sum(weights)
+        window = sum(weights[:COVERAGE_WINDOW])
+        hit_mass = sum(idf for _, idf in hit.values())
+        return {
+            "score": sum(part for part, _ in hit.values()),
+            "shared": len(shared),
+            "named": len(named),
+            "name_size": len(name_tokens),
+            "coverage": min(1.0, hit_mass / window) if window else 0.0,
+            "focus": hit_mass / mass if mass else 0.0,
+        }
 
-    def rank(self, query_tokens: List[str], *, exclude: Iterable[str] = ()) -> List[Dict[str, Any]]:
+    def score(self, query_tokens: List[str], doc: Dict[str, Any]) -> Tuple[float, int, float]:
+        """``(bm25, distinctive shared tokens, coverage)`` with every token its own concept."""
+        found = self.match(query_tokens, doc)
+        return found["score"], found["shared"], found["coverage"]
+
+    def rank(self, query_tokens: List[str], *, exclude: Iterable[str] = (), concept_of: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         skip = set(exclude)
         rows = []
         for doc in self.docs:
             if doc["name"] in skip:
                 continue
-            score, shared, coverage = self.score(query_tokens, doc)
-            if score > 0:
-                rows.append({"name": doc["name"], "runtime": doc["runtime"], "description": doc["description"], "score": round(score, 3), "shared": shared, "coverage": round(coverage, 3)})
+            found = self.match(query_tokens, doc, concept_of)
+            if found["score"] > 0:
+                rows.append({
+                    "name": doc["name"], "runtime": doc["runtime"], "description": doc["description"],
+                    "score": round(found["score"], 3), "shared": found["shared"], "named": found["named"],
+                    "name_size": found["name_size"], "coverage": round(found["coverage"], 3), "focus": round(found["focus"], 3),
+                })
         rows.sort(key=lambda row: (-row["score"], row["name"]))
         return rows
+
+
+def _anchored(row: Dict[str, Any]) -> bool:
+    """The match rests on the skill's name, or on a focused prompt full of its description.
+
+    * name: ``MIN_NAME_CONCEPTS`` shared concepts are name words and the
+      windowed coverage holds — the only way a long prompt matches;
+    * description: ``MIN_DESCRIPTION_CONCEPTS`` shared concepts and the
+      coverage holds over the *whole* prompt — a symptom told in the
+      description's words, never a few words inside a pasted report.
+    """
+    if row["coverage"] < MIN_COVERAGE:
+        return False
+    if row["name_size"] and row["named"] >= min(MIN_NAME_CONCEPTS, row["name_size"]):
+        return True
+    return row["shared"] >= MIN_DESCRIPTION_CONCEPTS and row["focus"] >= MIN_COVERAGE
 
 
 def candidates_for(
@@ -483,16 +672,17 @@ def candidates_for(
     runtimes' skills *after* ranking: scores keep using the whole index so the
     thresholds stay calibrated (IDF over a one-skill root is near zero)."""
     synonyms = load_synonyms() if synonyms is None else synonyms
-    tokens = expand_prompt(prompt, synonyms)
+    tokens, concept_of = prompt_concepts(prompt, synonyms)
     if not tokens:
         return []
     ranker = Ranker(index.get("docs") or [])
     skip = set(exclude)
     keep = None if allowed is None else set(allowed)
+    min_shared = MIN_SHARED_CONCEPTS + (QUESTION_EXTRA_CONCEPTS if is_pure_question(prompt) else 0)
     ranked = [
-        row for row in ranker.rank(tokens)
+        row for row in ranker.rank(tokens, concept_of=concept_of)
         if (keep is None or row["name"] in keep)
-        and row["score"] >= MIN_SCORE and row["shared"] >= MIN_SHARED_TOKENS and row["coverage"] >= MIN_COVERAGE
+        and row["score"] >= MIN_SCORE and row["shared"] >= min_shared and _anchored(row)
     ]
     if not ranked:
         return []
@@ -511,13 +701,65 @@ def _skip_reason(prompt: str) -> Optional[str]:
     text = (prompt or "").strip()
     if len(text) < MIN_PROMPT_CHARS:
         return "short"
+    if len(text) > MAX_PROMPT_CHARS:
+        return "long"
     if text.startswith("/"):
         return "slash-command"
     if _is_approval(_strip_tail(text)):
         return "approval"
     if _is_choice_echo(text):
         return "choice-echo"
+    if _is_probe(text):
+        return "probe"
     return None
+
+
+#: A health probe tells the model what to reply, not what to do ("Reply with
+#: exactly: pong", "Name two tools you can call."): bridges and doctors send
+#: them, and their words ("name", "call", "single") are not a task.
+_PROBE_LEADS = ("reply with", "respond with", "answer with", "answer in one", "say exactly", "say only")
+_PROBE_MARKS = ("tool you can call", "tools you can call", "single word", "one word only")
+
+
+def _is_probe(text: str) -> bool:
+    if len(text) > PROBE_MAX_CHARS or not text.isascii():
+        return False
+    lowered = " ".join(text.lower().split())
+    return lowered.startswith(_PROBE_LEADS) or any(mark in lowered for mark in _PROBE_MARKS)
+
+
+#: Question forms that do ask for work: a proposal ("…할까?", "…없을까?",
+#: "can we …?") or a how-to. Everything else ending in "?" is a question
+#: about the state of things.
+_REQUEST_QUESTION_ENDINGS = ("까", "없나", "되나", "하나", "줄래", "어때")
+_REQUEST_QUESTION_LEADS = ("can you", "could you", "would you", "will you", "can we", "could we", "shall we", "how do", "how can", "how to")
+_SENTENCE_END = ".!?"
+
+
+def is_pure_question(prompt: str) -> bool:
+    """Every sentence ends in ``?`` and none of them is a request in question form.
+
+    Plain scan, no regex. A ``.``/``!`` only ends a sentence before white
+    space (``run.py``, ``v1.2`` stay whole); a line break always does.
+    """
+    sentences: List[str] = []
+    for line in (prompt or "").splitlines():
+        start = 0
+        for i, char in enumerate(line):
+            if char in _SENTENCE_END and (i + 1 == len(line) or line[i + 1].isspace()):
+                sentences.append(line[start : i + 1])
+                start = i + 1
+        sentences.append(line[start:])
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return False
+    for sentence in sentences:
+        if not sentence.endswith("?"):
+            return False
+        body = sentence.rstrip("?").rstrip().lower()
+        if body.endswith(_REQUEST_QUESTION_ENDINGS) or body.startswith(_REQUEST_QUESTION_LEADS):
+            return False
+    return True
 
 
 #: Separators after which an approval reply carries only the copied option
@@ -649,8 +891,8 @@ def cmd_query(argv: List[str]) -> int:
     limit = _opt_int(argv, "limit", MAX_CANDIDATES)
     index = load_index()
     synonyms = load_synonyms()
-    tokens = expand_prompt(text, synonyms)
-    rows = Ranker(index.get("docs") or []).rank(tokens)[:limit]
+    tokens, concept_of = prompt_concepts(text, synonyms)
+    rows = Ranker(index.get("docs") or []).rank(tokens, concept_of=concept_of)[:limit]
     if "--json" in argv:
         sys.stdout.write(json.dumps({"tokens": tokens, "results": rows}, ensure_ascii=False) + "\n")
     else:
