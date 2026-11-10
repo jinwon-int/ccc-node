@@ -1,29 +1,25 @@
-# TEMPORARY (#2738): is concurrent mkdir exclusive on ubuntu-26.04? Removed before merge.
+# TEMPORARY (#2738): loop start-lib.test.sh on ubuntu-26.04. Removed before merge.
 name: diag-2738
 on:
   pull_request:
 permissions:
   contents: read
 jobs:
-  mkdir-race:
+  loop:
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
-      - name: N concurrent creators of one path, repeated
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+      - name: Loop start-lib.test.sh x20
+        env:
+          TMPDIR: ${{ runner.temp }}/ccc-tmp
         run: |
-          set +e
-          trial() { # <label> <creator-cmd...>  -> rounds where more than one creator succeeded
-            local label="$1"; shift; local multi=0 zero=0 r i d
-            for r in $(seq 1 200); do
-              d="$(mktemp -d)/claim"; : > "$d.go.unused"
-              for i in $(seq 1 20); do ( "$@" "$d" && echo ok >> "$d.wins" ) 2>/dev/null & done; wait
-              n=$(wc -l < "$d.wins" 2>/dev/null || echo 0)
-              [ "$n" -gt 1 ] && multi=$((multi+1)); [ "$n" -eq 0 ] && zero=$((zero+1))
-            done
-            echo "$label: rounds-with-multiple-winners=$multi/200 zero=$zero"
-          }
-          excl() { ( set -C; : > "$1" ); }
-          trial "uutils mkdir" mkdir
-          trial "gnumkdir" /usr/bin/gnumkdir
-          trial "bash noclobber" excl
-          mkdir --version | head -1
+          mkdir -p "$TMPDIR"; set +e; fails=0
+          for i in $(seq 1 20); do
+            out="$(TMPDIR=$(mktemp -d) bash bridge/start-lib.test.sh 2>&1)"
+            echo "run $i: $(grep -E 'PASS=' <<<"$out" | tail -1)"
+            if grep -q '^FAIL' <<<"$out"; then fails=$((fails+1)); grep -E '^FAIL|^diag ' <<<"$out" | cut -c1-600; fi
+          done
+          echo "failing-runs=$fails/20"
