@@ -263,7 +263,7 @@
       "name": "gh-ci-wait",
       "source": "skills/gh-ci-wait",
       "status": "active",
-      "tree_sha256": "8ca1f94e2eb7d2411b7a8108ca5cd756776ccaaaf355e2a45cfd79088f1d995d"
+      "tree_sha256": "3a0f1e1b244a1e5680332766b93ebbc41149dd1e295c4769db5063d0519976cc"
     },
     {
       "audience": "claude",

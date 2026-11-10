@@ -28,7 +28,10 @@ Two categories are reported, because they need different actions:
     Terminal, the notification was delivered, but the continuation never ran
     (``wake.resumed is False``). Nothing else will pick these up -- the owner
     or the agent has to act by hand. ``skip_reason`` says why it stopped;
-    ``session_moved`` is the one the 4-hour rotation produces.
+    ``session_moved`` is the one the 4-hour rotation produces. Once the step
+    is done by hand, ``external_wait_cli ack <wait_id>`` closes the row
+    (#2730); a later PR-less registration of the same promise
+    (``source`` + summary) that resumed closes it too.
 
 Usage::
 
@@ -113,6 +116,26 @@ def _pr_key(rec: Dict[str, Any]):
         return None
     return (repo, str(pr).strip())
 
+
+def _summary_key(rec: Dict[str, Any]):
+    """Identity of a PR-less promise: ``(source, normalized summary)`` (#2730).
+
+    Detached jobs, local tasks and Actions runs have no ``(repo, pr)`` to
+    supersede on, and a re-registered job gets a new unit/log, so the
+    agent-written summary is the only thing that names the promise. An empty
+    summary names nothing and never matches.
+    """
+    summary = " ".join(str(rec.get("summary") or "").split())
+    if not summary:
+        return None
+    return (str(rec.get("source") or ""), summary)
+
+
+def _resumed(rec: Dict[str, Any]) -> bool:
+    wake = rec.get("wake")
+    return isinstance(wake, dict) and wake.get("resumed") is True
+
+
 def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     """Split into (still monitoring, promise dropped).
 
@@ -138,6 +161,21 @@ def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
         created = str(rec.get("created_at") or "")
         if created >= latest_by_pr.get(key, ""):
             latest_by_pr[key] = created
+    # PR-less records (#2730): a later registration of the same promise that
+    # actually resumed carries it, so the earlier dropped one is settled. Only
+    # a *resumed* successor counts — unlike the PR rule, a later record that
+    # also dropped (or is merely monitoring, which is reported on its own)
+    # must not hide the owed one.
+    latest_fulfilled: Dict[Tuple[str, str], str] = {}
+    for rec in records:
+        if _pr_key(rec) is not None or not _resumed(rec):
+            continue
+        skey = _summary_key(rec)
+        if skey is None:
+            continue
+        created = str(rec.get("created_at") or "")
+        if created > latest_fulfilled.get(skey, ""):
+            latest_fulfilled[skey] = created
     for rec in records:
         wake = rec.get("wake")
         wake = wake if isinstance(wake, dict) else {}
@@ -149,6 +187,10 @@ def classify(records: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
         key = _pr_key(rec)
         if key is not None and str(rec.get("created_at") or "") < latest_by_pr.get(key, ""):
             continue
+        if key is None:
+            skey = _summary_key(rec)
+            if skey is not None and str(rec.get("created_at") or "") < latest_fulfilled.get(skey, ""):
+                continue
         if wake.get("state") == "done" and wake.get("resumed") is False:
             dropped.append(rec)
     key = lambda r: str(r.get("created_at") or "")  # noqa: E731
@@ -213,7 +255,8 @@ def render(records: List[Dict[str, Any]]) -> str:
     if monitoring and dropped:
         lines.append("")
     lines += _section(
-        "⚠ 알림은 갔으나 이어가지 못한 약속 — 아무도 대신 처리하지 않는다. 직접 확인할 것:",
+        "⚠ 알림은 갔으나 이어가지 못한 약속 — 아무도 대신 처리하지 않는다. 직접 확인할 것"
+        " (이미 이행했으면 `external_wait_cli ack <wait_id>`로 닫는다):",
         dropped,
         with_reason=True,
     )

@@ -24,6 +24,7 @@ Body-free by contract: records never store prompts, tokens, or check logs.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -32,11 +33,17 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX hosts keep the in-process lock only
+    fcntl = None  # type: ignore[assignment]
 
 from telegram_bot.utils.secure_fs import (
     SessionStoreDurabilityError,
     _atomic_write_bytes,
+    _ensure_storage_directory,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +141,66 @@ _MAX_SUMMARY_CHARS = 200
 _MAX_RUN_LABEL_CHARS = 80
 #: Live run status kept on an Actions-run record for display only (#2590).
 _RUN_STATUS_RE = re.compile(r"^[a-z_]{1,24}$")
+#: Cross-process registry lock (#2730). A read-modify-write holds it for
+#: milliseconds; the bound only keeps a stopped holder from wedging the bridge.
+_FILE_LOCK_TIMEOUT_SECONDS = 5.0
+_FILE_LOCK_POLL_SECONDS = 0.02
+
+#: ``acknowledge`` outcomes (#2730).
+ACK_ACKED = "acked"
+ACK_ALREADY = "already-acked"
+ACK_NOT_FOUND = "not-found"
+ACK_MONITORING = "monitoring"
+ACK_WAKE_PENDING = "wake-pending"
+ACK_NO_WAKE = "no-wake"
+ACK_ERROR = "registry-error"
+
+
+@contextlib.contextmanager
+def _registry_file_lock(path: Path) -> Iterator[bool]:
+    """Exclusive ``flock`` on ``<registry>.lock`` shared by every process (#2730).
+
+    The in-process ``threading.Lock`` only serialized one registry object, yet
+    the bridge builds several objects for the same file and the agent-side CLI
+    writes from its own process: two read-modify-writes could interleave and
+    the later ``os.replace`` silently dropped the earlier change. Yields
+    whether the lock is held; on timeout or a lock-file error it proceeds
+    unlocked (the registry's fail-open contract) and logs once.
+    """
+    if fcntl is None:
+        yield False
+        return
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        _ensure_storage_directory(lock_path.parent)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except Exception as exc:  # noqa: BLE001 - lock setup must never break the fail-open write
+        logger.warning("External-wait registry lock unavailable: %s", type(exc).__name__)
+        yield False
+        return
+    locked = False
+    try:
+        deadline = time.monotonic() + _FILE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                logger.warning("External-wait registry lock failed: %s", type(exc).__name__)
+                break
+            if time.monotonic() >= deadline:
+                logger.warning("External-wait registry lock timed out; writing unlocked")
+                break
+            time.sleep(_FILE_LOCK_POLL_SECONDS)
+        yield locked
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class ExternalWaitValidationError(ValueError):
@@ -331,7 +398,7 @@ class ExternalWaitRegistry:
         self._last_payload = payload
 
     def _mutate(self, fn) -> Any:
-        with self._lock:
+        with self._lock, _registry_file_lock(self._path):
             try:
                 records = self._read()
                 result = fn(records)
@@ -804,6 +871,48 @@ class ExternalWaitRegistry:
             if wake.get("resumed") is False:
                 out.append(rec)
         return out
+
+    def acknowledge(self, wait_id: str, *, note: Optional[str] = None) -> str:
+        """Operator ack: the promise of a finished wait was fulfilled by hand (#2730).
+
+        A dropped promise (``wake.resumed is False``) used to have no closing
+        path: ``cancel`` only touches monitoring records and ``mark_wake`` is
+        the bridge's own journal call, so a promise someone already carried
+        out by hand resurfaced at every SessionStart until retention pruned
+        it. This records ``wake.resumed = True`` plus a body-free
+        ``wake.manual_ack`` (time, prior ``resumed``, optional bounded note);
+        ``state``, ``terminal_status`` and ``skip_reason`` stay as they were,
+        so the record still says how it ended and why it was not resumed.
+
+        Returns one of the ``ACK_*`` outcomes. Monitoring waits are refused
+        (use ``cancel``), as are pending wakes (the bridge is still delivering
+        them) and records that never journaled a wake (nothing was owed).
+        Repeating an ack is a no-op that reports ``already-acked``.
+        """
+        note_text = validate_summary(note)
+
+        def _do(records):
+            rec = records.get(wait_id)
+            if rec is None:
+                return ACK_NOT_FOUND
+            if rec.get("state") == STATE_MONITORING:
+                return ACK_MONITORING
+            wake = rec.get("wake")
+            if not isinstance(wake, dict):
+                return ACK_NO_WAKE
+            if wake.get("state") == "pending":
+                return ACK_WAKE_PENDING
+            if isinstance(wake.get("manual_ack"), dict):
+                return ACK_ALREADY
+            ack: Dict[str, Any] = {"at": _utc_now_iso(), "prior_resumed": wake.get("resumed")}
+            if note_text:
+                ack["note"] = note_text
+            rec["wake"] = {**wake, "resumed": True, "manual_ack": ack}
+            rec["updated_at"] = _utc_now_iso()
+            return ACK_ACKED
+
+        result = self._mutate(_do)
+        return str(result) if result else ACK_ERROR
 
     # --- startup / introspection ---------------------------------------------------
     def reconcile_on_start(self, *, now: Optional[float] = None) -> int:

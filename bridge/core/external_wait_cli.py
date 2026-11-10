@@ -30,6 +30,15 @@ Usage (inside an agent turn)::
         --summary "read the compare log and report" [--timeout-seconds 7200]
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
+    python -m telegram_bot.core.external_wait_cli ack <wait_id> [--note "cleaned up by hand"]
+
+``ack`` (#2730) closes a *dropped* promise — a finished wait whose wake landed
+but whose continuation never ran (``resumed=false``, the SessionStart
+``⚠ 미완 약속`` rows) — after the promised step was carried out by hand. It
+records ``wake.resumed=true`` plus a body-free ``wake.manual_ack``; the terminal
+state and skip reason are kept. Monitoring waits are refused (use ``cancel``).
+No active route is needed, and the write takes the registry's cross-process
+file lock, so it is safe while the bridge runs.
 
 ``--source merge-queue`` (#2118) watches an *enqueued* PR instead of its
 check rollup: the wait ends ``merged`` when it lands, ``evicted`` when the
@@ -87,6 +96,13 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from telegram_bot.core.external_wait import (
+    ACK_ACKED,
+    ACK_ALREADY,
+    ACK_ERROR,
+    ACK_MONITORING,
+    ACK_NO_WAKE,
+    ACK_NOT_FOUND,
+    ACK_WAKE_PENDING,
     SOURCE_GITHUB_ACTIONS_RUN,
     SOURCE_GITHUB_MERGE_QUEUE,
     SOURCE_DETACHED_JOB,
@@ -590,6 +606,7 @@ def _cmd_list(home: Path) -> int:
                     # resumed=false is still owed an action by the owner.
                     "resumed": (rec.get("wake") or {}).get("resumed"),
                     "skip_reason": (rec.get("wake") or {}).get("skip_reason"),
+                    "manual_ack": isinstance((rec.get("wake") or {}).get("manual_ack"), dict),
                 }
                 for rec in sorted(records, key=lambda r: str(r.get("created_at") or ""))
             ],
@@ -610,6 +627,46 @@ def _cmd_cancel(home: Path, args: dict[str, Any]) -> int:
     return RC_OK if cancelled else RC_USAGE
 
 
+_ACK_MESSAGES = {
+    ACK_ACKED: "marked as fulfilled by hand; it no longer surfaces as a dropped promise",
+    ACK_ALREADY: "already acknowledged; nothing changed",
+    ACK_NOT_FOUND: "no such wait_id (unknown, or pruned after the 24 h retention)",
+    ACK_MONITORING: "the wait is still monitoring; use cancel to stop it",
+    ACK_WAKE_PENDING: "the wake is still being delivered; retry after it lands",
+    ACK_NO_WAKE: "the wait never journaled a wake, so no promise is owed",
+    ACK_ERROR: "registry update failed; nothing was written",
+}
+
+
+def _cmd_ack(home: Path, args: dict[str, Any]) -> int:
+    """Close a dropped promise that was fulfilled by hand (#2730).
+
+    Does not need an active route: the operator acks from any shell, and the
+    write goes through the registry's cross-process file lock, so a running
+    bridge never loses it.
+    """
+    positional = args.get("_") or []
+    wait_id = str(positional[0] if positional else args.get("wait_id", "")).strip()
+    if not wait_id:
+        _emit({"ok": False, "code": "validation", "message": "ack requires a wait_id"})
+        return RC_USAGE
+    registry = ExternalWaitRegistry(default_registry_path(home))
+    outcome = registry.acknowledge(wait_id, note=args.get("note"))
+    ok = outcome in {ACK_ACKED, ACK_ALREADY}
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "wait_id": wait_id,
+        "outcome": outcome,
+        "message": _ACK_MESSAGES.get(outcome, outcome),
+    }
+    if not ok:
+        payload["code"] = "registry-error" if outcome == ACK_ERROR else "not-ackable"
+    _emit(payload)
+    if ok:
+        return RC_OK
+    return RC_REGISTRY_ERROR if outcome == ACK_ERROR else RC_USAGE
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     tokens = list(argv if argv is not None else sys.argv[1:])
     if not tokens or tokens[0] in {"-h", "--help"}:
@@ -628,6 +685,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_list(home)
     if command == "cancel":
         return _cmd_cancel(home, args)
+    if command == "ack":
+        return _cmd_ack(home, args)
     _emit({"ok": False, "code": "validation", "message": f"unknown command: {command}"})
     return RC_USAGE
 
