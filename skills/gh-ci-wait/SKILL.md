@@ -182,6 +182,15 @@ continuation never ran. Each entry carries a `skip_reason`. Branch on it:
   blindly. Inspect the live registry with `... external_wait_cli list` and
   confirm the route metadata is restorable first. Re-registering onto a broken
   route reproduces the same drop.
+- **Already fulfilled** (an earlier session did the promised step by hand) —
+  verify the evidence (merge commit, branch deleted, result comment), then close
+  the row with `... external_wait_cli ack <wait_id> --note "<evidence id>"`. It
+  sets `wake.resumed=true` plus a `manual_ack` stamp and keeps the terminal
+  state; it refuses monitoring waits (use `cancel`). Never hand-edit
+  `waits.json` — the CLI takes the registry's cross-process lock, a raw edit
+  can be overwritten by the running bridge. A PR-less promise (detached job,
+  local task) that was **re-registered and resumed** under the same source and
+  summary is hidden automatically; no ack needed.
 
 Before acting on any of these entries, remember they are **inherited claims**
 written before the session boundary — see `handoff-premise-freshness-verification`

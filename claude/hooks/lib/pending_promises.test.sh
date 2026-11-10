@@ -155,5 +155,64 @@ w shadowed '{"a":{"wait_id":"a1","state":"failure","repo":"o/r","pr_number":9,"h
 out="$(python3 "$MOD" "$TMP/shadowed.json")"
 ok "older dropped record is hidden behind the newer wait for the same PR" '! grep -q "dddddddd" <<<"$out" && grep -q "아직 대기 중" <<<"$out" && grep -q "eeeeeeee" <<<"$out"'
 
+# ---- #2730: PR-less superseded + manual ack ---------------------------------
+# Measured shape (2026-11-10): a detached job ended `lost` with a dropped
+# wake, then the same promise was re-registered and fulfilled (resumed=true).
+# The older record has no (repo, pr) key, so the #1408 rule never hid it.
+w detached_redo '{"ab9da4672ff4":{"wait_id":"ab9da4672ff4","source":"detached_job","state":"lost","repo":"","pr_number":null,
+  "summary":"auto-distill TM-4477 플릿 11노드 설치 후 22:30·23:00 회차 관찰","created_at":"2026-11-09T13:13:47Z",
+  "wake":{"state":"done","resumed":false,"skip_reason":"non_terminal_rollup"}},
+ "51859192ca83":{"wait_id":"51859192ca83","source":"detached_job","state":"success","repo":"","pr_number":null,
+  "summary":"auto-distill  TM-4477 플릿 11노드 설치 후 22:30·23:00 회차 관찰","created_at":"2026-11-09T13:31:32Z",
+  "wake":{"state":"done","resumed":true}}}'
+out="$(python3 "$MOD" "$TMP/detached_redo.json")"
+ok "PR-less dropped record is hidden by a later resumed same-summary record" '[ -z "$out" ]'
+
+# A later same-summary record that ALSO dropped must not hide the earlier one.
+w detached_both_dropped '{"a":{"wait_id":"pa1","source":"detached_job","state":"lost","summary":"nightly compare",
+  "created_at":"2026-11-09T01:00:00Z","wake":{"state":"done","resumed":false,"skip_reason":"non_terminal_rollup"}},
+ "b":{"wait_id":"pb1","source":"detached_job","state":"failure","summary":"nightly compare",
+  "created_at":"2026-11-09T02:00:00Z","wake":{"state":"done","resumed":false,"skip_reason":"daily_cap"}}}'
+out="$(python3 "$MOD" "$TMP/detached_both_dropped.json")"
+ok "a later dropped successor does not hide the earlier PR-less drop" 'grep -q "\[pa1\]" <<<"$out" && grep -q "\[pb1\]" <<<"$out"'
+
+# The resumed record must be LATER; an earlier fulfilment says nothing about a newer drop.
+w detached_older_ok '{"a":{"wait_id":"pc1","source":"detached_job","state":"success","summary":"nightly compare",
+  "created_at":"2026-11-09T01:00:00Z","wake":{"state":"done","resumed":true}},
+ "b":{"wait_id":"pd1","source":"detached_job","state":"lost","summary":"nightly compare",
+  "created_at":"2026-11-09T02:00:00Z","wake":{"state":"done","resumed":false,"skip_reason":"non_terminal_rollup"}}}'
+out="$(python3 "$MOD" "$TMP/detached_older_ok.json")"
+ok "an earlier resumed record does not hide a newer PR-less drop" 'grep -q "\[pd1\]" <<<"$out"'
+
+# Different source or a different summary is a different promise.
+w detached_other '{"a":{"wait_id":"pe1","source":"detached_job","state":"lost","summary":"job A",
+  "created_at":"2026-11-09T01:00:00Z","wake":{"state":"done","resumed":false,"skip_reason":"non_terminal_rollup"}},
+ "b":{"wait_id":"pf1","source":"local_task","state":"success","summary":"job A",
+  "created_at":"2026-11-09T02:00:00Z","wake":{"state":"done","resumed":true}},
+ "c":{"wait_id":"pg1","source":"detached_job","state":"success","summary":"job B",
+  "created_at":"2026-11-09T03:00:00Z","wake":{"state":"done","resumed":true}}}'
+out="$(python3 "$MOD" "$TMP/detached_other.json")"
+ok "summary match is scoped to the same source and exact summary" 'grep -q "\[pe1\]" <<<"$out"'
+
+# An empty summary names nothing: two empty-summary records never pair up.
+w detached_nosummary '{"a":{"wait_id":"ph1","source":"detached_job","state":"lost","summary":"",
+  "created_at":"2026-11-09T01:00:00Z","wake":{"state":"done","resumed":false,"skip_reason":"non_terminal_rollup"}},
+ "b":{"wait_id":"pi1","source":"detached_job","state":"success","summary":"",
+  "created_at":"2026-11-09T02:00:00Z","wake":{"state":"done","resumed":true}}}'
+out="$(python3 "$MOD" "$TMP/detached_nosummary.json")"
+ok "empty summaries never supersede each other" 'grep -q "\[ph1\]" <<<"$out"'
+
+# Measured shape: merge-queue wait whose cleanup was done by hand, then acked
+# through `external_wait_cli ack` (wake.resumed=true + manual_ack).
+w acked '{"9209cb9d049a":{"wait_id":"9209cb9d049a","source":"github_merge_queue","state":"merged","repo":"jinwon-int/a2a-nexus",
+  "pr_number":2532,"head_sha":"bc81d214aaaaaaaa","created_at":"2026-11-08T22:00:00Z",
+  "wake":{"state":"done","resumed":true,"skip_reason":"daily_cap","manual_ack":{"at":"2026-11-10T05:00:00Z","prior_resumed":false}}}}'
+out="$(python3 "$MOD" "$TMP/acked.json")"
+ok "manually acked promise is not reported" '[ -z "$out" ]'
+
+# The dropped section tells the reader how to close a row they already fulfilled.
+out="$(python3 "$MOD" "$TMP/dropped_only.json")"
+ok "dropped section names the ack command" 'grep -q "external_wait_cli ack" <<<"$out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
