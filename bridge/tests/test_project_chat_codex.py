@@ -2802,6 +2802,40 @@ def _pin_terminal_stall_bound(monkeypatch: pytest.MonkeyPatch, seconds: float) -
     monkeypatch.setitem(consumer_globals, "_select_timeout", pinned)
 
 
+def _hold_terminal_stall_until_delegated_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> asyncio.Event:
+    """Keep the terminal guard off until a delegated start reaches the state.
+
+    #2731: with a text event followed by a delegated ``started`` event, the
+    consumer re-selects its bound between the two. If applying the text event
+    outlasts a tiny terminal-stall grace on a loaded runner, the bound is
+    already spent and the turn ends as TERMINAL_STALL before the lifecycle
+    event is ever read (3.11 flake). Synchronize on the lifecycle event
+    instead of a time margin: until ``delegated_tasks_active`` is observed,
+    the terminal bound is disabled; from then on the configured value applies
+    unchanged, so a regression that keeps the terminal guard armed while
+    delegated work runs still fails. Returns the latch so the test can assert
+    the delegated start was actually observed.
+    """
+
+    process_globals = ProjectChatHandler._process_agent_message.__globals__
+    consumer_globals = process_globals["consume_turn_stream"].__globals__
+    select = consumer_globals["_select_timeout"]
+    delegated_started = asyncio.Event()
+
+    def gated(**kwargs: object) -> object:
+        state = kwargs["state"]
+        if getattr(state, "delegated_tasks_active", 0) > 0:
+            delegated_started.set()
+        if not delegated_started.is_set():
+            kwargs = {**kwargs, "terminal_stall_seconds": 0.0}
+        return select(**kwargs)
+
+    monkeypatch.setitem(consumer_globals, "_select_timeout", gated)
+    return delegated_started
+
+
 @pytest.mark.anyio
 async def test_unbounded_events_keep_the_project_chat_consumer_task_identity(
     tmp_path: Path,
@@ -3005,12 +3039,14 @@ async def test_delegated_lifecycle_defers_terminal_guard_until_distinct_limit(
     handler._config.terminal_stall_seconds = 0.005
     handler._config.delegated_task_stall_seconds = 0.05
     handler._process_timeout_seconds = 5.0
+    delegated_started = _hold_terminal_stall_until_delegated_start(monkeypatch)
 
     response = await asyncio.wait_for(
         handler.process_message("deep research", 7, 70),
         timeout=5,
     )
 
+    assert delegated_started.is_set()
     assert response.success is False
     assert response.error == "Delegated work exceeded its maximum runtime"
     assert "delegated work is running" in response.content
