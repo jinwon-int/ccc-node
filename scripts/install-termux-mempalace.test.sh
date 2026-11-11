@@ -153,7 +153,7 @@ out="$(run_install --apply --codex 2>&1)"; rc=$?
 ok "apply creates a dedicated container, managed wrapper and body-free metadata" \
   '[ "$rc" = 0 ] && [ -x "$container_root/opt/ccc-mempalace/venv/bin/mempalace" ] && [ -x "$home/.local/bin/mempalace" ] && [ "$(stat -c %a "$home/.nunchi/termux-mempalace/status.json")" = 600 ]'
 ok "apply wires nunchi to the exact wrapper and Codex source" \
-  'grep -q "args=--apply --codex" "$nunchi_capture" && grep -q "cli=$home/.local/bin/mempalace" "$nunchi_capture" && grep -q "source=$home/.codex/sessions" "$nunchi_capture"'
+  'grep -qx "args=--apply --codex --keep-optins" "$nunchi_capture" && grep -q "cli=$home/.local/bin/mempalace" "$nunchi_capture" && grep -q "source=$home/.codex/sessions" "$nunchi_capture"'
 ok "the initial refresh records a successful provider-scoped status" \
   'jq -e '\'' .provider == "codex" and .state == "ok" '\'' "$home/.nunchi/mempalace-refresh.status.json" >/dev/null'
 

@@ -270,6 +270,39 @@ cron entries. The nunchi code and local database remain in place, while the next
 Codex materialization falls back to canonical `load-memory.sh`. This wiring does
 not claim completion of pilot or gate-3 observation.
 
+### Re-applying: opt-in drop guard
+
+`install-nunchi.sh --apply` rewrites every managed cron line from the flags of
+that one invocation and stores them in `state/install-nunchi.json`, which
+self-update replays. A re-run that leaves out an opt-in the node already had
+would remove its cron line and make the reduced flags permanent, with no error
+(#2759: two nodes lost their judge cron this way for 17 days).
+
+`--apply` therefore compares the previous record with the opt-ins the new
+invocation resolves to (flags and `CCC_NUNCHI_*` environment) before it writes
+anything. If one would be dropped it exits 5, changes nothing, and prints the
+dropped opt-ins and the command that keeps them.
+
+| Recorded | Dropped when the re-apply has |
+|---|---|
+| `--judge-apply` | `--judge` only, or no judge flag |
+| `--judge` | no judge flag (`--judge-apply` covers it) |
+| `--wiki-promote-apply` | `--wiki-promote` only, or neither |
+| `--wiki-promote` | neither (`--wiki-promote-apply` covers it) |
+| `--conflict-sweep` | no `--conflict-sweep` |
+| `--verbatim-backend gotgan\|both`, `--audience-scoped ROOT`, `--gotgan-run-bytes N`, `--gotgan-python PATH` | the flag absent (a different value is an explicit choice, not a drop) |
+
+```bash
+scripts/install-nunchi.sh --apply --claude --keep-optins        # carry every recorded opt-in forward
+scripts/install-nunchi.sh --apply --claude --allow-drop-optins  # drop the missing ones on purpose
+scripts/install-nunchi.sh --claude                              # dry run: prints the same warning, then status
+```
+
+Neither switch is stored in the record. Replaying the record (self-update) drops
+nothing, so it is never refused. A missing, unreadable or malformed record
+blocks nothing. `--remove` is not guarded. `install-termux-mempalace.sh` re-applies
+nunchi with `--keep-optins`.
+
 ### Piri global snapshot materializer (ccc-piri)
 
 `scripts/ccc-piri` is the node-global Piri counterpart of `scripts/ccc-codex`.

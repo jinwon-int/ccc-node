@@ -146,8 +146,11 @@ ok "replaying the recorded argv preserves the judge cron line" \
 # A re-apply that genuinely drops --judge is opt-OUT, not replay: the line is
 # removed on purpose. This asserts the removal path, which the previous
 # revision of this case claimed to be survival while asserting a count of 0.
+# Since #2759 a drop has to be acknowledged (--allow-drop-optins) — an
+# unacknowledged one is refused, see the opt-in drop guard section at the
+# end. Every later case that steps an opt-in down on purpose passes it too.
 ok "a deliberate re-apply without --judge removes the judge cron" \
-  'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c "judge-batch.py" "$cron_store")" = 0 ]'
+  'run_install --apply --codex --allow-drop-optins >/dev/null 2>&1 && [ "$(grep -c "judge-batch.py" "$cron_store")" = 0 ]'
 ok "opting out also drops --judge from the install record" \
   'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 
@@ -182,7 +185,7 @@ for bad in 0 1.5 abc -0.5; do
 done
 
 # --- #2271: auto-mode judge is Claude-only; the GPT fallback is opt-in -------
-out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
+out="$(run_install --apply --codex --judge --allow-drop-optins 2>&1)"; rc=$?
 ok "a Codex-runtime node stamps NUNCHI_JUDGE_PROVIDER=codex on the judge line" \
   '[ "$rc" = 0 ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_PROVIDER=codex "'
 out="$(run_install --apply --claude --judge 2>&1)"; rc=$?
@@ -210,12 +213,12 @@ ok "install record materializes --judge-apply, not the weaker --judge" \
 ok "replaying the recorded argv keeps APPLY (no silent downgrade to dry-run)" \
   'run_install --apply --codex --judge-apply >/dev/null 2>&1 && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1"'
 # Stepping back down to plain --judge must actually disarm the cron.
-out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
+out="$(run_install --apply --codex --judge --allow-drop-optins 2>&1)"; rc=$?
 ok "re-applying with plain --judge disarms APPLY on the cron line" \
   '[ "$rc" = 0 ] && grep -q "judge-batch.py" "$cron_store" && ! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY"'
 ok "stepping down also rewrites the install record to --judge" \
   'jq -e ".argv==[\"--apply\",\"--codex\",\"--judge\"]" "$nrec" >/dev/null'
-run_install --apply --codex >/dev/null 2>&1
+run_install --apply --codex --allow-drop-optins >/dev/null 2>&1
 
 # --- Wiki-promote batch (#1447): opt-in via --wiki-promote, a 5th managed line
 # that is ALWAYS dry-run on the cron by design — APPLY queues fleet facts for
@@ -232,7 +235,7 @@ ok "install record materializes --wiki-promote so a self-update replay keeps the
 ok "replaying the recorded argv preserves the wiki-promote cron line" \
   'run_install --apply --codex --wiki-promote >/dev/null 2>&1 && [ "$(grep -c "wiki-promote.py" "$cron_store")" = 1 ]'
 ok "a deliberate re-apply without --wiki-promote removes the wiki-promote cron" \
-  'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c "wiki-promote.py" "$cron_store")" = 0 ]'
+  'run_install --apply --codex --allow-drop-optins >/dev/null 2>&1 && [ "$(grep -c "wiki-promote.py" "$cron_store")" = 0 ]'
 ok "opting out also drops --wiki-promote from the install record" \
   'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 
@@ -249,12 +252,12 @@ ok "install record materializes --wiki-promote-apply, not the weaker flag" \
   'jq -e ".argv==[\"--apply\",\"--codex\",\"--wiki-promote-apply\"]" "$nrec" >/dev/null'
 ok "replaying the recorded argv keeps APPLY (no silent downgrade to dry-run)" \
   'run_install --apply --codex --wiki-promote-apply >/dev/null 2>&1 && grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY=1"'
-out="$(run_install --apply --codex --wiki-promote 2>&1)"; rc=$?
+out="$(run_install --apply --codex --wiki-promote --allow-drop-optins 2>&1)"; rc=$?
 ok "re-applying with plain --wiki-promote disarms APPLY on the cron line" \
   '[ "$rc" = 0 ] && grep -q "wiki-promote.py" "$cron_store" && ! grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY"'
 ok "stepping down also rewrites the install record to --wiki-promote" \
   'jq -e ".argv==[\"--apply\",\"--codex\",\"--wiki-promote\"]" "$nrec" >/dev/null'
-run_install --apply --codex >/dev/null 2>&1
+run_install --apply --codex --allow-drop-optins >/dev/null 2>&1
 
 # --- Conflict-sweep (#2479): opt-in daily line. Flag-only by construction
 # (review=1 + pair ledger, never closes), so the cron always runs --apply and
@@ -290,7 +293,7 @@ env HOME="$home" NUNCHI_HOME="$nunchi_home" NUNCHI_DB="$nunchi_home/facts.db" NU
   python3 "$hooks/nunchi/nunchi.py" conflict-sweep --since-days 2 --max-pairs 100 --judge none >/dev/null 2>&1; rc=$?
 ok "the installed subcommand accepts those args (LLM-free dry run exits 0)" '[ "$rc" = 0 ]'
 ok "a deliberate re-apply without --conflict-sweep removes the line" \
-  'run_install --apply --codex >/dev/null 2>&1 && [ "$(grep -c " conflict-sweep " "$cron_store")" = 0 ]'
+  'run_install --apply --codex --allow-drop-optins >/dev/null 2>&1 && [ "$(grep -c " conflict-sweep " "$cron_store")" = 0 ]'
 ok "opting out also drops --conflict-sweep from the install record" \
   'jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 out="$(CCC_NUNCHI_CONFLICT_SWEEP=1 run_install --apply --codex 2>&1)"; rc=$?
@@ -316,7 +319,7 @@ out="$(run_install --apply --codex --conflict-sweep 2>&1)"; rc=$?
 ok "stale hooks without the subcommand: exit 2, crontab untouched" \
   '[ "$rc" = 2 ] && grep -q "has no conflict-sweep subcommand" <<<"$out" && cmp -s "$TMP/cron.before" "$cron_store"'
 cp "$TMP/nunchi.py.keep" "$hooks/nunchi/nunchi.py"
-run_install --apply --codex >/dev/null 2>&1
+run_install --apply --codex --allow-drop-optins >/dev/null 2>&1
 
 # --- Piri lane: Piri has no distill feed, so its lane runs a per-session
 # extractor (piri-feed.sh) and mines transcripts with the conversation miner
@@ -602,7 +605,7 @@ ok "Codex materializer auto-selects the installed managed nunchi loader" \
 
 unrelated_sweep='43 4 * * * /opt/operator/mempalace sweep /srv/operator-archive'
 printf '%s\n' "$unrelated_sweep" >> "$cron_store"
-out="$(run_install --apply --codex 2>&1)"; rc=$?
+out="$(run_install --apply --codex --allow-drop-optins 2>&1)"; rc=$?
 ok "Codex reapply is cron-idempotent" \
   '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ]'
 ok "managed cron rewrites preserve unrelated operator MemPalace jobs" \
@@ -930,7 +933,7 @@ ok "replaying the install record keeps exactly one gotgan line" \
 out="$(run_install --apply --codex --verbatim-backend gotgan 2>&1)"; rc=$?
 ok "--verbatim-backend gotgan drops the MemPalace sweep, keeps feed/gotgan/bench (3 managed lines)" \
   '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 3 ] && ! grep -q "mempalace-refresh.sh" "$cron_store" && grep -q "gotgan-refresh.sh codex" "$cron_store" && grep -q "MemPalace refresh cron not installed" <<<"$out" && [ "$(cat "$backend_file")" = gotgan ]'
-run_install --apply --codex >/dev/null 2>&1
+run_install --apply --codex --allow-drop-optins >/dev/null 2>&1
 ok "re-apply without the flag returns to mempalace (gotgan line and file gone)" \
   '! grep -q "gotgan-refresh.sh" "$cron_store" && [ ! -e "$backend_file" ] && grep -q "mempalace-refresh.sh codex" "$cron_store" && jq -e ".argv==[\"--apply\",\"--codex\"]" "$nrec" >/dev/null'
 # --- #2475: the per-node gotgan budget/interpreter survive a self-update
@@ -947,10 +950,10 @@ env -u GOTGAN_RUN_BYTES -u CCC_NUNCHI_GOTGAN_PYTHON "${common_env[@]}" \
   bash "$ROOT/scripts/install-nunchi.sh" "${rec_argv[@]}" >/dev/null 2>&1
 ok "replaying the record without the env keeps the pinned budget on exactly one :27 line" \
   '[ "$(grep -c "gotgan-refresh.sh codex" "$cron_store")" = 1 ] && grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=33554432 CCC_NUNCHI_GOTGAN_PYTHON=/usr/bin/python3 "'
-run_install --apply --codex --verbatim-backend both --gotgan-run-bytes 16777216 >/dev/null 2>&1
+run_install --apply --codex --verbatim-backend both --gotgan-run-bytes 16777216 --allow-drop-optins >/dev/null 2>&1
 ok "the flag sets the budget directly and wins over nothing in env" \
   'grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=16777216 " && ! grep "gotgan-refresh.sh" "$cron_store" | grep -q "CCC_NUNCHI_GOTGAN_PYTHON=" && jq -e ".argv==[\"--apply\",\"--codex\",\"--verbatim-backend\",\"both\",\"--gotgan-run-bytes\",\"16777216\"]" "$nrec" >/dev/null'
-run_install --apply --codex --verbatim-backend both >/dev/null 2>&1
+run_install --apply --codex --verbatim-backend both --allow-drop-optins >/dev/null 2>&1
 ok "unset budget leaves the line and the record unchanged (no pin)" \
   '! grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_RUN_BYTES=" && jq -e ".argv==[\"--apply\",\"--codex\",\"--verbatim-backend\",\"both\"]" "$nrec" >/dev/null'
 rc=0; run_install --apply --codex --gotgan-run-bytes 0 >/dev/null 2>&1 || rc=$?
@@ -1075,6 +1078,143 @@ rc=$?
 ok "without the installed probe parser the refresh records unknown and skips repair-status" \
   '[ "$rc" = 0 ] && jq -e '\''.state == "ok" and .index_status.state == "unknown"'\'' "$ix_status" >/dev/null && ! grep -q repair-status "$ix_calls"'
 mv "$ix_hooks/ccc_memory_probe.py.off" "$ix_hooks/ccc_memory_probe.py"
+
+# --- #2759: opt-in drop guard. Incident 2026-10-25: a re-run as
+# `--apply --claude` on nodes recorded as `--apply --claude --judge-apply`
+# removed the judge cron and overwrote the record, so self-update replayed the
+# reduced argv from then on (unnoticed for 17 days). --apply now refuses before
+# its first write unless the drop is acknowledged or carried forward.
+# shellcheck disable=SC2034  # the snapshots below are read via eval inside ok()
+guard_snap() {  # freeze everything a refused --apply must leave untouched
+  cp "$cron_store" "$TMP/guard.cron"; cp "$nrec" "$TMP/guard.rec"
+  cp "$claude_dir/settings.local.json" "$TMP/guard.settings"; cp "$state/nunchi.mode" "$TMP/guard.mode"
+}
+guard_untouched() {
+  cmp -s "$TMP/guard.cron" "$cron_store" && cmp -s "$TMP/guard.rec" "$nrec" \
+    && cmp -s "$TMP/guard.settings" "$claude_dir/settings.local.json" && cmp -s "$TMP/guard.mode" "$state/nunchi.mode"
+}
+guard_argv() { jq -c '.argv' "$nrec"; }
+run_install --remove >/dev/null 2>&1
+out="$(run_install --apply --codex 2>&1)"; rc=$?
+ok "#2759 first install (no previous record) is never blocked" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\"]" ]'
+out="$(run_install --apply --codex --judge-apply --conflict-sweep 2>&1)"; rc=$?
+ok "#2759 adding opt-ins to an existing install proceeds" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge-apply\",\"--conflict-sweep\"]" ]'
+
+# the incident: same command minus the opt-ins
+guard_snap
+out="$(run_install --apply --codex 2>&1)"; rc=$?
+ok "#2759 re-apply that omits recorded opt-ins is refused with a non-zero exit" \
+  '[ "$rc" = 5 ] && grep -q "^REFUSED: " <<<"$out" && grep -q "nothing was changed" <<<"$out"'
+ok "#2759 refusal lists every opt-in that would be dropped" \
+  'grep -qx "    --judge-apply " <<<"$out" && grep -qx "    --conflict-sweep " <<<"$out"'
+ok "#2759 refusal prints the exact command that keeps them and names both switches" \
+  'grep -q "To keep them: .*install-nunchi.sh --apply --codex --judge-apply --conflict-sweep$" <<<"$out" && grep -q -- "--keep-optins" <<<"$out" && grep -q -- "--allow-drop-optins" <<<"$out"'
+ok "#2759 refused apply leaves crontab, install record, hook settings and mode untouched" 'guard_untouched'
+ok "#2759 refused apply keeps the judge APPLY and conflict-sweep cron lines" \
+  'grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1" && [ "$(grep -c " conflict-sweep " "$cron_store")" = 1 ]'
+
+# self-update reapply replays the recorded argv verbatim: must never be refused
+mapfile -t rec_argv < <(jq -r '.argv[]' "$nrec")
+out="$(env "${common_env[@]}" bash "$ROOT/scripts/install-nunchi.sh" "${rec_argv[@]}" 2>&1)"; rc=$?
+ok "#2759 replaying the recorded argv (self-update reapply) proceeds, record and lines unchanged" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED\|WARNING: --apply" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge-apply\",\"--conflict-sweep\"]" ] && grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1" && [ "$(grep -c " conflict-sweep " "$cron_store")" = 1 ]'
+out="$(CCC_NUNCHI_JUDGE=1 CCC_NUNCHI_JUDGE_APPLY=1 CCC_NUNCHI_CONFLICT_SWEEP=1 run_install --apply --codex 2>&1)"; rc=$?
+ok "#2759 opt-ins resolved from CCC_NUNCHI_* env count as present" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge-apply\",\"--conflict-sweep\"]" ]'
+
+# implied flags: --judge-apply implies --judge
+guard_snap
+out="$(run_install --apply --codex --judge --conflict-sweep 2>&1)"; rc=$?
+ok "#2759 --judge after a recorded --judge-apply is a drop of apply mode" \
+  '[ "$rc" = 5 ] && grep -qx "    --judge-apply " <<<"$out" && ! grep -qx "    --conflict-sweep " <<<"$out" && guard_untouched'
+out="$(run_install --apply --codex --judge --conflict-sweep --allow-drop-optins 2>&1)"; rc=$?
+ok "#2759 --allow-drop-optins proceeds and says what it dropped" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && grep -q "as acknowledged (--allow-drop-optins)" <<<"$out" && grep -qx "    --judge-apply " <<<"$out"'
+ok "#2759 acknowledged drop updates the record and disarms APPLY on the cron line" \
+  '[ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge\",\"--conflict-sweep\"]" ] && [ "$(grep -c "judge-batch.py" "$cron_store")" = 1 ] && ! grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY"'
+ok "#2759 the acknowledgement is never written to the install record" '! grep -q "allow-drop-optins\|keep-optins" "$nrec"'
+out="$(run_install --apply --codex --judge-apply --conflict-sweep 2>&1)"; rc=$?
+ok "#2759 --judge-apply alone covers a recorded --judge (upgrade, not a drop)" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge-apply\",\"--conflict-sweep\"]" ]'
+out="$(run_install --apply --codex --judge-apply --conflict-sweep --wiki-promote-apply 2>&1)"; rc=$?
+ok "#2759 adding --wiki-promote-apply proceeds" '[ "$rc" = 0 ] && grep -q "wiki-promote-apply" "$nrec"'
+guard_snap
+out="$(run_install --apply --codex --judge-apply --conflict-sweep --wiki-promote 2>&1)"; rc=$?
+ok "#2759 --wiki-promote after a recorded --wiki-promote-apply is a drop of apply mode" \
+  '[ "$rc" = 5 ] && grep -qx "    --wiki-promote-apply " <<<"$out" && ! grep -qx "    --judge-apply " <<<"$out" && guard_untouched'
+
+# dry-run (no --apply): same warning, exit and status output as before
+guard_snap
+out="$(run_install --codex 2>&1)"; rc=$?
+ok "#2759 dry-run prints the drop warning and still exits 0 with the status block" \
+  '[ "$rc" = 0 ] && grep -q "^WARNING: --apply with these arguments would be refused" <<<"$out" && grep -qx "    --judge-apply " <<<"$out" && grep -qx "    --wiki-promote-apply " <<<"$out" && grep -q "^mode: on" <<<"$out" && grep -q "^cron: " <<<"$out"'
+ok "#2759 dry-run keep command includes --apply" \
+  'grep -q "To keep them: .*install-nunchi.sh --apply --codex --judge-apply --wiki-promote-apply --conflict-sweep$" <<<"$out"'
+ok "#2759 dry-run changes nothing" 'guard_untouched'
+out="$(run_install 2>&1)"; rc=$?
+ok "#2759 bare status (no install arguments) stays quiet" \
+  '[ "$rc" = 0 ] && ! grep -q "WARNING: --apply\|REFUSED" <<<"$out" && grep -q "^mode: on" <<<"$out"'
+
+# --keep-optins carries the recorded opt-ins forward instead of refusing
+out="$(run_install --codex --keep-optins 2>&1)"; rc=$?
+ok "#2759 dry-run with --keep-optins reports what would be carried, no warning" \
+  '[ "$rc" = 0 ] && ! grep -q "WARNING: --apply\|REFUSED" <<<"$out" && grep -q "would carry forward" <<<"$out" && guard_untouched'
+out="$(run_install --apply --codex --keep-optins 2>&1)"; rc=$?
+ok "#2759 --apply --keep-optins re-applies with every recorded opt-in" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && grep -q "keeping opt-in(s) recorded by the previous install" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge-apply\",\"--wiki-promote-apply\",\"--conflict-sweep\"]" ]'
+ok "#2759 --keep-optins keeps the opt-in cron lines armed" \
+  'grep "judge-batch.py" "$cron_store" | grep -q "NUNCHI_JUDGE_APPLY=1" && grep "wiki-promote.py" "$cron_store" | grep -q "NUNCHI_WIKI_PROMOTE_APPLY=1" && [ "$(grep -c " conflict-sweep " "$cron_store")" = 1 ]'
+guard_snap
+out="$(run_install --apply --codex --keep-optins --allow-drop-optins 2>&1)"; rc=$?
+ok "#2759 --keep-optins and --allow-drop-optins are exclusive" \
+  '[ "$rc" = 2 ] && grep -q "exclusive" <<<"$out" && guard_untouched'
+
+# valued opt-ins: dropped when absent, a different value is an explicit choice
+out="$(run_install --apply --codex --keep-optins --verbatim-backend both --gotgan-run-bytes 16777216 2>&1)"; rc=$?
+ok "#2759 adding a verbatim backend and a gotgan pin proceeds" \
+  '[ "$rc" = 0 ] && jq -e ".argv | index(\"--verbatim-backend\") and index(\"--gotgan-run-bytes\") and index(\"--judge-apply\")" "$nrec" >/dev/null'
+guard_snap
+out="$(run_install --apply --codex --judge-apply --wiki-promote-apply --conflict-sweep 2>&1)"; rc=$?
+ok "#2759 omitting a recorded --verbatim-backend / --gotgan-run-bytes is refused, values shown" \
+  '[ "$rc" = 5 ] && grep -qx "    --verbatim-backend both " <<<"$out" && grep -qx "    --gotgan-run-bytes 16777216 " <<<"$out" && guard_untouched'
+out="$(run_install --apply --codex --judge-apply --wiki-promote-apply --conflict-sweep --verbatim-backend gotgan --gotgan-run-bytes 33554432 2>&1)"; rc=$?
+ok "#2759 naming a different value for a valued opt-in is not a drop" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && jq -e ".argv | index(\"gotgan\") and index(\"33554432\")" "$nrec" >/dev/null'
+run_install --remove >/dev/null 2>&1
+out="$(run_install --apply --piri --audience-scoped "$audience_root" 2>&1)"; rc=$?
+guard_snap
+out="$(run_install --apply --piri 2>&1)"
+# shellcheck disable=SC2034  # rc2 is read via eval inside ok()
+rc2=$?
+ok "#2759 omitting a recorded --audience-scoped root is refused (no silent un-scoping)" \
+  '[ "$rc" = 0 ] && [ "$rc2" = 5 ] && grep -qxF "    --audience-scoped $audience_root " <<<"$out" && guard_untouched'
+
+# a missing, unreadable-as-JSON or malformed record never blocks an install
+guard_bad_rc=0
+# shellcheck disable=SC2034  # guard_bad_rc is read via eval inside ok()
+for bad in '{not json' '' '[]' '{"schema":"ccc.install-record.v1","argv":"--judge-apply"}' \
+  '{"schema":"ccc.install-record.v1","argv":["--apply","--codex","--judge-apply",7]}' \
+  '{"schema":"ccc.install-record.v1","argv":["--apply","--codex","--judge-apply","--verbatim-backend"]}' \
+  '{"schema":"something-else","argv":["--apply","--codex","--judge-apply"]}' \
+  '{"schema":"ccc.install-record.v1"}'; do
+  printf '%s' "$bad" > "$nrec"
+  bad_out="$(run_install --apply --codex 2>&1)" || guard_bad_rc=1
+  grep -q "REFUSED" <<<"$bad_out" && guard_bad_rc=1
+  [ "$(guard_argv 2>/dev/null)" = '["--apply","--codex"]' ] || guard_bad_rc=1
+done
+ok "#2759 a malformed previous record (8 shapes) never blocks --apply and is replaced by a valid one" '[ "$guard_bad_rc" = 0 ]'
+rm -f "$nrec"
+out="$(run_install --apply --codex --judge 2>&1)"; rc=$?
+ok "#2759 a missing record with live cron lines proceeds (nothing to compare against)" \
+  '[ "$rc" = 0 ] && ! grep -q "REFUSED" <<<"$out" && [ "$(guard_argv)" = "[\"--apply\",\"--codex\",\"--judge\"]" ]'
+# shellcheck disable=SC2034  # out/rc are read via eval inside ok()
+out="$(run_install --help 2>&1)"
+# shellcheck disable=SC2034
+rc=$?
+ok "#2759 --help documents the guard and both switches" \
+  '[ "$rc" = 0 ] && grep -q -- "--keep-optins" <<<"$out" && grep -q -- "--allow-drop-optins" <<<"$out" && grep -q "Opt-in drop guard (#2759)" <<<"$out" && grep -q "never blocks an install" <<<"$out"'
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
