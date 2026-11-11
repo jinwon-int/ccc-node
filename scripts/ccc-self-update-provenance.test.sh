@@ -27,6 +27,9 @@ export CCC_SELF_UPDATE_MATRIX_HEALTH_FILE="$TMP/no-such-matrix-health.json"
 export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
 export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
 export CCC_SELF_UPDATE_SERVING_HEALTH_FILE="$TMP/no-such-serving-health.json"
+# The post-restart stability window (#2742) would add 15 s per restarted unit;
+# it is covered by scripts/ccc-self-update.test.sh.
+export CCC_SELF_UPDATE_RESTART_STABLE_SECONDS=0
 export CCC_A2A_HANDLER_SYSTEM_DEST="$TMP/no-such-sbin"
 # The signature gate has its own suite; keep gpg out of these runs.
 export CCC_SELF_UPDATE_SIGNATURE_MODE=off

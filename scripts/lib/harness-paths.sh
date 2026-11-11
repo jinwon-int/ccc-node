@@ -15,6 +15,78 @@ CCC_MANAGED_PATHS=(
   agents commands skills CLAUDE.md memories
 )
 
+# Install manifests (#2742). setup.sh records what THIS repo installed into
+# skills/, commands/ and output-styles/ in these files, and decides from them
+# whether a node copy is "node-modified" (keep) or "ours" (update / prune).
+# They live under state/, which is deliberately NOT a managed path (state holds
+# node-local data), so a rollback that restored the three trees used to leave
+# the manifests describing the release that was just undone: the restored old
+# skill no longer matched its recorded hash while the repo copy did, the next
+# run read that as "node-modified, repo unchanged" and kept the old skill
+# forever, and entries the undone release had pruned were never pruned again.
+# The manifests are part of the same install transaction as the trees they
+# describe, so both rollbacks (setup.sh's own and self-update's) carry them.
+# Only these exact files are touched — nothing else under state/.
+# shellcheck disable=SC2034  # sourced library: consumed by setup.sh / ccc-self-update.sh
+CCC_MANAGED_STATE_FILES=(
+  state/repo-skills.manifest
+  state/repo-commands.manifest
+  state/repo-output-styles.manifest
+)
+
+# Capture the install manifests of <claude-dir> into <snapshot-dir>/manifests.
+# A manifest that does not exist is recorded by its absence, so the restore
+# removes one the interrupted run created. Anything that is not a regular file
+# (a symlink above all) is refused: setup.sh replaces these with `mv`, and
+# copying through a link would read or later write outside the tree.
+ccc_snapshot_install_manifests() { # <claude-dir> <snapshot-dir>
+  local claude_dir="$1" snapshot_dir="$2" rel src
+  mkdir -p "$snapshot_dir/manifests" || return 1
+  chmod 700 "$snapshot_dir/manifests" || return 1
+  for rel in "${CCC_MANAGED_STATE_FILES[@]}"; do
+    src="$claude_dir/$rel"
+    if [ -L "$src" ]; then
+      printf 'refusing install manifest symlink: %s\n' "$src" >&2
+      return 1
+    fi
+    [ -e "$src" ] || continue
+    if [ ! -f "$src" ]; then
+      printf 'refusing non-regular install manifest: %s\n' "$src" >&2
+      return 1
+    fi
+    cp -p -- "$src" "$snapshot_dir/manifests/${rel##*/}" || return 1
+  done
+}
+
+# Put back what ccc_snapshot_install_manifests captured: each manifest returns
+# byte-for-byte through a same-directory temp file and rename, or disappears
+# when the snapshot proves it did not exist. A half-written `<manifest>.tmp`
+# from the interrupted run is removed too. A snapshot taken before this
+# function existed has no manifests/ directory; that is reported as a failure
+# rather than silently deleting the node's manifests.
+ccc_restore_install_manifests() { # <claude-dir> <snapshot-dir>
+  local claude_dir="$1" snapshot_dir="$2" rel dest saved tmp failed=0
+  [ -d "$snapshot_dir/manifests" ] || return 1
+  for rel in "${CCC_MANAGED_STATE_FILES[@]}"; do
+    dest="$claude_dir/$rel"
+    saved="$snapshot_dir/manifests/${rel##*/}"
+    rm -f -- "$dest.tmp" || failed=1
+    if [ -f "$saved" ] && [ ! -L "$saved" ]; then
+      mkdir -p "${dest%/*}" || { failed=1; continue; }
+      if tmp="$(mktemp "${dest%/*}/.${dest##*/}.restore.XXXXXX")" \
+         && cp -p -- "$saved" "$tmp" && mv -f -- "$tmp" "$dest"; then
+        :
+      else
+        [ -n "${tmp:-}" ] && rm -f -- "$tmp"
+        failed=1
+      fi
+    else
+      rm -f -- "$dest" || failed=1
+    fi
+  done
+  [ "$failed" = 0 ]
+}
+
 # Deployable hook inventory (#569) — the SINGLE convention for which files under
 # claude/hooks/ are installed to <claude-dir>/hooks. setup.sh deploys exactly
 # this set (recursively, preserving structure, every file executable) and

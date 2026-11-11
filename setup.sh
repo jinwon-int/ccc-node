@@ -284,7 +284,10 @@ atomic_install() { # <src> <dest>
 # setup is transactional even with --no-backup. The operator backup is a
 # durable restore point; this private snapshot exists only long enough to undo
 # a failed install. Exact managed paths are archived so credentials, projects,
-# transcripts, state, and other node-local data never enter the snapshot.
+# transcripts, state, and other node-local data never enter the snapshot. The
+# one exception under state/ is the three install manifests
+# (CCC_MANAGED_STATE_FILES, #2742): they describe the archived trees, so they
+# roll back with them.
 ccc_validate_managed_artifacts "ERROR:" "$CLAUDE_DIR" "$HERMES_ROOT" "${CCC_MANAGED_PATHS[@]}" || exit 2
 SETUP_TXN_DIR=""
 SETUP_TXN_ACTIVE=0
@@ -357,6 +360,9 @@ begin_install_transaction() {
   fi
   snapshot_paths "$CLAUDE_DIR" "$SETUP_TXN_DIR/claude.tar.gz" "${CCC_MANAGED_PATHS[@]}"
   tar -tzf "$SETUP_TXN_DIR/claude.tar.gz" >/dev/null
+  # The install manifests describe the skills/commands/output-styles trees
+  # archived above but live under state/, outside CCC_MANAGED_PATHS (#2742).
+  ccc_snapshot_install_manifests "$CLAUDE_DIR" "$SETUP_TXN_DIR"
   ccc_snapshot_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR"
   SETUP_TXN_ACTIVE=1
 }
@@ -367,6 +373,10 @@ rollback_install_transaction() {
   for item in "${CCC_MANAGED_PATHS[@]}"; do rm -rf -- "${CLAUDE_DIR:?}/$item" || failed=1; done
   mkdir -p "$CLAUDE_DIR" "$HERMES_ROOT" || failed=1
   tar -xzf "$SETUP_TXN_DIR/claude.tar.gz" -C "$CLAUDE_DIR" || failed=1
+  # Without this the restored trees are described by the manifests of the run
+  # that just failed, and the next run keeps the old skills as "node-modified"
+  # (#2742).
+  ccc_restore_install_manifests "$CLAUDE_DIR" "$SETUP_TXN_DIR" || failed=1
   ccc_restore_codex_policy_state "$CODEX_DIR" "$SETUP_TXN_DIR" || failed=1
   if [ "$failed" = 0 ]; then
     echo "ERROR: setup failed; restored previous installed artifacts (Claude harness, Codex GitHub policy config)" >&2

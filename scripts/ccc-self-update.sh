@@ -65,7 +65,8 @@
 #      Also runs on every settled up-to-date tick (#1460: the first tick that
 #      pulls a commit runs the previously installed script, so a node could
 #      stay drifted until main changed again). Opt out: CCC_SELF_UPDATE_A2A_HANDLERS=0.
-#   6. restart each allowlisted service and verify it is active again
+#   6. restart each allowlisted service, verify it is active again and that it
+#      STAYS up for the stability window (#2742)
 #   7. append a JSONL audit record and queue an owner Telegram notification
 #      (spool only — this script never touches the bot token)
 #
@@ -123,6 +124,17 @@
 #      resumes like an install drift (re-deploy + restart) instead of reporting
 #      up-to-date. The deferral cap counts from the record's started_at, so a
 #      frontend that is busy at every recheck cannot starve the activation.
+# Stability window (#2742): `restart` rc 0 plus one `is-active` only proves the
+#      unit forked — a Type=simple/Restart=always bridge that dies two seconds
+#      into start-up (import or config error) is "active" at that instant, so
+#      the run cleared the pending record and announced completion while
+#      systemd looped `activating (auto-restart)`. Each restarted unit is
+#      therefore watched for CCC_SELF_UPDATE_RESTART_STABLE_SECONDS (15; 0..120,
+#      0 = off): it must stay active, and systemd must not have started it
+#      again (NRestarts and ActiveEnterTimestampMonotonic unchanged). A unit
+#      that fails the window is a restart failure (exit 7, pending record and
+#      recovery snapshot kept, audit entry carries "unstable":true); it is not
+#      restarted a second time.
 # Exit: 0 = up-to-date or updated cleanly; 7 = a restart (allowlisted service
 #      or external restart-cmd) or a recovery attempt failed; 8 = deferred
 #      (bridge busy, or — #1961, uncapped and not bypassed by --force — a
@@ -198,6 +210,7 @@ PREPARE_BUDGET_SOURCE=default
 PREPARE_BUDGET_NOTE=""
 PREPARE_BUDGET_WARNINGS=()
 RESTART_WAIT_SECONDS="${CCC_SELF_UPDATE_RESTART_WAIT_SECONDS:-60}"
+RESTART_STABLE_SECONDS="${CCC_SELF_UPDATE_RESTART_STABLE_SECONDS:-15}"
 # Hand-off ledger written by the external restart command (#2626): a busy
 # frontend it could not restart inside the budget is left to a detached
 # follower, and that is a deferral, not a failure. Cleared before each run.
@@ -926,6 +939,10 @@ snapshot_installed_artifacts() {
   # rollback does not strand the new policy while claiming a full restore.
   ccc_snapshot_codex_policy_state "$CODEX_DIR" "$INSTALL_SNAPSHOT_DIR" || return 1
   chmod 600 "$CODEX_SNAPSHOT" || return 1
+  # The install manifests under state/ describe the skills/commands/
+  # output-styles trees archived above. Restoring the trees without them made
+  # the next run keep the old skills as "node-modified" (#2742).
+  ccc_snapshot_install_manifests "$CLAUDE_DIR" "$INSTALL_SNAPSHOT_DIR" || return 1
   python3 - "$CLAUDE_SNAPSHOT" "$HERMES_SNAPSHOT" "$CODEX_SNAPSHOT" "${CCC_MANAGED_PATHS[*]}" <<'PY' || return 1
 import pathlib
 import sys
@@ -957,6 +974,7 @@ restore_installed_artifacts() {
   rm -f -- "$HERMES_ROOT/honcho.json" || failed=1
   tar -xzf "$HERMES_SNAPSHOT" -C "$HERMES_ROOT" || failed=1
   ccc_restore_codex_policy_state "$CODEX_DIR" "$INSTALL_SNAPSHOT_DIR" || failed=1
+  ccc_restore_install_manifests "$CLAUDE_DIR" "$INSTALL_SNAPSHOT_DIR" || failed=1
   [ "$failed" = 0 ]
 }
 
@@ -1069,6 +1087,7 @@ if [ "$MODE" = "status" ]; then
   say "prepare command: $(resolve_prepare_cmd >/dev/null 2>&1 && echo "configured (timeout ${PREPARE_COMMAND_TIMEOUT_SECONDS}s, source=${PREPARE_BUDGET_SOURCE}${PREPARE_BUDGET_NOTE:+, $PREPARE_BUDGET_NOTE})" || echo none)"
   for _w in "${PREPARE_BUDGET_WARNINGS[@]}"; do say "prepare budget warning: $_w (budget stays ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)"; done
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
+  say "post-restart stability window: ${RESTART_STABLE_SECONDS}s per allowlisted service"
   say "notify mode: $(notify_mode_describe "$(notify_mode)")"
   say "installed A2A handler refresh: $([ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ] && echo "disabled (CCC_SELF_UPDATE_A2A_HANDLERS=0)" || echo "enabled (existing copies only)")"
   pending_rc=0
@@ -1092,6 +1111,13 @@ fi
 # its deadline at zero). Status remains available for invalid configuration.
 if [[ ! "$RESTART_WAIT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$RESTART_WAIT_SECONDS" -gt 86400 ]; then
   say "self-update: CCC_SELF_UPDATE_RESTART_WAIT_SECONDS must be an integer in 1..86400" >&2
+  exit 2
+fi
+
+# Per-service observation after an allowlisted restart (#2742). Bounded so a
+# long allowlist cannot push one tick toward the lock's stale threshold.
+if [[ ! "$RESTART_STABLE_SECONDS" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$RESTART_STABLE_SECONDS" -gt 120 ]; then
+  say "self-update: CCC_SELF_UPDATE_RESTART_STABLE_SECONDS must be an integer in 0..120" >&2
   exit 2
 fi
 
@@ -2307,6 +2333,54 @@ service_failure_reason() { # <unit> <system|user> <since-epoch>
   printf '%s' "$reason"
 }
 
+# --- post-restart stability window (#2742) --------------------------------------
+# See the header "Stability window" paragraph. Properties systemd does not
+# report (a non-service unit, an old systemd) are skipped, so the window then
+# degrades to the is-active poll instead of failing a healthy unit.
+service_restart_marks() { # <unit> <system|user> — prints "<NRestarts>|<ActiveEnterTimestampMonotonic>"
+  local unit="$1" scope="$2" key val n="" t=""
+  local -a sargs=()
+  [ "$scope" = user ] && sargs=(--user)
+  while IFS='=' read -r key val; do
+    case "$key" in
+      NRestarts) n="$val" ;;
+      ActiveEnterTimestampMonotonic) t="$val" ;;
+    esac
+  done < <("$SYSTEMCTL" ${sargs[@]+"${sargs[@]}"} show \
+    -p NRestarts,ActiveEnterTimestampMonotonic "$unit" 2>/dev/null | head -n 10)
+  printf '%s|%s' "$n" "$t"
+}
+# 0 = the unit stayed up for the whole window (or the window is off);
+# 1 = it did not, and RESTART_UNSTABLE_REASON says how.
+service_restart_stable() { # <unit> <system|user>
+  local unit="$1" scope="$2" marks base_n base_t n t i=0
+  local -a sargs=()
+  RESTART_UNSTABLE_REASON=""
+  [ "$RESTART_STABLE_SECONDS" -gt 0 ] || return 0
+  [ "$scope" = user ] && sargs=(--user)
+  marks="$(service_restart_marks "$unit" "$scope")"
+  base_n="${marks%%|*}"; base_t="${marks#*|}"
+  while [ "$i" -lt "$RESTART_STABLE_SECONDS" ]; do
+    sleep 1
+    i=$((i + 1))
+    if ! "$SYSTEMCTL" ${sargs[@]+"${sargs[@]}"} is-active --quiet "$unit" 2>/dev/null; then
+      RESTART_UNSTABLE_REASON="재시작 ${i}초 뒤 active 상태가 아님"
+      return 1
+    fi
+    marks="$(service_restart_marks "$unit" "$scope")"
+    n="${marks%%|*}"; t="${marks#*|}"
+    if [[ "$base_n" =~ ^[0-9]+$ ]] && [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$base_n" ]; then
+      RESTART_UNSTABLE_REASON="재시작 후 ${i}초 안에 systemd가 다시 띄움 (NRestarts ${base_n}→${n})"
+      return 1
+    fi
+    if [[ "$base_t" =~ ^[1-9][0-9]*$ ]] && [[ "$t" =~ ^[1-9][0-9]*$ ]] && [ "$t" != "$base_t" ]; then
+      RESTART_UNSTABLE_REASON="재시작 후 ${i}초 안에 다시 시작됨 (active 진입 시각 변경)"
+      return 1
+    fi
+  done
+  return 0
+}
+
 # --- pre-restart idle recheck (#2667) ------------------------------------------
 # The first gate ran before fetch; everything since (setup, reapply, prepare)
 # took time in which a new turn may have been admitted. Look again right before
@@ -2399,6 +2473,15 @@ if [ -f "$SERVICES_FILE" ]; then
       [ "$ok" = "true" ] && break
       [ "$attempt" -lt 2 ] && log "service retry name=$svc attempt=$attempt scope=$scope"
     done
+    # Active once is not active for good (#2742). A unit that falls over inside
+    # the window is not restarted again: a second restart of a crash-looping
+    # unit only repeats the outage.
+    unstable=""
+    if [ "$ok" = "true" ] && ! service_restart_stable "$svc" "$scope"; then
+      ok=false
+      unstable="$RESTART_UNSTABLE_REASON"
+      log "service unstable name=$svc scope=$scope window=${RESTART_STABLE_SECONDS}s detail=$unstable"
+    fi
     if [ "$ok" = "true" ]; then
       RESTARTED=$((RESTARTED + 1))
       SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" '. + [{name:$n, ok:$ok, scope:$s}]')"
@@ -2406,7 +2489,14 @@ if [ -f "$SERVICES_FILE" ]; then
     else
       FAILED=$((FAILED + 1))
       reason="$(service_failure_reason "$svc" "$scope" "$restart_since")"
-      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" --arg r "$reason" '. + [{name:$n, ok:$ok, scope:$s} + (if $r == "" then {} else {reason:$r} end)]')"
+      if [ -n "$unstable" ]; then
+        # The unit may be up again at this instant, so the Result/ExecMainStatus
+        # fallback can read "success" — that is not the cause; keep the journal
+        # line when there is one.
+        case "$reason" in result=success*) reason="" ;; esac
+        reason="${unstable}${reason:+; $reason}"
+      fi
+      SERVICES_JSON="$(printf '%s' "$SERVICES_JSON" | jq -c --arg n "$svc" --arg s "$scope" --argjson ok "$ok" --arg r "$reason" --arg u "$unstable" '. + [{name:$n, ok:$ok, scope:$s} + (if $r == "" then {} else {reason:$r} end) + (if $u == "" then {} else {unstable:true} end)]')"
       log "service name=$svc ok=$ok scope=$scope reason=${reason:-unknown}"
       FAILED_NAMES="${FAILED_NAMES:+$FAILED_NAMES, }${svc} (${reason:-사유 미확인})"
     fi

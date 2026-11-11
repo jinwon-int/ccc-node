@@ -54,6 +54,9 @@ export CCC_SELF_UPDATE_HANDE_HEALTH_FILE="$TMP/no-such-hande-health.json"
 # gated health file exists. Sections that leave a fixture health file in place
 # would otherwise spend 11 s per changed tick; the #2667 section opts back in.
 export CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS=0
+# The post-restart stability window (#2742) watches every restarted unit for
+# 15 s by default; the #2742 section opts back in with a short window.
+export CCC_SELF_UPDATE_RESTART_STABLE_SECONDS=0
 # And for the A2A worker gate (#2138): never read the node's real unit cgroups,
 # or a fixture run on a worker node mid-task would defer.
 export CCC_SELF_UPDATE_CGROUP_ROOT="$TMP/no-such-cgroup"
@@ -99,6 +102,24 @@ case "\$*" in
     if [ -f "$TMP/fake-show/\$unit" ]; then cat "$TMP/fake-show/\$unit"
     else printf '%s\n' Result=exit-code ExecMainStatus=3 LoadState=loaded; fi
     exit 0
+    ;;
+  *"show -p NRestarts,ActiveEnterTimestampMonotonic "*)
+    # #2742 stability marks: the n-th call for a unit prints line n of
+    # $TMP/fake-marks/<unit> (the last line repeats), one KEY=VALUE per word.
+    # No fixture -> no output, like a unit that has no such properties.
+    unit="\${*: -1}"
+    if [ -f "$TMP/fake-marks/\$unit" ]; then
+      n="\$(cat "$TMP/fake-marks/\$unit.calls" 2>/dev/null || echo 0)"; n=\$((n + 1))
+      echo "\$n" > "$TMP/fake-marks/\$unit.calls"
+      total="\$(wc -l < "$TMP/fake-marks/\$unit")"; [ "\$n" -gt "\$total" ] && n="\$total"
+      sed -n "\${n}p" "$TMP/fake-marks/\$unit" | tr ' ' '\n'
+    fi
+    exit 0
+    ;;
+  *"is-active --quiet wobbly"*)
+    # #2742: active for the first check only, then gone.
+    if [ -e "$TMP/wobbly.seen" ]; then exit 3; fi
+    : > "$TMP/wobbly.seen"
     ;;
   *flaky*)
     if [ ! -e "$TMP/flaky.failed" ]; then
@@ -671,6 +692,91 @@ ok "successful retry is recorded" \
   'grep -q "service retry name=flaky-unit attempt=1" "$STATE/self-update.log"'
 ok "successful retry removes the recovery snapshot" \
   '! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "stability window off (0) never reads restart marks (#2742)" \
+  '! grep -q "NRestarts" "$TMP/systemctl.calls"'
+
+# --- #2742: active once is not active for good ---------------------------------
+# `restart` rc 0 plus one `is-active` only proves the unit forked. A unit that
+# systemd has to start again inside the window, or that is no longer active, is
+# a restart failure: exit 7, pending record and snapshot kept, no second
+# restart, never an `ok` audit.
+mkdir -p "$TMP/fake-marks" "$TMP/fake-show" "$FAKE_JOURNAL_DIR/1"
+stable_reset() {
+  rm -f "$TMP/fake-marks"/*.calls "$TMP/wobbly.seen" "$TMP/spool"/*.json \
+    "$STATE/self-update.pending-activation.json" "$STATE/self-update.activation-notified"
+  rm -rf "$STATE"/self-update-install-rollback.*
+  : > "$TMP/systemctl.calls"
+}
+last_result() { grep "^{" "$STATE/self-update.log" | tail -1; }
+stable_notice() { jq -r .text "$TMP/spool"/*SelfUpdate*.json 2>/dev/null; }
+
+# (a) crash loop: systemd restarted the unit again within the window.
+printf '%s\n' 'NRestarts=0 ActiveEnterTimestampMonotonic=100' \
+  'NRestarts=1 ActiveEnterTimestampMonotonic=350' > "$TMP/fake-marks/loopy.service"
+printf '%s\n' 'loopy.service: Main process exited, code=exited, status=1/FAILURE' \
+  > "$FAKE_JOURNAL_DIR/1/loopy.service"
+printf '%s\n' 'loopy.service' 'hermes-broker' > "$CLAUDE/self-update.services"
+stable_reset
+out="$(CCC_SELF_UPDATE_RESTART_STABLE_SECONDS=3 run_selfup run --force 2>&1)"; rc=$?
+ok "crash-looping unit fails the run instead of reporting ok (#2742)" \
+  '[ "$rc" = 7 ] && ! grep -q "self-update: ok" <<<"$out" && last_result | jq -e ".result == \"restart-failures\"" >/dev/null'
+ok "crash loop is audited as unstable with the restart counter (#2742)" \
+  'last_result | jq -e ".services[] | select(.name == \"loopy.service\") | .ok == false and .unstable == true and (.reason | contains(\"NRestarts 0→1\")) and (.reason | contains(\"Main process exited, code=exited, status=1/FAILURE\"))" >/dev/null'
+ok "a unit that stayed up in the same run is still recorded ok (#2742)" \
+  'last_result | jq -e ".services[] | select(.name == \"hermes-broker\") | .ok == true and (has(\"unstable\") | not)" >/dev/null'
+ok "crash-looping unit is not restarted a second time (#2742)" \
+  '[ "$(grep -c "^restart loopy.service$" "$TMP/systemctl.calls")" = 1 ]'
+ok "crash loop keeps the pending-activation record (#2742)" \
+  'jq -e ".outcome == \"restart-failed\"" "$STATE/self-update.pending-activation.json" >/dev/null'
+ok "crash loop keeps the recovery snapshot (#2742)" \
+  'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+ok "crash loop notice names the unit and how it fell over (#2742)" \
+  'stable_notice | grep -qF "loopy.service (재시작 후 1초 안에 systemd가 다시 띄움 (NRestarts 0→1); Main process exited" && ! stable_notice | grep -q "self-update 완료"'
+
+# (b) the unit is simply gone a second later.
+printf '%s\n' 'wobbly.service' > "$CLAUDE/self-update.services"
+stable_reset
+out="$(CCC_SELF_UPDATE_RESTART_STABLE_SECONDS=3 run_selfup run --force 2>&1)"; rc=$?
+ok "unit inactive inside the window fails the run (#2742)" \
+  '[ "$rc" = 7 ] && last_result | jq -e ".result == \"restart-failures\" and (.services[] | select(.name == \"wobbly.service\") | .unstable == true and (.reason | startswith(\"재시작 1초 뒤 active 상태가 아님\")))" >/dev/null'
+
+# (c) no NRestarts property, but the unit entered active again; the Result
+# fallback reads "success" because the unit is up at that instant — not a cause.
+printf '%s\n' 'ActiveEnterTimestampMonotonic=100' 'ActiveEnterTimestampMonotonic=900' \
+  > "$TMP/fake-marks/reenter.service"
+printf '%s\n' Result=success ExecMainStatus=0 LoadState=loaded > "$TMP/fake-show/reenter.service"
+printf '%s\n' 'reenter.service' > "$CLAUDE/self-update.services"
+stable_reset
+out="$(CCC_SELF_UPDATE_RESTART_STABLE_SECONDS=3 run_selfup run --force 2>&1)"; rc=$?
+ok "a changed active-enter timestamp alone fails the run (#2742)" \
+  '[ "$rc" = 7 ] && last_result | jq -e ".services[] | select(.name == \"reenter.service\") | .unstable == true and (.reason | contains(\"active 진입 시각 변경\")) and (.reason | contains(\"result=success\") | not)" >/dev/null'
+rm -f "$TMP/fake-show/reenter.service"
+
+# (d) a unit that stays up passes, in user scope too, and leaves no residue.
+printf '%s\n' 'NRestarts=0 ActiveEnterTimestampMonotonic=100' > "$TMP/fake-marks/steady.service"
+printf '%s\n' 'user:steady.service' 'hermes-broker' > "$CLAUDE/self-update.services"
+stable_reset
+out="$(CCC_SELF_UPDATE_RESTART_STABLE_SECONDS=2 run_selfup run --force 2>&1)"; rc=$?
+ok "a unit that stays up passes the window (#2742)" \
+  '[ "$rc" = 0 ] && last_result | jq -e ".result == \"ok\" and all(.services[]; .ok == true)" >/dev/null'
+ok "the window polls the unit in its own scope for its whole length (#2742)" \
+  'grep -q "^--user show -p NRestarts,ActiveEnterTimestampMonotonic steady.service$" "$TMP/systemctl.calls" && [ "$(grep -c "^--user is-active --quiet steady.service$" "$TMP/systemctl.calls")" = 3 ] && [ "$(grep -c "^is-active --quiet hermes-broker$" "$TMP/systemctl.calls")" = 3 ]'
+ok "a passed window records the activation and leaves no snapshot (#2742)" \
+  'jq -e ".outcome == \"activated\"" "$STATE/self-update.pending-activation.json" >/dev/null && ! compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
+
+# (e) the knob is bounded; status stays available and shows it.
+stable_reset
+for bad_window in -1 01 1.5 abc 121 1000; do
+  out="$(CCC_SELF_UPDATE_RESTART_STABLE_SECONDS="$bad_window" run_selfup run --force 2>&1)"; rc=$?
+  ok "invalid stability window [$bad_window] exits 2 before any restart (#2742)" \
+    '[ "$rc" = 2 ] && grep -q "CCC_SELF_UPDATE_RESTART_STABLE_SECONDS.*0..120" <<<"$out" && [ ! -s "$TMP/systemctl.calls" ]'
+done
+out="$(CCC_SELF_UPDATE_RESTART_STABLE_SECONDS='' run_selfup status 2>&1)"; rc=$?
+ok "status reports the default stability window (#2742)" \
+  '[ "$rc" = 0 ] && grep -q "post-restart stability window: 15s" <<<"$out"'
+# Back to the fixture state the following sections were written against.
+stable_reset
+printf '%s\n' 'flaky-unit' > "$CLAUDE/self-update.services"
 
 # A success-path cleanup failure must not be hidden by clearing the snapshot
 # variable and continuing to an `ok` audit. Inject an rm that fails only for
@@ -714,6 +820,16 @@ out="$(run_selfup run --force 2>&1)"; rc=$?
 ok "managed artifact symlink is rejected before setup" \
   '[ "$rc" = 6 ] && [ "$(wc -l < "$SETUP_MARKER")" = "$setup_count_before" ] && grep -q "artifact-snapshot-failed" "$STATE/self-update.log"'
 rm -f "$CLAUDE/settings.json"
+
+# The install manifests are snapshotted with the trees they describe (#2742); a
+# symlinked one is refused the same way, before setup runs.
+ln -s "$TMP/missing-manifest-target" "$STATE/repo-skills.manifest"
+# shellcheck disable=SC2034  # setup_count_before is read via eval inside ok()
+setup_count_before="$(wc -l < "$SETUP_MARKER")"
+out="$(run_selfup run --force 2>&1)"; rc=$?
+ok "install manifest symlink is rejected before setup (#2742)" \
+  '[ "$rc" = 6 ] && [ "$(wc -l < "$SETUP_MARKER")" = "$setup_count_before" ] && grep -q "artifact-snapshot-failed" "$STATE/self-update.log" && grep -q "refusing install manifest symlink" <<<"$out"'
+rm -f "$STATE/repo-skills.manifest"
 
 # --- 3) service restart failure is reported ------------------------------------
 echo change3 > "$TMP/seed/file.txt"
@@ -794,6 +910,11 @@ printf '%s\n' 'sentinel = "KEEP-ME"' '' '[plugins."github@openai-curated-remote"
 # shellcheck disable=SC2034  # CODEX_CFG_BEFORE is read via eval inside ok()
 CODEX_CFG_BEFORE="$(sha256sum "$TMP/codex/config.toml")"
 rm -f "$CLAUDE/headless.sh"
+# The install manifests under state/ describe the skills/commands/output-styles
+# trees. The broken setup rewrites one, creates one that did not exist and
+# leaves a half-written temp file; the rollback must undo all three (#2742).
+printf '%s\n' 'alpha recorded-v1' > "$STATE/repo-skills.manifest"
+rm -f "$STATE/repo-commands.manifest" "$STATE/repo-output-styles.manifest"
 # shellcheck disable=SC2034  # INSTALLED_BEFORE is read via eval inside ok()
 INSTALLED_BEFORE="$(sha256sum "$CLAUDE/hooks/installed-hook.sh")"
 cat > "$TMP/seed/setup.sh" <<'SH'
@@ -801,6 +922,9 @@ cat > "$TMP/seed/setup.sh" <<'SH'
 printf '%s\n' 'partially-updated-hook' > "${CCC_CLAUDE_DIR:?}/hooks/installed-hook.sh"
 printf '%s\n' 'partially-created-headless' > "${CCC_CLAUDE_DIR:?}/headless.sh"
 printf '%s\n' '{"newHoncho":true}' > "${CCC_HERMES_DIR:?}/honcho.json"
+printf '%s\n' 'alpha recorded-v2' > "${CCC_CLAUDE_DIR:?}/state/repo-skills.manifest"
+printf '%s\n' 'newcmd recorded-v2' > "${CCC_CLAUDE_DIR:?}/state/repo-commands.manifest"
+printf '%s\n' 'half-written' > "${CCC_CLAUDE_DIR:?}/state/repo-output-styles.manifest.tmp"
 mkdir -p "${CODEX_HOME:?}"
 printf '%s\n' 'enabled = false # rewritten by policy' >> "${CODEX_HOME:?}/config.toml"
 exit 1
@@ -815,6 +939,10 @@ ok "setup failure restores Codex GitHub policy config byte-for-byte (#1131)" \
 ok "rollback notification names the restored scope honestly (#1131)" \
   'jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "Codex GitHub 정책 설정"'
 ok "setup failure keeps managed absent artifact absent" '[ ! -e "$CLAUDE/headless.sh" ]'
+ok "setup failure restores the skill manifest of the restored trees (#2742)" \
+  '[ "$(cat "$STATE/repo-skills.manifest")" = "alpha recorded-v1" ]'
+ok "setup failure removes a manifest the failed run created (#2742)" \
+  '[ ! -e "$STATE/repo-commands.manifest" ] && [ ! -e "$STATE/repo-output-styles.manifest.tmp" ]'
 # settings.local.json is node-local (unmanaged): self-update's snapshot/deploy/
 # rollback lifecycle never touches it, so a node's approvals survive intact (#454).
 ok "self-update leaves node-local settings.local.json untouched" \

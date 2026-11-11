@@ -37,6 +37,10 @@ rather than composing the steps ad hoc.
 3. `git fetch` + `merge --ff-only` (never rewrites local history; diverged →
    abort)
 4. if HEAD changed (or `run --force`): snapshot the managed Claude artifacts
+   and the three install manifests that describe them
+   (`state/repo-{skills,commands,output-styles}.manifest`, #2742 — without
+   them a rollback restored the old skills but kept the new release's
+   manifest, and the next run kept the old skills as "node-modified")
    (plus the legacy Hermes `honcho.json` where one still exists — Honcho is
    retired, #1436; the file is only carried through the rollback snapshot
    until its owner-approved disposal, TM-2029 phase 5), then let `./setup.sh`
@@ -93,8 +97,19 @@ rather than composing the steps ad hoc.
    `~/.claude/state/self-update.a2a-handlers-notified` so twice-daily
    up-to-date ticks log `a2a-handlers notify=suppressed reason=already-notified`
    instead of re-paging); a clean pass clears the marker.
-6. restarts each service listed in the operator allowlist and verifies it is
-   active again
+6. restarts each service listed in the operator allowlist, verifies it is
+   active again, and then watches it for a stability window (#2742,
+   `CCC_SELF_UPDATE_RESTART_STABLE_SECONDS`, default 15 s per service). One
+   `is-active` right after `restart` only proves the unit forked: a
+   `Type=simple`, `Restart=always` bridge that dies two seconds into start-up
+   is "active" at that instant, so the run used to clear the pending record
+   and announce completion while systemd looped `activating (auto-restart)`.
+   During the window the unit must stay active and systemd must not have
+   started it again (`NRestarts` and `ActiveEnterTimestampMonotonic`
+   unchanged; a property systemd does not report is skipped). A unit that
+   fails the window is a restart failure — exit 7, pending-activation record
+   and recovery snapshot kept, the audit entry carries `"unstable":true` and
+   the notice says how it fell over — and it is not restarted a second time
 7. appends a JSONL audit record (`~/.claude/state/self-update.log`) and queues
    an owner Telegram notification via the push spool (token never touched;
    delivery needs the bridge `CCC_PUSH_ENABLED=true` opt-in)
@@ -401,6 +416,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS` | `180` | complete external restart command budget (integer 1..900 seconds), shared by update and recovery; timeout remains a failure |
 | `CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS` | `3600` | budget for the optional `prepare-cmd` (integer 1..7200 seconds); when unset, an operator file `~/.config/ccc-node/termux-prepare.env` with `CCC_TERMUX_PREPARE_TIMEOUT=<T>` raises it to `T + 300` (never lowers it; see [Termux build preparation](termux-build-preparation.md#per-node-preparation-timeout-operator-file), #2487). `status` and the `prepare begin` log line show the value and `source=env\|file\|default` |
 | `CCC_SELF_UPDATE_RESTART_WAIT_SECONDS` | `60` | wall-time budget for the up-to-date health probe and, separately, post-restart polling (integer 1..86400 seconds); includes command execution and sleeps |
+| `CCC_SELF_UPDATE_RESTART_STABLE_SECONDS` | `15` | how long each restarted allowlisted service must stay up before the restart counts (integer 0..120; `0` = accept the first `is-active`, the pre-#2742 behaviour). Adds that many seconds per allowlisted service to a changed tick |
 | `CCC_SELF_UPDATE_HEALTH_FILE` | `~/.telegram_bot/health.json` | bridge health file the idle gate reads |
 | `CCC_SELF_UPDATE_SERVING_HEALTH_FILE` | unset: every allowlisted frontend's health file (#2558) | when set, the single bridge health file whose `runtime_generation.source_git.head` (from a live process started after the restart) must equal the installed target after an external restart (#2142); point it at the bridge's `<project>/.telegram_bot/health.json` when `start.sh --path` is not `$HOME`, or at a nonexistent path to opt out. When unset, the serving generation is read from each allowlisted frontend — `ccc-telegram-bridge` → `CCC_SELF_UPDATE_HEALTH_FILE`, `ccc-matrix-bridge` → `CCC_SELF_UPDATE_MATRIX_HEALTH_FILE`, `ccc-hande-bridge` → `CCC_SELF_UPDATE_HANDE_HEALTH_FILE` (falling back to `CCC_SELF_UPDATE_HEALTH_FILE` when none is allowlisted); files whose writer is dead are ignored, so a retired Telegram bridge's frozen health no longer makes every tick `identity-unknown`. Live frontends on different heads log `serving-generation result=partial <frontend>=<head>…` and count as a serving-mismatch |
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
@@ -452,7 +468,8 @@ case; see "Commit provenance gate" below. Kept distinct from 14 so a held
 update is never read as an activation problem.
 On exit 9, the validated private recovery snapshot is retained under
 `~/.claude/state/self-update-install-rollback.*/` (`0700` directory containing
-`0600` Claude and Hermes archives) for local operator
+`0600` Claude and Hermes archives and a `manifests/` directory with the
+install manifests, #2742) for local operator
 recovery only; do not share it because it may contain settings and memory
 files. Exit 10 likewise reports and retains the path rather than recording a
 false success. Normal success and successful rollback remove it automatically.
