@@ -377,6 +377,15 @@ class _AckLoopBase(_Base):
         with outbox.database(self.queue) as conn:
             return conn.execute("SELECT txn, kind, ref FROM receipts WHERE channel='hande' ORDER BY at").fetchall()
 
+    def _wait_for_log(self, logs, needle: str, timeout: float = 5.0) -> None:
+        """Block until the loop thread has logged ``needle`` (``logs`` is the assertLogs watcher)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(needle in line for line in list(logs.output)):
+                return
+            time.sleep(0.01)
+        self.fail(f"log line not seen within {timeout}s: {needle}")
+
 
 class NoticeAckLoopTest(_AckLoopBase):
     """family-messenger#703: id on every notice, row kept until notice_ack, nack handling, resend on reconnect."""
@@ -392,6 +401,13 @@ class NoticeAckLoopTest(_AckLoopBase):
             self.assertEqual(f1["id"], t1)
             # Slow ack: well past the warn threshold the row stays and nothing is resent here.
             self.clock.now += hande.ACK_WARN_SECONDS + 1
+            # The loop thread warns on its next tick. Wait for that line rather
+            # than trusting a tick to fit inside silent()'s 0.3 s (#2768): the
+            # frame reaches the bot before the loop has written the notice's
+            # receipt, and on a busy runner that write can outlast the wait —
+            # the ack below then settles the notice first and no warning is
+            # ever logged.
+            self._wait_for_log(logs, "no notice_ack after")
             self.assertTrue(bot.silent(), "resent (or sent the next row) before the ack")
             self.assertEqual([t for t, _ in self._mirror_rows()], [t1, t2])
             bot.ack(t1, seq=21)
