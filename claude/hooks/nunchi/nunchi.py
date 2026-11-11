@@ -3316,6 +3316,8 @@ def _reattr_print(report):
         tally = report["by_kind"][state]
         if tally:
             print(f"  {state} by kind: " + " ".join(f"{k}={n}" for k, n in tally.items()))
+    if report["unknown_total"]:
+        print("  by proof: " + " ".join(f"{k}={n}" for k, n in report["by_proof"].items()))
     for row in report["rename_sample"]:
         line("rename", row)
     for row in report["collide_sample"]:

@@ -154,6 +154,8 @@ ok "dry-run: counts (total/open/closed, rename, collisions, unproven)" \
   '[ "$rc" = 0 ] && grep -qF "reattribute-unknown (dry-run): node=$NODE unknown=9 (open=7 closed=2) rename=5 (open=4 closed=1) collide_close=1 collide_keep_both=1 unproven_skipped=3" <<<"$out"'
 ok "dry-run: by-kind breakdown for open and closed rows" \
   'grep -qx "  open by kind: context=1 fact=5 task-progress=1" <<<"$out" && grep -qx "  closed by kind: fact=2" <<<"$out"'
+ok "dry-run: proof breakdown (how each row was shown to be a subject=node fact)" \
+  'grep -qx "  by proof: ingest-node=5 supersede-chain=1 unproven=3" <<<"$out"'
 ok "dry-run: sample lines carry id, kind, state, created date and proof" \
   'grep -qE "^  rename #$A \[fact\] open created=[0-9]{4}-[0-9]{2}-[0-9]{2} proof=ingest-node$" <<<"$out" && grep -qE "^  rename #$C \[fact\] closed created=.* proof=ingest-node$" <<<"$out" && grep -qE "^  rename #$D \[fact\] open created=.* proof=supersede-chain$" <<<"$out"'
 ok "dry-run: collision and unproven rows are listed with what happens to them" \
