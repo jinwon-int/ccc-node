@@ -54,8 +54,9 @@ The sweep is opt-in per node. `install-nunchi.sh --apply --conflict-sweep` (or
 | `--since-days 2` | one day of overlap so a fact landing just after a run is still paired; the ledger keeps the overlap free |
 | `--max-pairs 100` | the real-DB run above saw ~67 new pairs/day, i.e. ~4 batched Haiku calls per node per night |
 
-- The flag is materialized in the install record, so a self-update replay keeps the line; an
-  explicit re-apply without it removes the line.
+- The flag is materialized in the install record, so a self-update replay keeps the line. A
+  re-apply without it is refused (#2759, see [memory.md](memory.md#re-applying-opt-in-drop-guard));
+  add `--allow-drop-optins` to remove the line on purpose.
 - The installer refuses (exit 2, crontab untouched) when the installed `nunchi.py` predates the
   subcommand.
 - The judge is `llm_synthesize` (claude → codex → pi, first that answers), not judge-batch's

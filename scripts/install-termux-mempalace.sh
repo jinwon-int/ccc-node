@@ -571,8 +571,14 @@ case "$ACTION" in
       echo "MemPalace wrapper validation failed; peer_facts-only wiring preserved" >&2
       exit 1
     fi
+    # --keep-optins (#2759): this re-apply only rewires the MemPalace CLI. Run
+    # as a bare `--apply --<provider>` it also removed every opt-in the node
+    # had recorded (judge cron and friends) and rewrote the install record
+    # without them — the shape of the 2026-10-25 incident. The nunchi
+    # installer now refuses such a drop; carrying the recorded opt-ins
+    # forward is what this caller always meant.
     if ! CCC_NUNCHI_MEMPALACE_CLI="$wrapper" NUNCHI_SWEEP_DIR="$source" \
-      bash "$nunchi_installer" --apply "--$provider"; then
+      bash "$nunchi_installer" --apply "--$provider" --keep-optins; then
       disable_refresh_cron
       mv -f "$wrapper" "$disabled_wrapper"
       chmod 700 "$disabled_wrapper"

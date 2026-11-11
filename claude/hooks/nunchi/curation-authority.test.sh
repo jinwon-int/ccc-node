@@ -60,6 +60,26 @@ ok "g5_legacy_close never writes the review flag" '! grep -qE "SET[^\"]*review[[
 ok "g5_legacy_close peer_facts writes are because/kind only" \
   '[ -z "$(grep -oE "UPDATE peer_facts SET [a-z_=?, ]+" <<<"$g5_src" | grep -vE "^UPDATE peer_facts SET (because=\?|kind=\?, mutability=\?)$")" ]'
 
+# ---- rule 3c: task-progress TTL (#2759) is off by default and never ages out an owner
+# statement, a review-flagged fact, or a fact the owner reopened --------------------------
+ttl_src="$(python3 - "$NP" <<'PY'
+import ast, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for node in ast.parse(src).body:
+    if isinstance(node, ast.FunctionDef) and node.name == "_close_expired_task_progress":
+        print(ast.get_source_segment(src, node))
+PY
+)"
+ok "_close_expired_task_progress function found" '[ -n "$ttl_src" ]'
+ok "task-progress TTL default is off (\"0\")" \
+  'grep -qF "_TASK_PROGRESS_TTL_DAYS = _float_env(\"NUNCHI_TASK_PROGRESS_TTL_DAYS\", \"0\")" "$NP"'
+ok "task-progress TTL selects task-progress only and excludes rank 3, review and already-swept rows" \
+  'grep -qF "kind='"'"'task-progress'"'"' AND valid_to IS NULL" <<<"$ttl_src" && grep -qF "COALESCE(source_rank, 1) < 3" <<<"$ttl_src" && grep -qF "COALESCE(review, 0) = 0" <<<"$ttl_src" && grep -qF "id NOT IN (SELECT fact_id FROM ttl_close)" <<<"$ttl_src"'
+ok "task-progress TTL writes peer_facts as valid_to only" \
+  '[ "$(grep -oE "UPDATE peer_facts SET [a-z_=?, ]+" <<<"$ttl_src")" = "UPDATE peer_facts SET valid_to=? " ]'
+ok "doc names the task-progress TTL knob and its default" \
+  'grep -qF "NUNCHI_TASK_PROGRESS_TTL_DAYS" "$DOC" && grep -qF "off by default" "$DOC"'
+
 # ---- the boundary is stated where the owner reads it ------------------------------------
 ok "usage text carries the curation authority block" 'grep -q "^Curation authority (#2464 제안 4" "$NP"'
 ok "usage lists review and retag" 'grep -qE "^  nunchi.py review \[" "$NP" && grep -qE "^  nunchi.py retag " "$NP"'

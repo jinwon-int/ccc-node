@@ -26,12 +26,42 @@ passes add and update, deletion is a human-confirmed proposal.
 | G1 progress→done | inside ingest | close the in-flight fact replaced by a completion fact of equal or higher rank | `nunchi.py` `_close_fact` (G1 branch) |
 | B2 correction | inside ingest | close the single best-matching open fact a `kind=correction` replaces (token overlap ≥ 0.5) | `nunchi.py` `_auto_supersede` |
 | observation TTL | ingest, `snapshot`, `assemble` | close `kind=observation` facts older than `NUNCHI_OBSERVATION_TTL_DAYS` (7; ≤0 disables) | `nunchi.py` `_close_expired_observations` |
+| task-progress TTL (opt-in, #2759) | same sweep step as the observation TTL | **off by default.** With `NUNCHI_TASK_PROGRESS_TTL_DAYS` > 0: close `kind=task-progress` facts older than that many days, except user-stated ones (`source_rank` 3), review-flagged ones and facts this sweep already closed once; one body-free `ttl_close` ledger row per close | `nunchi.py` `_close_expired_task_progress` |
 | judge-batch | hourly cron (`install-nunchi.sh`, managed marker) | `review=0` only, and only with `NUNCHI_JUDGE_APPLY=1`; supersede appears as proposal text | `judge-batch.py` `apply_clear` |
 | conflict-sweep (opt-in) | daily cron when installed with `install-nunchi.sh --conflict-sweep` (#2479) | `review=1` on the newer fact plus a `conflict_sweep` ledger row; never closes | `nunchi.py` `conflict_sweep` |
 | schema migration | first open | backfill derived columns (`mutability`) | `nunchi.py` `_migrate_gate_cols` |
 
 A lower-rank fact never closes a higher-rank one (G2), so an agent inference cannot bury a user
 statement through G1 or B2.
+
+### Task-progress TTL (#2759)
+
+G1 closes an in-flight fact only when a matching completion fact arrives. A task that was dropped,
+renamed or finished without a matching sentence stays open forever: on 2026-11-11, 2,789 of the
+5,078 open `task-progress` facts fleet-wide were older than 30 days. The TTL is the age gate for
+that class.
+
+- **Off unless set.** `NUNCHI_TASK_PROGRESS_TTL_DAYS` unset, `0`, negative, non-finite or
+  unparsable all mean no sweep, and a node that never enables it never gains the ledger table.
+  Enabling it (for example `30`) is a per-node owner decision. The sweep runs inside `snapshot`
+  and `assemble`, so the variable has to be in that process's environment. For the 10-minute feed
+  cron that means a `NUNCHI_TASK_PROGRESS_TTL_DAYS=30` environment line in the crontab above the
+  managed lines: `install-nunchi.sh` re-renders the managed lines and does not stamp this
+  variable. That one place is enough — a SessionStart `assemble` without the variable simply does
+  not sweep. Remove the line to turn it off again; nothing already closed is reopened by that.
+- **What it never closes.** A user-stated fact (`source_rank` 3): an owner statement is not closed
+  by a lexical or age rule (G2). A review-flagged fact: it is waiting for a verdict. Any other
+  kind.
+- **Reversible, once.** The close sets `valid_to` only. `ttl_close` (fact id, kind, TTL in force,
+  timestamp; no fact text) lists exactly what the sweep closed, so
+  `UPDATE peer_facts SET valid_to=NULL WHERE id IN (SELECT fact_id FROM ttl_close)` undoes it. A
+  fact is closed by age at most once: after the owner reopens it, later sweeps leave it open.
+- **Same failure posture as the observation TTL.** It runs in the same opportunistic transaction:
+  when the write lock is busy the sweep is skipped with one stderr line and `snapshot`/`assemble`
+  continue read-only.
+- **Visibility.** `nunchi.py metrics` prints `task_progress_open`, `task_progress_open_over_30d`
+  (reported with the TTL off too, to size the decision), `task_progress_ttl_days` (0 = off) and
+  `task_progress_ttl_closed` (ledger count). The weekly bench sheet records them.
 
 ## Tier 2 — owner-invoked bulk passes (dry run by default)
 
@@ -112,6 +142,8 @@ rows are derived from source files and rebuilt on the next refresh, so they are 
 - `conflict-sweep` gains a `valid_to` write;
 - `g5-legacy-close` writes `valid_to` or `review`, or writes `peer_facts` other than `because`
   or `kind`/`mutability`;
+- the task-progress TTL defaults to anything but off, loses its `source_rank`/`review`/ledger
+  exclusions, or writes anything to `peer_facts` other than `valid_to`;
 - the `review` listing or the usage text stops stating the boundary.
 
 When a new pass needs more authority, change this page and the test in the same PR, and state

@@ -29,8 +29,25 @@
 #                                            # `gotgan` drops the MemPalace sweep,
 #                                            # `mempalace` (default) is unchanged
 #   install-nunchi.sh --apply --target-user gongmyoung
+#   install-nunchi.sh --apply --claude --keep-optins
+#                                            # re-apply and carry forward every
+#                                            # opt-in the previous install recorded
+#   install-nunchi.sh --apply --claude --allow-drop-optins
+#                                            # acknowledge that recorded opt-ins
+#                                            # missing from this command are dropped
 #   install-nunchi.sh --remove             # mode off + managed cron/hook removal
 #   install-nunchi.sh                      # status
+#
+# Opt-in drop guard (#2759): --apply rewrites every managed cron line from the
+# flags of THIS invocation, and the install record that self-update replays is
+# rewritten with them. A re-run that omits an opt-in the previous install
+# recorded (--judge, --judge-apply, --wiki-promote, --wiki-promote-apply,
+# --conflict-sweep, --verbatim-backend, --audience-scoped, --gotgan-run-bytes,
+# --gotgan-python) would therefore remove it for good, silently. --apply now
+# refuses (exit 5, nothing changed) and prints the dropped opt-ins plus the
+# command that keeps them, unless --keep-optins or --allow-drop-optins is
+# given. Without --apply the same warning is printed and status runs as usual.
+# A missing, unreadable or malformed record never blocks an install.
 #
 # Claude retains the standalone SessionStart hook and reuses the Session
 # Distiller output (zero LLM cost). Codex and Piri keep supplementary nunchi
@@ -105,11 +122,26 @@ VERBATIM_BACKEND="${CCC_NUNCHI_VERBATIM_BACKEND:-mempalace}"
 # setting is lost when self-update replays the recorded argv without it.
 GOTGAN_RUN_BYTES_PIN="${GOTGAN_RUN_BYTES:-}"
 GOTGAN_PYTHON_PIN="${CCC_NUNCHI_GOTGAN_PYTHON:-}"
+# #2759 — opt-in drop guard switches (see the header). Neither is written to
+# the install record: the record holds the RESOLVED opt-ins, so a replay of it
+# drops nothing and needs neither.
+ALLOW_DROP_OPTINS=0
+KEEP_OPTINS=0
+# 1 when the caller named a provider, an opt-in or a pin: without --apply that
+# is a preview of an install, so the drop warning is printed. A bare status
+# call (no arguments, or only --target-user) stays quiet.
+INSTALL_ARGS_GIVEN=0
 ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
+    --apply|--remove|--target-user|--allow-drop-optins|--keep-optins|--help|-h) ;;
+    *) INSTALL_ARGS_GIVEN=1 ;;
+  esac
+  case "$1" in
     --apply) ACTION="apply" ;;
     --remove) ACTION="remove" ;;
+    --allow-drop-optins) ALLOW_DROP_OPTINS=1 ;;
+    --keep-optins) KEEP_OPTINS=1 ;;
     --codex) PROVIDER="codex" ;;
     --claude) PROVIDER="claude" ;;
     --piri) PROVIDER="piri" ;;
@@ -139,7 +171,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--gotgan-python requires an absolute path" >&2; exit 2; }
       GOTGAN_PYTHON_PIN="$2"; shift ;;
     --help|-h)
-      sed -n '2,33p' "$0"; exit 0 ;;
+      sed -n '2,50p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -148,6 +180,9 @@ case "$PROVIDER" in
   codex|claude|piri|danso|auto) ;;
   *) echo "invalid provider: $PROVIDER" >&2; exit 2 ;;
 esac
+if [ "$ALLOW_DROP_OPTINS" = 1 ] && [ "$KEEP_OPTINS" = 1 ]; then
+  echo "--keep-optins and --allow-drop-optins are exclusive" >&2; exit 2
+fi
 case "$VERBATIM_BACKEND" in
   mempalace|gotgan|both) ;;
   *) echo "invalid verbatim backend: $VERBATIM_BACKEND (mempalace|gotgan|both)" >&2; exit 2 ;;
@@ -719,9 +754,133 @@ detect_provider() {
   fi
 }
 
+# --- opt-in drop guard (#2759) ------------------------------------------------
+# Incident 2026-10-25: two nodes were re-applied as `--apply --claude` while
+# their record said `--apply --claude --judge-apply`. strip_cron removed the
+# judge line, nothing re-added it, and the record was overwritten with the
+# reduced argv, so every later self-update replay kept the node that way. It
+# went unnoticed for 17 days. The record was the only place that still knew
+# what the node had opted into, so it is compared BEFORE anything is changed.
+#
+# The comparison is between the previous record's argv and the opt-ins this
+# invocation RESOLVES to (flags and CCC_NUNCHI_* env, exactly the values the
+# new record would materialize), so replaying a record never trips it.
+#   --judge-apply covers a recorded --judge; --judge after a recorded
+#   --judge-apply is a drop of apply mode. Same for --wiki-promote[-apply].
+#   A valued opt-in is dropped only when it is absent now; naming a different
+#   value (another backend, another audience root) is an explicit choice.
+optin_drops() {  # -> one dropped opt-in per line, its tokens TAB-separated
+  local record cur_judge=0 cur_wp=0
+  record="$(ccc_installer_record_path "$STATE" "$NUNCHI_SELF_DIR/install-nunchi.sh")" || return 0
+  [ -f "$record" ] && [ -r "$record" ] || return 0
+  if [ "$JUDGE_APPLY" = 1 ]; then cur_judge=2; elif [ "$JUDGE" = 1 ]; then cur_judge=1; fi
+  if [ "$WIKI_PROMOTE_APPLY" = 1 ]; then cur_wp=2; elif [ "$WIKI_PROMOTE" = 1 ]; then cur_wp=1; fi
+  python3 - "$record" "$cur_judge" "$cur_wp" "$CONFLICT_SWEEP" "$VERBATIM_BACKEND" \
+    "$AUDIENCE_SCOPED" "$GOTGAN_RUN_BYTES_PIN" "$GOTGAN_PYTHON_PIN" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+path, judge, wiki, sweep, backend, scoped, run_bytes, gotgan_python = sys.argv[1:9]
+# Any defect in the record (unreadable, not JSON, wrong shape, a valued flag
+# with no value) means "no usable previous install": print nothing, block
+# nothing. A first install and a damaged record behave the same.
+try:
+    with open(path, encoding="utf-8") as handle:
+        record = json.load(handle)
+    argv = record["argv"]
+    if record.get("schema") != "ccc.install-record.v1" or not isinstance(argv, list):
+        raise ValueError("shape")
+    if not all(isinstance(arg, str) and "\t" not in arg and "\n" not in arg for arg in argv):
+        raise ValueError("argv")
+    valued = ("--audience-scoped", "--target-user", "--verbatim-backend",
+              "--gotgan-run-bytes", "--gotgan-python")
+    flags, values, index = set(), {}, 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in valued:
+            values[arg] = argv[index + 1]  # IndexError -> malformed
+            index += 2
+        else:
+            flags.add(arg)
+            index += 1
+except Exception:
+    raise SystemExit(0)
+
+drops = []
+for apply_flag, base_flag, current in (("--judge-apply", "--judge", int(judge)),
+                                       ("--wiki-promote-apply", "--wiki-promote", int(wiki))):
+    previous = 2 if apply_flag in flags else 1 if base_flag in flags else 0
+    if previous > current:
+        drops.append([apply_flag if previous == 2 else base_flag])
+if "--conflict-sweep" in flags and sweep != "1":
+    drops.append(["--conflict-sweep"])
+if values.get("--verbatim-backend") in ("gotgan", "both") and backend == "mempalace":
+    drops.append(["--verbatim-backend", values["--verbatim-backend"]])
+if values.get("--audience-scoped") and scoped != "1":
+    drops.append(["--audience-scoped", values["--audience-scoped"]])
+if values.get("--gotgan-run-bytes") and not run_bytes:
+    drops.append(["--gotgan-run-bytes", values["--gotgan-run-bytes"]])
+if values.get("--gotgan-python") and not gotgan_python:
+    drops.append(["--gotgan-python", values["--gotgan-python"]])
+for tokens in drops:
+    print("\t".join(tokens))
+PY
+}
+
+guard_optin_drops() {  # <apply|preview> — returns only when it is safe to continue
+  local mode="$1" line arg drops=() tokens=() keep_args=() shown=""
+  mapfile -t drops < <(optin_drops)
+  [ "${#drops[@]}" -gt 0 ] || return 0
+  for line in "${drops[@]}"; do
+    IFS=$'\t' read -r -a tokens <<<"$line"
+    keep_args+=("${tokens[@]}")
+    shown+="    $(printf '%q ' "${tokens[@]}")"$'\n'
+  done
+  if [ "$KEEP_OPTINS" = 1 ]; then
+    if [ "$mode" = apply ]; then
+      echo "keeping opt-in(s) recorded by the previous install (--keep-optins):" >&2
+      printf '%s' "$shown" >&2
+      # Re-enter through the normal parser so the carried flags get the same
+      # validation as typed ones. --keep-optins is not passed on: the second
+      # pass has nothing left to carry, so it cannot loop.
+      local passed=()
+      for arg in "${ORIGINAL_ARGS[@]}"; do
+        [ "$arg" = --keep-optins ] || passed+=("$arg")
+      done
+      exec bash "$0" "${passed[@]}" "${keep_args[@]}"
+    fi
+    echo "note: --apply --keep-optins would carry forward the recorded opt-in(s):" >&2
+    printf '%s' "$shown" >&2
+    return 0
+  fi
+  if [ "$mode" = apply ] && [ "$ALLOW_DROP_OPTINS" = 1 ]; then
+    echo "dropping opt-in(s) recorded by the previous install, as acknowledged (--allow-drop-optins):" >&2
+    printf '%s' "$shown" >&2
+    return 0
+  fi
+  local keep_cmd
+  keep_cmd="$(printf '%q ' "$0")"
+  [ "$mode" = apply ] || keep_cmd+="--apply "
+  keep_cmd+="$(printf '%q ' "${ORIGINAL_ARGS[@]}" "${keep_args[@]}")"
+  if [ "$mode" = apply ]; then
+    echo "REFUSED: this --apply would drop opt-in(s) the previous install recorded ($STATE/install-nunchi.json):" >&2
+  else
+    echo "WARNING: --apply with these arguments would be refused — it drops opt-in(s) the previous install recorded ($STATE/install-nunchi.json):" >&2
+  fi
+  printf '%s' "$shown" >&2
+  echo "  Their cron lines would be removed and self-update would replay the reduced flags from then on." >&2
+  echo "  To keep them:            ${keep_cmd% }" >&2
+  echo "  or carry them forward:   add --keep-optins" >&2
+  echo "  To drop them on purpose: add --allow-drop-optins" >&2
+  [ "$mode" = apply ] || return 0
+  echo "nothing was changed." >&2
+  exit 5
+}
+
 case "$ACTION" in
   apply)
     [ -f "$HOOKS/nunchi.py" ] || { echo "hooks missing at $HOOKS — run setup.sh first" >&2; exit 2; }
+    guard_optin_drops apply  # #2759 — before the first write of any kind
     mkdir -p "$NUNCHI_DIR"; chmod 700 "$NUNCHI_DIR"  # owner-only: logs/state stay private (#865)
     resolved_provider="$(detect_provider)"
     if [ "$AUDIENCE_SCOPED" = 1 ]; then
@@ -1032,5 +1191,8 @@ case "$ACTION" in
     echo "nunchi disabled (code and ~/.nunchi DB kept)"
     status
     ;;
-  *) status ;;
+  *)
+    if [ "$INSTALL_ARGS_GIVEN" = 1 ]; then guard_optin_drops preview; fi
+    status
+    ;;
 esac
