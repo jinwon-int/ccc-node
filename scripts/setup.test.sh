@@ -952,6 +952,74 @@ out="$(HOME="$TMP/codex-new-home" PATH="$TMP/fail-skills-bin:$PATH" \
 ok "setup failure after the policy step on a codex-less node exits non-zero" '[ "$rc" != 0 ]'
 ok "rollback removes a Codex dir the failed run created (#1131)" '[ ! -e "$codex_new_codex" ]'
 
+# --- rollback covers the install manifests (#2742) ---------------------------
+# The manifests under state/ record what the repo installed into skills/,
+# commands/ and output-styles/. They are not a managed path, so a rollback used
+# to restore the trees but leave the manifests of the release it had just
+# undone. The next run then saw current(v1) != recorded(v2) with repo(v2) ==
+# recorded(v2), read that as "node-modified, repo unchanged" and kept the old
+# skill forever; a skill the undone release had removed was restored and never
+# pruned again. Three real runs from a repo copy: install release 1, fail
+# release 2 after the skills step, then run release 2 again.
+mf_repo="$TMP/mf-repo"; mf_home="$TMP/mf-home"; mf_claude="$mf_home/.claude"
+mkdir -p "$mf_repo"
+tar -C "$ROOT" -cf - --exclude=.git --exclude=bridge/venv --exclude=bridge/tests . \
+  | (cd "$mf_repo" && tar -xf -)
+mkdir -p "$mf_repo/skills/mf-alpha" "$mf_repo/skills/mf-gone"
+printf -- '---\nname: mf-alpha\ndescription: Use when testing manifest rollback.\n---\nalpha v1\n' \
+  > "$mf_repo/skills/mf-alpha/SKILL.md"
+printf -- '---\nname: mf-gone\ndescription: Use when testing manifest rollback pruning.\n---\ngone v1\n' \
+  > "$mf_repo/skills/mf-gone/SKILL.md"
+# The Codex compatibility catalog fails closed on an unclassified asset, so the
+# fixture skills are classified in the copy (and the removed one unclassified
+# again with it in release 2).
+mf_classify() { # <skill-name>... — rewrite the copy's catalog with exactly these fixture rules
+  local rules='[]' name
+  for name in "$@"; do
+    rules="$(jq -c --arg p "skills/$name/**" '. + [{pattern:$p, compatibility:"claude-only", audience:"claude", reason:"setup.test.sh fixture"}]' <<<"$rules")"
+  done
+  jq --argjson add "$rules" \
+    '.classifications |= (map(select(.reason != "setup.test.sh fixture")) + $add)' \
+    "$mf_repo/codex/compatibility.json" > "$mf_repo/codex/compatibility.json.new" \
+    && mv "$mf_repo/codex/compatibility.json.new" "$mf_repo/codex/compatibility.json"
+}
+mf_classify mf-alpha mf-gone
+git -C "$mf_repo" init -q -b main && git -C "$mf_repo" add -A && git -C "$mf_repo" commit -qm release-1
+mf_setup() { # [PATH] — one real setup run of the repo copy
+  (cd "$mf_repo" && HOME="$mf_home" CCC_CLAUDE_DIR="$mf_claude" CCC_HERMES_DIR="$mf_home/.hermes" \
+    CODEX_HOME="$mf_home/.codex" PATH="${1:-$REAL_PATH}" bash "$mf_repo/setup.sh" --no-backup 2>&1)
+}
+out="$(mf_setup)"; rc=$?
+ok "release 1 installs and records both fixture skills (#2742)" \
+  '[ "$rc" = 0 ] && grep -q "alpha v1" "$mf_claude/skills/mf-alpha/SKILL.md" && grep -q "^mf-alpha " "$mf_claude/state/repo-skills.manifest" && grep -q "^mf-gone " "$mf_claude/state/repo-skills.manifest"'
+# shellcheck disable=SC2034  # mf_manifest_before is read via eval inside ok()
+mf_manifest_before="$(sha256sum < "$mf_claude/state/repo-skills.manifest")"
+# shellcheck disable=SC2034  # mf_commands_before is read via eval inside ok()
+mf_commands_before="$(sha256sum < "$mf_claude/state/repo-commands.manifest")"
+
+# Release 2 changes one skill and removes the other; the run dies at the Codex
+# managed-skills step, i.e. after the skills trees and manifests were rewritten.
+printf -- '---\nname: mf-alpha\ndescription: Use when testing manifest rollback.\n---\nalpha v2\n' \
+  > "$mf_repo/skills/mf-alpha/SKILL.md"
+rm -rf "$mf_repo/skills/mf-gone"
+mf_classify mf-alpha
+git -C "$mf_repo" add -A && git -C "$mf_repo" commit -qm release-2
+out="$(mf_setup "$TMP/fail-skills-bin:$REAL_PATH")"; rc=$?
+ok "release 2 fails after the skills step and rolls back (#2742)" \
+  '[ "$rc" != 0 ] && grep -Fq "restored previous installed artifacts" <<<"$out"'
+ok "rollback restores the skill trees of release 1 (#2742)" \
+  'grep -q "alpha v1" "$mf_claude/skills/mf-alpha/SKILL.md" && [ -f "$mf_claude/skills/mf-gone/SKILL.md" ]'
+ok "rollback restores the install manifests byte-for-byte (#2742)" \
+  '[ "$(sha256sum < "$mf_claude/state/repo-skills.manifest")" = "$mf_manifest_before" ] && [ "$(sha256sum < "$mf_claude/state/repo-commands.manifest")" = "$mf_commands_before" ]'
+ok "rollback leaves no manifest temp files behind (#2742)" \
+  '[ -z "$(find "$mf_claude/state" -maxdepth 1 \( -name "*.manifest.tmp" -o -name ".*.restore.*" \) -print -quit)" ]'
+
+out="$(mf_setup)"; rc=$?
+ok "the run after a rollback installs the new skill, not 'kept node-modified' (#2742)" \
+  '[ "$rc" = 0 ] && grep -q "alpha v2" "$mf_claude/skills/mf-alpha/SKILL.md" && ! grep -q "kept node-modified skill mf-alpha" <<<"$out"'
+ok "the run after a rollback prunes the skill the undone release removed (#2742)" \
+  '[ ! -e "$mf_claude/skills/mf-gone" ] && ! grep -q "^mf-gone " "$mf_claude/state/repo-skills.manifest"'
+
 # Root-run Claude would reject --dangerously-skip-permissions, so setup must
 # neutralize the bypassPermissions default when the run user is root. Simulate
 # root deterministically with the setup test seam, which is accepted only when
