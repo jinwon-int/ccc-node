@@ -56,3 +56,26 @@ activation or reconciliation) and is simply replaced when a different target
 fails, so each new main commit that a Termux prepared-generation bridge cannot
 serve costs at most one alarm instead of one per tick. Unhealthy-runtime and
 corrupt-record notices are outside this rule and still report every tick.
+
+### A hold notice does not count as the failure notice (#2742)
+
+When the external restart command hands a busy frontend to a detached
+follower (#2626), the owner gets a *hold* notice ("실패가 아니라 보류"). That
+notice used to write the same marker, so a real failure for the same target
+on a later tick — the follower gave up, or the old generation is still
+serving — was dropped as `already-notified` and the owner's last word stayed
+"보류". The marker now records what the owner was told on its second line
+(`hold` or `failure`; a one-line marker written before this counts as
+`failure`):
+
+- a `hold` marker suppresses only another hold; a `failure` marker suppresses
+  both, so the rule above (at most one alarm per target) is unchanged;
+- a later tick with outcome `external-restart-deferred` is still a hold while
+  a follower is inside its own wait: a `pending` line in
+  `self-update.restart-deferred` with no `done`, whose epoch + `max_wait`
+  + 300 s has not passed. Once every follower is done or overdue, an
+  unverified activation is notified as a failure — a follower that died
+  without writing `done` cannot keep the notice suppressed;
+- so a target costs at most one hold notice and one failure notice. The log
+  line carries the kind: `notify=suppressed reason=already-notified
+  target=<sha> kind=hold|failure`.

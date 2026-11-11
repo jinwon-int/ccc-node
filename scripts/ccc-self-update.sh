@@ -105,7 +105,12 @@
 #      consulted only when ccc-matrix-bridge is in the services allowlist),
 #      CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS (90), CCC_SELF_UPDATE_BUSY_MAX_SECONDS
 #      (1800 — never defer a task older than this), CCC_SELF_UPDATE_MAX_DEFER_SECONDS
-#      (3600 — cap total deferral so continuous load can't starve updates).
+#      (3600 — cap total deferral so continuous load can't starve updates),
+#      CCC_SELF_UPDATE_MIN_DEFER_TICKS (2; 0..20 — the cap may force a busy run
+#      only after this many deferred ticks, #2742: ticks are an hour or more
+#      apart, so a cap in seconds alone meant "defer once" — the second busy
+#      tick always proceeded and killed whatever turn was running; 0 = seconds
+#      only, the previous behaviour).
 #      Fail-open (missing/unreadable/stale health → proceed); --force bypasses.
 #      It also defers while an allowlisted A2A worker unit (a2a-*worker*) runs
 #      a task — its cgroup holds a handler child besides the worker (#2138);
@@ -123,7 +128,15 @@
 #      8. The next tick sees HEAD == installed marker but that record, and
 #      resumes like an install drift (re-deploy + restart) instead of reporting
 #      up-to-date. The deferral cap counts from the record's started_at, so a
-#      frontend that is busy at every recheck cannot starve the activation.
+#      frontend that is busy at every recheck cannot starve the activation;
+#      CCC_SELF_UPDATE_MIN_DEFER_TICKS applies here too, counted per target.
+# Lock lease (#2742): the lock directory is stale 30 minutes after its mtime,
+#      but a prepare command may run for up to two hours and nothing refreshed
+#      the mtime, so the next tick could take the lock of a run that was still
+#      alive. Before a bounded long step the holder moves the directory's mtime
+#      to now + that step's budget (capped at 7200 s) and back to now when the
+#      step ends; stage boundaries refresh it. A run that dies mid-step is
+#      still recovered: the lock goes stale 30 minutes after the lease ends.
 # Stability window (#2742): `restart` rc 0 plus one `is-active` only proves the
 #      unit forked — a Type=simple/Restart=always bridge that dies two seconds
 #      into start-up (import or config error) is "active" at that instant, so
@@ -370,6 +383,23 @@ acquire_lock() {
   return 1
 }
 
+# Lock lease (#2742) — see the header paragraph. Only the holder calls this,
+# after acquire_lock. A future mtime is "not older than 30 minutes" to the
+# stale test above until 30 minutes after it has passed. Fail-open: a lease
+# that cannot be written leaves the previous mtime, i.e. the old behaviour.
+LOCK_LEASE_MAX_SECONDS=7200
+lock_lease() { # [seconds-from-now, default 0 = refresh]
+  local extra="${1:-0}"
+  case "$extra" in ''|*[!0-9]*) extra=0 ;; esac
+  [ "$extra" -le "$LOCK_LEASE_MAX_SECONDS" ] || extra="$LOCK_LEASE_MAX_SECONDS"
+  [ -d "$LOCK" ] && [ ! -L "$LOCK" ] || return 0
+  python3 -c 'import os, sys, time
+t = time.time() + int(sys.argv[2])
+os.utime(sys.argv[1], (t, t))' "$LOCK" "$extra" 2>/dev/null \
+    || log "warn lock lease not written seconds=$extra"
+  return 0
+}
+
 resolve_repo() {
   if [ -n "${CCC_SELF_UPDATE_REPO:-}" ]; then printf '%s' "$CCC_SELF_UPDATE_REPO"; return; fi
   if [ -f "$REPO_FILE" ]; then head -1 "$REPO_FILE" | tr -d '[:space:]'; return; fi
@@ -533,7 +563,7 @@ write_pending_activation() {
     return 1
   fi
 }
-clear_pending_activation() { activation_state clear "$NEW_SHA" && clear_activation_notice; }
+clear_pending_activation() { activation_state clear "$NEW_SHA" && clear_activation_notice && clear_restart_defer_count; }
 
 # One owner notice per unresolved target generation (#2148). A Termux bridge
 # runs a prepared generation that self-update cannot rebuild, so after an
@@ -543,21 +573,54 @@ clear_pending_activation() { activation_state clear "$NEW_SHA" && clear_activati
 # window. The marker below records the target the owner was already told
 # about; later ticks for that target only log and keep exiting 14. A new
 # target, or a verified activation/reconciliation, starts over.
+#
+# The marker also records WHAT the owner was told (#2742): line 2 is `hold`
+# for the "not a failure, a follower will restart it" notice and `failure` for
+# everything else. A hold notice used to write the same marker, so a real
+# failure for that target on a later tick (serving mismatch, restart failure)
+# was dropped as already-notified and the owner's last word stayed "보류". A
+# hold now suppresses only another hold; a failure suppresses both. A marker
+# without line 2 (written before this) counts as failure.
 ACTIVATION_NOTIFIED_FILE="$STATE_DIR/self-update.activation-notified"
-activation_notice_sent() { # <target-sha>
+activation_notice_kind() { # <target-sha> — prints hold|failure when the marker names this target
+  local kind
   [ -n "$1" ] && [ -f "$ACTIVATION_NOTIFIED_FILE" ] \
-    && [ "$(head -n1 "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null)" = "$1" ]
+    && [ "$(head -n1 "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null)" = "$1" ] || return 1
+  kind="$(sed -n 2p "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null)"
+  [ "$kind" = hold ] || kind=failure
+  printf '%s' "$kind"
 }
-mark_activation_notice() { printf '%s\n' "$1" > "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null || :; }
+activation_notice_sent() { # <target-sha> <hold|failure>
+  local have
+  have="$(activation_notice_kind "$1")" || return 1
+  [ "$have" = failure ] || [ "${2:-failure}" = hold ]
+}
+mark_activation_notice() { # <target-sha> <hold|failure>
+  printf '%s\n%s\n' "$1" "${2:-failure}" > "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null || :
+}
 clear_activation_notice() { rm -f "$ACTIVATION_NOTIFIED_FILE" 2>/dev/null || :; }
-notify_activation_incomplete() { # <target-sha> <text> <dedup-suffix>
-  if activation_notice_sent "$1"; then
-    log "pending-activation notify=suppressed reason=already-notified target=$1"
+notify_activation_incomplete() { # <target-sha> <text> <dedup-suffix> [hold|failure]
+  local kind="${4:-failure}"
+  [ "$kind" = hold ] || kind=failure
+  if activation_notice_sent "$1" "$kind"; then
+    log "pending-activation notify=suppressed reason=already-notified target=$1 kind=$kind"
     return 0
   fi
   notify "$2" "$3"
-  mark_activation_notice "$1"
+  mark_activation_notice "$1" "$kind"
 }
+
+# Restart deferrals for one target, counted for CCC_SELF_UPDATE_MIN_DEFER_TICKS
+# (#2742). Keyed by target SHA, so a count left by an older target is ignored.
+RESTART_DEFER_COUNT_FILE="$STATE_DIR/self-update.restart-deferred-count"
+restart_defer_count() { # <target-sha> — prints the count (0 when none)
+  local sha="" n=""
+  [ -f "$RESTART_DEFER_COUNT_FILE" ] && read -r sha n < "$RESTART_DEFER_COUNT_FILE" 2>/dev/null
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$sha" = "$1" ] || n=0
+  printf '%s' "$n"
+}
+clear_restart_defer_count() { rm -f "$RESTART_DEFER_COUNT_FILE" 2>/dev/null || :; }
 load_pending_activation() {
   local rec rc
   PENDING_TARGET_SHA=""; PENDING_OUTCOME=""; PENDING_SERVICES='[]'
@@ -603,7 +666,11 @@ serving_generation_matches() { [ "$1" = "$2" ] && [ "$2" = "$NEW_SHA" ]; }
 #   2 = still incomplete — caller reports and exits 14
 #   3 = runtime is DOWN — caller defers to the existing #971 recovery policy
 report_pending_activation() {
-  local serving hcmd
+  local serving hcmd notice_kind=failure
+  # Still the hold the owner was told about, or a failure by now (#2742).
+  if [ "${PENDING_OUTCOME:-}" = "external-restart-deferred" ] && restart_follower_waiting; then
+    notice_kind=hold
+  fi
   # Operator probe first; else the live bridge's frozen startup source head
   # (#2142) — generation provenance from the running process, not health
   # availability, so the health-only rule below still holds.
@@ -611,7 +678,7 @@ report_pending_activation() {
     if ! serving_generation_matches "$serving" "$PENDING_TARGET_SHA"; then
       log "pending-activation result=incomplete reason=serving-mismatch target=$PENDING_TARGET_SHA serving=$serving outcome=${PENDING_OUTCOME:-unknown}"
       audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
-      notify_activation_incomplete "$PENDING_TARGET_SHA" "self-update: ${PENDING_TARGET_SHA:0:7} 세대 활성화가 아직 완료되지 않았습니다 — 서빙 세대($(printf '%.7s' "$serving"))가 설치 목표와 다릅니다. 건강한 구버전 런타임을 임의로 재시작하지 않습니다; 확인 후 수동 개입이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+      notify_activation_incomplete "$PENDING_TARGET_SHA" "self-update: ${PENDING_TARGET_SHA:0:7} 세대 활성화가 아직 완료되지 않았습니다 — 서빙 세대($(printf '%.7s' "$serving"))가 설치 목표와 다릅니다. 건강한 구버전 런타임을 임의로 재시작하지 않습니다; 확인 후 수동 개입이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA" "$notice_kind"
       say "self-update: activation incomplete — serving ${serving:0:7} != installed target ${PENDING_TARGET_SHA:0:7}; not reporting up-to-date" >&2
       return 2
     fi
@@ -639,7 +706,7 @@ report_pending_activation() {
   fi
   log "pending-activation result=incomplete reason=identity-unknown target=$PENDING_TARGET_SHA outcome=${PENDING_OUTCOME:-unknown}"
   audit "activation-incomplete" "$OLD_SHA" "$NEW_SHA" false true "$PENDING_SERVICES"
-  notify_activation_incomplete "$PENDING_TARGET_SHA" "self-update: ${PENDING_TARGET_SHA:0:7} 세대 설치는 완료됐지만 활성화(재시작) 완료 증거가 없습니다(마지막 시도: ${PENDING_OUTCOME:-unknown}). 구버전 런타임이 건강해 보여도 수렴으로 보지 않습니다 — 서빙 세대 확인 또는 self-update.serving-generation-cmd 설정이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA"
+  notify_activation_incomplete "$PENDING_TARGET_SHA" "self-update: ${PENDING_TARGET_SHA:0:7} 세대 설치는 완료됐지만 활성화(재시작) 완료 증거가 없습니다(마지막 시도: ${PENDING_OUTCOME:-unknown}). 구버전 런타임이 건강해 보여도 수렴으로 보지 않습니다 — 서빙 세대 확인 또는 self-update.serving-generation-cmd 설정이 필요합니다. 로그: ~/.claude/state/self-update.log" "pending-$PENDING_TARGET_SHA" "$notice_kind"
   say "self-update: activation incomplete — ${PENDING_TARGET_SHA:0:7} installed but never verified active (outcome=${PENDING_OUTCOME:-unknown}); not reporting up-to-date" >&2
   return 2
 }
@@ -849,6 +916,8 @@ run_external_restart() {
   RESTART_BEGIN_EPOCH="$(date -u +%s)"
   rcmd="$(resolve_restart_cmd)" || return 1
   hcmd="$(resolve_health_cmd || true)"
+  # Command budget plus the health wait that follows it (#2742 lock lease).
+  lock_lease "$(( RESTART_COMMAND_TIMEOUT_SECONDS + RESTART_WAIT_SECONDS ))"
   started=$SECONDS
   log_offset="$(wc -c < "$LOG" 2>/dev/null | tr -cd '0-9')"
   [ -n "$log_offset" ] || log_offset=0
@@ -908,6 +977,30 @@ restart_deferred_pending() {
     RESTART_DEFERRED_SUMMARY="${RESTART_DEFERRED_SUMMARY:+$RESTART_DEFERRED_SUMMARY, }$name${rest:+ ($rest)}"
   done
   [ -n "$RESTART_DEFERRED_SUMMARY" ]
+}
+
+# True while a follower that was handed a frontend (#2626) is still inside its
+# own wait: a `pending` ledger line with no `done`, whose epoch + max_wait
+# (+ grace) has not passed. A later tick that still sees the old generation is
+# then the SAME hold the owner already heard about. Once every follower is done
+# or overdue, an unverified activation is a failure — a follower that died
+# without writing `done` must not keep the notice suppressed forever (#2742).
+RESTART_FOLLOWER_GRACE_SECONDS=300
+restart_follower_waiting() {
+  [ -r "$RESTART_DEFERRED_FILE" ] || return 1
+  awk -v now="$(date +%s)" -v grace="$RESTART_FOLLOWER_GRACE_SECONDS" '
+    $2 == "done" { fin[$3] = 1 }
+    $2 == "pending" && $1 ~ /^[0-9]+$/ {
+      wait = 3600
+      for (i = 4; i <= NF; i++) if ($i ~ /^max_wait=[0-9]+$/) wait = substr($i, 10)
+      limit[$3] = $1 + wait + grace
+    }
+    END {
+      found = 0
+      for (n in limit) if (!(n in fin) && now <= limit[n]) found = 1
+      exit(found ? 0 : 1)
+    }
+  ' "$RESTART_DEFERRED_FILE" 2>/dev/null
 }
 
 snapshot_installed_artifacts() {
@@ -1088,6 +1181,7 @@ if [ "$MODE" = "status" ]; then
   for _w in "${PREPARE_BUDGET_WARNINGS[@]}"; do say "prepare budget warning: $_w (budget stays ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)"; done
   say "post-restart health budget: ${RESTART_WAIT_SECONDS}s"
   say "post-restart stability window: ${RESTART_STABLE_SECONDS}s per allowlisted service"
+  say "busy deferral: cap ${CCC_SELF_UPDATE_MAX_DEFER_SECONDS:-3600}s, at least ${CCC_SELF_UPDATE_MIN_DEFER_TICKS:-2} deferred tick(s) before the cap forces a run"
   say "notify mode: $(notify_mode_describe "$(notify_mode)")"
   say "installed A2A handler refresh: $([ "${CCC_SELF_UPDATE_A2A_HANDLERS:-1}" = "0" ] && echo "disabled (CCC_SELF_UPDATE_A2A_HANDLERS=0)" || echo "enabled (existing copies only)")"
   pending_rc=0
@@ -1170,6 +1264,13 @@ FRESH_SECONDS="${CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS:-90}"
 BUSY_MAX_SECONDS="${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}"
 MAX_DEFER_SECONDS="${CCC_SELF_UPDATE_MAX_DEFER_SECONDS:-3600}"
 DEFER_MARK="$STATE_DIR/self-update.deferred-since"
+# How many busy ticks have been deferred since DEFER_MARK was written (#2742).
+DEFER_COUNT_FILE="$STATE_DIR/self-update.deferred-count"
+MIN_DEFER_TICKS="${CCC_SELF_UPDATE_MIN_DEFER_TICKS:-2}"
+if [[ ! "$MIN_DEFER_TICKS" =~ ^(0|[1-9][0-9]?)$ ]] || [ "$MIN_DEFER_TICKS" -gt 20 ]; then
+  say "self-update: CCC_SELF_UPDATE_MIN_DEFER_TICKS must be an integer in 0..20" >&2
+  exit 2
+fi
 PRE_RESTART_SETTLE_SECONDS="${CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS:-11}"
 if [[ ! "$PRE_RESTART_SETTLE_SECONDS" =~ ^(0|[1-9][0-9]?)$ ]] || [ "$PRE_RESTART_SETTLE_SECONDS" -gt 60 ]; then
   say "self-update: CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS must be an integer in 0..60" >&2
@@ -1328,19 +1429,26 @@ if [ -n "$busy_kind" ]; then
   now_epoch="$(date +%s)"
   since="$(cat "$DEFER_MARK" 2>/dev/null)"
   case "$since" in ''|*[!0-9]*) since="" ;; esac
-  [ -n "$since" ] || { since="$now_epoch"; printf '%s' "$now_epoch" > "$DEFER_MARK" 2>/dev/null; }
+  deferrals="$(cat "$DEFER_COUNT_FILE" 2>/dev/null)"
+  case "$deferrals" in ''|*[!0-9]*) deferrals=0 ;; esac
+  # The count belongs to the marker: a new deferral series starts at zero.
+  [ -n "$since" ] || { since="$now_epoch"; deferrals=0; printf '%s' "$now_epoch" > "$DEFER_MARK" 2>/dev/null; }
   waited=$(( now_epoch - since ))
-  if [ "$waited" -lt "$MAX_DEFER_SECONDS" ]; then
-    log "deferred reason=${busy_kind}-busy $busy_reason waited=${waited}s"
+  # The cap needs BOTH the time and the tick floor (#2742): with ticks an hour
+  # or more apart, time alone forced the run on the second busy tick.
+  if [ "$waited" -lt "$MAX_DEFER_SECONDS" ] || [ "$deferrals" -lt "$MIN_DEFER_TICKS" ]; then
+    deferrals=$((deferrals + 1))
+    printf '%s' "$deferrals" > "$DEFER_COUNT_FILE" 2>/dev/null
+    log "deferred reason=${busy_kind}-busy $busy_reason waited=${waited}s deferrals=$deferrals"
     say "self-update: $busy_label busy ($busy_reason) — deferring, will retry next tick"
     exit 8
   fi
-  log "proceed reason=defer-cap-exceeded waited=${waited}s $busy_reason"
-  say "self-update: $busy_label busy but deferred ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
+  log "proceed reason=defer-cap-exceeded waited=${waited}s deferrals=$deferrals $busy_reason"
+  say "self-update: $busy_label busy but deferred ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap after $deferrals deferred tick(s) — proceeding"
   IDLE_GATE_CAP_PROCEEDED=1
 fi
 # Not busy (or forced, or cap exceeded) → clear any deferral marker and continue.
-rm -f "$DEFER_MARK" 2>/dev/null
+rm -f "$DEFER_MARK" "$DEFER_COUNT_FILE" 2>/dev/null
 
 REPO="$(resolve_repo)"
 
@@ -2055,6 +2163,7 @@ if [ "$CHANGED" = "false" ] && [ "$FORCE" != "1" ]; then
 fi
 
 # --- redeploy harness ---------------------------------------------------------
+lock_lease   # gate, fetch and reconcile are behind us; restart the 30-minute clock
 SETUP_OK=true
 if ! snapshot_installed_artifacts; then
   if reset_repo_to_old_sha; then
@@ -2216,8 +2325,12 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && pcmd="$(resolve_prepare
   for _w in "${PREPARE_BUDGET_WARNINGS[@]}"; do log "prepare budget warning: $_w (budget stays ${PREPARE_COMMAND_TIMEOUT_SECONDS}s)"; done
   log "prepare begin timeout=${PREPARE_COMMAND_TIMEOUT_SECONDS}s source=${PREPARE_BUDGET_SOURCE}${PREPARE_BUDGET_NOTE:+ $PREPARE_BUDGET_NOTE} target=$NEW_SHA"
   prepare_rc=0
+  # The budget can be two hours; without a lease the next tick took the lock
+  # of this still-running prepare after 30 minutes (#2742).
+  lock_lease "$PREPARE_COMMAND_TIMEOUT_SECONDS"
   CCC_SELF_UPDATE_TARGET_SHA="$NEW_SHA" CCC_SELF_UPDATE_PREVIOUS_SHA="$OLD_SHA" CCC_SELF_UPDATE_REPO_DIR="$REPO" \
     run_bounded_operator_cmd "$PREPARE_COMMAND_TIMEOUT_SECONDS" "$pcmd" || prepare_rc=$?
+  lock_lease
   log "prepare exit=$prepare_rc elapsed=$((SECONDS - prepare_started))s"
   if [ "$prepare_rc" -ne 0 ]; then
     SHORT_NEW="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
@@ -2392,7 +2505,7 @@ gated_health_file_present() {
   return 1
 }
 pre_restart_idle_recheck() {
-  local kind="" reason label now since waited
+  local kind="" reason label now since waited deferrals
   [ "$FORCE" = "1" ] && return 0
   [ "$IDLE_GATE_CAP_PROCEEDED" = "1" ] && return 0
   if [ "$PRE_RESTART_SETTLE_SECONDS" -gt 0 ] && gated_health_file_present; then
@@ -2412,11 +2525,14 @@ pre_restart_idle_recheck() {
   load_pending_activation && since="$PENDING_STARTED_EPOCH"
   case "$since" in ''|*[!0-9]*) since="$now" ;; esac
   waited=$(( now - since ))
-  if [ "$waited" -ge "$MAX_DEFER_SECONDS" ]; then
-    log "proceed reason=defer-cap-exceeded stage=pre-restart waited=${waited}s $reason"
-    say "self-update: $label busy before restart but activation waited ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap — proceeding"
+  deferrals="$(restart_defer_count "$NEW_SHA")"
+  if [ "$waited" -ge "$MAX_DEFER_SECONDS" ] && [ "$deferrals" -ge "$MIN_DEFER_TICKS" ]; then
+    log "proceed reason=defer-cap-exceeded stage=pre-restart waited=${waited}s deferrals=$deferrals $reason"
+    say "self-update: $label busy before restart but activation waited ${waited}s ≥ ${MAX_DEFER_SECONDS}s cap after $deferrals deferred restart(s) — proceeding"
     return 0
   fi
+  deferrals=$((deferrals + 1))
+  printf '%s %s\n' "$NEW_SHA" "$deferrals" > "$RESTART_DEFER_COUNT_FILE" 2>/dev/null
   # Code and harness are installed; only the restart is postponed. Keep the
   # recovery snapshot with the record so the resumed tick can still roll back.
   KEEP_INSTALL_SNAPSHOT=1
@@ -2429,7 +2545,7 @@ pre_restart_idle_recheck() {
      && [ "$PENDING_SNAPSHOT" != "$INSTALL_SNAPSHOT_DIR" ]; then
     KEEP_INSTALL_SNAPSHOT=0
   fi
-  log "deferred reason=${kind}-busy stage=pre-restart $reason waited=${waited}s target=$NEW_SHA"
+  log "deferred reason=${kind}-busy stage=pre-restart $reason waited=${waited}s deferrals=$deferrals target=$NEW_SHA"
   audit "activation-deferred" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$PREPARE_JSON" \
     "$(jq -nc --arg k "$kind" '{deferred_stage:"pre-restart", busy_kind:$k}')"
   say "self-update: $label busy ($reason) right before restart — restart deferred; ${NEW_SHA:0:7} is installed and the next tick restarts into it"
@@ -2438,6 +2554,7 @@ pre_restart_idle_recheck() {
 pre_restart_idle_recheck
 
 # --- restart allowlisted services ----------------------------------------------
+lock_lease
 SERVICES_JSON="$PREPARE_JSON"
 FAILED_NAMES=""
 FAILED=0
@@ -2541,7 +2658,7 @@ if { [ "$CHANGED" = "true" ] || [ "$FORCE" = "1" ]; } && [ "$RESTARTED" -eq 0 ];
       write_pending_activation "external-restart-deferred" "$SERVICES_JSON" "$INSTALL_SNAPSHOT_DIR" || exit 14
       log "pending-activation result=deferred reason=follower-pending target=$NEW_SHA frontends=$RESTART_DEFERRED_SUMMARY"
       audit "activation-deferred" "$OLD_SHA" "$NEW_SHA" "$CHANGED" "$SETUP_OK" "$SERVICES_JSON" "$(jq -nc --arg f "$RESTART_DEFERRED_SUMMARY" '{deferred_frontends: $f}')"
-      notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 코드 갱신·재시작 명령은 끝났고, 작업 중이던 프런트엔드(${RESTART_DEFERRED_SUMMARY})는 분리 follower가 유휴해지면 재시작합니다. 실패가 아니라 보류이며 다음 틱이 서빙 세대로 확인합니다. 롤백 자료: ${INSTALL_SNAPSHOT_DIR}" "pending-$NEW_SHA"
+      notify_activation_incomplete "$NEW_SHA" "self-update ${SHORT_NEW}: 코드 갱신·재시작 명령은 끝났고, 작업 중이던 프런트엔드(${RESTART_DEFERRED_SUMMARY})는 분리 follower가 유휴해지면 재시작합니다. 실패가 아니라 보류이며 다음 틱이 서빙 세대로 확인합니다. 롤백 자료: ${INSTALL_SNAPSHOT_DIR}" "deferred-$NEW_SHA" hold
       say "self-update: updated to $SHORT_NEW; restart deferred to a follower for $RESTART_DEFERRED_SUMMARY — activation is verified on the next tick" >&2
       exit 14
     fi
