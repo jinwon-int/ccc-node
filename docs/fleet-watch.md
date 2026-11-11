@@ -92,6 +92,18 @@ after the reviewed fix is integrated into the normal checkout.
   `meta.health` sync state in the read-only SQLite store named by its config.
   Missing, stale or ambiguous evidence is `UNVERIFIED`. Matrix rows carry
   `channel=matrix`; Telegram rows retain their existing format.
+  A node that gives no answer is classified by how the transport ended
+  (#2766, the same rule as the hande watch, #2673): `UNREACHABLE <node>
+  channel=matrix` only when ssh itself failed (exit 255); `UNVERIFIED <node>
+  channel=matrix inspection=probe-timeout` when the 10 s limit expired on a
+  node that had accepted the connection (exit 124); `UNVERIFIED …
+  inspection=probe-error rc=<n>` when the probe died. Before, every empty
+  answer was `UNREACHABLE`, so a far watcher whose ssh session took over 10 s
+  twice in a row paged the owner about a healthy node — on 2026-11-11 about a
+  Matrix frontend that had been retired for four days. `UNVERIFIED` is
+  confirmed over three runs instead of two (below). The limit itself is
+  unchanged: raising it to the hande watch's 20 s would put the light-mode
+  worst case past the task timeout (see *Scheduling*).
   The health snapshot keeps `service.state=degraded` from one failed agent
   turn until the next turn succeeds, which on a quiet room can be days
   (ccc-node#2098). When that degraded state is explained only by an agent
