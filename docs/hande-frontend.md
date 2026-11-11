@@ -36,6 +36,7 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `turn.session_id` (always `null` today) | ignored — the session manager is the resume authority, exactly as on Matrix |
 | `turn.prompt` starting with `/` | the Matrix command set (`new model effort usage stop continue history resume revert waits cancelwait distill skills memory_promote restart task_*`); owner-only ones refuse non-owners. Numbered menus (`/resume`, `/revert`) are plain `result` text answered by a bare-number turn |
 | `turn.attachment` (#2606; family-messenger `docs/FLEET-WORKER.md` "첨부 turn") | only with **`attachment_frames: true`**. The bot has already decrypted the file-v2/v1 attachment (the file key never leaves it) and left the plaintext in `attachment_spool_dir`; the frame names it (`{v:1, path, kind, mime, name?, size, sha256, caption}`). A malformed object → `rejected invalid-attachment`; an unknown `v` or the knob off → the turn runs on `prompt` (the bot's "attachment received but cannot be opened" fallback). `HandeBot._run_attachment` renames the file into `BOT_DATA_DIR/matrix-media` (taking it over), checks regular file · same uid · 0600 · `size` · `sha256` · the Matrix size limits, then runs the Telegram/Matrix image or document prompt with channel `Hande` and deletes the file when the turn ends. A failed check answers once with the Matrix attachment wording and runs no model |
+| deliverable files an answer names (Telegram/Matrix auto-send, #2001) | only with **`attachment_out_frames: true`** (#2764; family-messenger `docs/FLEET-WORKER.md` "나가는 첨부"): same selection as Telegram/Matrix (`core/deliverables.py` extension list, real file < 50 MiB, inside `PROJECT_ROOT`, direct rooms only), at most 4 per turn. Each file is written to `attachment_spool_dir` as `out-<32 hex>.bin` and sent as `attachment{v:1, path, kind, mime, name?, size, sha256}` **before** `result`; the bot answers `attachment_ack`/`attachment_nack` and deletes the file. The result waits up to 60 s per file for that answer; a nack/timeout/local failure appends `📎 첨부를 보내지 못했습니다: <name>(<reason\|no_ack>)`. Off (default) → no frame, the paths stay text as before. Self-jobs never send files (no bot turn to post into) |
 | `TurnSink.approval` | `approval{approval_id, action, description=<redacted snapshot>, arguments={}}` → `approve`/`deny` → `approval-resolved`; `approval_timeout_s` (default 120) → denied. Audit ledger as on Matrix |
 | `TurnSink.typing` | no-op (the port has no typing indicator) |
 | `TurnSink.status` (the `⏳ Working — 10s \| Bash: …` heartbeat Matrix edits in place) | no-op by default (no editable bubble). **`status_frames: true`** (status-v1, family-messenger#560 / `archive/native-mls/STATUS-V1.md`) forwards every heartbeat as an `interim` frame tagged `kind:"status"` at the Matrix cadence: a status-v1 bot posts it under a `status-<uuid>` client_id, the relay sends no push for it, and the apps show the newest one per sender as one transient bubble (dropped when the reply lands) — turn it on only after the node's bot is status-v1 (an older bot posts it as a plain interim). Otherwise `status_interims: true` forwards it as `interim` frames — a new room message each — throttled: the first line as soon as the heartbeat starts, then one line per `status_interim_interval_s` (default 60, 10..3600) — a changing tool label does not reopen the window (on Matrix it carries the Bash command and changes with every quick call); `None` has no frame, answer previews are never forwarded; needs `interim_frames` (off → counted in `notices_dropped`). A real in-place status bubble needs an app-layer `status` message kind (family-messenger, tracked with the live-preview gap) |
@@ -87,6 +88,7 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   "steward_tools": true,
   "steward_tools_approve_all": false,
   "attachment_frames": false,
+  "attachment_out_frames": false,
   "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
 }
 ```
@@ -108,6 +110,23 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   this knob (config edit + `ccc-hande-bridge` restart) **first**, then the bot's own
   attachment switch. `health_signals()` reports `attachment_frames` and
   `attachments_ignored`.
+
+- `attachment_out_frames` (default off, #2764) sends the files an answer names as
+  `attachment` frames (see the mapping table) through the **same** `attachment_spool_dir`
+  (required with either knob). The bridge creates `out-<32 hex>.bin` with
+  `O_CREAT|O_EXCL|O_NOFOLLOW` and fsyncs it before the frame: mode 0600 when the bridge runs
+  as the spool directory's owner (Termux, one uid), otherwise 0640 in the directory's group
+  (Linux: the bot-owned 2770 `native-relay-bot` directory) so the bot can read and delete it.
+  A spool writable by *other* is refused (ccc-node#2625). Files outside `PROJECT_ROOT` are
+  **not** sent — Telegram asks with a tap-to-confirm button, but the hande port has no confirm
+  step (the `approval` frame is for tool/provider approvals) — so, as on Matrix, the answer says
+  how many were skipped. The bridge deletes its own leftover `out-*.bin` 30 s after `result`
+  and when the bot hangs up; it never touches the bot's inbound `<32 hex>.bin` files. Rollout
+  order: the bot's `NATIVE_MLS_BOT_AGENT_ATTACHMENTS_OUT=1` **first**, then this knob (config
+  edit + `ccc-hande-bridge` restart); turn off in reverse. An older bot ignores the frame, so the
+  only cost of the wrong order is one 60 s wait and a `no_ack` line per turn with files.
+  `health_signals()` reports `attachment_out_frames`, `attachments_out_sent`,
+  `attachments_out_acked` and `attachments_out_failed`.
 
 - `status_frames` (default off, status-v1) forwards the `⏳ Working — Ns | <tool>` heartbeat as
   `kind:"status"` interim frames at the Matrix cadence for a status-v1 bot/app pair (see the

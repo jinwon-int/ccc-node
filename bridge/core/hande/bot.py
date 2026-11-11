@@ -269,6 +269,55 @@ class HandeBot(HandeWaitStatusMixin, MatrixBot):
         finally:
             matrix_media.remove(path)
 
+    # -- outbound attachments (#2764) ------------------------------------------
+
+    def _enqueue_deliverables(self, room_id: str, content: str) -> None:
+        """Hand the files an answer names to the transport as ``attachment`` frames.
+
+        ``MatrixBot`` queues them on its outbox after the answer; the hande
+        port has no outbox, so with ``attachment_out_frames`` on they are staged
+        on the running turn and go out before ``result``. The selection is the
+        Telegram/Matrix one (``core/deliverables.py``): a real file with a
+        deliverable extension, under 50 MiB, inside ``PROJECT_ROOT``, in a
+        direct room. Files outside the project root are not sent — Telegram
+        asks with a button, and the hande port has no confirm step either, so
+        the answer only says how many were skipped (as on Matrix). At most
+        :data:`.outbound.MAX_ATTACHMENTS_PER_TURN` per turn (the bot's limit).
+        With the knob off nothing changes: the paths stay text. Never raises.
+        """
+
+        transport = self._transport
+        stage = getattr(transport, "stage_attachments", None)
+        if (
+            not content.strip()
+            or not callable(stage)
+            or not getattr(transport, "attachment_out_frames", False)
+        ):
+            return
+        try:
+            from telegram_bot.core import deliverables
+            from telegram_bot.core import paths as path_scope
+            from telegram_bot.core.matrix.bot import FILES_DIRECT_ONLY
+
+            from . import outbound
+
+            root = Path(str(getattr(self._settings, "project_root", "") or ".")).resolve()
+            found = deliverables.resolve_deliverable_paths(
+                content, root, max_bytes=outbound.MAX_OUT_FILE_BYTES
+            )
+            if not found:
+                return
+            if transport.room_kind(room_id) != "direct":
+                stage([], root=root, notes=[FILES_DIRECT_ONLY.format(count=len(found))])
+                return
+            inside, outside = path_scope.split_paths_by_scope(found, root)
+            limit = outbound.MAX_ATTACHMENTS_PER_TURN
+            skipped = len(outside) + max(0, len(inside) - limit)
+            notes = [outbound.FILES_SKIPPED.format(count=skipped)] if skipped else []
+            stage(inside[:limit], root=root, notes=notes)
+        except Exception:
+            logger.warning("hande deliverable files not staged", exc_info=True)
+
     def _turn_request_extras(self) -> dict[str, Any]:
         if not self._steward_enabled():
             return {}

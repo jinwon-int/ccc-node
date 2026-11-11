@@ -23,6 +23,7 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "steward_tools": true,
       "steward_tools_approve_all": false,
       "attachment_frames": false,
+      "attachment_out_frames": false,
       "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
     }
 
@@ -171,6 +172,7 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         "status_frames",
         "wait_status_frames",
         "attachment_frames",
+        "attachment_out_frames",
     ):
         value = config.get(key, key == "steward_tools")  # steward tools default on
         if type(value) is not bool:
@@ -199,23 +201,28 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
             f"{MIN_WAIT_STATUS_INTERVAL_S}..{MAX_WAIT_STATUS_INTERVAL_S}"
         )
     knobs["wait_status_interval_s"] = wait_raw
-    knobs["attachment_spool_dir"] = _validate_spool_dir(config, knobs["attachment_frames"])
+    knobs["attachment_spool_dir"] = _validate_spool_dir(
+        config, knobs["attachment_frames"] or knobs["attachment_out_frames"]
+    )
     return knobs
 
 
 def _validate_spool_dir(config: Mapping[str, Any], enabled: bool) -> str | None:
     """``attachment_spool_dir`` (#2606): where the bot leaves decrypted attachments.
 
-    Required once ``attachment_frames`` is on. It must be the same absolute path
-    the bot is configured with: a frame's ``path`` is accepted only as a direct
-    child of exactly this directory (normalised, no ``~``).
+    Required once ``attachment_frames`` or ``attachment_out_frames`` (#2764, the
+    bridge writes ``out-*.bin`` files there for the bot) is on. It must be the
+    same absolute path the bot is configured with: a frame's ``path`` is
+    accepted only as a direct child of exactly this directory (normalised, no
+    ``~``).
     """
 
     raw = config.get("attachment_spool_dir")
     if raw is None:
         if enabled:
             raise HandeConfigError(
-                "hande config 'attachment_spool_dir' is required when 'attachment_frames' is on"
+                "hande config 'attachment_spool_dir' is required when 'attachment_frames' "
+                "or 'attachment_out_frames' is on"
             )
         return None
     if not isinstance(raw, str) or not os.path.isabs(raw):
