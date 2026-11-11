@@ -31,8 +31,26 @@ for node in $NODES; do
     [ "$attempt" -gt "$RETRIES" ] && break
     [ "$RETRY_DELAY" -gt 0 ] && sleep "$RETRY_DELAY"
   done
+  # An empty answer is classified by the last attempt's exit, like the hande
+  # watch (#2673, #2766): only an ssh transport failure (255) means the node
+  # was not reached. A timeout (124) is a node that accepted the connection
+  # but did not finish the probe inside the limit — on 2026-11-11 the T2
+  # watcher needed 5.6-14.0s for `ssh true` to one healthy node (key exchange
+  # done by 3.4s, authentication by 11.1s), so two runs in a row hit the 10s
+  # limit and a Matrix frontend that had been retired for four days paged the
+  # owner as UNREACHABLE. UNVERIFIED says what is known, and
+  # fleet_watch_state.py confirms it over more runs than UNREACHABLE because
+  # it is weaker evidence. A probe that died (stderr is discarded) is
+  # UNVERIFIED too.
   if [ -z "$out" ]; then
-    echo "UNREACHABLE $node channel=matrix"; fail=1; continue
+    if [ "$node" != "$SELF" ] && [ "$rc" = 255 ]; then
+      echo "UNREACHABLE $node channel=matrix"
+    elif [ "$node" != "$SELF" ] && [ "$rc" = 124 ]; then
+      echo "UNVERIFIED $node channel=matrix inspection=probe-timeout"
+    else
+      echo "UNVERIFIED $node channel=matrix inspection=probe-error rc=$rc"
+    fi
+    fail=1; continue
   fi
   if [ "$rc" != 0 ] || [ "$(printf '%s\n' "$out" | tail -1)" != PROBE_COMPLETE=1 ]; then
     echo "UNVERIFIED $node channel=matrix inspection=incomplete-probe"; fail=1; continue
