@@ -8,8 +8,10 @@ in for ``MatrixBot``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 import pytest
@@ -1084,6 +1086,239 @@ async def test_malformed_turn_attachment_is_rejected_not_run(tmp_path: Path) -> 
         await bot.send(bot.turn("t-a5", "x", attachment="nope"))
         assert (await bot.recv())["reason"] == "invalid-attachment"
         assert served.runner.jobs == []
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+# -- #2764: outbound ``attachment`` frames ----------------------------------------
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+
+
+def _out_setup(tmp_path: Path) -> tuple[Path, Path]:
+    spool = tmp_path / "spool"
+    spool.mkdir(mode=0o700)
+    project = tmp_path / "proj"
+    project.mkdir()
+    return spool, project
+
+
+def _staging_behaviour(served: _Served, paths: list[Path], root: Path, staged: list[bool]) -> Any:
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        staged.append(served.transport.stage_attachments(paths, root=root))
+        return TurnResult(text="done", session_id=None)
+
+    return behaviour
+
+
+def _out_files(spool: Path) -> list[Path]:
+    return sorted(spool.glob("out-*.bin"))
+
+
+async def test_attachment_out_frame_goes_before_result_and_is_acked(tmp_path: Path) -> None:
+    spool, project = _out_setup(tmp_path)
+    image = project / "chart.png"
+    image.write_bytes(PNG_BYTES)
+    served = await _serve(
+        tmp_path, attachment_out_frames=True, attachment_spool_dir=str(spool)
+    )
+    served.transport.attachment_cleanup_delay_s = 0.05
+    staged: list[bool] = []
+    served.runner.behaviour = _staging_behaviour(served, [image], project, staged)
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-o1", "draw"))
+        frame = await bot.recv()
+        assert frame["type"] == "attachment" and frame["turn_id"] == "t-o1"
+        attachment = frame["attachment"]
+        digest = hashlib.sha256(PNG_BYTES).hexdigest()
+        assert attachment == {
+            "v": 1,
+            "path": attachment["path"],
+            "kind": "image",
+            "mime": "image/png",
+            "name": "chart.png",
+            "size": len(PNG_BYTES),
+            "sha256": digest,
+        }
+        spool_file = Path(attachment["path"])
+        assert spool_file.parent == spool
+        assert re.fullmatch(r"out-[0-9a-f]{32}\.bin", spool_file.name)
+        assert spool_file.read_bytes() == PNG_BYTES
+        assert spool_file.stat().st_mode & 0o777 == 0o600  # one uid owns the spool
+        # The result waits for the bot's answer.
+        with pytest.raises(asyncio.TimeoutError):
+            await bot.recv(timeout=0.2)
+        # An unrelated answer is ignored, never a protocol error.
+        await bot.send({"type": "attachment_ack", "turn_id": "t-o1", "sha256": "f" * 12})
+        await bot.send({"type": "attachment_ack", "turn_id": "t-o1", "sha256": digest[:12]})
+        result = await bot.recv_kind("result")
+        assert result["status"] == "complete" and result["text"] == "done"
+        assert staged == [True]
+        signals = served.transport.health_signals()
+        assert signals["attachment_out_frames"] is True
+        assert signals["attachments_out_sent"] == 1 and signals["attachments_out_acked"] == 1
+        # The bot did not delete its copy: the bridge sweeps it after result.
+        for _ in range(100):
+            if not _out_files(spool):
+                break
+            await asyncio.sleep(0.02)
+        assert _out_files(spool) == []
+        assert image.exists()  # the deliverable itself is never touched
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_attachment_out_nack_and_unreadable_file_append_fixed_lines(tmp_path: Path) -> None:
+    spool, project = _out_setup(tmp_path)
+    report = project / "report.pdf"
+    report.write_bytes(b"%PDF-1.7\n")
+    gone = project / "gone.csv"
+    served = await _serve(tmp_path, attachment_out_frames=True, attachment_spool_dir=str(spool))
+    served.runner.behaviour = _staging_behaviour(served, [report, gone], project, [])
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-o2", "report"))
+        frame = await bot.recv_kind("attachment")
+        assert frame["attachment"]["mime"] == "application/pdf"
+        assert frame["attachment"]["kind"] == "file"
+        await bot.send(
+            {
+                "type": "attachment_nack",
+                "turn_id": "t-o2",
+                "sha256": frame["attachment"]["sha256"][:12],
+                "reason": "upload",
+            }
+        )
+        result = await bot.recv_kind("result")
+        assert result["text"] == (
+            "done\n\n"
+            "📎 첨부를 보내지 못했습니다: gone.csv(file)\n"
+            "📎 첨부를 보내지 못했습니다: report.pdf(upload)"
+        )
+        assert str(project) not in result["text"] and str(spool) not in result["text"]
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_attachment_out_without_ack_waits_one_window_then_says_no_ack(tmp_path: Path) -> None:
+    """An older bot ignores the frame: one timeout, not one per file."""
+
+    spool, project = _out_setup(tmp_path)
+    first, second = project / "a.txt", project / "b.txt"
+    first.write_text("a")
+    second.write_text("b")
+    served = await _serve(tmp_path, attachment_out_frames=True, attachment_spool_dir=str(spool))
+    served.transport.attachment_ack_timeout_s = 0.3
+    served.runner.behaviour = _staging_behaviour(served, [first, second], project, [])
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-o3", "two"))
+        assert (await bot.recv())["type"] == "attachment"
+        assert (await bot.recv())["type"] == "attachment"
+        started = asyncio.get_running_loop().time()
+        result = await bot.recv_kind("result")
+        assert asyncio.get_running_loop().time() - started < 0.55
+        assert result["text"].endswith(
+            "📎 첨부를 보내지 못했습니다: a.txt(no_ack)\n📎 첨부를 보내지 못했습니다: b.txt(no_ack)"
+        )
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_attachment_out_frames_off_sends_no_attachment_frame(tmp_path: Path) -> None:
+    """Regression: knob off ⇒ the turn is exactly what it was before #2764."""
+
+    spool, project = _out_setup(tmp_path)
+    image = project / "chart.png"
+    image.write_bytes(PNG_BYTES)
+    served = await _serve(tmp_path, attachment_spool_dir=str(spool))
+    staged: list[bool] = []
+    served.runner.behaviour = _staging_behaviour(served, [image], project, staged)
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-o4", "draw"))
+        assert await bot.recv() == {
+            "type": "result",
+            "turn_id": "t-o4",
+            "status": "complete",
+            "text": "done",
+            "session_id": None,
+        }
+        assert staged == [False]
+        assert _out_files(spool) == []
+        assert served.transport.health_signals()["attachments_out_sent"] == 0
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_attachment_out_family_room_keeps_notes_but_sends_no_file(tmp_path: Path) -> None:
+    spool, project = _out_setup(tmp_path)
+    image = project / "chart.png"
+    image.write_bytes(PNG_BYTES)
+    served = await _serve(tmp_path, attachment_out_frames=True, attachment_spool_dir=str(spool))
+
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        served.transport.stage_attachments([image], root=project, notes=["📎 note"])
+        return TurnResult(text="done", session_id=None)
+
+    served.runner.behaviour = behaviour
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-o5", "draw", room="fleet", sender="@kid-ipad:hande"))
+        assert await bot.recv() == {
+            "type": "result",
+            "turn_id": "t-o5",
+            "status": "complete",
+            "text": "done\n\n📎 note",
+            "session_id": None,
+        }
+        assert _out_files(spool) == []
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_attachment_out_files_are_swept_when_the_bot_hangs_up(tmp_path: Path) -> None:
+    spool, project = _out_setup(tmp_path)
+    image = project / "chart.png"
+    image.write_bytes(PNG_BYTES)
+    served = await _serve(tmp_path, attachment_out_frames=True, attachment_spool_dir=str(spool))
+    served.runner.behaviour = _staging_behaviour(served, [image], project, [])
+    unrelated = spool / ("ab" * 16 + ".bin")  # an inbound file: the bot's, never ours
+    unrelated.write_bytes(b"x")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-o6", "draw"))
+        await bot.recv_kind("attachment")
+        assert len(_out_files(spool)) == 1
+        await bot.close()
+        for _ in range(100):
+            if not _out_files(spool):
+                break
+            await asyncio.sleep(0.02)
+        assert _out_files(spool) == []
+        assert unrelated.exists()
+        assert served.runner.cancelled == ["t-o6"]
+    finally:
+        await _stop(served)
+
+
+async def test_attachment_answers_are_accepted_without_any_waiting_turn(tmp_path: Path) -> None:
+    served = await _serve(tmp_path)
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send({"type": "attachment_ack", "turn_id": "t-x", "sha256": "0" * 12})
+        await bot.send({"type": "attachment_nack", "turn_id": "t-x", "sha256": 5, "reason": None})
+        await bot.send(bot.turn("t-o7", "hi"))
+        # No ``rejected unknown-command``: the next frame is this turn's own.
+        assert (await bot.recv())["type"] == "session"
+        assert (await bot.recv_kind("result"))["text"] == "echo:hi"
         await bot.close()
     finally:
         await _stop(served)

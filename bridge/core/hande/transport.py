@@ -16,6 +16,9 @@ Frames in (from the bot)::
     {"type":"approve"|"deny","turn_id":"t-12","approval_id":"<nonce>"}
     {"type":"cancel","turn_id":"t-12"}
     {"type":"tool-result", …}            # steward tools: not served here
+    {"type":"attachment_ack","turn_id":…,"sha256":"<12 hex>"}
+    {"type":"attachment_nack","turn_id":…,"sha256":"<12 hex>","reason":…}
+                                         # #2764, answers to ``attachment`` out
 
 Frames out (to the bot)::
 
@@ -29,6 +32,9 @@ Frames out (to the bot)::
      "text":…,"session_id":…[,"reason":…]}
     {"type":"notice","room":…,"text":…[,"kind":"status"]}   # no turn; kind
                                          # status = external-wait line (#2590)
+    {"type":"attachment","turn_id":…,"attachment":{"v":1,"path":…,"kind":…,
+     "mime":…[,"name":…],"size":…,"sha256":…}}   # #2764, before ``result``,
+                                         # only with attachment_out_frames on
 
 Limits follow the port: 64 KiB per inbound line, 512 KiB per outbound line,
 turn ids ``[A-Za-z0-9_-]{1,128}``. Anything malformed ends the connection
@@ -58,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+import dataclasses
 import grp
 import hashlib
 import json
@@ -74,6 +81,7 @@ from typing import Any, Mapping
 
 from telegram_bot.contracts.transport import TurnResult, TurnRunner
 
+from . import outbound
 from .attachments import AttachmentFrameError, parse_frame_attachment
 from .state import (
     DEFAULT_SOCKET_MODE,
@@ -211,6 +219,14 @@ class _ActiveTurn:
         # an interim reply would hide the line until the next heartbeat (#2602);
         # the sink re-posts this text right after each interim.
         self.status_text: str | None = None
+        # Outbound attachments (#2764, attachment_out_frames): the deliverables
+        # the answer named, staged by HandeBot while the turn runs and sent as
+        # ``attachment`` frames before ``result``; notes are appended to the
+        # answer; ``out_files`` are this turn's spool names (swept after result).
+        self.out_paths: list[Path] = []
+        self.out_root: Path | None = None
+        self.out_notes: list[str] = []
+        self.out_files: list[str] = []
 
     def settle_tool(self, outcome: Mapping[str, Any]) -> None:
         if self.tool is not None and not self.tool[1].done():
@@ -483,6 +499,21 @@ class HandeTransport:
             self.attachment_spool_dir
         )
         self._attachments_ignored = 0
+        # #2764: agent deliverables out as ``attachment`` frames into the same spool.
+        self.attachment_out_frames = bool(self.c.get("attachment_out_frames")) and bool(
+            self.attachment_spool_dir
+        )
+        self.attachment_ack_timeout_s = outbound.ACK_TIMEOUT_S
+        self.attachment_cleanup_delay_s = outbound.CLEANUP_DELAY_S
+        # (turn_id, sha256[:12]) -> future of the bot's answer: ``None`` = ack,
+        # a reason string = nack.
+        self._attachment_waits: dict[tuple[str, str], asyncio.Future[str | None]] = {}
+        # Spool names this process wrote and has not swept yet (never anyone else's).
+        self._out_files: set[str] = set()
+        self._out_cleanups: set[asyncio.Task[None]] = set()
+        self._attachments_out_sent = 0
+        self._attachments_out_acked = 0
+        self._attachments_out_failed = 0
         # Heartbeat (``TurnSink.status``) as throttled interim frames; see _HandeSink.status.
         self.status_interims = bool(self.c.get("status_interims"))
         # status-v1 (family-messenger#560): heartbeat as ``kind:"status"`` interims.
@@ -597,6 +628,9 @@ class HandeTransport:
             self._self_job_task.cancel()
         if self._client is not None:
             await self._client.close()
+        for task in list(self._out_cleanups):
+            task.cancel()
+        self._sweep_out_files()
         if self._server is not None:
             self._server.close()
             try:
@@ -996,6 +1030,10 @@ class HandeTransport:
             "status_resent": self._status_resent,
             "attachment_frames": self.attachment_frames,
             "attachments_ignored": self._attachments_ignored,
+            "attachment_out_frames": self.attachment_out_frames,
+            "attachments_out_sent": self._attachments_out_sent,
+            "attachments_out_acked": self._attachments_out_acked,
+            "attachments_out_failed": self._attachments_out_failed,
             "self_jobs_pending": len(self._self_jobs),
             "self_jobs_served": self._self_jobs_served,
             "self_jobs_uncertain": self._self_jobs_uncertain,
@@ -1057,6 +1095,8 @@ class HandeTransport:
             if self._client is client:
                 self._client = None
             await client.close()
+            # The bot deletes what it handled; what is left of ours goes now.
+            self._sweep_out_files()
 
     async def _dispatch(self, client: _Client, frame: Mapping[str, Any]) -> bool:
         kind = frame.get("type")
@@ -1074,6 +1114,9 @@ class HandeTransport:
             return await self._on_cancel(client, frame)
         if kind == "tool-result":
             return await self._on_tool_result(client, frame)
+        if kind in ("attachment_ack", "attachment_nack"):
+            self._on_attachment_answer(frame, kind == "attachment_ack")
+            return True
         await client.send(
             {"type": "rejected", "turn_id": turn_id or "", "reason": "unknown-command"}
         )
@@ -1154,6 +1197,16 @@ class HandeTransport:
             result = await self.runner.run(
                 turn.job, sink=sink, session_id=None, room_kind=room_kind
             )
+            if (
+                result is not None
+                and getattr(result, "status", "complete") == "complete"
+                and (turn.out_paths or turn.out_notes)
+            ):
+                # #2764: files first (the room shows them before the answer),
+                # still inside the turn so a /stop or a hang-up ends the wait.
+                lines = await self._deliver_attachments(client, turn)
+                if lines:
+                    result = _with_lines(result, lines)
         except asyncio.CancelledError:
             reason = "cancelled" if turn.cancelled else "worker_gone"
         except Exception as error:
@@ -1198,9 +1251,169 @@ class HandeTransport:
                     else None,
                 }
             )
+        if turn.out_files:
+            self._schedule_out_cleanup(list(turn.out_files))
         self._hook("turn_closed", turn.job)
         self._hook("delivered", turn.job)
         self._kick_self_jobs()
+
+    # -- outbound attachments (#2764) -----------------------------------------
+
+    def stage_attachments(
+        self, paths: list[Path], *, root: Path | None, notes: list[str] | None = None
+    ) -> bool:
+        """Bind the deliverables an answer names to the bot turn running now.
+
+        ``HandeBot`` calls this while the turn runs (the Telegram/Matrix
+        selection rule already applied); the files go out as ``attachment``
+        frames before ``result`` and ``notes`` are appended to the answer.
+        ``False`` (nothing staged) with the knob off, or when no bot turn is
+        running — a self-job has no bot turn for the bot to post a file into.
+        """
+
+        turn = self._active
+        if not self.attachment_out_frames or turn is None or turn.self_job:
+            return False
+        room = turn.job.get("room_id") if isinstance(turn.job, Mapping) else None
+        if str(room or "") not in self.family_rooms:  # never a file into a shared room
+            room_left = outbound.MAX_ATTACHMENTS_PER_TURN - len(turn.out_paths)
+            turn.out_paths.extend(list(paths)[: max(0, room_left)])
+        turn.out_root = root
+        turn.out_notes.extend(notes or ())
+        return True
+
+    async def _deliver_attachments(self, client: _Client, turn: _ActiveTurn) -> list[str]:
+        """Spool, send and await each staged file; returns the lines for the answer.
+
+        Every frame goes out before any wait (the bot posts them in order,
+        ahead of the answer). Then each one gets up to
+        ``attachment_ack_timeout_s`` for its ``attachment_ack``/``_nack``. A bot
+        that does not know the frame never answers, so after the first timeout
+        the rest are not waited for again (an old bot costs one window, not four).
+        """
+
+        lines = list(turn.out_notes)
+        spool_dir = str(self.attachment_spool_dir)
+        loop = asyncio.get_running_loop()
+        sent: list[tuple[outbound.PreparedAttachment, tuple[str, str], asyncio.Future[str | None]]] = []
+        seen: set[str] = set()
+        try:
+            for path in turn.out_paths:
+                # Named before the write so a hang-up mid-write still sweeps it.
+                spool_name = outbound.new_spool_name()
+                turn.out_files.append(spool_name)
+                self._out_files.add(spool_name)
+                try:
+                    item = await asyncio.to_thread(
+                        outbound.prepare,
+                        path,
+                        spool_dir=spool_dir,
+                        spool_name=spool_name,
+                        root=turn.out_root,
+                    )
+                except outbound.OutboundAttachmentError as error:
+                    self._attachments_out_failed += 1
+                    logger.warning("hande attachment out not staged reason=%s", error.reason)
+                    lines.append(outbound.not_sent_line(outbound.display_name(path), error.reason))
+                    continue
+                key = (turn.turn_id, item.sha256[:12])
+                if item.sha256 in seen or key in self._attachment_waits:
+                    # Same bytes twice in one answer: one post (the ack names the hash).
+                    outbound.remove_spool_files(spool_dir, [spool_name])
+                    continue
+                seen.add(item.sha256)
+                future: asyncio.Future[str | None] = loop.create_future()
+                self._attachment_waits[key] = future
+                frame = {"type": "attachment", "turn_id": turn.turn_id, "attachment": item.attachment}
+                if not await client.send(frame):
+                    self._attachment_waits.pop(key, None)
+                    self._attachments_out_failed += 1
+                    lines.append(outbound.not_sent_line(item.display, "send"))
+                    continue
+                self._attachments_out_sent += 1
+                logger.info(
+                    "hande attachment out sent kind=%s size=%d sha=%s",
+                    item.attachment["kind"], item.attachment["size"], item.sha256[:12],
+                )
+                sent.append((item, key, future))
+            timed_out = False
+            for item, key, future in sent:
+                answer: str | None
+                if future.done():
+                    answer = future.result()
+                elif timed_out:
+                    answer = "no_ack"
+                else:
+                    try:
+                        answer = await asyncio.wait_for(
+                            asyncio.shield(future), self.attachment_ack_timeout_s
+                        )
+                    except asyncio.TimeoutError:
+                        answer = "no_ack"
+                        timed_out = True
+                if answer is None:
+                    self._attachments_out_acked += 1
+                    continue
+                self._attachments_out_failed += 1
+                logger.info("hande attachment out not posted reason=%s sha=%s", answer, key[1])
+                lines.append(outbound.not_sent_line(item.display, answer))
+        finally:
+            for _item, key, future in sent:
+                self._attachment_waits.pop(key, None)
+                if not future.done():
+                    future.cancel()
+        return lines
+
+    def _on_attachment_answer(self, frame: Mapping[str, Any], acked: bool) -> None:
+        """Settle the wait for one ``attachment_ack``/``_nack``; anything else is ignored.
+
+        Never a protocol error and never answered: a late, duplicate or
+        unknown answer (the bot also answers after ``result`` timed it out)
+        changes nothing.
+        """
+
+        turn_id = frame.get("turn_id")
+        digest = frame.get("sha256")
+        if not isinstance(turn_id, str) or not isinstance(digest, str):
+            return
+        future = self._attachment_waits.get((turn_id, digest.lower()))
+        if future is None or future.done():
+            logger.debug("hande attachment answer without a waiting frame")
+            return
+        if acked:
+            future.set_result(None)
+            return
+        reason = frame.get("reason")
+        if not isinstance(reason, str) or not outbound.NACK_REASON_PATTERN.fullmatch(reason):
+            reason = "error"
+        future.set_result(reason)
+
+    def _schedule_out_cleanup(self, names: list[str]) -> None:
+        """Sweep a finished turn's spool files the bot did not delete, a little later."""
+
+        async def _later() -> None:
+            await asyncio.sleep(self.attachment_cleanup_delay_s)
+            self._sweep_out_files(names)
+
+        task = asyncio.get_running_loop().create_task(_later())
+        self._out_cleanups.add(task)
+        task.add_done_callback(self._out_cleanups.discard)
+
+    def _sweep_out_files(self, names: list[str] | None = None) -> None:
+        """Delete our own ``out-*.bin`` (all of them, or ``names``); ENOENT is normal."""
+
+        if not self.attachment_spool_dir:
+            return
+        # A turn's own names are swept even after a hang-up sweep forgot them: a
+        # write cancelled mid-thread can still land after that sweep ran.
+        targets = set(self._out_files if names is None else names)
+        if not targets:
+            return
+        self._out_files -= targets
+        try:
+            outbound.remove_spool_files(str(self.attachment_spool_dir), targets)
+        except Exception:
+            logger.debug("hande attachment spool sweep failed", exc_info=True)
 
     def _hook(self, name: str, job: Mapping[str, Any]) -> None:
         hook = getattr(self.runner, name, None)
@@ -1326,6 +1539,23 @@ class HandeTransport:
             logger.debug("hande runner.cancel failed", exc_info=True)
         if turn.task is not None and not turn.task.done():
             turn.task.cancel()
+
+
+def _with_lines(result: Any, lines: list[str]) -> Any:
+    """``result`` with ``lines`` appended to its text (the attachment notes, #2764)."""
+
+    text = str(getattr(result, "text", "") or "").rstrip()
+    suffix = "\n".join(lines)
+    combined = f"{text}\n\n{suffix}" if text else suffix
+    try:
+        return dataclasses.replace(result, text=combined)
+    except TypeError:
+        return TurnResult(
+            text=combined,
+            session_id=getattr(result, "session_id", None),
+            streamed=bool(getattr(result, "streamed", False)),
+            status=str(getattr(result, "status", "complete")),
+        )
 
 
 def _is_stop_command(body: str) -> bool:
