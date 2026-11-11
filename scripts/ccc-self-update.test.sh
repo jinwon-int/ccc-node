@@ -33,6 +33,7 @@ unset CCC_SELF_UPDATE_RESTART_COMMAND_TIMEOUT_SECONDS
 unset CCC_SELF_UPDATE_RESTART_CMD_FILE CCC_SELF_UPDATE_HEALTH_CMD_FILE
 unset CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS
 unset CCC_SELF_UPDATE_BUSY_MAX_SECONDS CCC_SELF_UPDATE_MAX_DEFER_SECONDS
+unset CCC_SELF_UPDATE_MIN_DEFER_TICKS
 unset CCC_SELF_UPDATE_REAPPLY CCC_SELF_UPDATE_CRONTAB_CMD
 unset CODEX_HOME
 # The bridge runtime preflight (bridge/runtime_config_check.py) prefers the
@@ -281,6 +282,41 @@ ok "deferred hand-off is audited as activation-deferred, never as restart-failur
 ok "deferred hand-off tells the owner it is a deferral, not a failure" 'cat "$TMP/spool"/*.json 2>/dev/null | jq -r .text | grep -q "분리 follower가 유휴해지면 재시작"'
 ok "deferred hand-off retains the recovery snapshot" 'compgen -G "$STATE/self-update-install-rollback.*" >/dev/null'
 ok "the ledger is cleared at the start of each run (only one pending line present)" '[ "$(grep -c "pending hande" "$STATE/self-update.restart-deferred")" = 1 ]'
+# #2742: the hold notice must not swallow a later failure for the same target.
+# The marker records what the owner was told; a hold suppresses only another hold.
+# shellcheck disable=SC2034  # hold_target is read via eval inside ok()
+hold_target="$(git -C "$TMP/seed" rev-parse HEAD)"
+spool_count() { compgen -G "$TMP/spool/*SelfUpdate*.json" | wc -l; }
+ok "hold notice marks the target as told-about-a-hold (#2742)" \
+  '[ "$(sed -n 1p "$STATE/self-update.activation-notified")" = "$hold_target" ] && [ "$(sed -n 2p "$STATE/self-update.activation-notified")" = hold ] && jq -r .dedup "$TMP/spool"/*SelfUpdate*.json | grep -q "SelfUpdate:deferred-"'
+rm -f "$CLAUDE/self-update.health-cmd" "$TMP/spool"/*.json; : > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "tick while the follower is still inside its wait stays quiet (#2742)" \
+  '[ "$rc" = 14 ] && [ "$(spool_count)" = 0 ] && grep -q "notify=suppressed reason=already-notified target=$hold_target kind=hold" "$STATE/self-update.log"'
+# The follower's own wait (max_wait=3600) is over and it never reported done.
+printf '%s pending hande want=main-deadbeef max_wait=3600\n' "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.restart-deferred"
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "an overdue follower turns the hold into a notified failure (#2742)" \
+  '[ "$rc" = 14 ] && [ "$(spool_count)" = 1 ] && jq -r .text "$TMP/spool"/*SelfUpdate*.json | grep -q "활성화(재시작) 완료 증거가 없습니다" && [ "$(sed -n 2p "$STATE/self-update.activation-notified")" = failure ]'
+: > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "the failure is notified once, later ticks stay quiet (#2148 kept)" \
+  '[ "$rc" = 14 ] && [ "$(spool_count)" = 1 ] && grep -q "notify=suppressed reason=already-notified target=$hold_target kind=failure" "$STATE/self-update.log"'
+# A follower that reported done while the old generation still serves: failure too.
+printf '%s\nhold\n' "$hold_target" > "$STATE/self-update.activation-notified"
+printf '%s pending hande want=main-deadbeef max_wait=3600\n%s done hande rc=3\n' "$(date +%s)" "$(date +%s)" > "$STATE/self-update.restart-deferred"
+rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "a finished follower with no verified activation is notified as a failure (#2742)" \
+  '[ "$rc" = 14 ] && [ "$(spool_count)" = 1 ]'
+# A marker written before the kind existed (one line) keeps suppressing.
+printf '%s\n' "$hold_target" > "$STATE/self-update.activation-notified"
+rm -f "$TMP/spool"/*.json
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "a one-line marker from before #2742 still counts as a notified failure" \
+  '[ "$rc" = 14 ] && [ "$(spool_count)" = 0 ]'
+printf '%s\n' 'exit 1' > "$CLAUDE/self-update.health-cmd"
 # a follower that already reported `done` is no longer a deferral: same hand-off, health still old → genuine failure
 echo drift3e > "$TMP/seed/file3e.txt"
 git -C "$TMP/seed" add -A && git -C "$TMP/seed" commit -qm five-e && git -C "$TMP/seed" push -q origin main
@@ -1051,9 +1087,44 @@ ok "task older than busy-max proceeds" '[ "$rc" = 0 ]'
 # total-deferral cap: continuous busy must not starve updates forever
 mk_health "$(now_iso)" 1 60
 echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
+echo 2 > "$STATE/self-update.deferred-count"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "deferral cap exceeded proceeds despite busy" '[ "$rc" = 0 ]'
-ok "deferral marker cleared after proceeding" '[ ! -f "$STATE/self-update.deferred-since" ]'
+ok "deferral marker cleared after proceeding" '[ ! -f "$STATE/self-update.deferred-since" ] && [ ! -f "$STATE/self-update.deferred-count" ]'
+
+# #2742: ticks are an hour or more apart, so the cap in seconds alone meant
+# "defer once" — the second busy tick always proceeded. The cap now also needs
+# CCC_SELF_UPDATE_MIN_DEFER_TICKS (default 2) deferred ticks.
+mk_health "$(now_iso)" 1 60
+echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
+rm -f "$STATE/self-update.deferred-count"; : > "$STATE/self-update.log"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "past the time cap but only the first deferred tick: still defers (#2742)" \
+  '[ "$rc" = 8 ] && [ "$(cat "$STATE/self-update.deferred-count")" = 1 ] && grep -q "deferred reason=bridge-busy .* deferrals=1" "$STATE/self-update.log"'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "second busy tick past the time cap still defers (#2742)" \
+  '[ "$rc" = 8 ] && [ "$(cat "$STATE/self-update.deferred-count")" = 2 ]'
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "third busy tick: the cap forces the run and says how often it deferred (#2742)" \
+  '[ "$rc" = 0 ] && grep -q "proceed reason=defer-cap-exceeded waited=[0-9]*s deferrals=2 " "$STATE/self-update.log" && [ ! -f "$STATE/self-update.deferred-count" ]'
+# A count without its marker belongs to an older series and starts over.
+clr_defer; echo 9 > "$STATE/self-update.deferred-count"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "a new deferral series starts counting at one (#2742)" \
+  '[ "$rc" = 8 ] && [ "$(cat "$STATE/self-update.deferred-count")" = 1 ]'
+# 0 restores the seconds-only cap.
+echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"; rm -f "$STATE/self-update.deferred-count"
+out="$(CCC_SELF_UPDATE_MIN_DEFER_TICKS=0 run_selfup run 2>&1)"; rc=$?
+ok "CCC_SELF_UPDATE_MIN_DEFER_TICKS=0 keeps the seconds-only cap (#2742)" '[ "$rc" = 0 ]'
+for bad_ticks in -1 01 1.5 abc 21; do
+  out="$(CCC_SELF_UPDATE_MIN_DEFER_TICKS="$bad_ticks" run_selfup run 2>&1)"; rc=$?
+  ok "invalid deferred-tick floor [$bad_ticks] exits 2 and releases the lock (#2742)" \
+    '[ "$rc" = 2 ] && grep -q "CCC_SELF_UPDATE_MIN_DEFER_TICKS.*0..20" <<<"$out" && [ ! -d "$STATE/self-update.lock" ]'
+done
+out="$(run_selfup status 2>&1)"
+ok "status reports the deferral cap and tick floor (#2742)" \
+  'grep -q "busy deferral: cap 3600s, at least 2 deferred tick(s)" <<<"$out"'
+clr_defer; rm -f "$STATE/self-update.deferred-count"
 
 # Matrix frontend: its health file gates only when ccc-matrix-bridge is allowlisted.
 MHFILE="$TMP/matrix-health.json"
@@ -1135,6 +1206,7 @@ ok "old leftover child alone does not defer" '[ "$rc" = 0 ]'
 kill "$wleft" "$wfresh" 2>/dev/null; wait "$wleft" "$wfresh" 2>/dev/null
 printf '%s\n%s\n' "$wmain" "$whandler" > "$WPROCS"
 echo "$(( $(date +%s) - 7200 ))" > "$STATE/self-update.deferred-since"
+echo 2 > "$STATE/self-update.deferred-count"
 out="$(run_selfup run 2>&1)"; rc=$?
 ok "worker deferral cap exceeded proceeds" '[ "$rc" = 0 ] && [ ! -f "$STATE/self-update.deferred-since" ]'
 clr_defer; printf '%s\n' 'hermes-broker' > "$CLAUDE/self-update.services"
@@ -2138,6 +2210,33 @@ ok "prepare-cmd runs before the external restart and the tick exits 0" \
   '[ "$rc" = 0 ] && [ "$(sed -n 1p "$SEQ" | cut -d" " -f1)" = prepare ] && [ "$(sed -n 2p "$SEQ")" = restart ]'
 ok "prepare-cmd receives the target, previous SHA and checkout" \
   'grep -q "target=$(git -C "$TMP/seed" rev-parse HEAD) prev=" "$SEQ" && grep -q "repo=$REPO" "$SEQ"'
+
+# #2742 lock lease: the lock is stale 30 minutes after its mtime, a prepare may
+# run for two hours and nothing refreshed the mtime — the next tick could take
+# the lock of a live run. During a bounded long step the holder's lock mtime
+# is now + that step's budget; each command below records what it saw.
+: > "$SEQ"
+printf 'echo "prepare-lease=$(( $(stat -c %%Y %s) - $(date +%%s) ))" >> %s\n' "$STATE/self-update.lock" "$SEQ" > "$CLAUDE/self-update.prepare-cmd"
+printf 'echo "restart-lease=$(( $(stat -c %%Y %s) - $(date +%%s) ))" >> %s\n' "$STATE/self-update.lock" "$SEQ" > "$CLAUDE/self-update.restart-cmd"
+bump2142 lock-lease
+out="$(CCC_SELF_UPDATE_PREPARE_COMMAND_TIMEOUT_SECONDS=5400 run_selfup run 2>&1)"; rc=$?
+lease_of() { sed -n "s/^$1-lease=//p" "$SEQ" | head -n1; }
+ok "the lock is leased for the prepare budget while prepare runs (#2742)" \
+  '[ "$rc" = 0 ] && l="$(lease_of prepare)" && [ "$l" -ge 5390 ] && [ "$l" -le 5400 ]'
+ok "the lock is leased for the restart budget plus health wait while the restart command runs (#2742)" \
+  'l="$(lease_of restart)" && [ "$l" -ge 173 ] && [ "$l" -le 183 ]'
+ok "the lock is released when the run ends (#2742)" '[ ! -e "$STATE/self-update.lock" ]'
+# A lease is not immortality: a dead holder's lock is recovered 30 minutes
+# after the lease ends, and a live lease still blocks the next tick.
+mkdir "$STATE/self-update.lock"
+python3 -c 'import os, sys, time; t = time.time() + 600; os.utime(sys.argv[1], (t, t))' "$STATE/self-update.lock"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "a lock inside its lease blocks the next tick (#2742)" '[ "$rc" = 3 ] && [ -d "$STATE/self-update.lock" ]'
+python3 -c 'import os, sys, time; t = time.time() - 1860; os.utime(sys.argv[1], (t, t))' "$STATE/self-update.lock"
+out="$(run_selfup run 2>&1)"; rc=$?
+ok "a lock whose lease ended more than 30 minutes ago is taken over (#2742)" '[ "$rc" != 3 ] && [ ! -e "$STATE/self-update.lock" ]'
+printf 'echo "prepare target=$CCC_SELF_UPDATE_TARGET_SHA prev=$CCC_SELF_UPDATE_PREVIOUS_SHA repo=$CCC_SELF_UPDATE_REPO_DIR" >> %s\n' "$SEQ" > "$CLAUDE/self-update.prepare-cmd"
+printf 'echo restart >> %s\n' "$SEQ" > "$CLAUDE/self-update.restart-cmd"
 ok "audit lists prepare ok ahead of the external restart" \
   'grep "^{" "$STATE/self-update.log" | tail -1 | jq -e ".result == \"ok\" and .services[0].name == \"prepare\" and .services[0].ok == true and .services[0].scope == \"external\" and .services[1].name == \"external-restart\"" >/dev/null'
 ok "up-to-date tick does not re-run the prepare command" ': > "$SEQ"; run_selfup run >/dev/null 2>&1; [ ! -s "$SEQ" ]'
@@ -2229,10 +2328,30 @@ ok "#2667 completion notice says the deferred restart finished" \
 ok "#2667 the tick after that is a plain up-to-date" \
   ': > "$TMP/systemctl.calls"; o="$(run_selfup run 2>&1)"; [ "$?" = 0 ] && grep -q "already up to date" <<<"$o" && [ "$(hande_restarts_2667)" = 0 ]'
 
+# (d0) #2742: past the time cap, but the restart of this target was deferred
+# fewer than CCC_SELF_UPDATE_MIN_DEFER_TICKS (2) times — defer, counted per target.
+busy_prepare_2667; mk_idle_2667; bump2142 recheck-floor-2667
+# shellcheck disable=SC2034  # read via eval inside ok()
+floor_target="$(git -C "$TMP/seed" rev-parse HEAD)"
+: > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
+out="$(CCC_SELF_UPDATE_MAX_DEFER_SECONDS=0 run_selfup run 2>&1)"; rc=$?
+ok "#2742 first busy recheck defers even past the time cap" \
+  '[ "$rc" = 8 ] && [ "$(hande_restarts_2667)" = 0 ] && [ "$(cat "$STATE/self-update.restart-deferred-count")" = "$floor_target 1" ] && grep -q "stage=pre-restart .* deferrals=1 target=$floor_target" "$STATE/self-update.log"'
+mk_idle_2667
+out="$(CCC_SELF_UPDATE_MAX_DEFER_SECONDS=0 run_selfup run 2>&1)"; rc=$?
+ok "#2742 second busy recheck defers again" \
+  '[ "$rc" = 8 ] && [ "$(hande_restarts_2667)" = 0 ] && [ "$(cat "$STATE/self-update.restart-deferred-count")" = "$floor_target 2" ]'
+mk_idle_2667; : > "$STATE/self-update.log"
+out="$(CCC_SELF_UPDATE_MAX_DEFER_SECONDS=0 run_selfup run 2>&1)"; rc=$?
+ok "#2742 third busy recheck: the cap forces the restart" \
+  '[ "$rc" = 0 ] && [ "$(hande_restarts_2667)" = 1 ] && grep -q "proceed reason=defer-cap-exceeded stage=pre-restart waited=[0-9]*s deferrals=2 " "$STATE/self-update.log"'
+ok "#2742 verified activation drops the per-target deferral count" \
+  '[ ! -e "$STATE/self-update.restart-deferred-count" ]'
+
 # (d) busy at the recheck but the activation already waited past the cap → proceed.
 busy_prepare_2667; mk_idle_2667; bump2142 recheck-cap-2667
 : > "$TMP/systemctl.calls"; : > "$STATE/self-update.log"
-out="$(CCC_SELF_UPDATE_MAX_DEFER_SECONDS=0 run_selfup run 2>&1)"; rc=$?
+out="$(CCC_SELF_UPDATE_MAX_DEFER_SECONDS=0 CCC_SELF_UPDATE_MIN_DEFER_TICKS=0 run_selfup run 2>&1)"; rc=$?
 ok "#2667 deferral cap reached at the recheck proceeds with the restart" \
   '[ "$rc" = 0 ] && [ "$(hande_restarts_2667)" = 1 ] && grep -q "proceed reason=defer-cap-exceeded stage=pre-restart" "$STATE/self-update.log"'
 

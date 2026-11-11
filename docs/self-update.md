@@ -184,6 +184,17 @@ The lock is the **directory** `$STATE_DIR/self-update.lock` (default
 `~/.claude/state/self-update.lock`), taken with `mkdir` and released with
 `rmdir`. A directory older than 30 minutes is treated as stale and replaced.
 
+**Lock lease (#2742).** "Older than 30 minutes" is measured from the
+directory's mtime, and nothing used to refresh it — while a `prepare-cmd` may
+run for up to two hours. The next tick could therefore take the lock of a run
+that was still alive. The holder now moves the mtime to *now + the step's
+budget* before a bounded long step (the prepare command; the external restart
+command plus its health wait; capped at 7200 s), back to *now* when the step
+ends, and refreshes it at stage boundaries. A future mtime is simply "not
+older than 30 minutes" until 30 minutes after it has passed, so a run that
+dies mid-step is still recovered — 30 minutes after its lease ends. An
+external script that follows the `mkdir`/`rmdir` contract needs no change.
+
 An external script that wants to serialize with the updater must follow the
 same contract — `mkdir` the directory before its work and `rmdir` it after.
 **Never create a file at that path.** Opening it with `O_CREAT` + `flock`
@@ -242,7 +253,13 @@ the bridge is serving a request:
   scheduled task apply it, or use `--force`;
 - bounded so it can't starve updates: a single task older than
   `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` no longer blocks, and total deferral is
-  capped at `CCC_SELF_UPDATE_MAX_DEFER_SECONDS`;
+  capped at `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` — but the cap forces a busy
+  run only after `CCC_SELF_UPDATE_MIN_DEFER_TICKS` deferred ticks (default 2,
+  #2742). Ticks are an hour or more apart, so the cap in seconds alone meant
+  "defer once": the second busy tick always proceeded and killed whatever turn
+  was running then. With the default, the third consecutive busy tick
+  proceeds; `0` restores the seconds-only cap. The pre-restart recheck below
+  applies the same floor, counted per target generation;
 - fail-open (missing / unreadable / stale `health.json` → proceed) and
   `--force` bypasses the gate entirely.
 
@@ -274,8 +291,11 @@ the first restart**:
   completion notice ends with `(보류됐던 재시작 완료)`;
 - the deferral cap counts from the record's `started_at` (first install of that
   target), so a frontend that is busy at every recheck still gets restarted once
-  `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` has passed; `--force` and a first gate that
-  already proceeded on the cap skip the recheck.
+  `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` has passed and its restart was deferred
+  `CCC_SELF_UPDATE_MIN_DEFER_TICKS` times (#2742; the count lives in
+  `self-update.restart-deferred-count`, keyed by target, and is dropped on
+  verified activation); `--force` and a first gate that already proceeded on
+  the cap skip the recheck.
 
 This narrows the window to the bridge's reporting lag; it does not close it.
 An admission handshake before stop is #1608.
@@ -422,6 +442,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_HEALTH_FRESH_SECONDS` | `90` | max age of `health.json` for its workload to count |
 | `CCC_SELF_UPDATE_BUSY_MAX_SECONDS` | `1800` | never defer for a task older than this |
 | `CCC_SELF_UPDATE_MAX_DEFER_SECONDS` | `3600` | cap total deferral so continuous load can't starve updates |
+| `CCC_SELF_UPDATE_MIN_DEFER_TICKS` | `2` | deferred ticks required before that cap may force a busy run (integer 0..20; `0` = seconds only, the pre-#2742 behaviour). Applies to the first gate and, per target generation, to the pre-restart recheck |
 | `CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS` | `11` | wait before the pre-restart idle recheck when a gated health file exists, so a just-admitted turn reaches `health.json` (integer 0..60; `0` = recheck immediately, #2667) |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_A2A_HANDLERS` | `1` | set to `0` to skip refreshing drifted installed A2A handler copies (#2357) |
