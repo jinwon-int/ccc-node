@@ -93,7 +93,10 @@ Usage:
                                              # fold near-dup / retire phase constraints (#2222)
   nunchi.py g5-legacy-close [--apply] [--close-only|--retag-only] [--sample N] [--json]
                                              # G5 legacy backlog: retag logs / policy reason (#2221)
-  nunchi.py metrics                         # body-free counters for bench
+  nunchi.py reattribute-unknown [--apply] [--node NAME] [--sample N] [--show-text] [--json]
+  nunchi.py reattribute-unknown --revert [--apply] [--sample N] [--json]
+                                             # legacy observed=unknown facts -> node name (#2759)
+  nunchi.py metrics                        # body-free counters for bench
   nunchi.py backend-status                   # synthesis backend health (#1263)
   nunchi.py stats
 
@@ -104,7 +107,9 @@ Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
   opt-in task-progress TTL) and set/clear review flags. Tier 2 bulk closes
   (review-stale, constraints-triage) are owner-invoked and dry-run by default;
   conflict-sweep only flags; g5-legacy-close only sets because/kind on the G5
-  legacy backlog.
+  legacy backlog; reattribute-unknown only moves provable subject=node rows
+  from observed=unknown to the node name (closing a legacy row only when the
+  same open fact already exists there).
   Tier 3 per-fact edits (supersede, merge, retag, annotate, review --clear)
   are owner commands. curation-authority.test.sh enforces the boundary.
 """
@@ -3083,6 +3088,400 @@ def g5_legacy_close(apply=False, sample=20, do_retag=True, do_close=True, as_jso
     return report
 
 
+# ---- #2759 — re-attribute legacy observed='unknown' facts to this node --------
+# #2541: until 2026-10-28 `_node_name()` answered "unknown" on nodes whose cron
+# ingest had no CCC_NODE and no state/node.txt, so every subject=node fact was
+# stored under observed='unknown' (measured 2026-11-11: 3,748 open rows on six
+# nodes, none created after 2026-10-28). #2542 fixed the inflow and left the
+# stored rows as a separate, owner-approved DB change. This is the tool for it.
+#
+# Who can write observed='unknown' (audited for this command):
+#   1. ingest with subject == "node": map_observed -> _node_name(). Every other
+#      subject maps to the user peer, a canonical slug or `session:<id>` (a
+#      payload without a session id gives `session:unknown`, never the bare
+#      word), and no feed writes peer_facts except through ingest.
+#   2. `supersede` on such a row: the successor copies `observed`.
+# Nothing else inserts a fact or rewrites `observed`. The command still proves
+# each row instead of trusting that audit: `dedup` is sha1("<observer>|<subject>
+# |<fact>") at ingest and sha1("<observer>|manual|<fact>") for a supersede
+# successor, and no path edits `fact` or `dedup` in place. So a row is in scope
+# only when its stored dedup equals the subject=node key for its own text, or
+# the supersede key while its `supersedes` parent is itself in scope. Anything
+# else (a hand-inserted row, a DB written by other code) is reported as
+# `unproven` and left alone.
+#
+# `dedup` does not contain the observed peer, so the rename never touches it:
+# keeping the subject=node key is what makes a re-fed payload a no-op afterwards.
+_UNKNOWN_PEER = "unknown"
+_REATTR_MERGE_MARK = "merged-away:#"  # same greppable lineage token as `merge`
+# Body-free ledger: which rows were changed, from/to which peer, why they were
+# in scope, and when. Created by the first --apply that changes something, so a
+# node that never applies (or has no such rows) never gains the table.
+_REATTR_LEDGER_DDL = (
+    "CREATE TABLE IF NOT EXISTS reattribute_unknown("
+    " fact_id INTEGER PRIMARY KEY, action TEXT NOT NULL, old_observed TEXT NOT NULL,"
+    " new_observed TEXT NOT NULL, proof TEXT NOT NULL, survivor_id INTEGER,"
+    " applied_at TEXT NOT NULL, reverted_at TEXT)")
+
+
+def _reattr_target(explicit=None):
+    """Canonical slug the rows move to, or exit non-zero before the DB is opened.
+
+    Default: this node's own identity (`_node_name()`). `--node` exists for a
+    node whose identity does not resolve; it must name a roster node and may not
+    contradict an identity that does resolve — a typo would otherwise move
+    every legacy row onto another node's peer.
+    """
+    local = _node_name()
+    local_slug = canon_node(local)
+    if explicit is None:
+        if not local_slug:
+            sys.exit(f"reattribute-unknown: this node's name resolves to '{local}', which is not"
+                     " a canonical fleet node (CCC_NODE / state/node.txt / hostname) — nothing"
+                     " changed. Fix the identity or pass --node <name>.")
+        return local_slug, "resolved"
+    slug = canon_node(explicit)
+    if not slug:
+        sys.exit(f"reattribute-unknown: --node '{explicit}' is not a canonical fleet node"
+                 " — nothing changed")
+    if local_slug and local_slug != slug:
+        sys.exit(f"reattribute-unknown: --node '{slug}' contradicts this node's resolved"
+                 f" identity '{local_slug}' — nothing changed")
+    return slug, "--node"
+
+
+def _reattr_sha(text):
+    try:
+        return hashlib.sha1(text.encode()).hexdigest()
+    except UnicodeError:
+        return None
+
+
+def _reattr_proof(observer, fact, dedup, supersedes, proven):
+    """Why this observed='unknown' row is provably a node-subject fact, or None."""
+    if not dedup:
+        return None
+    if dedup == _reattr_sha(f"{observer}|node|{fact}"):
+        return "ingest-node"
+    if supersedes in proven and dedup == _reattr_sha(f"{observer}|manual|{fact}"):
+        return "supersede-chain"
+    return None
+
+
+def _reattr_plan(c, target):
+    """Classify every observed='unknown' row. Read-only.
+
+    Actions: `rename` (observed only), `close` (rename, and close as a
+    duplicate of an open fact with the same kind and text already stored under
+    the node name), `keep-both` (rename; the same duplicate exists but ranks
+    below this row, and a lower-rank fact never closes a higher-rank one — G2),
+    `skip` (unproven). Closed rows are renamed too and can never collide.
+    """
+    rivals = {}  # (kind, fact) -> (id, rank): best open fact under the node name
+    for fid, kind, fact, rank in c.execute(
+            "SELECT id, kind, fact, COALESCE(source_rank, 1) FROM peer_facts"
+            " WHERE observed=? AND valid_to IS NULL ORDER BY id", (target,)):
+        best = rivals.get((kind, fact))
+        if best is None or (int(rank), fid) > (best[1], best[0]):
+            rivals[(kind, fact)] = (fid, int(rank))
+    proven, items = set(), []
+    # Ascending id: a supersede successor is always inserted after its parent.
+    for fid, observer, kind, fact, dedup, parent, closed, created, rank in c.execute(
+            "SELECT id, observer, kind, fact, dedup, supersedes, valid_to, created_at,"
+            " COALESCE(source_rank, 1) FROM peer_facts WHERE observed=? ORDER BY id",
+            (_UNKNOWN_PEER,)).fetchall():
+        proof = _reattr_proof(observer, fact, dedup, parent, proven)
+        item = {"id": fid, "kind": kind, "state": "open" if closed is None else "closed",
+                "created": str(created or "")[:10], "proof": proof or "unproven",
+                "action": "skip", "survivor": None, "text": fact}
+        if proof:
+            proven.add(fid)
+            item["action"] = "rename"
+            rival = rivals.get((kind, fact)) if closed is None else None
+            if rival:
+                item["survivor"] = rival[0]
+                item["action"] = "close" if rival[1] >= int(rank) else "keep-both"
+        items.append(item)
+    return items
+
+
+def _reattr_apply(c, items, target, stamp):
+    """Write the plan. Caller holds the BEGIN IMMEDIATE transaction."""
+    done = {"rename": 0, "close": 0}
+    c.execute(_REATTR_LEDGER_DDL)
+    for it in items:
+        if it["action"] == "skip":
+            continue
+        if it["action"] == "close":
+            mark = f"{_REATTR_MERGE_MARK}{it['survivor']}"
+            wrote = c.execute(
+                "UPDATE peer_facts SET observed=?, valid_to=?, evidence=CASE"
+                " WHEN evidence IS NULL OR evidence='' THEN ? ELSE evidence || ' ' || ? END"
+                " WHERE id=? AND observed=? AND valid_to IS NULL",
+                (target, stamp, mark, mark, it["id"], _UNKNOWN_PEER)).rowcount
+            action = "close"
+        else:
+            wrote = c.execute("UPDATE peer_facts SET observed=? WHERE id=? AND observed=?",
+                              (target, it["id"], _UNKNOWN_PEER)).rowcount
+            action = "rename"
+        if wrote:
+            done[action] += 1
+            c.execute("INSERT OR REPLACE INTO reattribute_unknown VALUES (?,?,?,?,?,?,?,NULL)",
+                      (it["id"], action, _UNKNOWN_PEER, target, it["proof"], it["survivor"],
+                       stamp))
+    _reattr_reindex(c)
+    return done
+
+
+def _reattr_reindex(c):
+    """facts_fts indexes (fact, observed) and only has an AFTER INSERT trigger:
+    until now nothing changed an indexed column in place. 'rebuild' re-reads
+    the content table, so the index is right whatever state it was in before,
+    and it runs in the caller's transaction (a failure rolls the rename back)."""
+    c.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+
+
+def _reattr_unknown_counts(c):
+    total, open_ = c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(valid_to IS NULL), 0) FROM peer_facts WHERE observed=?",
+        (_UNKNOWN_PEER,)).fetchone()
+    return int(total), int(open_)
+
+
+def _reattr_sample(items, actions, sample, show_text):
+    out = []
+    for it in items:
+        if it["action"] not in actions:
+            continue
+        if len(out) >= sample:
+            break
+        row = {k: it[k] for k in ("id", "kind", "state", "created", "proof")}
+        if it["survivor"] is not None:
+            row["survivor"] = it["survivor"]
+        if show_text:
+            row["text"] = it["text"][:120]
+        out.append(row)
+    return out
+
+
+def _reattr_report(items, target, source, apply, sample, show_text):
+    def count(actions, state=None):
+        return sum(1 for it in items
+                   if it["action"] in actions and state in (None, it["state"]))
+
+    def kinds(state):
+        tally = {}
+        for it in items:
+            if it["state"] == state:
+                tally[it["kind"]] = tally.get(it["kind"], 0) + 1
+        return dict(sorted(tally.items()))
+
+    renames = ("rename", "keep-both")
+    return {
+        "mode": "apply" if apply else "dry-run",
+        "node": target,
+        "node_source": source,
+        "unknown_total": len(items),
+        "unknown_open": count(("rename", "keep-both", "close", "skip"), "open"),
+        "unknown_closed": count(("rename", "keep-both", "close", "skip"), "closed"),
+        "by_kind": {"open": kinds("open"), "closed": kinds("closed")},
+        "by_proof": {p: sum(1 for it in items if it["proof"] == p)
+                     for p in ("ingest-node", "supersede-chain", "unproven")},
+        "rename": count(renames),
+        "rename_open": count(renames, "open"),
+        "rename_closed": count(renames, "closed"),
+        "collide_close": count(("close",)),
+        "collide_keep_both": count(("keep-both",)),
+        "unproven_skipped": count(("skip",)),
+        "rename_sample": _reattr_sample(items, ("rename",), sample, show_text),
+        "collide_sample": _reattr_sample(items, ("close", "keep-both"), sample, show_text),
+        "unproven_sample": _reattr_sample(items, ("skip",), sample, show_text),
+    }
+
+
+def _reattr_print(report):
+    def line(label, row, tail=""):
+        text = f": {row['text']}" if "text" in row else ""
+        print(f"  {label} #{row['id']} [{row['kind']}] {row['state']}"
+              f" created={row['created'] or '-'} proof={row['proof']}{tail}{text}")
+
+    print(f"reattribute-unknown ({report['mode']}): node={report['node']}"
+          f" unknown={report['unknown_total']} (open={report['unknown_open']}"
+          f" closed={report['unknown_closed']}) rename={report['rename']}"
+          f" (open={report['rename_open']} closed={report['rename_closed']})"
+          f" collide_close={report['collide_close']}"
+          f" collide_keep_both={report['collide_keep_both']}"
+          f" unproven_skipped={report['unproven_skipped']}")
+    for state in ("open", "closed"):
+        tally = report["by_kind"][state]
+        if tally:
+            print(f"  {state} by kind: " + " ".join(f"{k}={n}" for k, n in tally.items()))
+    for row in report["rename_sample"]:
+        line("rename", row)
+    for row in report["collide_sample"]:
+        line("collide", row, f" duplicate-of=#{row['survivor']}")
+    for row in report["unproven_sample"]:
+        line("unproven", row, " (dedup is not a subject=node key — left as is)")
+    if report["mode"] == "apply":
+        print(f"applied: renamed {report['applied_rename']}, closed"
+              f" {report['applied_close']} as duplicates; observed=unknown now"
+              f" {report['unknown_open_after']} open / {report['unknown_total_after']} total"
+              " (ledger: reattribute_unknown; undo: nunchi.py reattribute-unknown --revert"
+              " --apply)")
+    else:
+        print("dry-run — nothing changed. Back up the DB, then:"
+              " nunchi.py reattribute-unknown --apply")
+
+
+def _reattr_revert_plan(c):
+    """Ledger rows not yet reverted, each classified against the live row."""
+    if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                     " AND name='reattribute_unknown'").fetchone():
+        return []
+    items = []
+    for fid, action, old, new, survivor, applied, observed, closed, evidence in c.execute(
+            "SELECT l.fact_id, l.action, l.old_observed, l.new_observed, l.survivor_id,"
+            " l.applied_at, f.observed, f.valid_to, f.evidence FROM reattribute_unknown l"
+            " LEFT JOIN peer_facts f ON f.id=l.fact_id WHERE l.reverted_at IS NULL"
+            " ORDER BY l.fact_id").fetchall():
+        item = {"id": fid, "old": old, "new": new, "applied": applied, "evidence": evidence,
+                "mark": f"{_REATTR_MERGE_MARK}{survivor}", "action": "skip"}
+        if observed == new:
+            # Reopen only a close this command made and nothing has touched since.
+            item["action"] = "reopen" if action == "close" and closed == applied else "restore"
+        items.append(item)
+    return items
+
+
+def _reattr_strip_mark(evidence, mark):
+    """Evidence as it was before `_reattr_apply` appended the lineage token."""
+    if evidence == mark:
+        return None  # was NULL or '' — the two are interchangeable everywhere
+    if evidence and evidence.endswith(" " + mark):
+        return evidence[: -len(mark) - 1]
+    return evidence
+
+
+def _reattr_revert_apply(c, items, stamp):
+    """Undo the ledgered changes. Caller holds the BEGIN IMMEDIATE transaction."""
+    done = {"restore": 0, "reopen": 0}
+    for it in items:
+        if it["action"] == "reopen":
+            wrote = c.execute(
+                "UPDATE peer_facts SET observed=?, valid_to=NULL, evidence=?"
+                " WHERE id=? AND observed=? AND valid_to=?",
+                (it["old"], _reattr_strip_mark(it["evidence"], it["mark"]), it["id"],
+                 it["new"], it["applied"])).rowcount
+        elif it["action"] == "restore":
+            wrote = c.execute("UPDATE peer_facts SET observed=? WHERE id=? AND observed=?",
+                              (it["old"], it["id"], it["new"])).rowcount
+        else:
+            continue
+        if wrote:
+            done[it["action"]] += 1
+            c.execute("UPDATE reattribute_unknown SET reverted_at=? WHERE fact_id=?",
+                      (stamp, it["id"]))
+    _reattr_reindex(c)
+    return done
+
+
+def _reattr_revert(c, apply, sample, as_json):
+    """`--revert`: put ledgered rows back under their previous peer."""
+    items = _reattr_revert_plan(c)
+
+    def count(action):
+        return sum(1 for it in items if it["action"] == action)
+
+    report = {
+        "mode": "revert-apply" if apply else "revert-dry-run",
+        "ledger_active": len(items),
+        "restore": count("restore") + count("reopen"),
+        "reopen": count("reopen"),
+        "skipped_changed": count("skip"),
+        "sample": [{"id": it["id"], "action": it["action"], "from": it["new"], "to": it["old"]}
+                   for it in items][:sample],
+    }
+    if apply and report["restore"]:
+        done = _reattr_revert_apply(c, items, now())
+        c.commit()
+        report["applied_restore"] = done["restore"] + done["reopen"]
+        report["applied_reopen"] = done["reopen"]
+    elif apply:
+        c.rollback()
+        report["applied_restore"] = report["applied_reopen"] = 0
+    if apply:
+        report["unknown_total_after"], report["unknown_open_after"] = _reattr_unknown_counts(c)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return report
+    print(f"reattribute-unknown ({report['mode']}): ledger_active={report['ledger_active']}"
+          f" restore={report['restore']} (reopen={report['reopen']})"
+          f" skipped_changed={report['skipped_changed']}")
+    for row in report["sample"]:
+        print(f"  {row['action']} #{row['id']} {row['from']} -> {row['to']}")
+    if apply:
+        print(f"reverted: restored {report['applied_restore']} (reopened"
+              f" {report['applied_reopen']}); observed=unknown now"
+              f" {report['unknown_open_after']} open / {report['unknown_total_after']} total")
+    else:
+        print("dry-run — nothing changed. To undo: nunchi.py reattribute-unknown --revert --apply")
+    return report
+
+
+def reattribute_unknown(apply=False, node=None, revert=False, sample=10, as_json=False,
+                        show_text=False):
+    """`reattribute-unknown` — move legacy observed='unknown' facts to the node name (#2759).
+
+    Scope: rows stored under observed='unknown' that are provably subject=node
+    facts (see the block comment above). Open and closed rows are both renamed:
+    a closed row cannot collide, and leaving it behind would split a supersede
+    chain across two peers. Only `observed` changes — never the fact text,
+    kind, source_rank, review flag, timestamps or dedup key, and no ingest gate
+    (G1/G2/G3) is re-run. The one exception is an open legacy row whose kind and
+    text already exist as an open fact under the node name: it is renamed and
+    closed with a `merged-away:#<id>` lineage token (the convention of `merge`)
+    so the rename cannot create a second open copy; the existing fact is never
+    touched. Nothing is deleted.
+
+    Dry-run by default. `--apply` plans and writes inside one BEGIN IMMEDIATE
+    transaction, rebuilds the FTS index there, and records every change in the
+    `reattribute_unknown` ledger; a second run finds nothing in scope.
+    `--revert` (again a dry run unless `--apply`) restores the ledgered rows.
+    """
+    target = source = None
+    if not revert:
+        target, source = _reattr_target(node)  # refuse before the DB is opened
+    c = db()
+    if c.in_transaction:
+        c.commit()
+    try:
+        if apply:
+            c.execute("BEGIN IMMEDIATE")  # plan under the write lock: no recheck needed
+        if revert:
+            return _reattr_revert(c, apply, sample, as_json)
+        items = _reattr_plan(c, target)
+        report = _reattr_report(items, target, source, apply, sample, show_text)
+        changes = report["rename"] + report["collide_close"]
+        if apply and changes:
+            done = _reattr_apply(c, items, target, now())
+            c.commit()
+        elif apply:
+            c.rollback()
+            done = {"rename": 0, "close": 0}
+        if apply:
+            report["applied_rename"], report["applied_close"] = done["rename"], done["close"]
+            report["unknown_total_after"], report["unknown_open_after"] = (
+                _reattr_unknown_counts(c))
+    except sqlite3.Error:
+        c.rollback()
+        raise
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _reattr_print(report)
+    return report
+
+
 def assemble(budget, hint, limit=25):
     """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
 
@@ -3456,6 +3855,9 @@ def metrics():
     print(f"task_progress_open_over_{_TASK_PROGRESS_REFERENCE_AGE_DAYS}d={tp_old}")
     print(f"task_progress_ttl_days={_task_progress_ttl_days():g}")
     print(f"task_progress_ttl_closed={tp_ttl_closed}")
+    # #2759 — legacy rows stored before the node identity resolved (#2541).
+    # `reattribute-unknown --apply` brings this to 0; it must then stay there.
+    print(f"observed_unknown_open={_reattr_unknown_counts(c)[1]}")
 
 
 def stats():
@@ -3544,6 +3946,22 @@ if __name__ == "__main__":
         g5_legacy_close(apply="--apply" in args, sample=sample_n,
                         do_retag="--close-only" not in args,
                         do_close="--retag-only" not in args, as_json="--json" in args)
+    elif cmd == "reattribute-unknown":
+        try:
+            sample_n = int(flag("--sample", "10"))
+            node_arg = flag("--node")
+        except (ValueError, IndexError):
+            sys.exit("reattribute-unknown: --sample is an integer, --node takes a name"
+                     " — nothing changed")
+        if sample_n < 0 or (node_arg is not None and node_arg.startswith("--")):
+            sys.exit("reattribute-unknown: need --sample >= 0 and --node <name>"
+                     " — nothing changed")
+        if "--revert" in args and node_arg is not None:
+            sys.exit("reattribute-unknown: --revert restores what the ledger recorded and"
+                     " takes no --node — nothing changed")
+        reattribute_unknown(apply="--apply" in args, node=node_arg, revert="--revert" in args,
+                            sample=sample_n, as_json="--json" in args,
+                            show_text="--show-text" in args)
     elif cmd == "review":
         pos = [a for a in args if not a.startswith("--")]
         review(int(pos[0]) if pos else None, clear="--clear" in args)

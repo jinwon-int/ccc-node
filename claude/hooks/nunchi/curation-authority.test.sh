@@ -80,11 +80,36 @@ ok "task-progress TTL writes peer_facts as valid_to only" \
 ok "doc names the task-progress TTL knob and its default" \
   'grep -qF "NUNCHI_TASK_PROGRESS_TTL_DAYS" "$DOC" && grep -qF "off by default" "$DOC"'
 
+# ---- rule 3d: reattribute-unknown (#2759) moves provable subject=node rows from the legacy
+# 'unknown' peer to the node name; `observed` is the only thing it rewrites about a fact ---
+reattr_src="$(python3 - "$NP" <<'PY'
+import ast, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for node in ast.parse(src).body:
+    if isinstance(node, ast.FunctionDef) and (
+            node.name.startswith("_reattr_") or node.name == "reattribute_unknown"):
+        print(ast.get_source_segment(src, node))
+PY
+)"
+reattr_writes="$(grep -oE "UPDATE peer_facts SET [a-z_]+" <<<"$reattr_src" | sort -u)"
+ok "reattribute_unknown functions found" \
+  'grep -q "^def reattribute_unknown" <<<"$reattr_src" && grep -q "^def _reattr_apply" <<<"$reattr_src"'
+ok "reattribute-unknown: every peer_facts write starts from the observed column" \
+  '[ "$reattr_writes" = "UPDATE peer_facts SET observed" ]'
+ok "reattribute-unknown never writes fact text, kind, rank, review, dedup or timestamps" \
+  '! grep -qE "(^|[ ,\"])(fact|kind|mutability|source_rank|review|dedup|created_at|valid_from|because|source_refs)[[:space:]]*=[[:space:]]*(\?|NULL|CASE)" <<<"$reattr_src"'
+ok "reattribute-unknown: every write is guarded on the row's current peer" \
+  '[ "$(grep -c "UPDATE peer_facts SET" <<<"$reattr_src")" = "$(grep -cE "WHERE id=\? AND observed=\?" <<<"$reattr_src")" ]'
+ok "reattribute-unknown selects the legacy peer only and proves each row" \
+  'grep -qF "FROM peer_facts WHERE observed=? ORDER BY id" <<<"$reattr_src" && grep -qF "_reattr_proof(observer, fact, dedup, parent, proven)" <<<"$reattr_src" && grep -qF "_UNKNOWN_PEER = \"unknown\"" "$NP"'
+ok "reattribute-unknown resolves a canonical target before the DB is opened" \
+  'grep -qF "target, source = _reattr_target(node)  # refuse before the DB is opened" <<<"$reattr_src"'
+
 # ---- the boundary is stated where the owner reads it ------------------------------------
 ok "usage text carries the curation authority block" 'grep -q "^Curation authority (#2464 제안 4" "$NP"'
 ok "usage lists review and retag" 'grep -qE "^  nunchi.py review \[" "$NP" && grep -qE "^  nunchi.py retag " "$NP"'
 ok "authority doc exists" '[ -f "$DOC" ]'
-for cmd in review-stale constraints-triage conflict-sweep g5-legacy-close supersede merge annotate retag "review <id> --clear"; do
+for cmd in review-stale constraints-triage conflict-sweep g5-legacy-close reattribute-unknown supersede merge annotate retag "review <id> --clear"; do
   ok "doc names owner command: $cmd" 'grep -qF -- "$cmd" "$DOC"'
 done
 ok "docs index links the authority page" 'grep -qF "(nunchi-curation-authority.md)" "$ROOT/docs/README.md"'
