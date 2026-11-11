@@ -71,12 +71,14 @@ that class.
 | `constraints-triage [--apply]` | fold near-duplicate constraints into a survivor (`merged-away:#id`) and close phase-scoped ones (`because` records why) |
 | `conflict-sweep [--apply]` | `review=1` on the newer fact plus a `conflict_sweep` ledger row; **never closes** ([nunchi-conflict-sweep.md](nunchi-conflict-sweep.md)) |
 | `g5-legacy-close [--apply]` | on the 2026-08 G5 legacy backlog only: retag progress-log rows to `task-progress`, set a fixed policy `because` on the rest, plus a `g5_legacy_close` ledger row; **never closes, never touches `review`** (see below) |
+| `reattribute-unknown [--apply]` | on provable `subject=node` rows stored under the legacy `observed='unknown'` peer only: set `observed` to the node name, plus a `reattribute_unknown` ledger row; closes a legacy row only when the same open fact already exists under the node name (`merged-away:#id`); **never rewrites text, kind, rank, `review`, `dedup` or timestamps** (see below) |
 
 Scheduling one of these turns it into a Tier 1 pass, so it then has to meet the Tier 1 rule: a
 sweep that closes facts cannot simply be put on a cron line. `review-stale` and
 `constraints-triage` close facts and stay owner-invoked. `conflict-sweep` only flags, so it may be
 scheduled: `install-nunchi.sh --apply --conflict-sweep` adds an opt-in daily line (#2479, see the
-Tier 1 table), and the enforcement test below keeps that line flag-only.
+Tier 1 table), and the enforcement test below keeps that line flag-only. `reattribute-unknown` is a
+one-off migration per node and is never scheduled.
 
 ### `g5-legacy-close` — G5 legacy backlog, Tier C (#2221)
 
@@ -118,6 +120,72 @@ reason cannot be recovered. Extracting a reason deterministically worked for too
 - **Undo.** To revert a retag, run `nunchi.py retag <id> decision`. To revert a policy close,
   clear `because` in SQL, since `annotate` refuses an empty reason. The ledger lists the ids.
 
+### `reattribute-unknown` — legacy `observed='unknown'` rows (#2759, #2542 제안 3)
+
+```
+nunchi.py reattribute-unknown [--apply] [--node NAME] [--sample N] [--show-text] [--json]
+nunchi.py reattribute-unknown --revert [--apply] [--sample N] [--json]
+```
+
+Until 2026-10-28 a node whose cron ingest had no `CCC_NODE` and no `state/node.txt` stored every
+`subject=node` fact under `observed='unknown'` (#2541). #2542 fixed the inflow and left the stored
+rows as a separate DB change. On 2026-11-11 six nodes still held 3,748 open rows of that kind, none
+created after 2026-10-28. Those rows are invisible to node-name recall, carry a `[kind/unknown]`
+label in the snapshot and fail wiki-promote's roster gate. This command moves them to the node
+name. Shipping it changes no database: applying it is a per-node owner decision.
+
+- **Scope.** Only rows with `observed='unknown'` that are provably `subject=node` facts. The code
+  audit says nothing else can write the bare `unknown` peer: every other subject maps to the user
+  peer, a canonical slug or `session:<id>` (a payload without a session id gives
+  `session:unknown`), no feed writes `peer_facts` except through `ingest`, and `supersede` copies
+  its parent's peer. The command checks each row anyway. `dedup` is
+  `sha1("<observer>|<subject>|<fact>")` at ingest and `sha1("<observer>|manual|<fact>")` for a
+  `supersede` successor, and no path edits `fact` or `dedup` in place. A row is in scope when its
+  `dedup` equals the `subject=node` key for its own text (`ingest-node`), or the supersede key
+  while its `supersedes` parent is itself in scope (`supersede-chain`). Any other row (hand
+  inserted, written by other code) is reported as `unproven` and left alone. There is no flag to
+  include it.
+- **Target.** The node's own identity (`CCC_NODE` → `state/node.txt` → canonical hostname). The
+  command exits non-zero before it opens the database when that identity is `unknown` or not a
+  roster node. `--node NAME` is for a node whose identity does not resolve: it accepts a roster
+  name or alias, and is refused when it contradicts an identity that does resolve.
+- **What changes.** `observed`, on open and closed rows alike. A closed row cannot collide, and
+  leaving it behind would split a `supersedes` chain and `recall --as-of` history across two
+  peers. Fact text, kind, `source_rank`, `review`, `because`, timestamps and `dedup` stay as they
+  are, and no ingest gate (G1/G2/G3) is re-run. `dedup` does not contain the observed peer, so
+  there is nothing to recompute; keeping the `subject=node` key is what makes a re-fed payload a
+  no-op after the rename.
+- **Collisions.** When an open fact with the same kind and the same text already exists under the
+  node name (a distiller emitted the slug as subject, or the owner re-entered it), the legacy row
+  is renamed and closed with `merged-away:#<id>` in `evidence`, the token `merge` uses, so the
+  rename cannot create a second open copy. The existing fact is not touched, not even with the
+  `merged:#<id>` counterpart. If the legacy row outranks the existing one (`source_rank`), both
+  stay open and the pair is listed as `collide_keep_both`: a lower-rank fact never closes a
+  higher-rank one (G2). Fold that pair by hand with `merge`.
+- **FTS.** `facts_fts` indexes `(fact, observed)` and only has an insert trigger, because until
+  now nothing changed an indexed column in place. `--apply` runs FTS5 `rebuild` in the same
+  transaction, so node-name recall finds the rows afterwards and `unknown` no longer does. A
+  failure there rolls the rename back. Measured on a 12,000-row test database with 4,000 legacy
+  rows: 0.26 s for the whole apply.
+- **Safety.** Dry run by default: counts (total, open, closed, by kind, by proof), how many rows
+  would be renamed, closed as duplicates or skipped, and `--sample N` rows per list (default 10)
+  with id, kind, state, created date and proof. Fact text is printed only with `--show-text` (cut
+  to 120 chars). `--apply` plans and writes inside one `BEGIN IMMEDIATE` transaction and records
+  every change in `reattribute_unknown` (fact id, action, old and new peer, proof, survivor id,
+  timestamps; no fact text). The table is created by the first apply that changes something.
+  Running it again changes nothing. It does not take a backup itself: back up `facts.db` before
+  `--apply`. It works on the one store `NUNCHI_DB` selects (default `~/.nunchi/facts.db`); on an
+  audience-scoped node (#1921) every scope's `facts.db` is a separate run.
+- **Undo.** `nunchi.py reattribute-unknown --revert` lists what the ledger would restore;
+  `--revert --apply` puts each row back under its previous peer, reopens the duplicates this
+  command closed (and removes their `merged-away` token), rebuilds the index and stamps
+  `reverted_at`. A row whose peer was changed again since is skipped and reported, and a close
+  that was changed since is left as it is.
+- **After applying.** `nunchi.py metrics` prints `observed_unknown_open`, which should then stay
+  at the number of `unproven` rows (normally 0). The legacy rows join the node peer's G1/G3 scope
+  for later ingests, and wiki-promote starts to examine them (its other gates and its per-run cap
+  still apply).
+
 ## Tier 3 — owner per-fact commands
 
 | Command | Effect |
@@ -142,6 +210,10 @@ rows are derived from source files and rebuilt on the next refresh, so they are 
 - `conflict-sweep` gains a `valid_to` write;
 - `g5-legacy-close` writes `valid_to` or `review`, or writes `peer_facts` other than `because`
   or `kind`/`mutability`;
+- `reattribute-unknown` writes a `peer_facts` column list that does not start from `observed`,
+  writes fact text, kind, rank, `review`, `dedup` or a timestamp, loses the per-row guard on the
+  current peer, the legacy-peer scope or the dedup proof, or resolves its target after opening
+  the database;
 - the task-progress TTL defaults to anything but off, loses its `source_rank`/`review`/ledger
   exclusions, or writes anything to `peer_facts` other than `valid_to`;
 - the `review` listing or the usage text stops stating the boundary.
