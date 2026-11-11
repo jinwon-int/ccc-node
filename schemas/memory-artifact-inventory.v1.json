@@ -27,7 +27,7 @@
           }
         ]
       },
-      "retention": "supersede-chain + observation-ttl(7d)",
+      "retention": "supersede-chain + observation-ttl(7d) + task-progress-ttl(opt-in, default off)",
       "requests": {
         "audience-erasure": "out-of-scope (global DB; scoped DBs live under the audience root entry)",
         "node-decommission": "handoff-or-drop",

@@ -26,6 +26,21 @@ against evidence changed during the model call. SQLite backups include WAL data.
 Missing reasons and near-duplicate proposals remain owner work outside the cap.
 Dry runs spend bounded model calls but do not advance persistent dispositions.
 
+## Age sweeps
+
+`snapshot` and `assemble` close facts by age in one opportunistic step (skipped,
+never blocking, when another writer holds the lock):
+
+| Kind | Variable | Default | Never closed |
+|---|---|---|---|
+| `observation` | `NUNCHI_OBSERVATION_TTL_DAYS` | 7 (`<=0` disables) | — |
+| `task-progress` | `NUNCHI_TASK_PROGRESS_TTL_DAYS` | **0 = off** (#2759) | user-stated (`source_rank` 3), review-flagged, already reopened once |
+
+The task-progress sweep is opt-in per node. Closing sets `valid_to` only and is
+recorded in the body-free `ttl_close` ledger; see
+[nunchi-curation-authority.md](nunchi-curation-authority.md#task-progress-ttl-2759)
+for the rules, the undo statement and the `metrics` counters.
+
 ## Danso cron authentication
 
 The installer selects the native judge for `--danso`; other providers retain

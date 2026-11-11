@@ -1605,5 +1605,113 @@ PY
 ok "#2739 a duplicate inside one payload closes only the intended fact" \
   'rq "SELECT valid_to IS NULL FROM peer_facts WHERE fact LIKE \"%master 아니라 main%\"" | grep -q "(1,)" && rq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact = \"기본 브랜치는 master 이다\"" | grep -q "(1,)"'
 
+# ---- #2759: optional task-progress TTL (default OFF) ------------------------
+# Private DB per case group (same convention as the #1478 block above). Rows
+# are inserted directly so created_at can be put in the past.
+tp_home="$TMP/tp-home"; mkdir -p "$tp_home"
+TPDB="$tp_home/facts.db"; TPSNAP="$tp_home/snapshot.md"
+tp() { NUNCHI_DB="$TPDB" NUNCHI_SNAPSHOT="$TPSNAP" "$@"; }
+tpq() { python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])" "$TPDB" "$1"; }
+tp_open() { tpq "SELECT COUNT(*) FROM peer_facts WHERE fact='$1' AND valid_to IS NULL"; }
+tp_row() {  # tp_row <fact> <kind> <created_at> <source_rank> <review>
+  python3 - "$TPDB" "$@" <<'PY'
+import sqlite3, sys
+db, fact, kind, created, rank, review = sys.argv[1:7]
+c = sqlite3.connect(db)
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review)"
+          " VALUES('family-assistant','peer-a',?,?,?,?,?,?,?)",
+          (kind, fact, created, "tp-" + fact, created, int(rank), int(review)))
+c.commit()
+PY
+}
+tp python3 "$NP" init >/dev/null 2>&1
+young="$(python3 -c "from datetime import datetime,timezone;print(datetime.now(timezone.utc).isoformat(timespec='seconds'))")"
+tp_row TP-OLD-INFERRED task-progress 2020-01-01T00:00:00+00:00 1 0
+tp_row TP-OLD-MEASURED task-progress 2020-01-01T00:00:00+00:00 2 0
+tp_row TP-OLD-USER     task-progress 2020-01-01T00:00:00+00:00 3 0
+tp_row TP-OLD-REVIEW   task-progress 2020-01-01T00:00:00+00:00 1 1
+tp_row TP-YOUNG        task-progress "$young" 1 0
+tp_row TP-OLD-DECISION decision      2020-01-01T00:00:00+00:00 1 0
+# default OFF: unset, 0, negative, unparsable and non-finite all mean no sweep
+tp python3 "$NP" snapshot --limit 5 >/dev/null 2>&1; rc=$?
+ok "#2759 default (unset): old task-progress stays open" \
+  '[ "$rc" = 0 ] && [ "$(tp_open TP-OLD-INFERRED)" = 1 ] && [ "$(tp_open TP-OLD-MEASURED)" = 1 ]'
+ok "#2759 default (unset): no ttl_close ledger table is created" \
+  '[ "$(tpq "SELECT COUNT(*) FROM sqlite_master WHERE name=\"ttl_close\"")" = 0 ]'
+tp_bad_rc=0
+# shellcheck disable=SC2034  # tp_bad_rc is read via eval inside ok()
+for v in 0 -30 abc "" nan inf -inf 1e12; do
+  NUNCHI_TASK_PROGRESS_TTL_DAYS="$v" tp python3 "$NP" snapshot --limit 5 >/dev/null 2>&1 || tp_bad_rc=1
+  NUNCHI_TASK_PROGRESS_TTL_DAYS="$v" tp python3 "$NP" assemble --budget 4096 --hint "" >/dev/null 2>&1 || tp_bad_rc=1
+done
+ok "#2759 off/invalid values (0, negative, text, empty, nan, inf, out-of-range) never close and never fail" \
+  '[ "$tp_bad_rc" = 0 ] && [ "$(tp_open TP-OLD-INFERRED)" = 1 ] && [ "$(tp_open TP-OLD-MEASURED)" = 1 ]'
+# same parser as the observation TTL: a malformed value falls back to each
+# knob's own default (7 for observations, 0 = off here) instead of a traceback
+# shellcheck disable=SC2034  # tp_parse is read via eval inside ok()
+tp_parse="$(NUNCHI_TASK_PROGRESS_TTL_DAYS=abc NUNCHI_OBSERVATION_TTL_DAYS=abc python3 - "$NP" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
+nx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nx)
+print(nx._OBSERVATION_TTL_DAYS, nx._TASK_PROGRESS_TTL_DAYS, nx._task_progress_ttl_days())
+PY
+)"
+ok "#2759 malformed env parses like the observation TTL (own default, no traceback)" \
+  '[ "$tp_parse" = "7.0 0.0 0.0" ]'
+out="$(tp python3 "$NP" metrics)"
+ok "#2759 metrics (TTL off): open/over-30d counts reported, ttl off, nothing closed" \
+  'grep -qx "task_progress_open=5" <<<"$out" && grep -qx "task_progress_open_over_30d=4" <<<"$out" && grep -qx "task_progress_ttl_days=0" <<<"$out" && grep -qx "task_progress_ttl_closed=0" <<<"$out"'
+# enabled: closes old inferred/measured rows only
+NUNCHI_TASK_PROGRESS_TTL_DAYS=30 tp python3 "$NP" snapshot --limit 5 >/dev/null 2>&1; rc=$?
+ok "#2759 enabled: old rank-1/rank-2 task-progress closed" \
+  '[ "$rc" = 0 ] && [ "$(tp_open TP-OLD-INFERRED)" = 0 ] && [ "$(tp_open TP-OLD-MEASURED)" = 0 ]'
+ok "#2759 enabled: user-stated (rank 3) task-progress stays open (G2)" '[ "$(tp_open TP-OLD-USER)" = 1 ]'
+ok "#2759 enabled: review-flagged task-progress stays open" '[ "$(tp_open TP-OLD-REVIEW)" = 1 ]'
+ok "#2759 enabled: young task-progress stays open" '[ "$(tp_open TP-YOUNG)" = 1 ]'
+ok "#2759 enabled: other kinds are not aged by this TTL" '[ "$(tp_open TP-OLD-DECISION)" = 1 ]'
+ok "#2759 nothing is deleted (close = valid_to only)" '[ "$(tpq "SELECT COUNT(*) FROM peer_facts")" = 6 ]'
+ok "#2759 ledger records the closes body-free (ids/kind/ttl/time only)" \
+  '[ "$(tpq "SELECT COUNT(*) FROM ttl_close WHERE kind=\"task-progress\" AND ttl_days=30")" = 2 ] && [ "$(tpq "SELECT GROUP_CONCAT(name) FROM pragma_table_info(\"ttl_close\")")" = "fact_id,kind,ttl_days,closed_at" ]'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(NUNCHI_TASK_PROGRESS_TTL_DAYS=30 tp python3 "$NP" metrics)"
+ok "#2759 metrics (TTL on): closed count and remaining exempt old rows visible" \
+  'grep -qx "task_progress_open=3" <<<"$out" && grep -qx "task_progress_open_over_30d=2" <<<"$out" && grep -qx "task_progress_ttl_days=30" <<<"$out" && grep -qx "task_progress_ttl_closed=2" <<<"$out"'
+# reversible: clearing valid_to reopens the fact, and the sweep closes a fact
+# by age at most once, so the owner's reopen survives the next tick
+python3 -c "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute(\"UPDATE peer_facts SET valid_to=NULL WHERE fact='TP-OLD-INFERRED'\");c.commit()" "$TPDB"
+ok "#2759 close is reversible: valid_to cleared -> open again" '[ "$(tp_open TP-OLD-INFERRED)" = 1 ]'
+NUNCHI_TASK_PROGRESS_TTL_DAYS=30 tp python3 "$NP" snapshot --limit 5 >/dev/null 2>&1
+ok "#2759 a reopened fact is not closed again by the next sweep" \
+  '[ "$(tp_open TP-OLD-INFERRED)" = 1 ] && [ "$(tp_open TP-OLD-MEASURED)" = 0 ]'
+# assemble (SessionStart path) runs the same sweep
+tp_row TP-OLD-ASSEMBLE task-progress 2020-01-01T00:00:00+00:00 1 0
+NUNCHI_TASK_PROGRESS_TTL_DAYS=30 tp python3 "$NP" assemble --budget 4096 --hint "" >/dev/null 2>&1; rc=$?
+ok "#2759 assemble runs the task-progress sweep too" '[ "$rc" = 0 ] && [ "$(tp_open TP-OLD-ASSEMBLE)" = 0 ]'
+# failure posture: a busy write lock skips the sweep (one stderr line, exit 0,
+# snapshot still written). Fresh DB with the observation sweep off, so the
+# first write the sweep attempts is this TTL's own ledger DDL.
+tp_home="$TMP/tp-lock-home"; mkdir -p "$tp_home"
+TPDB="$tp_home/facts.db"; TPSNAP="$tp_home/snapshot.md"
+tp python3 "$NP" init >/dev/null 2>&1
+tp_row TP-LOCK-OLD task-progress 2020-01-01T00:00:00+00:00 1 0
+# the hand-inserted row has no derived `mutability` yet; let the open-time
+# backfill write it now, or snapshot would queue behind the holder for that
+# unrelated write (full busy timeout) before it ever reaches the sweep
+tp python3 "$NP" init >/dev/null 2>&1
+holder="$(hold_lock "$TPDB" 4)"; sleep 0.5
+NUNCHI_TASK_PROGRESS_TTL_DAYS=30 NUNCHI_OBSERVATION_TTL_DAYS=0 NUNCHI_SQLITE_SWEEP_TIMEOUT_MS=200 \
+  tp python3 "$NP" snapshot --limit 5 >/dev/null 2>"$TMP/tp-lock.err"
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2759 snapshot exits 0 and still writes snapshot.md when the sweep cannot take the lock" \
+  '[ "$rc" = 0 ] && [ -s "$TPSNAP" ] && [ "$(grep -c "sweep skipped" "$TMP/tp-lock.err")" = 1 ]'
+ok "#2759 a skipped sweep closes nothing" '[ "$(tp_open TP-LOCK-OLD)" = 1 ]'
+# the holder was started inside $(...), so it is not this shell's child and
+# `wait` cannot block on it — poll until it has released the lock
+while kill -0 "$holder" 2>/dev/null; do sleep 0.2; done
+NUNCHI_TASK_PROGRESS_TTL_DAYS=30 NUNCHI_OBSERVATION_TTL_DAYS=0 tp python3 "$NP" snapshot --limit 5 >/dev/null 2>&1
+ok "#2759 the next uncontended tick performs the sweep" '[ "$(tp_open TP-LOCK-OLD)" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

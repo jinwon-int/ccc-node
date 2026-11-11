@@ -54,7 +54,18 @@ Storage / concurrency (#1478):
   - `snapshot`/`assemble` treat the observation-TTL sweep as opportunistic:
     if the write lock is busy (NUNCHI_SQLITE_SWEEP_TIMEOUT_MS, default 1000)
     they log one stderr line and continue read-only, so SessionStart
-    injection never fails because ingest holds the lock.
+    injection never fails because ingest holds the lock. The optional
+    task-progress TTL sweep (below) runs in the same step, same posture.
+
+Age sweeps (TTL):
+  - NUNCHI_OBSERVATION_TTL_DAYS (default 7; <=0 disables) closes open
+    `observation` facts older than the TTL (#1010).
+  - NUNCHI_TASK_PROGRESS_TTL_DAYS (default 0 = OFF; unset, <=0 or unparsable
+    all mean no sweep) closes open `task-progress` facts older than the TTL
+    (#2759). Never closed by age: user-stated facts (source_rank 3, G2) and
+    review-flagged facts. Each close is recorded body-free in the `ttl_close`
+    ledger and a fact is closed by age at most once, so clearing valid_to
+    reopens it for good. `metrics` reports the counts.
   - snapshot.md and backend-health.json are replaced atomically (same-dir
     temp file + os.replace, UTF-8); the health read-modify-write is
     serialized by an flock on a `.lock` sidecar.
@@ -89,10 +100,11 @@ Usage:
 Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
   No path deletes a fact row; "removing" means closing (valid_to), which is
   reversible. Tier 1 unattended passes (ingest, judge-batch cron, snapshot)
-  only add facts, close under a deterministic gate (G1, B2, observation TTL)
-  and set/clear review flags. Tier 2 bulk closes (review-stale, constraints-
-  triage) are owner-invoked and dry-run by default; conflict-sweep only flags;
-  g5-legacy-close only sets because/kind on the G5 legacy backlog.
+  only add facts, close under a deterministic gate (G1, B2, observation TTL,
+  opt-in task-progress TTL) and set/clear review flags. Tier 2 bulk closes
+  (review-stale, constraints-triage) are owner-invoked and dry-run by default;
+  conflict-sweep only flags; g5-legacy-close only sets because/kind on the G5
+  legacy backlog.
   Tier 3 per-fact edits (supersede, merge, retag, annotate, review --clear)
   are owner commands. curation-authority.test.sh enforces the boundary.
 """
@@ -102,6 +114,7 @@ import hashlib
 import json
 import os
 from itertools import zip_longest
+import math
 import re
 import sqlite3
 import time
@@ -496,6 +509,74 @@ def _close_expired_observations(c):
     return cur.rowcount
 
 
+# #2759 — optional age sweep for `task-progress`. Measured 2026-11-11: 2,789 of
+# 5,078 open task-progress facts fleet-wide were older than 30 days, because G1
+# only closes an in-flight fact when a matching completion fact arrives and
+# nothing else ages the class out. DEFAULT OFF: 0, unset, negative, non-finite
+# or unparsable all mean "no sweep", so shipping this changes no node — turning
+# it on (e.g. NUNCHI_TASK_PROGRESS_TTL_DAYS=30) is a per-node owner decision.
+_TASK_PROGRESS_TTL_DAYS = _float_env("NUNCHI_TASK_PROGRESS_TTL_DAYS", "0")
+# The age #2759 measured at; `metrics` reports the open count past it whether
+# or not the sweep is on, so the owner can size a TTL before enabling one.
+_TASK_PROGRESS_REFERENCE_AGE_DAYS = 30
+# Body-free audit ledger (fact id, kind, the TTL in force, when). Created only
+# by an enabled sweep, so a default-off node never gains the table. It makes
+# the closed count reportable, lets the owner list exactly which rows to
+# reopen, and is what keeps a reopened fact open (see the sweep below).
+_TTL_LEDGER_SQL = (
+    "CREATE TABLE IF NOT EXISTS ttl_close("
+    " fact_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, ttl_days REAL NOT NULL,"
+    " closed_at TEXT NOT NULL)")
+
+
+def _task_progress_ttl_days():
+    """Effective TTL in days, or 0.0 when the sweep is off."""
+    ttl = _TASK_PROGRESS_TTL_DAYS
+    return ttl if math.isfinite(ttl) and ttl > 0 else 0.0
+
+
+def _age_cutoff(days):
+    """ISO cutoff `days` ago, or None when the value is out of datetime range."""
+    try:
+        return (datetime.now(timezone.utc)
+                - timedelta(days=days)).isoformat(timespec="seconds")
+    except (OverflowError, ValueError):
+        return None
+
+
+def _close_expired_task_progress(c):
+    """Sweep: close open task-progress facts past the opt-in TTL (#2759).
+
+    Same close as the observation sweep (valid_to only, nothing deleted).
+    Never closed by age:
+      - source_rank >= 3 — G2: an owner statement is not buried by an age rule;
+      - review = 1 — the fact is waiting on a human/judge verdict;
+      - a fact this sweep already closed once — if the owner reopened it
+        (valid_to cleared), that decision stands.
+    Returns the closed count.
+    """
+    ttl = _task_progress_ttl_days()
+    cutoff = _age_cutoff(ttl) if ttl else None
+    if not cutoff:
+        return 0
+    c.execute(_TTL_LEDGER_SQL)
+    ids = [r[0] for r in c.execute(
+        "SELECT id FROM peer_facts"
+        " WHERE kind='task-progress' AND valid_to IS NULL AND created_at < ?"
+        " AND COALESCE(source_rank, 1) < 3 AND COALESCE(review, 0) = 0"
+        " AND id NOT IN (SELECT fact_id FROM ttl_close)", (cutoff,))]
+    if not ids:
+        return 0
+    stamp = now()
+    c.executemany(
+        "INSERT INTO ttl_close(fact_id, kind, ttl_days, closed_at)"
+        " VALUES(?, 'task-progress', ?, ?)", [(i, ttl, stamp) for i in ids])
+    c.executemany(
+        "UPDATE peer_facts SET valid_to=? WHERE id=? AND valid_to IS NULL",
+        [(stamp, i) for i in ids])
+    return len(ids)
+
+
 def _sweep_expired_observations(c):
     """#1478 — the snapshot/assemble variant of the TTL sweep: opportunistic.
 
@@ -504,11 +585,13 @@ def _sweep_expired_observations(c):
     stall for the full busy timeout) because an `ingest` holds the write lock.
     Waits at most NUNCHI_SQLITE_SWEEP_TIMEOUT_MS, then logs one stderr line
     and leaves the connection read-only for the rest of the run. Returns True
-    when the sweep committed.
+    when the sweep committed. The opt-in task-progress TTL (#2759) rides the
+    same transaction, so it shares the lock-contention posture exactly.
     """
     try:
         c.execute(f"PRAGMA busy_timeout={int(_SQLITE_SWEEP_TIMEOUT_MS)}")
         _close_expired_observations(c)
+        _close_expired_task_progress(c)
         c.commit()
         return True
     except sqlite3.OperationalError as exc:
@@ -3348,6 +3431,20 @@ def metrics():
     ).fetchone()[0]
     closed = total - open_
     ratio = (stale_suspect / open_) if open_ else 0.0
+    # #2759 — task-progress age. The over-30d count is reported whether or not
+    # the TTL is on (it is what sizes the decision); ttl_closed reads the
+    # sweep's ledger, which exists only once an enabled sweep has run.
+    tp_open = c.execute(
+        "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND kind='task-progress'"
+    ).fetchone()[0]
+    tp_old = c.execute(
+        "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NULL AND kind='task-progress'"
+        " AND created_at < ?", (_age_cutoff(_TASK_PROGRESS_REFERENCE_AGE_DAYS),)).fetchone()[0]
+    try:
+        tp_ttl_closed = c.execute(
+            "SELECT COUNT(*) FROM ttl_close WHERE kind='task-progress'").fetchone()[0]
+    except sqlite3.OperationalError:
+        tp_ttl_closed = 0  # no ledger yet: the sweep has never been enabled here
     print(f"facts_total={total}")
     print(f"facts_open={open_}")
     print(f"facts_closed={closed}")
@@ -3355,6 +3452,10 @@ def metrics():
     print(f"stale_suspect_ratio={ratio:.2f}")
     print(f"review_pending={pending}")
     print(f"constraints_open={cons}")
+    print(f"task_progress_open={tp_open}")
+    print(f"task_progress_open_over_{_TASK_PROGRESS_REFERENCE_AGE_DAYS}d={tp_old}")
+    print(f"task_progress_ttl_days={_task_progress_ttl_days():g}")
+    print(f"task_progress_ttl_closed={tp_ttl_closed}")
 
 
 def stats():
