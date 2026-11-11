@@ -196,9 +196,15 @@ async def test_extractor_output_and_timeout_are_bounded(tmp_path, body):
 async def test_extractor_cancellation_reaps_child(tmp_path):
     script = tmp_path / "fake"
     pid = tmp_path / "pid"
+    # The child publishes its pid with write-then-rename (#2762). A plain
+    # open(pid, "w").write(...) creates the file before it has any content, so
+    # a waiter that only checks pid.exists() could cancel in between, kill the
+    # child before the write and then read an empty file.
     script.write_text(
         "#!/usr/bin/python3\nimport os,time\n"
-        + f'open({str(pid)!r},"w").write(str(os.getpid()))\n'
+        + f"tmp={str(pid) + '.tmp'!r}\n"
+        + 'open(tmp,"w").write(str(os.getpid()))\n'
+        + f"os.replace(tmp,{str(pid)!r})\n"
         + "time.sleep(20)\n"
     )
     script.chmod(0o700)
