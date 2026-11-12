@@ -81,6 +81,9 @@ Q2_MAX_COUNT = 5
 Q2_MAX_DIFF = 800
 DEFAULT_STATE_DIR = Path(os.environ.get("CCC_STATE_DIR") or Path.home() / ".claude" / "state")
 LEDGER_REL = Path("delegated-approval") / "shadow.jsonl"
+# Touched by ``ask`` next to the ledger: lets a per-prompt hook leave before starting an interpreter
+# when this node has never asked. The hook removes it once no ask is open.
+OPEN_ASKS_MARKER = "open-asks"
 
 L3_PATH_RES = (
     re.compile(r"^\.github/workflows/"),
@@ -307,6 +310,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         row = build_ask_row(repo=args.repo, pr=args.pr, head=head, meta=meta, promotion=bool(args.promotion),
                             ledger=ledger, session=args.session, node=args.node)
         append_ledger(path, row)
+        marker = path.parent / OPEN_ASKS_MARKER
+        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
     except Exception as exc:  # best-effort, like record: asking the owner must never fail on this
         print(f"delegated-approval shadow: ask not recorded ({type(exc).__name__})", file=sys.stderr)
         return 0

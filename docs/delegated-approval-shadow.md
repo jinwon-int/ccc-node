@@ -67,10 +67,40 @@ They are record-only too: nothing here changes whether an approval is submitted.
 - `ask`, `decide` and `record` are best-effort: quiet on stdout, exit 0, one
   line on stderr. `CCC_DELEGATED_SHADOW=0` turns all three off.
 
-Not yet: the `gh-pr-flow` step that calls `ask` and the reply hook that
-classifies the owner's answer. Until they land, `ask` and `decide` are called
-by hand or not at all, and `implicit_ask` shows how many approvals had no
-recorded request.
+`gh-pr-flow` (both runtimes) tells the agent to call `ask` right before it asks
+the owner, and `decide` where no reply hook runs. `implicit_ask` shows how
+many approvals still had no recorded request.
+
+## Reply hook (opt-in per node)
+
+`claude/hooks/delegated-reply.sh` is a `UserPromptSubmit` hook. When this node
+has an open ask and the owner's reply is a clear non-approval, it appends one
+`decision` row. **It is off until the node opts in.**
+
+| | |
+|---|---|
+| Reads | the prompt just sent, the tail of the session transcript (the last `[답변 필요]` block the agent wrote), this node's shadow ledger |
+| Writes | one `decision` row — class, source `reply`, PR, head. Never the prompt, never transcript text |
+| Output | none: stdout of this hook would be injected into the turn. Always exit 0, 3-second limit |
+| Opt in | `touch ~/.claude/state/delegated-approval/reply-hook.on` |
+| Opt out | remove that file (next prompt), or `CCC_DELEGATED_SHADOW=0` |
+| Costs nothing when | not opted in, or no ask is open (`open-asks` marker next to the ledger, set by `ask`): it exits before starting python |
+
+Rules — when in doubt it is not a refusal:
+
+| The reply… | Row |
+|---|---|
+| carries the PR's approval phrase (`<n> 승인`), or picks the option that does | none (the approval tool records it) |
+| picks a **different option of a single-choice block** that offered the approval | `decline` (`other-option`) |
+| says hold / 보류 / 중단 together with the PR number | `hold` |
+| leaves the approval unpicked in a multi-choice block, or is free text while the approval was offered | `reply-unclassified` (a note; the ask stays open) |
+| relates to a PR number that two open asks share | `reply-unclassified` (`ambiguous-pr`) |
+| has nothing to do with an open ask | none |
+
+Limits: Codex sessions have no hooks, so there the `decide` wording in
+`gh-pr-flow` and `reconcile` carry the signal. A refusal in free text stays
+`reply-unclassified`. If the transcript format changes and the block cannot be
+read, the hook can only produce notes, never a wrong `decline`.
 
 ## Collect and reconcile (window verdict helpers)
 

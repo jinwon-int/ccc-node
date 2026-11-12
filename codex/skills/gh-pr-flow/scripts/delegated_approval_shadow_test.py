@@ -327,6 +327,8 @@ class CliTest(unittest.TestCase):
         rc, out, err = self._run(self._ask_argv(head="A" * 40))
         self.assertEqual((rc, out), (0, ""))
         self.assertIn("ask L1", err)
+        marker = sh.ledger_path(self.state).parent / sh.OPEN_ASKS_MARKER
+        self.assertEqual((marker.exists(), stat.S_IMODE(os.stat(marker).st_mode)), (True, 0o600))  # tells the reply hook to look
         rc, out, err = self._run(self._ask_argv())  # asking twice for the same head adds nothing
         self.assertEqual((rc, out), (0, ""))
         self.assertIn("already open", err)

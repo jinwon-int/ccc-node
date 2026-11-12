@@ -112,6 +112,23 @@ so the account name is not an identity.
      not count. If approval is absent or ambiguous, stop and ask. An option
      the owner sends back as is counts as the phrase it carries (see
      "Reading the owner's reply" under Conditional bundled approval, #2665).
+   - **Record that you asked (#2137).** Right before you ask the owner to
+     approve a PR at a head, note the request in the delegated-approval shadow
+     ledger. It is best-effort and quiet, and never blocks:
+
+     ```bash
+     # RELAY_FLOW_DIR: the managed Codex skill scripts, resolved as under Direction A below
+     python3 "$RELAY_FLOW_DIR/delegated_approval_shadow.py" \
+       ask --repo <owner/repo> --pr <n> --head "$head_sha"
+     ```
+
+     Without it a refusal leaves no trace and the later approval row is
+     flagged `implicit_ask`. A node that opted in to the reply hook
+     (`delegated-reply.sh`) notes the owner's non-approval by itself. Where
+     there is no hook, and the owner answers with another option or says hold,
+     add `… decide --repo <owner/repo> --pr <n> --decision decline|hold
+     --source manual`. Record the class only; never put the owner's words in
+     `--detail`.
    - **Pushing to someone else's PR can delete the only remaining approver.**
      `jinwon-int/ccc-node` `main` sets `require_last_push_approval: true`, so
      the account that pushed last cannot approve that PR. Push a review fix to
