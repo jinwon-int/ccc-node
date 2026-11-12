@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -193,14 +194,11 @@ class MetadataTest(unittest.TestCase):
             meta.private_text(record, self.uid)
 
     def test_sole_member_group_definition(self):
-        Group = type('Group', (), {})
-        Passwd = type('Passwd', (), {})
-
         def group(gid, members):
-            g = Group(); g.gr_gid = gid; g.gr_mem = members; return g
+            return SimpleNamespace(gr_gid=gid, gr_mem=members)
 
         def account(name, uid, gid):
-            p = Passwd(); p.pw_name = name; p.pw_uid = uid; p.pw_gid = gid; return p
+            return SimpleNamespace(pw_name=name, pw_uid=uid, pw_gid=gid)
 
         owner, peer = account('svcacct', 1000, 1000), account('other', 1001, 1001)
         cases = [
