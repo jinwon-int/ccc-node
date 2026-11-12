@@ -9,9 +9,12 @@ a byte-identical result while due_plan() runs once per tick, and the manual
 boot_id() process cache introduced for the same per-plan cost reason.
 """
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,6 +30,7 @@ class PlanRowReuseTest(unittest.TestCase):
             "append_run_history", "apply_retry_transition", "apply_run_limit",
             "commit_run_state", "release_for_run", "notification_base",
             "headless_metadata", "parse_schedule", "record_failure_alarm",
+            "_refresh_locked_task",
         ):
             self._saved[name] = getattr(agent_cron, name)
 
@@ -62,6 +66,12 @@ class PlanRowReuseTest(unittest.TestCase):
         agent_cron.notification_base = lambda t: {"policy": "none"}
         agent_cron.headless_metadata = lambda t, execute=False: {"command": "true"}
         agent_cron.parse_schedule = lambda *a, **k: {"kind": "cron"}
+        # The post-lock re-read (#2741) plans only the locked task and reads
+        # the store; stub it so this test counts tick replans and never reads
+        # the default (live) store. RefreshLockedTaskTest covers it for real.
+        agent_cron._refresh_locked_task = lambda tid, at: {
+            "task": self.task, "due": True, "status": "due",
+            "scheduledAt": "2026-01-01T00:05:00Z"}
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -121,6 +131,53 @@ class SchedulerExecuteWiringTest(unittest.TestCase):
         self.assertIs(calls[1][1], row_b)
         self.assertEqual(calls[0][2], plan["at"])
         self.assertEqual(calls[1][2], plan["at"])
+
+
+class RefreshLockedTaskTest(unittest.TestCase):
+    """The post-lock re-read (#2741) reads the store fresh and plans one task."""
+
+    def setUp(self):
+        self._old_store = agent_cron.store
+        self._old_plan = agent_cron.due_plan
+        self.tempdir = tempfile.TemporaryDirectory()
+        agent_cron.store = Path(self.tempdir.name) / "tasks.json"
+        self.planned = []
+
+        def spy_due_plan(data):
+            self.planned.append([t.get("id") for t in data.get("tasks", [])])
+            return self._old_plan(data)
+
+        agent_cron.due_plan = spy_due_plan
+
+    def tearDown(self):
+        agent_cron.store = self._old_store
+        agent_cron.due_plan = self._old_plan
+        self.tempdir.cleanup()
+
+    def _write(self, tasks):
+        agent_cron.store.write_text(json.dumps({"version": 1, "tasks": tasks}), encoding="utf-8")
+
+    def test_plans_only_the_locked_task_from_the_current_store(self):
+        self._write([
+            {"id": "other", "schedule": "* * * * *", "prompt": "o", "enabled": True},
+            {"id": "probe", "schedule": "* * * * *", "prompt": "p", "enabled": True,
+             "lastRunAt": "2026-01-01T00:00:00Z", "runCount": 7},
+        ])
+        fresh = agent_cron._refresh_locked_task("probe", "2026-01-01T00:01:10Z")
+        self.assertEqual(self.planned, [["probe"]])
+        self.assertEqual(fresh["task"]["runCount"], 7)
+        self.assertTrue(fresh["due"])
+        self.assertEqual(fresh["scheduledAt"], "2026-01-01T00:01:00Z")
+
+    def test_disabled_removed_and_unreadable(self):
+        self._write([{"id": "probe", "schedule": "* * * * *", "prompt": "p", "enabled": False}])
+        fresh = agent_cron._refresh_locked_task("probe", "2026-01-01T00:01:10Z")
+        self.assertFalse(fresh["due"])
+        self.assertEqual(fresh["status"], "disabled")
+        self.assertEqual(agent_cron._refresh_locked_task("gone", "2026-01-01T00:01:10Z"), {"task": None})
+        agent_cron.store.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            agent_cron._refresh_locked_task("probe", "2026-01-01T00:01:10Z")
 
 
 class BootIdCacheTest(unittest.TestCase):
