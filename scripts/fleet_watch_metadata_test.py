@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -31,6 +32,17 @@ class MetadataTest(unittest.TestCase):
         self.ref.chmod(0o600)
         for directory in [self.home, self.repo, *self.repo.rglob('*')]:
             directory.chmod(0o700 if directory.is_dir() else 0o600)
+        # Group membership is host data: whether the fixture's group (root's
+        # `root`, a CI runner's `docker`, …) has other members differs per
+        # machine. Pin it to a shared group so every group-write case below
+        # means "someone else can write"; the private-group cases opt in.
+        self.real_sole_member_group = meta.sole_member_group
+        shared = patch.object(meta, 'sole_member_group', return_value=False)
+        shared.start()
+        self.addCleanup(shared.stop)
+
+    def private_group(self):
+        return patch.object(meta, 'sole_member_group', return_value=True)
 
     def test_installed_reference_is_distinct_from_runtime(self):
         self.assertEqual(meta.installed_root(self.home, self.uid), self.repo)
@@ -141,6 +153,81 @@ class MetadataTest(unittest.TestCase):
         script.chmod(0o620)
         with self.assertRaises(ValueError):
             meta.harness_root(self.repo, self.uid)
+
+    def test_private_group_write_is_owner_write(self):
+        # #2773: a umask-002 service account leaves its checkout and
+        # reference group-writable to its own user-private group. When that
+        # group can hold nobody but the file's owner, group write is owner
+        # write; other-write is never accepted.
+        with self.private_group():
+            self.ref.chmod(0o664)
+            (self.repo / 'scripts').chmod(0o775)
+            (self.repo / 'scripts/ccc-doctor.sh').chmod(0o775)
+            (self.repo / 'claude/settings.base.json').chmod(0o664)
+            self.home.chmod(0o770)
+            self.assertEqual(meta.installed_root(self.home, self.uid), self.repo)
+            self.assertEqual(meta.harness_root(self.repo, self.uid), self.repo)
+            for path, mode in ((self.ref, 0o666), (self.ref, 0o646),
+                               (self.repo / 'scripts', 0o777),
+                               (self.repo / 'scripts/ccc-doctor.sh', 0o777)):
+                old = path.stat().st_mode & 0o777
+                path.chmod(mode)
+                with self.subTest(path=path, mode=oct(mode)), self.assertRaises(ValueError):
+                    meta.installed_root(self.home, self.uid)
+                path.chmod(old)
+        # The same group-writable tree under a shared group stays refused.
+        with self.assertRaises(ValueError):
+            meta.installed_root(self.home, self.uid)
+
+    def test_private_group_does_not_bless_a_foreign_owner(self):
+        if self.uid == 0:
+            self.skipTest('a root caller is a trusted owner of every fixture')
+        with self.private_group(), self.assertRaises(ValueError):
+            meta.installed_root(self.home, self.uid + 1)
+
+    def test_private_text_ignores_the_private_group(self):
+        # Secrecy records keep owner-only modes; only integrity checks relax.
+        record = self.home / 'record.json'
+        record.write_text('{}')
+        record.chmod(0o660)
+        with self.private_group(), self.assertRaises(ValueError):
+            meta.private_text(record, self.uid)
+
+    def test_sole_member_group_definition(self):
+        def group(gid, members):
+            return SimpleNamespace(gr_gid=gid, gr_mem=members)
+
+        def account(name, uid, gid):
+            return SimpleNamespace(pw_name=name, pw_uid=uid, pw_gid=gid)
+
+        owner, peer = account('svcacct', 1000, 1000), account('other', 1001, 1001)
+        cases = [
+            ('user-private group', group(1000, []), [owner, peer], True),
+            ('owner listed as a supplementary member', group(1000, ['svcacct']), [owner, peer], True),
+            ('another supplementary member', group(1000, ['other']), [owner, peer], False),
+            ('another account with it as primary group', group(1000, []),
+             [owner, account('twin', 1002, 1000)], False),
+            ('unknown group', KeyError('gid'), [owner], False),
+            ('unknown owner', group(1000, []), [peer], False),
+        ]
+        for name, grp_entry, accounts, want in cases:
+            def getgrgid(gid, entry=grp_entry):
+                if isinstance(entry, Exception):
+                    raise entry
+                return entry
+
+            def getpwuid(uid, accounts=accounts):
+                for a in accounts:
+                    if a.pw_uid == uid:
+                        return a
+                raise KeyError(uid)
+            with self.subTest(name), patch.object(meta.grp, 'getgrgid', getgrgid), \
+                    patch.object(meta.pwd, 'getpwuid', getpwuid), \
+                    patch.object(meta.pwd, 'getpwall', lambda accounts=accounts: accounts):
+                self.assertIs(self.real_sole_member_group.__wrapped__(1000, 1000), want)
+        # Android CPython has no grp module: never private, never an error.
+        with patch.object(meta, 'grp', None):
+            self.assertIs(self.real_sole_member_group.__wrapped__(1000, 1000), False)
 
     def test_harness_mode_prints_only_a_verified_root(self):
         argv = [sys.executable, str(Path(meta.__file__)), 'harness', str(self.repo), '', str(self.home),
