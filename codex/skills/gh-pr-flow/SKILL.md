@@ -120,6 +120,21 @@ require fresh explicit approval for the exact repository, PR, and head (sole
 exception: the standing approval for mechanical fleet-skills promote PRs at
 the end of this skill):
 
+**Record that you asked (#2137).** Right before you ask the owner to approve a
+PR at a head, note the request in the delegated-approval shadow ledger
+(best-effort, quiet, never blocks):
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/gh-pr-flow/scripts/delegated_approval_shadow.py" \
+  ask --repo <owner/repo> --pr <n> --head "$head_sha"
+```
+
+Without it a refusal leaves no trace and the later approval row is flagged
+`implicit_ask`. This runtime has no reply hook, so when the owner answers with
+another option or says hold, add `… decide --repo <owner/repo> --pr <n>
+--decision decline|hold --source manual`. Record the class only; never put the
+owner's words in `--detail`.
+
 | PR author | Review profile | Expected reviewer | Remote gh config |
 | --- | --- | --- | --- |
 | `jinon86` | `seoseo-ai` | `seoseo-ai` | isolated root-owned profile config |

@@ -74,6 +74,11 @@
             "type": "command",
             "command": "bash /root/.claude/hooks/skill-router.sh",
             "timeout": 6
+          },
+          {
+            "type": "command",
+            "command": "bash /root/.claude/hooks/delegated-reply.sh",
+            "timeout": 5
           }
         ]
       }
