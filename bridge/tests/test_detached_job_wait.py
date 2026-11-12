@@ -560,3 +560,292 @@ def test_cli_timeout_above_the_budget_registers_notify_only(tmp_path: Path, monk
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["notify_only"] is False
     assert not registry.get(payload["wait_id"]).get("notify_only")
+
+
+# --- #2728: unfired timers and --user units are alive, not lost --------------------------
+
+
+class _Systemctl:
+    """``systemctl is-active`` stand-in: answers ``active`` for the listed units only.
+
+    Entries are ``<name>`` for the system manager and ``user:<name>`` for
+    ``systemctl --user``; every argv is recorded so a test can assert which
+    manager and which unit suffix was asked.
+    """
+
+    def __init__(self, *active: str) -> None:
+        self.active = set(active)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        argv = [str(a) for a in argv]
+        self.calls.append(argv)
+        assert argv[0] == "systemctl" and "is-active" in argv
+        key = ("user:" if "--user" in argv else "") + argv[-1]
+        alive = key in self.active
+
+        class _Proc:
+            returncode = 0 if alive else 3
+            stdout = b"active\n" if alive else b"inactive\n"
+
+        return _Proc()
+
+
+@pytest.fixture(autouse=True)
+def lost_recheck_is_instant(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ``lost`` is confirmed by a second probe after a short pause; no real sleep in tests.
+    monkeypatch.setattr(external_wait_monitor, "DETACHED_JOB_LOST_RECHECK_DELAY_SECONDS", 0.0, raising=False)
+
+
+def _cli_register(tmp_path: Path, capsys: pytest.CaptureFixture, *flags: str) -> tuple[int, dict]:
+    rc = external_wait_cli.main(["register", "--source", "detached-job", *flags])
+    return rc, json.loads(capsys.readouterr().out.strip())
+
+
+def _real_probe_monitor(tmp_path: Path, recorder: _Recorder) -> tuple[ExternalWaitMonitor, ExternalWaitRegistry]:
+    """A monitor on the CLI's registry that keeps the real filesystem/systemd probe."""
+    clock = _Clock(time.time() + 1.0)
+    registry = ExternalWaitRegistry(default_registry_path(tmp_path), clock=clock)
+    monitor = ExternalWaitMonitor(
+        registry, transport=_NoTransport(), notifier=recorder.notify, resumer=recorder.resume,
+        session_lookup=_session_of, clock=clock, status_syncer=recorder.sync,
+    )
+    return monitor, registry
+
+
+def _quiet_log(path: Path, text: str = "prepared\n", *, age: float = 3600.0) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    os.utime(path, (time.time() - age, time.time() - age))
+    return path
+
+
+@pytest.fixture
+def cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("CCC_EXTERNAL_WAIT_HOME", str(tmp_path))
+    publish_active_turn(tmp_path, user_id=7, chat_id=70, session_id="sess-1")
+    return tmp_path
+
+
+@pytest.mark.anyio
+async def test_unfired_timer_is_not_lost_however_long_the_log_stays_quiet(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, lost_recheck_is_instant: None
+) -> None:
+    # The 2026-11-09 case: a transient timer that fires later, log created empty up front.
+    systemctl = _Systemctl("obs-rollout.timer")
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", systemctl)
+    quiet = _quiet_log(cli_home / "state" / "obs.log", "")
+    rc, payload = _cli_register(
+        cli_home, capsys, "--unit", "obs-rollout", "--log", str(quiet), "--scheduled-at", "23:10", "--log-offset", "0"
+    )
+    assert rc == 0
+    rc, never = _cli_register(
+        cli_home, capsys, "--unit", "obs-rollout", "--log", str(cli_home / "state" / "not-yet.log"),
+        "--scheduled-at", "23:10", "--log-offset", "0",
+    )
+    assert rc == 0
+    recorder = _Recorder()
+    monitor, registry = _real_probe_monitor(cli_home, recorder)
+    await monitor._tick()
+    for wait_id in (payload["wait_id"], never["wait_id"]):
+        rec = registry.get(wait_id)
+        assert rec["state"] == STATE_MONITORING and rec["terminal_status"] is None, rec
+    assert recorder.notifications == []
+    assert ["systemctl", "is-active", "obs-rollout.timer"] in systemctl.calls
+
+
+@pytest.mark.anyio
+async def test_user_scope_unit_is_asked_of_the_user_manager(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, lost_recheck_is_instant: None
+) -> None:
+    systemctl = _Systemctl("user:hand-built.service")
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", systemctl)
+    quiet = _quiet_log(cli_home / "state" / "hand.log")
+    rc, payload = _cli_register(
+        cli_home, capsys, "--unit", "hand-built", "--log", str(quiet), "--scope", "user", "--log-offset", "0"
+    )
+    assert rc == 0
+    recorder = _Recorder()
+    monitor, registry = _real_probe_monitor(cli_home, recorder)
+    await monitor._tick()
+    rec = registry.get(payload["wait_id"])
+    assert rec["state"] == STATE_MONITORING and rec["terminal_status"] is None, rec.get("terminal_detail")
+    assert rec["scope"] == "user"
+    assert ["systemctl", "--user", "is-active", "hand-built.service"] in systemctl.calls
+    assert ["systemctl", "is-active", "hand-built.service"] not in systemctl.calls
+
+
+@pytest.mark.anyio
+async def test_records_without_scope_or_schedule_are_judged_as_before(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, lost_recheck_is_instant: None
+) -> None:
+    # A timer and a user unit of the same name are up, but nothing says to ask about them.
+    systemctl = _Systemctl("legacy.timer", "user:legacy.service", "user:legacy.timer")
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", systemctl)
+    stale = _quiet_log(cli_home / "state" / "legacy.log")
+    rc, with_log = _cli_register(cli_home, capsys, "--unit", "legacy", "--log", str(stale), "--log-offset", "0")
+    assert rc == 0
+    rc, no_log = _cli_register(
+        cli_home, capsys, "--unit", "legacy", "--log", str(cli_home / "state" / "absent.log"), "--log-offset", "0"
+    )
+    assert rc == 0
+    recorder = _Recorder()
+    monitor, registry = _real_probe_monitor(cli_home, recorder)
+    for wait_id in (with_log["wait_id"], no_log["wait_id"]):
+        assert "scope" not in registry.get(wait_id) and "scheduled_at" not in registry.get(wait_id)
+    await monitor._tick()
+    assert registry.get(with_log["wait_id"])["terminal_detail"] == {"reason": "no-exit-marker"}
+    assert registry.get(no_log["wait_id"])["terminal_detail"] == {"reason": "no-log"}
+    assert systemctl.calls and all(call == ["systemctl", "is-active", "legacy.service"] for call in systemctl.calls)
+
+    # A fresh log still means running, with or without a live unit.
+    fresh = cli_home / "state" / "fresh.log"
+    fresh.write_text("working\n")
+    rc, running = _cli_register(cli_home, capsys, "--unit", "legacy", "--log", str(fresh), "--log-offset", "0")
+    await monitor._tick()
+    assert registry.get(running["wait_id"])["state"] == STATE_MONITORING
+
+
+@pytest.mark.anyio
+async def test_scheduled_job_ends_on_its_exit_marker_once_it_fires(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, lost_recheck_is_instant: None
+) -> None:
+    systemctl = _Systemctl("nightly.timer", "nightly-bad.timer")
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", systemctl)
+    good, bad = cli_home / "state" / "good.log", cli_home / "state" / "bad.log"
+    rc, ok_wait = _cli_register(
+        cli_home, capsys, "--unit", "nightly", "--log", str(good), "--scheduled-at", "05:00", "--log-offset", "0",
+        "--summary", "read the nightly log",
+    )
+    rc, bad_wait = _cli_register(
+        cli_home, capsys, "--unit", "nightly-bad", "--log", str(bad), "--scheduled-at", "05:00", "--log-offset", "0",
+        "--summary", "read the nightly log",
+    )
+    recorder = _Recorder()
+    monitor, registry = _real_probe_monitor(cli_home, recorder)
+    await monitor._tick()
+    assert registry.get(ok_wait["wait_id"])["state"] == STATE_MONITORING
+    assert registry.get(bad_wait["wait_id"])["state"] == STATE_MONITORING
+
+    # The timers fired and are gone; the jobs ran and wrote their markers.
+    systemctl.active.clear()
+    good.parent.mkdir(parents=True, exist_ok=True)
+    good.write_text("ran\nEXIT=0\n")
+    bad.write_text("ran\nEXIT=3\n")
+    monitor._clock.now += 120.0
+    await monitor._tick()
+    ok_rec, bad_rec = registry.get(ok_wait["wait_id"]), registry.get(bad_wait["wait_id"])
+    assert ok_rec["terminal_status"] == TERMINAL_SUCCESS and ok_rec["terminal_detail"] == {"exit_code": 0}
+    assert bad_rec["terminal_status"] == TERMINAL_FAILURE and bad_rec["terminal_detail"] == {"exit_code": 3}
+    assert len(recorder.notifications) == 2 and len(recorder.resumes) == 2
+    assert any("terminal=success unit=nightly " in prompt for _, prompt in recorder.resumes)
+    assert any("terminal=failure unit=nightly-bad " in prompt and "exit=3" in prompt for _, prompt in recorder.resumes)
+
+
+@pytest.mark.anyio
+async def test_scheduled_job_whose_timer_is_gone_without_a_marker_is_still_lost(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, lost_recheck_is_instant: None
+) -> None:
+    systemctl = _Systemctl()
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", systemctl)
+    stale = _quiet_log(cli_home / "state" / "gone.log")
+    rc, with_log = _cli_register(
+        cli_home, capsys, "--unit", "gone", "--log", str(stale), "--scheduled-at", "05:00", "--log-offset", "0"
+    )
+    rc, no_log = _cli_register(
+        cli_home, capsys, "--unit", "gone", "--log", str(cli_home / "state" / "never.log"),
+        "--scheduled-at", "05:00", "--scope", "user", "--log-offset", "0",
+    )
+    recorder = _Recorder()
+    monitor, registry = _real_probe_monitor(cli_home, recorder)
+    await monitor._tick()
+    assert registry.get(with_log["wait_id"])["terminal_status"] == TERMINAL_LOST
+    assert registry.get(with_log["wait_id"])["terminal_detail"] == {"reason": "no-exit-marker"}
+    assert registry.get(no_log["wait_id"])["terminal_status"] == TERMINAL_LOST
+    assert registry.get(no_log["wait_id"])["terminal_detail"] == {"reason": "no-log"}
+    # Both the service and the timer were asked, each of its own manager.
+    assert ["systemctl", "is-active", "gone.timer"] in systemctl.calls
+    assert ["systemctl", "--user", "is-active", "gone.timer"] in systemctl.calls
+
+
+@pytest.mark.anyio
+async def test_lost_is_confirmed_by_a_second_probe(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, lost_recheck_is_instant: None
+) -> None:
+    # One slow or racing ``systemctl`` answer (a timer handing over to its service)
+    # must not end the wait: ``lost`` is never resumed, so a later EXIT would reach nobody.
+    answers = iter([b"inactive\n", b"active\n", b"active\n"])
+    calls: list[list[str]] = []
+
+    def flaky(argv, **kwargs):
+        calls.append([str(a) for a in argv])
+
+        class _Proc:
+            returncode = 0
+            stdout = next(answers, b"active\n")
+
+        return _Proc()
+
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", flaky)
+    stale = _quiet_log(cli_home / "state" / "handover.log")
+    rc, payload = _cli_register(cli_home, capsys, "--unit", "handover", "--log", str(stale), "--log-offset", "0")
+    recorder = _Recorder()
+    monitor, registry = _real_probe_monitor(cli_home, recorder)
+    await monitor._tick()
+    rec = registry.get(payload["wait_id"])
+    assert rec["state"] == STATE_MONITORING and rec["terminal_status"] is None
+    assert len(calls) == 2 and recorder.notifications == []
+
+
+def test_cli_scope_and_schedule_flags_are_validated_and_recorded(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", _Systemctl())
+    log = cli_home / "state" / "flags.log"
+    registry = ExternalWaitRegistry(default_registry_path(cli_home))
+
+    rc, payload = _cli_register(
+        cli_home, capsys, "--unit", "flags", "--log", str(log), "--scope", "USER",
+        "--scheduled-at", "  2026-11-13   05:00:00  Asia/Seoul ",
+    )
+    assert rc == 0 and payload["scope"] == "user" and payload["scheduled_at"] == "2026-11-13 05:00:00 Asia/Seoul"
+    rec = registry.get(payload["wait_id"])
+    assert rec["scope"] == "user" and rec["scheduled_at"] == "2026-11-13 05:00:00 Asia/Seoul"
+
+    # Defaults keep the pre-#2728 record shape.
+    rc, plain = _cli_register(cli_home, capsys, "--unit", "plain", "--log", str(log), "--scope", "system")
+    assert rc == 0 and plain["scope"] == "system"
+    assert "scope" not in registry.get(plain["wait_id"]) and "scheduled_at" not in registry.get(plain["wait_id"])
+
+    rc, bad = _cli_register(cli_home, capsys, "--unit", "bad", "--log", str(log), "--scope", "root")
+    assert rc == 2 and bad["code"] == "validation"
+    rc, bad = _cli_register(cli_home, capsys, "--unit", "bad", "--log", str(log), "--scheduled-at", "x" * 200)
+    assert rc == 2 and bad["code"] == "validation"
+
+    # Registering the same unit and log again with the scope it lacked corrects the open wait.
+    rc, again = _cli_register(cli_home, capsys, "--unit", "plain", "--log", str(log), "--scope", "user")
+    assert rc == 0 and again["wait_id"] == plain["wait_id"]
+    assert registry.get(plain["wait_id"])["scope"] == "user"
+
+
+def test_cli_baseline_skips_an_earlier_runs_marker_for_a_job_that_has_not_fired(
+    cli_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    # Re-scheduling under the same unit and log: yesterday's EXIT=1 is still in the tail.
+    log = cli_home / "state" / "rerun.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("yesterday\nEXIT=1\n")
+    registry = ExternalWaitRegistry(default_registry_path(cli_home))
+
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", _Systemctl("user:rerun.timer"))
+    rc, armed = _cli_register(
+        cli_home, capsys, "--unit", "rerun", "--log", str(log), "--scope", "user", "--scheduled-at", "05:00"
+    )
+    assert rc == 0 and registry.get(armed["wait_id"])["log_offset"] == log.stat().st_size
+
+    # Nothing is armed or running: the marker may be this run's own, so it is accepted.
+    monkeypatch.setattr(external_wait_monitor.subprocess, "run", _Systemctl())
+    rc, done = _cli_register(
+        cli_home, capsys, "--unit", "rerun-done", "--log", str(log), "--scope", "user", "--scheduled-at", "05:00"
+    )
+    assert rc == 0 and "log_offset" not in registry.get(done["wait_id"])
