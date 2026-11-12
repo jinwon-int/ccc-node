@@ -723,7 +723,7 @@ together are each selected. Propose them under the agent-choices-v2 header —
 `**[답변 필요]** 하나만 선택` for mutually exclusive options,
 `**[답변 필요]** 여러 개 선택 가능` for independent ones — one action and its
 exact target (PR, head, version) per option. It is **not** an approval —
-ask once more, with the recommended option first — when the message sends
+ask once more, with the recommended option first and marked `1. (권장) …` — when the message sends
 several options of a 「하나만」 block, repeats a question or a conditional
 sentence ("보였다면 … 승인을 주세요") without answering it, or names a PR whose
 head (or a version) moved since the proposal. External PRs still need an

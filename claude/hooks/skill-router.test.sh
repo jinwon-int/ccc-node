@@ -102,6 +102,16 @@ for p in "1. 2651 승인 (권장)" "2637 2638 승인 — 두 PR 모두 리뷰" "
   run_hook "$p" sess-5
   ok "#2652: no suggestion for copied option reply '$p'" '[ "$rc" = 0 ] && [ -z "$out" ]'
 done
+# Recommended options are marked up front now ("1. (권장) …", several allowed).
+# A pasted option in that form, with or without its number, never routes; a
+# real request behind the note still does. (Guards the new convention: the
+# numbered form is a choice echo, the bare form carries no skill words.)
+for p in "1. (권장) 2651 승인" "(권장) 2651 승인 — 두 PR 모두 리뷰" "(권장) 2637 2638 승인" "2. (권장) 2652 승인 (recommended option)"; do
+  run_hook "$p" sess-5
+  ok "prefix (권장): no suggestion for copied option reply '$p'" '[ "$rc" = 0 ] && [ -z "$out" ]'
+done
+run_hook "(권장) 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-11
+ok "prefix (권장): a real request behind the note still routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
 run_hook "2026 브리지 재시작 전에 분리 유닛으로 돌려서 검증까지 해줘" sess-9
 ok "#2652: a request that merely starts with a number still routes" '[ "$(names | head -1)" = bridge-restart-detached ]'
 ok "silent prompts leave no last-session file" '[ ! -e "$CCC_STATE_DIR/skill-router/last-sess-5.json" ]'
