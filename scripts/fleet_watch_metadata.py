@@ -6,6 +6,11 @@ by setup.sh, not a guessed healthy checkout. Runtime provenance is independent.
 """
 from __future__ import annotations
 
+import functools
+try:
+    import grp
+except ImportError:  # CPython on Android ships no grp; Termux nodes run this too
+    grp = None
 import json
 import os
 from pathlib import Path
@@ -35,21 +40,52 @@ def private_text(path: Path, uid: int) -> str:
     return value.decode('utf-8')
 
 
+@functools.lru_cache(maxsize=None)
+def sole_member_group(gid: int, owner_uid: int) -> bool:
+    """True when group ``gid`` can hold no account but ``owner_uid``.
+
+    A umask-002 service account (#2773) leaves its checkout group-writable
+    to its user-private group. Group write is then owner write — but only when
+    no other account is a supplementary member and none has the group as its
+    primary group. Unknown group or owner, or no grp module, is not private
+    (fail closed: the pre-#2773 verdict).
+    """
+    if grp is None:
+        return False
+    try:
+        group = grp.getgrgid(gid)
+        owner = pwd.getpwuid(owner_uid)
+        accounts = pwd.getpwall()
+    except (KeyError, OSError):
+        return False
+    if any(member != owner.pw_name for member in group.gr_mem):
+        return False
+    return all(a.pw_uid == owner_uid for a in accounts if a.pw_gid == gid)
+
+
+def foreign_writable(info: os.stat_result) -> bool:
+    """Writable by an account other than the file's owner."""
+    if info.st_mode & 0o002:
+        return True
+    return bool(info.st_mode & 0o020) and not sole_member_group(info.st_gid, info.st_uid)
+
+
 def reference_text(path: Path, uid: int) -> str:
     """Read the self-update.repo install reference: integrity, not secrecy.
 
     The reference is a path, not a secret, and setups that wrote it before
     `chmod 600` leave it 0644 (#2703: every VPS node's reference failed
     private_text, so no retired node could be inspected). Nobody but root or
-    the owner may be able to rewrite it: owner in {0, uid}, no group/other
-    write bit, a regular file opened without following a symlink, under a
-    physical parent. Every other record keeps private_text.
+    the owner may be able to rewrite it: owner in {0, uid}, no other-write
+    bit and no group-write bit unless the group is the owner's alone
+    (sole_member_group, #2773), a regular file opened without following a
+    symlink, under a physical parent. Every other record keeps private_text.
     """
     physical(path.parent)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
         st = os.fstat(stream.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, uid) or st.st_mode & 0o022:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, uid) or foreign_writable(st):
             raise ValueError('unsafe_reference')
         value = stream.read(1024 * 1024 + 1)
     if len(value) > 1024 * 1024:
@@ -73,7 +109,9 @@ def protected_path(path: Path, uid: int) -> None:
         owners = {0, uid, 1000} if platform_parent else {0, uid}
         if info.st_uid not in owners:
             raise ValueError('foreign_path_owner')
-        writable = info.st_mode & 0o022
+        # Group write to a group only the item's owner can hold is owner
+        # write (#2773); other-write never is.
+        writable = foreign_writable(info)
         # Android assigns these app ancestors matching private app/system GIDs.
         app_parent = android and str(item) == '/data/data/com.termux/files'
         private_android_group = ((platform_parent or app_parent)

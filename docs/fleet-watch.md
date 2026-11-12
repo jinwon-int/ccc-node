@@ -81,6 +81,30 @@ after the reviewed fix is integrated into the normal checkout.
     (`no-harness`, `unverified-reference`, `unverified-harness`), never a
     failure.
 
+  **Declared harness account (#2773).** Some nodes are probed as root while
+  their harness, `self-update.repo` and `~/.claude` belong to a non-root
+  service account. The root fallback then finds nothing it may run (the
+  checkout is not root's), and the node reports `doctor:unverified-harness`
+  every day — never inspected, never paged. Name the account in the sweep's
+  environment:
+
+  ```
+  CCC_FLEET_HARNESS_ACCOUNTS="<node>=<account> [<node>=<account> …]"   # space or comma separated
+  ```
+
+  The account and its home (`getent passwd`) then replace the probing login
+  above: its reference, else `<home>/ccc-node`, else `/opt/ccc-node`, and the
+  doctor and memory check run as it (`su -` from root, `sudo -n` otherwise).
+  Because the operator said where the harness is, any way it cannot be
+  inspected is a failure, not a note:
+  `UNVERIFIED <node> inspection=harness-account:<reason> retired=<marker>`
+  (`unknown-account`, `invalid-account`, `unverified-reference`,
+  `unverified-harness`, `no-harness`). A malformed declaration (not
+  `node=account`, a node twice, or a name outside `[a-z_][a-z0-9_-]*`) fails
+  the whole run before any probe as `UNVERIFIED watcher
+  inspection=invalid-harness-accounts`: each value reaches a root shell on the
+  node. Undeclared nodes are unchanged.
+
   `retired=` is deliberately not `channel=`: the change-mode tracker reads
   `channel=` as the pair's channel, and the row belongs to the node's Telegram
   pair. Plain and `--light` runs are unchanged (no doctor, the bare `RETIRED`
@@ -125,8 +149,14 @@ after the reviewed fix is integrated into the normal checkout.
   `.claude/self-update.repo` recorded by setup and maintained by the operator.
   The reference is a path, not a secret, so integrity decides, not privacy
   (#2703): a regular file (never a symlink) owned by root or the inspected
-  account with no group/other write bit — the 0644 most nodes carry is
-  accepted, 0664/0646/0666 or a foreign owner are not. Preparation receipts
+  account with no other-write bit, and no group-write bit unless the group
+  can hold no account but the file's owner (#2773: a umask-002 service
+  account's user-private group — no supplementary member, no other account
+  with it as primary group; unknown groups, and Android's missing `grp`
+  module, count as shared). The 0644 most nodes carry is accepted, and so is
+  0664 under such a private group; 0646/0666, 0664 under a shared group, or a
+  foreign owner are not. The same rule applies to every checked ancestor and
+  script. Preparation receipts
   stay owner-private. Validate the reference, expected CCC files, imported script tree and their
   ancestor ownership/write permissions (root or the serving owner; Android
   platform ancestors are treated separately); do not search for a checkout

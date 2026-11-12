@@ -33,8 +33,10 @@ cat > "$STUB" <<STUBEOF
 node=""
 for a in "\$@"; do case "\$a" in -o|-*) ;; sh|-s) ;; *) node="\$a" ;; esac; done
 IFS= read -r first_line || true
+IFS= read -r second_line || true
 cat >/dev/null
 printf '%s\n' "\$first_line" >> "$TMP/reply/\$node.flags"
+printf '%s\n' "\$second_line" >> "$TMP/reply/\$node.acct"
 f="$TMP/reply/\$node"
 # Second and later answers come from <node>.2 when it exists (a degraded
 # recheck); <node>.2.unreachable makes every later answer a transport failure.
@@ -59,7 +61,7 @@ reply() { # <node> <runtime> <avail> <unit>
 
 run() { # <nodes>
   OUT="$TMP/out"; RC=0
-  rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+  rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags "$TMP"/reply/*.acct
   CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
     CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 CCC_FLEET_HANDE=0 \
     bash "$SC" >"$OUT" 2>&1 || RC=$?
@@ -169,7 +171,7 @@ rm -f "$TMP/reply/beta.2.unreachable"
 # Opt-out pages on the first answer, as before.
 reply beta /root/ccc-node degraded /root/ccc-node
 cp "$TMP/reply/alpha" "$TMP/reply/beta.2"
-OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags "$TMP"/reply/*.acct
 CCC_FLEET_NODES="beta" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
   CCC_FLEET_DEGRADED_RECHECK=0 bash "$SC" >"$OUT" 2>&1 || RC=$?
 okc "$RC" 1 "recheck disabled pages on the first degraded answer"
@@ -181,7 +183,7 @@ for n in d1 d2 d3; do
   reply "$n" /opt/ccc-node degraded /opt/ccc-node
   reply "$n.2" /opt/ccc-node yes /opt/ccc-node
 done
-OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags "$TMP"/reply/*.acct
 t0=$SECONDS
 CCC_FLEET_NODES="d1 d2 d3" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_RETRY_DELAY=0 \
   CCC_FLEET_DEGRADED_RECHECK_DELAY=2 bash "$SC" >"$OUT" 2>&1 || RC=$?
@@ -470,6 +472,41 @@ printf 'RUNTIME=-\nAVAIL=retired\nRETIRED=frontends\nUNIT=-\nPREPARED=-\n' > "$T
 CCC_FLEET_DOCTOR=1 run "rlost"
 ok "retired doctor: a doctor answer without DOCTOR is UNVERIFIED" \
   'test "$RC" = 1 && grep -q "^UNVERIFIED rlost inspection=incomplete-doctor retired=frontends$" "$OUT"'
+# ---- declared harness account (#2773) ---------------------------------------
+# A service-account node's harness belongs to that account, not to the root
+# login that probes it, so the retired fallback inspected root and reported
+# `doctor:unverified-harness` (never a page) every day. The watcher now names
+# the account per node; the node gets it as the payload's second line.
+rm -f "$TMP"/reply/*.acct
+reply_ret racct 0 ok
+reply_ret rplain 0 ok
+CCC_FLEET_DOCTOR=1 CCC_FLEET_HARNESS_ACCOUNTS="racct=svcacct" run "racct rplain"
+ok "harness account: a declared account is sent to its node only" \
+  '[ "$(cat "$TMP/reply/racct.acct")" = "CCC_FLEET_HARNESS_ACCOUNT=svcacct" ] && [ "$(cat "$TMP/reply/rplain.acct")" = "CCC_FLEET_HARNESS_ACCOUNT=" ] && [ "$(cat "$TMP/reply/racct.flags")" = "CCC_FLEET_DOCTOR=1" ]'
+ok "harness account: the verdicts are unchanged by the declaration" \
+  'test "$RC" = 0 && grep -qx "RETIRED racct marker=frontends" "$OUT" && grep -qx "RETIRED rplain marker=frontends" "$OUT"'
+CCC_FLEET_DOCTOR=1 CCC_FLEET_HARNESS_ACCOUNTS="racct=svcacct, rplain=svc_1" run "racct rplain"
+ok "harness account: comma and space separated pairs" \
+  '[ "$(cat "$TMP/reply/rplain.acct")" = "CCC_FLEET_HARNESS_ACCOUNT=svc_1" ]'
+# A declaration that cannot be read safely is a failed run, never a silent
+# skip: it is the only line between root and a shell command on every node.
+for bad in "racct" "racct=" "=svcacct" "racct=Gong" "racct=a;b" 'racct=$(id)' "racct=a racct=b" "racct=-x"; do
+  rm -f "$TMP"/reply/*.acct
+  CCC_FLEET_DOCTOR=1 CCC_FLEET_HARNESS_ACCOUNTS="$bad" run "racct rplain"
+  ok "harness account: invalid declaration '$bad' fails the run before any probe" \
+    'test "$RC" = 1 && grep -qx "UNVERIFIED watcher inspection=invalid-harness-accounts" "$OUT" && ! grep -qE "^(OK|RETIRED|DRIFT) " "$OUT" && [ ! -e "$TMP/reply/racct.acct" ]'
+done
+# A declared account the node cannot inspect is a failure: the operator said
+# where the harness is, so "nothing inspected" is no longer an acceptable note.
+reply_ret racct unverified unknown unknown-account
+CCC_FLEET_DOCTOR=1 CCC_FLEET_HARNESS_ACCOUNTS="racct=svcacct" run "racct"
+ok "harness account: an uninspectable declared account is UNVERIFIED with its reason" \
+  'test "$RC" = 1 && [ "$(cat "$OUT")" = "UNVERIFIED racct inspection=harness-account:unknown-account retired=frontends" ]'
+reply_ret racct unverified unknown
+CCC_FLEET_DOCTOR=1 run "racct"
+ok "harness account: an unverified reference without a note keeps its old row" \
+  'test "$RC" = 1 && [ "$(cat "$OUT")" = "UNVERIFIED racct inspection=harness-reference retired=frontends" ]'
+rm -f "$TMP"/reply/racct* "$TMP"/reply/rplain*
 # (e) the plain and light runs are unchanged: no doctor flag is sent and the
 # line is the RETIRED line, whatever DOCTOR/MEMORY a reply happens to carry.
 reply_ret rdrift 1 degraded:mempalace.index-diverged
@@ -972,7 +1009,10 @@ if [ "$(id -u)" = 0 ]; then
   PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
   ok "a read-only 0644 installation record is accepted" 'grep -q "^DOCTOR_ROOT=$TMP/install-repo$" "$TMP/prep-out" && grep -q "^DOCTOR=0$" "$TMP/prep-out"'
 fi
-for unsafe_mode in 664 646; do
+# Other-write only: whether group write (664) is foreign depends on who else
+# holds the fixture's group on this host (#2773, sole_member_group); the
+# metadata unit tests pin that case.
+for unsafe_mode in 646 666; do
   chmod "$unsafe_mode" "$TMP/probe-home/.claude/self-update.repo"
   PATH="$TMP/prep-bin:$TMP/probe-bin:$PATH" CCC_FLEET_DOCTOR=1 sh "$TMP/owner-probe.sh" > "$TMP/prep-out"
   ok "a writable-by-others installation record ($unsafe_mode) is unverified" 'grep -q "^DOCTOR=unverified$" "$TMP/prep-out"'
@@ -1356,7 +1396,7 @@ ok "retired probe: a read-only 0644 reference is used" \
   'grep -qx "DOCTOR_ROOT=$RH/inst" "$TMP/ret-out" && grep -q "^DOCTOR=0$" "$TMP/ret-out" && grep -qx "doctor root=$RH/inst CCC_DOCTOR_CLAUDE_DIR=$RH/h-ref644/.claude" "$TMP/ret-calls"'
 # A reference that fails the metadata check (writable by others) is not
 # replaced by a guess.
-ret_home "$RH/h-badref"; ret_ref "$RH/h-badref" "$RH/inst" 664
+ret_home "$RH/h-badref"; ret_ref "$RH/h-badref" "$RH/inst" 646
 ret_harness "$RH/h-badref/ccc-node"
 ret_probe "$RH/h-badref" CCC_FLEET_DOCTOR=1
 ok "retired probe: an unsafe reference runs nothing and says so" \
@@ -1372,7 +1412,7 @@ ok "retired probe: without a reference or home checkout /opt/ccc-node is used" \
   'grep -qx "DOCTOR_ROOT=$RH/opt-ccc-node" "$TMP/ret-out" && grep -qx "doctor root=$RH/opt-ccc-node CCC_DOCTOR_CLAUDE_DIR=$RH/h-opt/.claude" "$TMP/ret-calls"'
 rm -rf "$RH/opt-ccc-node"
 # A candidate whose scripts someone else could rewrite is not executed.
-ret_home "$RH/h-unsafe"; ret_harness "$RH/h-unsafe/ccc-node"; chmod g+w "$RH/h-unsafe/ccc-node/scripts/ccc-doctor.sh"
+ret_home "$RH/h-unsafe"; ret_harness "$RH/h-unsafe/ccc-node"; chmod o+w "$RH/h-unsafe/ccc-node/scripts/ccc-doctor.sh"
 ret_probe "$RH/h-unsafe" CCC_FLEET_DOCTOR=1
 ok "retired probe: a writable-by-others checkout runs nothing and says so" \
   'grep -q "^DOCTOR=-$" "$TMP/ret-out" && grep -q "^DOCTOR_NOTE=unverified-harness$" "$TMP/ret-out" && [ ! -s "$TMP/ret-calls" ]'
@@ -1381,6 +1421,86 @@ ret_home "$RH/h-none"
 ret_probe "$RH/h-none" CCC_FLEET_DOCTOR=1
 ok "retired probe: no harness anywhere is DOCTOR=- no-harness, MEMORY=unknown" \
   'grep -q "^DOCTOR=-$" "$TMP/ret-out" && grep -q "^DOCTOR_NOTE=no-harness$" "$TMP/ret-out" && grep -q "^MEMORY=unknown$" "$TMP/ret-out" && [ "$(tail -1 "$TMP/ret-out")" = PROBE_COMPLETE=1 ]'
+# (h) a declared harness account (#2773): the service-account shape. root probes and
+# holds the retirement declaration; the harness, its reference and its
+# ~/.claude belong to another account. `id`/`getent`/`su`/`sudo` are stubbed
+# so the test needs no real account: the declared account gets this test's own
+# uid (the fixtures' owner, which the metadata check requires) and the probing
+# login a different one, which is what makes the probe switch accounts — via
+# `su -` when the login is root (as on the VPS nodes) or `sudo -n` otherwise,
+# whichever this host's uid leaves for the stub. Both stubs log and run.
+real_id=$(command -v id)
+if [ "$("$real_id" -u)" = 0 ]; then login_uid=4242; else login_uid=0; fi
+mkdir -p "$TMP/acct-bin"
+cat > "$TMP/acct-bin/id" <<EOF
+#!$(command -v sh)
+case "\$*" in
+  '-u hacct') "$real_id" -u ;;
+  '-u') echo $login_uid ;;
+  '-nu') echo login ;;
+  *) exec "$real_id" "\$@" ;;
+esac
+EOF
+cat > "$TMP/acct-bin/getent" <<EOF
+#!$(command -v sh)
+[ "\$*" = "passwd hacct" ] || exit 2
+echo "hacct:x:\$("$real_id" -u):\$("$real_id" -g)::\${ACCT_HOME:-$RH/acct-home}:/bin/sh"
+EOF
+cat > "$TMP/acct-bin/su" <<EOF
+#!$(command -v sh)
+[ "\$1 \$2 \$3" = "- hacct -c" ] || { echo "unexpected su \$*" >> "$TMP/acct-su"; exit 97; }
+echo "as hacct" >> "$TMP/acct-su"
+exec sh -c "\$4"
+EOF
+cat > "$TMP/acct-bin/sudo" <<EOF
+#!$(command -v sh)
+[ "\$1 \$2 \$3 \$4 \$5" = "-n -H -u hacct --" ] || { echo "unexpected sudo \$*" >> "$TMP/acct-su"; exit 97; }
+echo "as hacct" >> "$TMP/acct-su"
+shift 5; exec "\$@"
+EOF
+chmod +x "$TMP/acct-bin/"*
+acct_probe() { # <account> [env...]
+  : > "$TMP/ret-calls"; : > "$TMP/acct-su"
+  env PATH="$TMP/acct-bin:$TMP/empty-bin:$PATH" HOME="$RH/h-root" CCC_FLEET_DOCTOR=1 \
+    CCC_FLEET_HARNESS_ACCOUNT="$1" "${@:2}" sh "$TMP/ret-probe.sh" > "$TMP/ret-out"
+}
+ret_home "$RH/h-root"
+ret_home "$RH/acct-home"; ret_ref "$RH/acct-home" "$RH/inst"
+acct_probe hacct RET_MEMORY="$TMP/mem-diverged.json"
+ok "harness account probe: the declared account's reference selects the harness" \
+  'grep -q "^RETIRED=frontends$" "$TMP/ret-out" && grep -qx "DOCTOR_ROOT=$RH/inst" "$TMP/ret-out" && grep -q "^DOCTOR=0$" "$TMP/ret-out"'
+ok "harness account probe: doctor and memory check run as that account on its ~/.claude" \
+  'grep -qx "doctor root=$RH/inst CCC_DOCTOR_CLAUDE_DIR=$RH/acct-home/.claude" "$TMP/ret-calls" && grep -qx "memory --json CCC_STATE_DIR=$RH/acct-home/.claude/state CCC_MEMORY_CACHE_DIR=$RH/acct-home/.claude/hooks/cache" "$TMP/ret-calls" && [ "$(cat "$TMP/acct-su")" = "$(printf "as hacct\nas hacct")" ]'
+ok "harness account probe: the memory column comes from that account" \
+  'grep -q "^MEMORY=degraded:mempalace.index-diverged$" "$TMP/ret-out" && [ "$(tail -1 "$TMP/ret-out")" = PROBE_COMPLETE=1 ]'
+# Without a reference the account's own ~/ccc-node is the candidate, not root's.
+ret_home "$RH/acct-noref"; ret_harness "$RH/acct-noref/ccc-node"; ret_harness "$RH/h-root/ccc-node"
+acct_probe hacct ACCT_HOME="$RH/acct-noref"
+ok "harness account probe: without a reference the account's home checkout is used" \
+  'grep -qx "DOCTOR_ROOT=$RH/acct-noref/ccc-node" "$TMP/ret-out" && ! grep -q "root=$RH/h-root/ccc-node" "$TMP/ret-calls"'
+rm -rf "$RH/h-root/ccc-node"
+# Every way the declared account cannot be inspected is DOCTOR=unverified (a
+# page), named, and runs nothing.
+acct_fail() { # <label> <note> <account> [env...]
+  acct_probe "${@:3}"
+  ok "harness account probe: $1 is DOCTOR=unverified $2 and runs nothing" \
+    'grep -q "^DOCTOR=unverified$" "$TMP/ret-out" && grep -qx "DOCTOR_NOTE='"$2"'" "$TMP/ret-out" && grep -q "^MEMORY=unknown$" "$TMP/ret-out" && [ ! -s "$TMP/ret-calls" ] && [ ! -s "$TMP/acct-su" ] && [ "$(tail -1 "$TMP/ret-out")" = PROBE_COMPLETE=1 ]'
+}
+acct_fail "an unknown account" unknown-account nosuch
+acct_fail "a malformed account name" invalid-account 'a;b'
+acct_fail "an account name starting with a dash" invalid-account '-x'
+acct_fail "a home that is not a plain absolute path" unknown-account hacct ACCT_HOME="relative/home"
+acct_fail "a home with shell metacharacters" unknown-account hacct ACCT_HOME="$RH/it's"
+ret_home "$RH/acct-badref"; ret_ref "$RH/acct-badref" "$RH/inst" 646
+acct_fail "an other-writable reference" unverified-reference hacct ACCT_HOME="$RH/acct-badref"
+ret_home "$RH/acct-none"
+acct_fail "an account with no harness" no-harness hacct ACCT_HOME="$RH/acct-none"
+# An empty declaration is the undeclared probe: the probing account itself.
+ret_harness "$RH/h-root/ccc-node"
+ret_probe "$RH/h-root" CCC_FLEET_DOCTOR=1 CCC_FLEET_HARNESS_ACCOUNT=
+ok "harness account probe: no declaration keeps inspecting the probing account" \
+  'grep -qx "DOCTOR_ROOT=$RH/h-root/ccc-node" "$TMP/ret-out" && grep -qx "doctor root=$RH/h-root/ccc-node CCC_DOCTOR_CLAUDE_DIR=$RH/h-root/.claude" "$TMP/ret-calls"'
+rm -rf "$RH/h-root/ccc-node"
 # (g) the #2659 incident shape end to end: a retired node whose MemPalace index
 # is diverged, probed by the watcher itself (CCC_FLEET_SELF runs the real
 # probe locally), pages on the second doctor sweep.
@@ -1515,7 +1635,7 @@ ok "visible process with unknown root is not reported DOWN" 'grep -q "^AVAIL=unv
 STATE="$TMP/state/fleet-watch.json"
 run_state() { # <nodes> [extra env...]
   OUT="$TMP/out"; RC=0
-  rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+  rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags "$TMP"/reply/*.acct
   env CCC_FLEET_NODES="$1" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ \
     CCC_FLEET_RETRY_DELAY=0 CCC_FLEET_MATRIX=0 CCC_FLEET_HANDE=0 "${@:2}" \
     bash "$SC" --state-file "$STATE" >"$OUT" 2>"$TMP/err" || RC=$?
@@ -1612,7 +1732,7 @@ okc "$RC" 2 "--state-file without a path is refused"
 # ---- --light cadence mode (#2086) -------------------------------------------
 # Never the doctor, fewer transport retries, and a run deadline.
 reply alpha /opt/ccc-node yes /opt/ccc-node
-OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags
+OUT="$TMP/out"; RC=0; rm -f "$TMP"/reply/*.seen "$TMP"/reply/*.flags "$TMP"/reply/*.acct
 CCC_FLEET_NODES="alpha" CCC_FLEET_SSH="$STUB" CCC_FLEET_SELF=_never_ CCC_FLEET_DOCTOR=1 \
   bash "$SC" --light >"$OUT" 2>"$TMP/err" || RC=$?
 okc "$RC" 0 "light mode: a healthy node passes"

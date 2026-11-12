@@ -77,6 +77,12 @@
 #                    memory-pending/unknown note), and a node with no usable
 #                    harness is `RETIRED … doctor:<reason>`, not a failure.
 #                    The per-node doctor budget (110 s) applies alike.
+#   CCC_FLEET_HARNESS_ACCOUNTS `node=account` pairs (space/comma separated,
+#                    #2773): inspect that retired node's harness as the named
+#                    account (its home, reference and ~/.claude) instead of the
+#                    probing login; failing to is `UNVERIFIED <node>
+#                    inspection=harness-account:<reason>`. A malformed value
+#                    fails the run before any probe. See docs/fleet-watch.md.
 #   CCC_FLEET_RETRIES extra attempts per node on transport failure (default 2,
 #                    capped at 5; only UNREACHABLE is retried — a node that
 #                    answers, even DOWN, is judged on its single answer)
@@ -173,6 +179,28 @@ past_deadline() { [ "$DEADLINE" -gt 0 ] && [ "$SECONDS" -ge "$DEADLINE" ]; }
 NODES="${CCC_FLEET_NODES:-seoseo dungae sogyo nosuk bangtong yukson soonwook gwakga jingun gongmyoung gongyung daegyo}"
 SSH_BIN="${CCC_FLEET_SSH:-ssh}"
 SELF="${CCC_FLEET_SELF:-$(hostname -s 2>/dev/null || echo _none_)}"
+
+# Declared harness accounts (#2773): `node=account` pairs, space or comma
+# separated. A retired node is inspected as its probing login unless one is
+# declared here, which a service-account node needs: root logs in, but the
+# harness, its self-update.repo and its ~/.claude belong to the service
+# account. Operator config, not a default table (see the stale-table defect in
+# the header). Each value ends up in a root shell on the node, so anything but
+# a plain node and account name fails the run before a single probe.
+declare -A harness_account=()
+_spec=${CCC_FLEET_HARNESS_ACCOUNTS:-}
+read -r -a _pairs <<< "${_spec//,/ }" || true
+for _pair in ${_pairs[@]+"${_pairs[@]}"}; do
+  _n=${_pair%%=*} _a=${_pair#*=}
+  if [ "$_n" = "$_pair" ] || ! [[ $_n =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] \
+     || ! [[ $_a =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || [ -n "${harness_account[$_n]+x}" ]; then
+    echo 'fleet-bridge-watch: CCC_FLEET_HARNESS_ACCOUNTS wants node=account pairs, each node once' >&2
+    echo 'UNVERIFIED watcher inspection=invalid-harness-accounts'
+    exit 1
+  fi
+  harness_account[$_n]=$_a
+done
+unset _spec _pairs _pair _n _a
 
 # Checkout roots a node may legitimately serve from. Several are in use at once
 # across the fleet (/opt on most, /root on yukson and gwakga, the Termux home on
@@ -488,24 +516,53 @@ if [ -z "$line" ]; then
     # locations that holds a doctor — ~/ccc-node, then /opt/ccc-node — under
     # the same check. Finding none is DOCTOR=- with its reason, which the
     # watcher shows but never fails on.
+    #
+    # Unless the watcher declared the harness account (#2773,
+    # CCC_FLEET_HARNESS_ACCOUNTS): a service-account node is probed as root,
+    # but its harness, reference and ~/.claude are the service account's. Then
+    # that account and its home take the probing login's place in everything
+    # above, the doctor and memory check run as it (doctor_sweep), and any
+    # way it cannot be inspected is DOCTOR=unverified with the reason — a
+    # page, because the operator said where the harness is.
     if [ "${CCC_FLEET_DOCTOR:-0}" = "1" ]; then
       runuid=$(id -u); runuser=$(id -nu 2>/dev/null || printf '%s' "$runuid")
-      root="" prepared="" bpath=$HOME cdir="$HOME/.claude" doctor_root="" doctor_note=no-harness
-      if [ -e "$cdir/self-update.repo" ] || [ -L "$cdir/self-update.repo" ]; then
-        doctor_note=unverified-reference
-        doctor_root=$(metadata installed 2>/dev/null) || doctor_root=""
-      else
-        for _cand in "$HOME/ccc-node" /opt/ccc-node; do
-          [ -f "$_cand/scripts/ccc-doctor.sh" ] || continue
-          doctor_note=unverified-harness
-          doctor_root=$(root=$_cand; metadata harness 2>/dev/null) || doctor_root=""
-          break
-        done
+      hacct=${CCC_FLEET_HARNESS_ACCOUNT:-} hhome=$HOME acct_note=""
+      if [ -n "$hacct" ]; then
+        case "$hacct" in
+          [!a-z_]*|*[!a-z0-9_-]*) acct_note=invalid-account ;;
+          *)
+            runuid=$(id -u "$hacct" 2>/dev/null) || runuid=""
+            hhome=$(getent passwd "$hacct" 2>/dev/null | cut -d: -f6)
+            runuser=$hacct
+            # The home is quoted into the `su -c` command line: plain paths only.
+            case "$runuid" in ''|*[!0-9]*) acct_note=unknown-account ;; esac
+            case "$hhome" in /*) ;; *) acct_note=unknown-account ;; esac
+            case "$hhome" in *[!A-Za-z0-9_./-]*) acct_note=unknown-account ;; esac
+            ;;
+        esac
       fi
-      if [ -n "$doctor_root" ] && [ -f "$doctor_root/scripts/ccc-doctor.sh" ]; then
-        doctor_sweep
+      if [ -n "$acct_note" ]; then
+        echo "DOCTOR=unverified"; echo "DOCTOR_NOTE=$acct_note"; echo "MEMORY=unknown"
       else
-        echo "DOCTOR=-"; echo "DOCTOR_NOTE=$doctor_note"; echo "MEMORY=unknown"
+        root="" prepared="" bpath=$hhome cdir="$hhome/.claude" doctor_root="" doctor_note=no-harness
+        if [ -e "$cdir/self-update.repo" ] || [ -L "$cdir/self-update.repo" ]; then
+          doctor_note=unverified-reference
+          doctor_root=$(metadata installed 2>/dev/null) || doctor_root=""
+        else
+          for _cand in "$hhome/ccc-node" /opt/ccc-node; do
+            [ -f "$_cand/scripts/ccc-doctor.sh" ] || continue
+            doctor_note=unverified-harness
+            doctor_root=$(root=$_cand; metadata harness 2>/dev/null) || doctor_root=""
+            break
+          done
+        fi
+        if [ -n "$doctor_root" ] && [ -f "$doctor_root/scripts/ccc-doctor.sh" ]; then
+          doctor_sweep
+        elif [ -n "$hacct" ]; then
+          echo "DOCTOR=unverified"; echo "DOCTOR_NOTE=$doctor_note"; echo "MEMORY=unknown"
+        else
+          echo "DOCTOR=-"; echo "DOCTOR_NOTE=$doctor_note"; echo "MEMORY=unknown"
+        fi
       fi
     fi
     echo "PROBE_COMPLETE=1"; exit 0
@@ -795,8 +852,11 @@ fi
 probe_node() {
   # The flag is prepended to the piped script rather than passed as an ssh
   # argument: the remote command stays exactly `sh -s`, so nothing downstream
-  # has to parse a modified argv.
+  # has to parse a modified argv. The declared harness account (#2773) is the
+  # second line, always present so a self probe never inherits one from the
+  # watcher's environment.
   payload="CCC_FLEET_DOCTOR=$2
+CCC_FLEET_HARNESS_ACCOUNT=${harness_account[$1]:-}
 $PROBE"
   # Doctor budget: its own 60s cap plus the memory check's 20s (#2659), with
   # the bridge status call's margin unchanged.
@@ -917,7 +977,15 @@ judge_node() {
       doctor=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR=//p' | head -1)
       case "$doctor" in
         '') echo "UNVERIFIED $node inspection=incomplete-doctor retired=${marker:-unknown}"; fail=1; return ;;
-        unverified) echo "UNVERIFIED $node inspection=harness-reference retired=${marker:-unknown}"; fail=1; return ;;
+        unverified)
+          # A declared harness account (#2773) names why it was not inspected.
+          doctor_note=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR_NOTE=//p' | head -1 | tr -cd 'a-z-' | cut -c1-40)
+          if [ -n "$doctor_note" ]; then
+            echo "UNVERIFIED $node inspection=harness-account:$doctor_note retired=${marker:-unknown}"
+          else
+            echo "UNVERIFIED $node inspection=harness-reference retired=${marker:-unknown}"
+          fi
+          fail=1; return ;;
       esac
       if [ "$doctor" = - ]; then
         doctor_note=$(printf '%s\n' "$out" | sed -n 's/^DOCTOR_NOTE=//p' | head -1 | tr -cd 'a-z-' | cut -c1-40)
