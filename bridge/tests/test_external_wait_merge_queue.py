@@ -162,6 +162,21 @@ async def test_queued_then_merged_wakes_once_and_resumes(tmp_path: Path) -> None
 
 
 @pytest.mark.anyio
+async def test_merge_at_the_deadline_is_read_before_expiring(tmp_path: Path) -> None:
+    """#2740 ⑤: the deadline passed while nobody polled; the PR landed meanwhile."""
+    clock = Clock()
+    transport = QueueTransport([_queued(in_queue=False, state="MERGED")])
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+    clock.advance(100_001)
+
+    await _run(monitor, clock, 1)
+
+    assert transport.queue_calls == 1
+    assert registry.get(wait_id)["terminal_status"] == TERMINAL_MERGED
+    assert len(recorder.resumes) == 1
+
+
+@pytest.mark.anyio
 async def test_eviction_after_queue_seen_names_the_failed_group_run(tmp_path: Path) -> None:
     clock = Clock()
     transport = QueueTransport([_queued(), _queued(in_queue=False)], failed_run=36990888999)

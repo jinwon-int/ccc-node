@@ -705,6 +705,7 @@ _SKIP_REASON_TEXT = {
     "non_terminal_rollup": "the result says nothing about the watched CI",
     "no_promise_recorded": "no next step was recorded",
     "resume_failed": "the continuation turn did not run",
+    "resume_interrupted": "the bridge restarted during the continuation turn",
 }
 
 
@@ -934,15 +935,26 @@ class ExternalWaitMonitor:
             # deadline is downgraded, not expired.
             await self._poll_detached_job(record, now)
             return
-        if now >= float(record.get("expires_epoch") or 0):
-            self._registry.finish(wait_id, TERMINAL_EXPIRED, now=now)
-            return
+        expired = now >= float(record.get("expires_epoch") or 0)
+        # At the deadline, ask GitHub once more before expiring (#2740): a
+        # node that was down, or a monitor loop held up by a long resume
+        # turn, reaches the deadline late, and the watched result may have
+        # arrived meanwhile. A terminal answer ends the wait as usual; any
+        # other answer (still pending, a read error) expires it below — unless
+        # that read error was the last allowed one, which ends it
+        # ``monitor-error`` exactly as on any other poll.
         if record.get("source") == SOURCE_GITHUB_MERGE_QUEUE:
             await self._poll_merge_queue(record, now)
-            return
-        if record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
+        elif record.get("source") == SOURCE_GITHUB_ACTIONS_RUN:
             await self._poll_actions_run(record, now)
-            return
+        else:
+            await self._poll_pr_checks(record, now)
+        if expired and self._registry.finish(wait_id, TERMINAL_EXPIRED, now=now):
+            self._transport_errors.pop(wait_id, None)
+            self._provisional_greens.pop(wait_id, None)
+
+    async def _poll_pr_checks(self, record: Dict[str, Any], now: float) -> None:
+        wait_id = record["wait_id"]
         try:
             state = await self._transport.fetch_pr_state(record["repo"], int(record["pr_number"]))
         except TransportError as exc:
@@ -1240,6 +1252,13 @@ class ExternalWaitMonitor:
             self._registry.mark_wake(wait_id, delivered=False, now=self._clock())
             return
 
+        # Journal the start before awaiting the continuation (#2740): on
+        # Telegram it is a whole agent turn, and a restart during it used to
+        # leave the wake ``pending``, so the next process sent the notice and
+        # ran the same continuation again.
+        if self._registry.mark_resume_started(wait_id, now=self._clock()) is False:
+            logger.info("External-wait wake no longer pending; continuation not run: wait=%s", wait_id)
+            return
         resumed = await self._run_resume(record)
         if resumed:
             self._registry.mark_wake(wait_id, delivered=True, resumed=True)

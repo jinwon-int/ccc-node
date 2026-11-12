@@ -21,6 +21,7 @@ from telegram_bot.core.external_wait import (
     SOURCE_GITHUB_ACTIONS_RUN,
     STATE_MONITORING,
     TERMINAL_CANCELLED,
+    TERMINAL_EXPIRED,
     TERMINAL_FAILURE,
     TERMINAL_MONITOR_ERROR,
     TERMINAL_SUCCESS,
@@ -284,6 +285,35 @@ async def test_failure_records_the_conclusion_and_still_resumes(tmp_path: Path) 
     assert record["state"] == TERMINAL_FAILURE
     assert "Run conclusion: timed_out" in recorder.notifications[0][1]
     assert "conclusion=timed_out" in recorder.resumes[0][1]
+
+
+@pytest.mark.anyio
+async def test_run_finished_at_the_deadline_is_read_before_expiring(tmp_path: Path) -> None:
+    """#2740 ⑤: past the deadline the run is read once more, not expired blind."""
+    clock = Clock()
+    transport = RunTransport([_run("completed", "success")])
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+    clock.advance(100_001)
+
+    await _drive(monitor, clock, 1)
+
+    assert len(transport.calls) == 1
+    assert registry.get(wait_id)["state"] == TERMINAL_SUCCESS
+    assert len(recorder.resumes) == 1
+
+
+@pytest.mark.anyio
+async def test_run_still_running_at_the_deadline_expires(tmp_path: Path) -> None:
+    clock = Clock()
+    transport = RunTransport([_run("in_progress")])
+    registry, wait_id, recorder, monitor = _setup(tmp_path, transport, clock)
+    clock.advance(100_001)
+
+    await _drive(monitor, clock, 2)
+
+    assert len(transport.calls) == 1
+    assert registry.get(wait_id)["state"] == TERMINAL_EXPIRED
+    assert recorder.resumes == []
 
 
 @pytest.mark.anyio
