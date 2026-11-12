@@ -389,6 +389,16 @@ out="$(python3 "$MOD" sweep "$CCC_DETACHED_JOBS_REGISTRY")"
 ok "#2710: register --user records scope=user and a live user unit is running, not lost" \
   'grep -q "진행 중" <<<"$out" && ! grep -q "소식 없음" <<<"$out"'
 
+# ---- #2728: the bridge wait must learn the unit's scope ----------------------
+reg2636
+python3 "$MOD" register --unit uarm --log "$TMP/uarm.log" --user --expect 30m >/dev/null
+ok "#2728: register --user hands scope=user to the bridge wait" \
+  '[ "$(arm_count)" = 1 ] && grep -q -- "--unit uarm .*--scope user" "$ARMS"'
+reg2636
+python3 "$MOD" register --unit sarm --log "$TMP/sarm.log" --expect 30m >/dev/null
+ok "#2728: a system-scope registration passes no --scope (same argv as before)" \
+  '[ "$(arm_count)" = 1 ] && grep -q -- "--unit sarm " "$ARMS" && ! grep -q -- "--scope" "$ARMS"'
+
 # Non-root + system manager auth error → hint to use --user.
 write_exec_stub "$TMP/bin/systemd-run" <<'SH'
 echo "Failed to start transient timer unit: Interactive authentication required." >&2

@@ -639,7 +639,7 @@ def cmd_register(argv: List[str]) -> int:
     if plan["timeout_seconds"] is None:
         sys.stdout.write(f"hint: {plan['reason']}\n")
     _arm_bridge_wait(unit, rec["log"], summary, timeout_seconds=plan["timeout_seconds"],
-                     log_offset=baseline)
+                     log_offset=baseline, user=rec.get("scope") == SCOPE_USER)
     return rc
 
 
@@ -944,7 +944,7 @@ def _bridge_python() -> str:
 
 
 def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds: Optional[int] = None,
-                     log_offset: int = 0) -> None:
+                     log_offset: int = 0, user: bool = False) -> None:
     """Best-effort: register the job as a bridge ``detached-job`` wait (ccc-node #2605).
 
     Inside a bridge turn this puts ``⏳ Running detached · <unit>`` on the
@@ -955,8 +955,10 @@ def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds:
     is given, it does nothing; the job registry above is never affected.
     ``timeout_seconds`` (#2636) sizes the wait to the caller's expectation;
     None keeps the bridge default. ``log_offset`` (#2740) is always passed, so
-    the wait ignores exactly the markers this registry entry ignores — the
-    bridge cannot measure it for a ``--user`` unit.
+    the wait ignores exactly the markers this registry entry ignores.
+    ``user`` (#2728) hands the bridge the unit's scope: without it the wait
+    asked the system manager about a ``--user`` unit and called it lost. A
+    system-scope registration sends the same argv as before.
     """
     if os.environ.get("CCC_DETACHED_JOBS_NO_WAIT", "").strip() in {"1", "true", "yes", "on"}:
         return
@@ -972,6 +974,8 @@ def _arm_bridge_wait(unit: str, log_path: str, summary: str, *, timeout_seconds:
     if timeout_seconds is not None:
         cmd += ["--timeout-seconds", str(int(timeout_seconds))]
     cmd += ["--log-offset", str(max(0, int(log_offset)))]
+    if user:
+        cmd += ["--scope", SCOPE_USER]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
