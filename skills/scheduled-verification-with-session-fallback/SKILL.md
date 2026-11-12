@@ -94,6 +94,28 @@ not a justification.
 - Emit an explicit completion marker (e.g. `EXIT=0` line) so a later session can
   distinguish "ran and passed", "ran and failed", and "never ran".
 - Include the task/issue ID in the output for traceability.
+- **Set `HOME` explicitly.** A system unit (no `User=`) runs with `HOME`
+  unset. `~` and Python `os.path.expanduser` still fall back to the passwd
+  entry, but a literal `$HOME` expands to an empty string: `$HOME/.x` becomes
+  `/.x` and `for d in $HOME /home/*` silently drops the root home. Branches
+  that run over `ssh` get a login `HOME`, so only the local node's own row goes
+  wrong — as `none`/`0`, not as an error. Put `Environment=HOME=/root` (or the
+  service user's home) in the unit, or `export HOME=…` at the top of the
+  script, and make a missing input file an error rather than an empty result.
+  Check before scheduling: `systemd-run --wait --pipe --quiet /bin/sh -c 'echo "HOME=[${HOME:-}]"'`.
+- **Deliver the verdict where it is tracked.** A chat/spool notification is not
+  delivery: if the check exists to settle an issue, either
+  1. post the result from the script (`gh issue comment <n> --body-file …`,
+     then write `COMMENT=posted` or `COMMENT=failed` to the output), when the
+     comment is factual and posting is within the approved scope; or
+  2. if the verdict needs a session's judgment, say so in the notification
+     ("needs a comment on <repo>#<n>") and add a pending-publish line (issue
+     URL + artifact path) to `working-state.md` in step 4, so the next session
+     sees an open item rather than a delivered alert.
+- One-shot units: have the script disable its own timer after it runs, and
+  write the reason on the tracking issue when you disable one early. Before
+  re-enabling a disabled unit, read that issue — a cancellation note means the
+  disable was intentional.
 
 ### 4. Record the working-state fallback ALWAYS
 
@@ -114,7 +136,11 @@ used — the explicit session-boundary risk. Never promise auto-resume for tier 
 
 ### 6. Next session: verify, then classify
 
-- Artifacts present → parse and report.
+- Artifacts present → parse and report, then confirm the verdict is on the
+  tracking issue (`COMMENT=posted`, or a comment after the fire time). A
+  notification that says "a session will summarize this" is still owed.
+- Any row that reads `none`/`0` only for the local node → suspect the `HOME`
+  rule in step 3 before trusting it; re-run that row with `HOME` set.
 - Artifacts absent → **the scheduler failed**. Do not re-schedule on the same
   tier. Re-probe capability (step 1), and if a higher tier was wrongly rejected,
   correct the recorded constraint before rescheduling.
@@ -151,6 +177,19 @@ approved window because its expiry timer was gone. Lessons: a transient timer
 survives session death but not a reboot; a reboot hold does not cancel a
 reboot that is already queued.
 
+### Third failure — ran, passed, never delivered (2026-11-05, #2646)
+
+A persistent one-shot timer ran a fleet re-check on time and exited 0 with a
+PASS verdict. The script only queued a chat notification ("a session will
+summarize this on #2646"); no session picked it up, so the issue sat open with
+an active claim for a week. The same run reported the local node as `t0=none`:
+its script read `$HOME/.claude/state/…` under a system unit where `HOME` was
+empty, while the remote rows (over `ssh`) were correct. An audit of the same
+node's other scheduled units found the same `$HOME` pattern in an inventory
+script whose local row came back empty while 11 matching config entries were
+present. Lessons: a delivered notification is not a delivered verdict, and
+`HOME` must be set explicitly in system units.
+
 ## Safety
 
 - Tier 4 (session-bounded) is best-effort and fails **silently** — never treat as guaranteed.
@@ -166,4 +205,7 @@ reboot that is already queued.
 2. Chosen tier logged with the rejection reason for each higher tier.
 3. Unit/job ID + fire time confirmed via `systemctl list-timers` (tiers 1–2).
 4. `working-state.md` fallback written and path reported.
-5. Next session: expected artifact exists; if not, re-probe capability before rescheduling.
+5. Unit or script sets `HOME`; the check's verdict has a delivery path to its
+   tracking issue (script posts it, or a pending-publish line exists).
+6. Next session: expected artifact exists and the verdict is on the issue; if
+   the artifact is missing, re-probe capability before rescheduling.
