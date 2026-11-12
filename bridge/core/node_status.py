@@ -3,7 +3,9 @@
 One call collects what used to take several shell probes (#1694): serving
 checkout state and bridge process (``ccc-bridge-locate.sh --json``), service/
 transport/provider health (``bridge/start.sh --status`` text, parsed), and
-scheduler/task occupancy (``agent-cron.sh status --json``).  The module is
+scheduler/task occupancy (``agent-cron.sh status --json``).  On a node whose
+frontend list (#2342) retires Telegram, service health comes from the declared
+frontends' own ``health.json`` instead (#2771).  The module is
 stdlib-only so it also runs remotely over ssh with any python3.
 
 Principles from issue #1694: every section carries ``status: ok|unknown``
@@ -117,6 +119,115 @@ def _parse_bridge_status(text: str) -> dict[str, Any]:
     }
 
 
+# Non-Telegram frontends write the same body-free ``health.json`` schema under
+# ``<bridge home>/.ccc-<name>/`` (#2771). A file older than this is stale —
+# the same bound ccc-doctor uses for hande bot health.
+FRONTEND_HEALTH_DIRS = {"matrix": ".ccc-matrix", "hande": ".ccc-hande"}
+FRONTEND_HEALTH_STALE_SECONDS = 300
+_FRONTEND_HEALTH_READ_LIMIT = 1 << 18
+_HEALTHY_STATES = {"available", "healthy"}
+
+
+def _declared_frontends(env: Mapping[str, str]) -> set[str] | None:
+    """Operator-owned frontend list (#2342), or None when not declared.
+
+    Same contract as ccc-doctor's ``frontends()``: ``CCC_FRONTENDS`` (comma/
+    space separated) wins over ``$HOME/.claude/frontends`` (one name per line,
+    ``#`` comments). None keeps the legacy Telegram-bridge assumption.
+    """
+
+    text = str(env.get("CCC_FRONTENDS", "")).strip()
+    if not text:
+        home = str(env.get("HOME", "")).strip()
+        if not home:
+            return None
+        try:
+            text = (Path(home) / ".claude" / "frontends").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+    names: set[str] = set()
+    for line in text.splitlines():
+        names.update(re.split(r"[\s,]+", line.split("#", 1)[0].strip()))
+    names.discard("")
+    return names
+
+
+def _frontend_health(name: str, home: Path, now: float) -> dict[str, Any]:
+    """Body-free summary of one frontend's ``health.json``; unknown on failure."""
+
+    directory = FRONTEND_HEALTH_DIRS.get(name)
+    if directory is None:
+        return {"status": "unknown", "error": "no health source for this frontend"}
+    path = home / directory / "health.json"
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_FRONTEND_HEALTH_READ_LIMIT + 1)
+            mtime = os.fstat(handle.fileno()).st_mtime
+    except FileNotFoundError:
+        return {"status": "unknown", "error": "health.json missing"}
+    except OSError as error:
+        return {"status": "unknown", "error": f"unreadable: {error.__class__.__name__}"}
+    if len(raw) > _FRONTEND_HEALTH_READ_LIMIT:
+        return {"status": "unknown", "error": "health.json exceeds the size bound"}
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"status": "unknown", "error": "unparseable health.json"}
+    if not isinstance(document, dict):
+        return {"status": "unknown", "error": "unparseable health.json"}
+
+    def state(key: str) -> str:
+        block = document.get(key)
+        value = block.get("state") if isinstance(block, dict) else None
+        return value if isinstance(value, str) else "unknown"
+
+    process = document.get("process")
+    pid = process.get("pid") if isinstance(process, dict) else None
+    age = max(0, int(now - mtime))
+    service_state = state("service")
+    return {
+        "status": "ok",
+        "service": service_state,
+        "claude": state("claude"),
+        "agent": state("agent"),
+        "pid": pid if isinstance(pid, int) else "unknown",
+        "age_seconds": age,
+        "stale": age > FRONTEND_HEALTH_STALE_SECONDS,
+        "healthy": service_state.lower() in _HEALTHY_STATES and age <= FRONTEND_HEALTH_STALE_SECONDS,
+    }
+
+
+def _retired_telegram_service(
+    parsed: dict[str, Any] | None,
+    frontends: set[str],
+    home: Path,
+    now: float,
+) -> dict[str, Any]:
+    """Service verdict for a node whose frontend list retires Telegram (#2771).
+
+    The Telegram probe still runs: a retired bridge that is alive again is
+    drift (the same rule as ccc-doctor's ``retired_bridge_status_verdict``).
+    Health comes from the declared frontends' own ``health.json``.
+    """
+
+    service: dict[str, Any] = dict(parsed or {})
+    service["telegram"] = "retired (frontend list)"
+    if parsed is not None and str(parsed.get("process", "")).lower().startswith("alive"):
+        service["telegram_drift"] = "retired but running"
+    declared = sorted(frontends - {"telegram"})
+    blocks = {name: _frontend_health(name, home, now) for name in declared}
+    service["frontends"] = blocks
+    if any(block.get("status") == "ok" and block.get("healthy") is False for block in blocks.values()):
+        service["healthy"] = False
+    elif blocks and all(block.get("healthy") is True for block in blocks.values()):
+        service["healthy"] = True
+    else:
+        # No declared frontend, or one without a readable health source:
+        # report unknown rather than fabricate a verdict (#1694).
+        service["healthy"] = "unknown"
+    return service
+
+
 def collect_local(
     *,
     env: Mapping[str, str] | None = None,
@@ -162,17 +273,24 @@ def collect_local(
     sections["bridge_process"] = bridge
 
     default_project = str(environment.get("CCC_BRIDGE_DEFAULT_PATH", "")).strip() or str(Path.home())
+    bridge_home = project_path or default_project
     section, stdout = _run_section(
         "service",
         _collector_cmd("bridge_status", repo / "bridge" / "start.sh", environment)
-        + ["--path", project_path or default_project, "--status"],
+        + ["--path", bridge_home, "--status"],
         runner,
     )
     service: dict[str, Any] = {**section}
-    if section["status"] == "ok":
-        service.update(_parse_bridge_status(stdout))
+    parsed = _parse_bridge_status(stdout) if section["status"] == "ok" else None
+    if parsed is not None:
+        service.update(parsed)
     else:
         partial = True
+    frontends = _declared_frontends(environment)
+    if frontends is not None and "telegram" not in frontends:
+        service.update(
+            _retired_telegram_service(parsed, frontends, Path(bridge_home), _dt.datetime.now().timestamp())
+        )
     sections["service"] = service
 
     section, stdout = _run_section(
