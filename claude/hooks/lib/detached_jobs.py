@@ -420,20 +420,20 @@ def classify_one(rec: Dict[str, Any], *, now: Optional[float] = None) -> Tuple[s
     if code is not None:
         return STATE_DONE, code
     age = _log_age(log_path)
-    user = rec.get("scope") == SCOPE_USER
-    if age is None:
-        # No log at all. If the unit is up the job simply has not written yet;
-        # otherwise there is no evidence anywhere and it must be investigated.
-        # A scheduled job (#2636) is "running" while its timer is still armed.
-        unit = str(rec.get("unit") or "")
-        if unit_is_active(unit, user=user):
-            return STATE_RUNNING, None
-        if rec.get("scheduled_at") and unit_is_active(unit, suffix=".timer", user=user):
-            return STATE_RUNNING, None
-        return STATE_LOST, None
-    if age < STALE_SECONDS:
+    if age is not None and age < STALE_SECONDS:
         return STATE_RUNNING, None
-    if unit_is_active(str(rec.get("unit") or ""), user=user):
+    # No log at all, or one that has been quiet past the threshold: the unit
+    # decides. If it is up the job simply has not written (yet, or lately).
+    # A scheduled job (#2636) is "running" while its timer is still armed —
+    # with a quiet log too (#2778): scheduling again under the same log leaves
+    # the previous run's output there, and that run's silence says nothing
+    # about a job that has not started. Otherwise there is no evidence
+    # anywhere and it must be investigated.
+    unit = str(rec.get("unit") or "")
+    user = rec.get("scope") == SCOPE_USER
+    if unit_is_active(unit, user=user):
+        return STATE_RUNNING, None
+    if rec.get("scheduled_at") and unit_is_active(unit, suffix=".timer", user=user):
         return STATE_RUNNING, None
     return STATE_LOST, None
 

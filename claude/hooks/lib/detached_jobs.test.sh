@@ -483,6 +483,78 @@ PY
 )"
 ok "#2740 read_exit_marker: shorter-than-offset log read whole, marker before the offset ignored, bad offset fails closed" '[ "$code" = "7 None None" ]'
 
+# ---- #2778: a re-scheduled job is alive while its timer is armed -------------
+# `schedule` under the same unit and log leaves the previous run's output in
+# the log. That log is long quiet, so the sweep took the "log exists" branch,
+# which asked only about the .service — and called an armed timer lost.
+R2778="$TMP/reg2778.jsonl"
+write_exec_stub "$TMP/bin/systemd-run" <<'SH'
+exit 0
+SH
+write_exec_stub "$TMP/bin/loginctl" <<'SH'
+echo "Linger=yes"
+SH
+old_log() { printf 'yesterday\nEXIT=0\n' > "$1"; touch -d '2 hours ago' "$1" 2>/dev/null || touch -t 200001010000 "$1"; }
+
+: > "$R2778"; old_log "$TMP/resched.log"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+[ "$1" = "is-active" ] && [ "$2" = "resched.timer" ] && { echo active; exit 0; }
+exit 3
+SH
+python3 "$MOD" schedule --unit resched --at 05:00 --log "$TMP/resched.log" --registry "$R2778" -- true >/dev/null 2>&1
+ok "#2778 setup: the re-schedule recorded scheduled_at and skips the previous run's marker" \
+  'python3 -c "import json,sys; r=[json.loads(l) for l in open(sys.argv[1]) if l.strip()][-1]; assert r[\"scheduled_at\"]==\"05:00\" and r[\"log_offset\"]>0" "$R2778"'
+out="$(python3 "$MOD" sweep "$R2778")"
+ok "#2778: a re-scheduled job with a long-quiet log is running while its timer is armed" \
+  'grep -q "진행 중" <<<"$out" && grep -q "⏰ 05:00" <<<"$out" && ! grep -q "소식 없음" <<<"$out"'
+
+: > "$R2778"; old_log "$TMP/uresched.log"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+[ "$1" = "--user" ] && [ "$3" = "uresched.timer" ] && { echo active; exit 0; }
+exit 3
+SH
+python3 "$MOD" schedule --unit uresched --at 05:00 --log "$TMP/uresched.log" --user --registry "$R2778" -- true >/dev/null 2>&1
+out="$(python3 "$MOD" sweep "$R2778")"
+ok "#2778: the same for a --user timer, asked of systemctl --user" \
+  'grep -q "진행 중" <<<"$out" && ! grep -q "소식 없음" <<<"$out"'
+
+# The timer fired and is gone, the job wrote its own marker after the offset.
+printf 'today\nEXIT=3\n' >> "$TMP/uresched.log"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+exit 3
+SH
+out="$(python3 "$MOD" sweep "$R2778")"
+ok "#2778: once it fires, the marker written after the offset ends it with its own exit code" \
+  'grep -q "uresched" <<<"$out" && grep -q "EXIT=3" <<<"$out" && ! grep -q "EXIT=0" <<<"$out"'
+
+# Timer gone and nothing written since: still lost, as before.
+: > "$R2778"; old_log "$TMP/gone.log"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+[ "$1" = "is-active" ] && [ "$2" = "gone.timer" ] && { echo active; exit 0; }
+exit 3
+SH
+python3 "$MOD" schedule --unit gone --at 05:00 --log "$TMP/gone.log" --registry "$R2778" -- true >/dev/null 2>&1
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+exit 3
+SH
+out="$(python3 "$MOD" sweep "$R2778")"
+ok "#2778: a scheduled job whose timer is gone with no new marker is still lost" 'grep -q "소식 없음" <<<"$out"'
+
+# A record without scheduled_at never asks about a timer, even one that is up.
+: > "$R2778"; printf 'started\n' > "$TMP/plain2778.log"
+touch -d '2 hours ago' "$TMP/plain2778.log" 2>/dev/null || touch -t 200001010000 "$TMP/plain2778.log"
+ASKED="$TMP/asked2778.log"; : > "$ASKED"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+printf '%s\n' "$*" >> "${ASKED_LOG:?}"
+case "$*" in *plain2778.timer*) echo active; exit 0;; esac
+exit 3
+SH
+ASKED_LOG="$ASKED" python3 "$MOD" register --unit plain2778 --log "$TMP/plain2778.log" --registry "$R2778" >/dev/null
+: > "$ASKED"
+out="$(ASKED_LOG="$ASKED" python3 "$MOD" sweep "$R2778")"
+ok "#2778: a record without scheduled_at is judged as before (lost) and no timer is asked about" \
+  'grep -q "소식 없음" <<<"$out" && grep -q "plain2778.service" "$ASKED" && ! grep -q "\.timer" "$ASKED"'
+
 # The summary line format is load-bearing: validate-harness.sh's
 # suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
 # reads as a suite that asserted nothing.
