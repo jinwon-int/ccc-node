@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Delegated-approval Phase 1 shadow recorder (a2a-nexus#2317, ccc-node#2137) — hermetic.
 # Wires codex/skills/gh-pr-flow/scripts/delegated_approval_shadow_test.py into the hook-test
-# suite and checks the four entrypoints parse --help. No gh, no network.
+# and delegated_approval_reconcile_test.py into the hook-test suite and checks every entrypoint
+# parses --help. No gh, no ssh, no network.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 D="$ROOT/codex/skills/gh-pr-flow/scripts"
@@ -9,6 +10,10 @@ pass=0; fail=0
 TMP="$(mktemp -d)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 if python3 "$D/delegated_approval_shadow_test.py" >"$TMP/unit.out" 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: shadow recorder unit suite"; tail -30 "$TMP/unit.out"; fi
+if python3 "$D/delegated_approval_reconcile_test.py" >"$TMP/unit2.out" 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: collect/reconcile unit suite"; tail -30 "$TMP/unit2.out"; fi
+for sub in "collect" "reconcile"; do
+  if python3 "$D/delegated_approval_reconcile.py" "$sub" --help >/dev/null 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: reconcile.py $sub --help"; fi
+done
 for sub in "record" "ask" "decide" "summary"; do
   if python3 "$D/delegated_approval_shadow.py" "$sub" --help >/dev/null 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $sub --help"; fi
 done

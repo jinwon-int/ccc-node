@@ -67,10 +67,52 @@ They are record-only too: nothing here changes whether an approval is submitted.
 - `ask`, `decide` and `record` are best-effort: quiet on stdout, exit 0, one
   line on stderr. `CCC_DELEGATED_SHADOW=0` turns all three off.
 
-Not in this slice: the `gh-pr-flow` step that calls `ask`, the reply hook that
-classifies the owner's answer, and `reconcile` (PR outcomes read back from
-GitHub). Until they land, `ask` and `decide` are called by hand or not at all,
-and `implicit_ask` shows how many approvals had no recorded request.
+Not yet: the `gh-pr-flow` step that calls `ask` and the reply hook that
+classifies the owner's answer. Until they land, `ask` and `decide` are called
+by hand or not at all, and `implicit_ask` shows how many approvals had no
+recorded request.
+
+## Collect and reconcile (window verdict helpers)
+
+`delegated_approval_reconcile.py` sits next to the recorder. Both commands only
+read: one `cat` per node, `gh` list/view calls. They never write a ledger row.
+
+```bash
+R=~/.codex/skills/gh-pr-flow/scripts/delegated_approval_reconcile.py
+# 1) every node's ledger into one directory (nodes from --node or CCC_FLEET_NODES;
+#    CCC_FLEET_SELF is read locally; CCC_FLEET_SSH overrides the ssh command)
+python3 "$R" collect --out ./ledgers
+# → nodes{status ok|no-ledger|unreachable, rows, dropped}, without_recorder, unreachable, complete
+# 2) what GitHub shows for the same window, against those ledgers
+python3 "$R" reconcile --since 2026-10-28T04:22:00+09:00 --until 2026-11-11T04:22:00+09:00 \
+  $(for f in ./ledgers/*.jsonl; do printf -- '--ledger %s ' "$f"; done)
+# → closed{merged, unmerged}, by_tier, l1{total, merged, closed_unmerged, changes_requested,
+#   hold_comment, reverted, refused[], approved_as_asked_rate}, coverage{…}, errors, complete
+```
+
+- `reconcile` lists every PR merged or closed-unmerged in `[since, until)` in
+  the given repositories (default: the repositories in the ledgers) and
+  classifies each with the recorder's own path and size rules. A PR on a base
+  other than `main`/`master` counts as L3 (promotion branch).
+- For the **L1** ones it looks for a refusal a person left on GitHub: closed
+  without merging, a `CHANGES_REQUESTED` review, a comment that starts with
+  `⛔ hold` (the hold channel in spec Q1), and a merged `Revert …` PR that names
+  it within seven days. `l1.approved_as_asked_rate` is spec §10.2 **5-b**;
+  `l1.refused` and `l1.reverted_prs` feed **5-c** together with
+  `summary`'s `asks.upward_misjudgement`.
+- `coverage` says how much of what merged the ledgers saw: `outside_ledger`
+  (merged without a recorded approval), `outside_by_bot`, `l1_outside_ledger`.
+  `collect` names the nodes without a recorder. Both go into the verdict as
+  counts (spec §10.2 "측정 방법").
+- A repository that fails after three tries is listed in `errors`, adds nothing
+  to the totals, and makes the exit code 1 — a partial report is never passed
+  off as complete. Same for an unreachable node in `collect`.
+- Nothing textual is kept: titles are read only for the PR number a revert
+  names, reviews for their state, comments for the marker.
+
+Run on 2026-11-12 over the Phase 1 window: 12 nodes collected (one without a
+recorder), 630 merged and 3 closed-unmerged PRs in 16 repositories, 53 L1, none
+refused or reverted, 87 merges outside the ledgers (13 by bots, 10 of them L1).
 
 ## Review (Q5)
 
