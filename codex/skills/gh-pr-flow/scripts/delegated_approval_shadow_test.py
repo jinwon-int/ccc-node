@@ -179,11 +179,20 @@ class AskDecisionTest(unittest.TestCase):
 
     def test_every_way_an_ask_can_end(self) -> None:
         t0, day = 10_000.0, 86400.0
-        self._ask(1, "a", t0); self._approve(1, "a", t0 + 60)                      # approved
-        self._ask(2, "a", t0); self._decide(2, "a", "decline", t0 + 60)           # owner chose another option
-        self._ask(3, "a", t0); self._decide(3, "a", "hold", t0 + 60)              # explicit hold
-        self._ask(4, "a", t0); self._decide(4, "a", "closed-unmerged", t0 + 60, source="github")
-        self._ask(5, "a", t0); self._ask(5, "b", t0 + 60)                          # new head before any answer
+        # approved
+        self._ask(1, "a", t0)
+        self._approve(1, "a", t0 + 60)
+        # owner chose another option
+        self._ask(2, "a", t0)
+        self._decide(2, "a", "decline", t0 + 60)
+        # explicit hold
+        self._ask(3, "a", t0)
+        self._decide(3, "a", "hold", t0 + 60)
+        self._ask(4, "a", t0)
+        self._decide(4, "a", "closed-unmerged", t0 + 60, source="github")
+        # new head before any answer
+        self._ask(5, "a", t0)
+        self._ask(5, "b", t0 + 60)
         self._ask(6, "a", t0)                                                      # never answered
         self._ask(7, "a", t0 + day)                                                # asked just now
         until = t0 + day + 3600
@@ -194,13 +203,20 @@ class AskDecisionTest(unittest.TestCase):
 
     def test_the_first_answer_wins_and_notes_do_not_close_an_ask(self) -> None:
         t0 = 20_000.0
-        self._ask(1, "a", t0); self._decide(1, "a", "decline", t0 + 10); self._approve(1, "a", t0 + 20)
+        self._ask(1, "a", t0)
+        self._decide(1, "a", "decline", t0 + 10)
+        self._approve(1, "a", t0 + 20)
         self.assertEqual(self._resolution(1, "a", t0 + 100), "decline")  # a refusal stays a refusal
-        self._ask(2, "a", t0); self._decide(2, "a", "reply-unclassified", t0 + 10)
+        self._ask(2, "a", t0)
+        self._decide(2, "a", "reply-unclassified", t0 + 10)
         self.assertEqual(self._resolution(2, "a", t0 + 100), "open")
-        self._ask(3, "a", t0); self._approve(3, "a", t0 + 3 * 86400)             # late approval, not "expired"
+        # late approval, not "expired"
+        self._ask(3, "a", t0)
+        self._approve(3, "a", t0 + 3 * 86400)
         self.assertEqual(self._resolution(3, "a", t0 + 4 * 86400), "approve")
-        self._ask(4, "a", t0); self._approve(4, "b", t0 + 10)                     # approved at another head
+        # approved at another head
+        self._ask(4, "a", t0)
+        self._approve(4, "b", t0 + 10)
         self.assertEqual(self._resolution(4, "a", t0 + 100), "superseded")
 
     def test_a_decision_on_another_head_or_before_the_ask_is_ignored(self) -> None:
@@ -212,10 +228,18 @@ class AskDecisionTest(unittest.TestCase):
 
     def test_summary_counts_l1_refusals_inside_the_window_only(self) -> None:
         t0 = 40_000.0
-        self._ask(1, "a", t0, paths=("docs/a.md",)); self._decide(1, "a", "decline", t0 + 5)       # L1 refused
-        self._ask(2, "a", t0, paths=("scripts/x.py",)); self._decide(2, "a", "hold", t0 + 5)       # L2 refused
-        self._ask(3, "a", t0, paths=("docs/b.md",)); self._approve(3, "a", t0 + 5)                 # L1 approved
-        self._ask(4, "a", t0 - 5000, paths=("docs/c.md",)); self._decide(4, "a", "decline", t0 - 4000)  # before the window
+        # L1 refused
+        self._ask(1, "a", t0, paths=("docs/a.md",))
+        self._decide(1, "a", "decline", t0 + 5)
+        # L2 refused
+        self._ask(2, "a", t0, paths=("scripts/x.py",))
+        self._decide(2, "a", "hold", t0 + 5)
+        # L1 approved
+        self._ask(3, "a", t0, paths=("docs/b.md",))
+        self._approve(3, "a", t0 + 5)
+        # before the window
+        self._ask(4, "a", t0 - 5000, paths=("docs/c.md",))
+        self._decide(4, "a", "decline", t0 - 4000)
         self._decide(3, "a", "reply-unclassified", t0 + 6)
         s = sh.summarize(sh.read_ledger(self.path), since=t0 - 100, until=t0 + 100)
         a = s["asks"]
@@ -242,7 +266,8 @@ class AskDecisionTest(unittest.TestCase):
         v1 = {"schema": "ccc.delegated-approval-shadow.v1", "repo": self.REPO, "pr": 1, "head": "a" * 40,
               "shadow_tier": "L2", "rule_id": "v0.L2.code", "ts": "x", "ts_epoch": t0 + 5}
         sh.append_ledger(self.path, v1)
-        self._ask(1, "a", t0); self._ask(1, "a", t0 + 1)
+        self._ask(1, "a", t0)
+        self._ask(1, "a", t0 + 1)
         s = sh.summarize(sh.read_ledger(self.path), since=t0 - 1, until=t0 + 100)
         self.assertEqual((s["total"], s["asks"]["total"], s["asks"]["by_resolution"]["approve"]), (1, 1, 1))
         self.assertEqual(s["implicit_ask"], {"approvals": 0, "implicit": 0, "rate": None})  # v1 rows carry no flag
