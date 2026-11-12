@@ -1605,6 +1605,83 @@ PY
 ok "#2739 a duplicate inside one payload closes only the intended fact" \
   'rq "SELECT valid_to IS NULL FROM peer_facts WHERE fact LIKE \"%master 아니라 main%\"" | grep -q "(1,)" && rq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact = \"기본 브랜치는 master 이다\"" | grep -q "(1,)"'
 
+# ---- #2739: B2 rank/kind guard --------------------------------------------
+# _auto_supersede had no G2 guard (G1 always had one): an inferred (rank 1)
+# correction closed a verified user statement (rank 3) or a constraint by
+# token overlap alone. A protected best match now blocks the close outright
+# instead of redirecting it to the runner-up.
+BDB="$TMP/nunchi-home/b2guard.db"
+bq() { python3 -c "
+import sqlite3, sys
+print(sqlite3.connect('$BDB').execute(sys.argv[1]).fetchall())" "$1"; }
+bin() { NUNCHI_DB="$BDB" python3 "$NP" ingest - 2>&1; }
+BTR="$TMP/b2guard-transcript.jsonl"
+printf '{"type":"user","message":{"content":"배포 채널은 알파 릴리스 채널 이다 그리고 로그 보존은 삼십일 보존 정책 이다"}}\n' > "$BTR"
+gpayload b1 preference user "배포 채널은 알파 릴리스 채널 이다" user-stated "배포 채널은 알파 릴리스 채널 이다" "$BTR" | bin >/dev/null
+ok "#2739 B2 setup: the user statement is verified rank 3" \
+  'bq "SELECT source_rank FROM peer_facts WHERE fact = \"배포 채널은 알파 릴리스 채널 이다\"" | grep -q "(3,)"'
+# a rank-1 runner-up that also clears the 0.5 overlap bar (4 of the 8
+# correction tokens; the user statement shares 6)
+gpayload b1 context user "배포 채널은 알파 릴리스 운영 노트" | bin >/dev/null
+gpayload b2 correction user "배포 채널은 알파 아니라 베타 릴리스 채널 이다" | bin >/dev/null
+ok "#2739 B2 an inferred correction cannot close a user-stated fact" \
+  'bq "SELECT valid_to IS NULL FROM peer_facts WHERE fact = \"배포 채널은 알파 릴리스 채널 이다\"" | grep -q "(1,)"'
+ok "#2739 B2 a protected best match blocks the close (runner-up stays open, no supersedes link)" \
+  'bq "SELECT valid_to IS NULL FROM peer_facts WHERE fact = \"배포 채널은 알파 릴리스 운영 노트\"" | grep -q "(1,)" && bq "SELECT supersedes IS NULL, evidence FROM peer_facts WHERE kind = \"correction\"" | grep -q "(1, .distill:b2.)"'
+gpayload b3 constraint user "로그 보존 기간 변경 시 사전 승인 필수" | bin >/dev/null
+gpayload b4 correction user "로그 보존 기간 변경 시 사전 승인 필수 아님" | bin >/dev/null
+ok "#2739 B2 a correction never closes a constraint" \
+  'bq "SELECT valid_to IS NULL FROM peer_facts WHERE kind = \"constraint\"" | grep -q "(1,)"'
+# not over-blocked: equal rank (user-stated vs user-stated) and lower-rank
+# targets still close exactly like before
+gpayload b5 preference user "로그 보존은 삼십일 보존 정책 이다" user-stated "로그 보존은 삼십일 보존 정책 이다" "$BTR" | bin >/dev/null
+printf '{"type":"user","message":{"content":"로그 보존은 삼십일 아니라 구십일 보존 정책 이다"}}\n' > "$TMP/b2guard-tr2.jsonl"
+gpayload b6 correction user "로그 보존은 삼십일 아니라 구십일 보존 정책 이다" user-stated "로그 보존은 삼십일 아니라 구십일 보존 정책 이다" "$TMP/b2guard-tr2.jsonl" | bin >/dev/null
+ok "#2739 B2 an equal-rank (user-stated) correction still closes a user-stated fact" \
+  'bq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact = \"로그 보존은 삼십일 보존 정책 이다\"" | grep -q "(1,)"'
+gpayload b7 fact user "알림 채널은 메일 채널 이다" | bin >/dev/null
+gpayload b8 correction user "알림 채널은 메일 아니라 메신저 채널 이다" | bin >/dev/null
+ok "#2739 B2 an inferred correction still closes an inferred fact" \
+  'bq "SELECT valid_to IS NOT NULL FROM peer_facts WHERE fact = \"알림 채널은 메일 채널 이다\"" | grep -q "(1,)"'
+
+# ---- #2739: snapshot() constraint block is budget-bounded -----------------
+# snapshot wrote every open constraint ahead of the facts with no bound (the
+# #2216 budget only reached `assemble`): one node's snapshot.md was ~119 KB
+# with 503 open constraints, so the byte-capped readers (sessionstart
+# `head -c 3000` fallback, codex-loader 3,072 B) never saw a fact.
+SDB="$TMP/nunchi-home/snapbudget.db"
+SSNAP="$TMP/nunchi-home/snapbudget.md"
+NUNCHI_DB="$SDB" python3 "$NP" init >/dev/null 2>&1
+python3 - "$SDB" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+ins = ("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,"
+       "source_rank,review,mutability) VALUES(?,?,?,?,?,?,?,?,?,?)")
+for i in range(400):  # distinct issue numbers: never folded (#1890 guard)
+    c.execute(ins, ("family-assistant", "node-a", "constraint",
+                    f"#{5000 + i} 작업 전에는 반드시 담당자 승인과 변경 기록 확인 절차를 거친다 RULE-{i:04d}",
+                    "2026-08-07", f"snapcons-{i}", "2026-08-07T00:00:00+00:00", 1, 0, "static"))
+c.execute(ins, ("family-assistant", "node-a", "context", "SNAP-FACT-2739 사실 줄은 제약 뒤에 남는다",
+                "2026-08-07", "snapfact", "2026-08-07T00:00:00+00:00", 1, 0, "static"))
+c.commit()
+PY
+# shellcheck disable=SC2034  # read via eval inside ok()
+snapb="$(NUNCHI_DB="$SDB" NUNCHI_SNAPSHOT="$SSNAP" python3 "$NP" snapshot --limit 25 2>&1)"
+ok "#2739 snapshot constraint lines stay inside the 12000 B constraint budget" \
+  '[ "$(grep "^- \[제약/" <<<"$snapb" | wc -c)" -le 12000 ] && [ "$(wc -c < "$SSNAP")" -lt 16000 ]'
+ok "#2739 snapshot counts the omitted constraints in a tail line" \
+  'grep -qE "^- \[제약\] [0-9]+건 생략\(예산 12000B, 열린 제약 400건\) — 전체: nunchi.py constraints$" "$SSNAP"'
+ok "#2739 snapshot keeps the newest constraints and drops the oldest" \
+  'grep -q "RULE-0399" "$SSNAP" && ! grep -q "RULE-0000" "$SSNAP"'
+ok "#2739 snapshot still carries the fact block after the bounded constraints" \
+  'grep -q "SNAP-FACT-2739" "$SSNAP"'
+cp "$SSNAP" "$SSNAP.first"
+NUNCHI_DB="$SDB" NUNCHI_SNAPSHOT="$SSNAP" python3 "$NP" snapshot --limit 25 >/dev/null 2>&1
+ok "#2739 snapshot output is deterministic across runs" 'cmp -s "$SSNAP" "$SSNAP.first"'
+CCC_NUNCHI_CONSTRAINT_BUDGET=0 NUNCHI_DB="$SDB" NUNCHI_SNAPSHOT="$SSNAP" python3 "$NP" snapshot --limit 25 >/dev/null 2>&1
+ok "#2739 CCC_NUNCHI_CONSTRAINT_BUDGET=0 keeps the legacy unbounded snapshot" \
+  '[ "$(grep -c "^- \[제약/" "$SSNAP")" = 400 ] && ! grep -q "건 생략" "$SSNAP"'
+
 # ---- #2759: optional task-progress TTL (default OFF) ------------------------
 # Private DB per case group (same convention as the #1478 block above). Rows
 # are inserted directly so created_at can be put in the past.

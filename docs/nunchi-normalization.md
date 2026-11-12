@@ -88,6 +88,10 @@ counters to manufacture capacity. Each partition must fit one maximal request.
 facts under their own byte budget, `CCC_NUNCHI_CONSTRAINT_BUDGET` (default
 12000; 0 = unbounded): hint matches first, then newest, with a
 `- [제약] N건 생략 …` tail pointing at `nunchi.py constraints` (#2216).
+`nunchi.py snapshot` (`snapshot.md`, read by the `CCC_NUNCHI_ASSEMBLE=0` /
+fallback `head -c 3000` path and by `codex-loader.py`) renders the same block
+with no hint — newest first, same budget, same fold and tail (#2739); before,
+it wrote every open constraint unbounded.
 
 Re-extracted copies of one rule fold to **one line per cluster** in two stages:
 the case/whitespace-normalised first 40 characters (#2216), then token Jaccard

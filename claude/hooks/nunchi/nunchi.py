@@ -12,7 +12,8 @@ Canonicalized from the 3-node hand-deployed pilot with the TM-1332 backlog:
   B1  facts_fts indexes (fact, observed) — node-name queries work; existing
       pilot DBs are migrated in place on first `init`/open.
   B2  kind=correction auto-supersedes the best-matching open fact for the
-      same observed peer (conservative: token-overlap >= 0.5, single fact).
+      same observed peer (conservative: token-overlap >= 0.5, single fact;
+      never a higher-rank fact or a constraint — #2739).
   B3  node persona aliases (육손→yukson, 등애→dungae, …) normalized at
       ingest and expanded at query time.
 
@@ -31,7 +32,8 @@ Write gate (#890 — graph-engineering review):
       Cross-session for session:* peers, same as G1 (#1255) — a same-kind
       near-duplicate landed under a different session id is still compared.
   G4  kind=constraint (금지/필수 rules) is stored near-verbatim and always
-      injected by `snapshot` regardless of the recency limit.
+      injected by `snapshot` regardless of the recency limit — within the
+      constraint byte budget shared with `assemble` (#2216, #2739).
   G5  kind=decision must carry its reason (#1264 — bench q7 measured a
       reasonless decision only the Wiki layer could answer). Legacy payloads
       with neither structured `because` nor an inline marker remain stored and
@@ -670,26 +672,37 @@ def _close_fact(c, pool, fid):
     pool.close(fid)
 
 
-def _auto_supersede(c, pool, observed, correction_text, sid):
+def _auto_supersede(c, pool, observed, correction_text, sid, new_rank=1):
     """B2 — close the open fact this correction most plausibly replaces.
 
     Conservative on purpose: same observed peer only, token-overlap of the
     correction against the candidate must be >= 0.5, and at most one fact is
     closed. Returns the superseded fact id or None. Reversible: valid_to can
     be cleared by hand and the link is kept in `supersedes`.
+
+    #2739 — the G2 rank guard G1 (_update_supersede) has always applied, plus
+    a kind guard: a correction never closes a fact of higher source rank (an
+    agent inference must not bury a user statement) and never closes a
+    constraint (G4 rules are retired only by the owner — `constraints-triage`,
+    `supersede`, `merge` — never by a lexical match). Unlike G1, which skips a
+    protected candidate and takes the next best, a protected BEST match blocks
+    the close outright: the correction was aimed at that fact, so closing the
+    runner-up would bury a fact nobody corrected. B2 therefore closes a subset
+    of what it closed before; both facts stay open and the newcomer is stored.
     """
     corr = _tokens(correction_text)
     if not corr:
         return None
-    best, best_ratio = None, 0.0
-    for fid, (o, _k, _f, _r, old) in pool.rows(observed).items():
+    best, best_ratio, best_protected = None, 0.0, False
+    for fid, (o, k, _f, old_rank, old) in pool.rows(observed).items():
         if o != observed:
             continue
         inter = len(corr & old)
         ratio = inter / len(corr)
         if ratio > best_ratio:
             best, best_ratio = fid, ratio
-    if best is not None and best_ratio >= 0.5:
+            best_protected = k == "constraint" or (old_rank or 1) > new_rank
+    if best is not None and best_ratio >= 0.5 and not best_protected:
         _close_fact(c, pool, best)
         return best
     return None
@@ -1042,7 +1055,7 @@ def ingest(path):
         # happen without a human in the loop.
         if auto_supersede and not evidence_source:
             if kind == "correction":
-                superseded = _auto_supersede(c, pool, observed, text, sid)
+                superseded = _auto_supersede(c, pool, observed, text, sid, rank)
             else:
                 superseded = _update_supersede(c, pool, observed, text, rank)
         if (superseded is None and not evidence_source
@@ -2506,13 +2519,17 @@ def snapshot(limit):
         rows.append((o, k, f, m))
     # G4 — constraints are never crowded out by recency: a rule you must not
     # break is exactly the fact whose miss is an incident, not a staleness.
-    cons = c.execute(
-        "SELECT observed,fact FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind = 'constraint' ORDER BY id DESC").fetchall()
+    # #2739 — but they are bounded by the same constraint block `assemble`
+    # renders since #2216 (CCC_NUNCHI_CONSTRAINT_BUDGET, default 12000 B; 0 =
+    # unbounded): newest first, near-duplicates folded, and a tail line
+    # counting what did not fit. Writing every open constraint made one node's
+    # snapshot.md ~119 KB (503 open constraints), and its byte-capped readers
+    # (sessionstart `head -c 3000` fallback, codex-loader 3,072 B) saw a slice
+    # of the constraints and never a fact. `nunchi.py constraints` stays the
+    # full view.
     # G5-split rationale moved to _snapshot_header (P2-7 shares the surface).
     lines = _snapshot_header(c)
-    for o, f in cons:
-        lines.append(f"- [제약/{o}] {f}")
+    lines.extend(_constraint_lines(c, (), _constraint_budget()))
     # #1264 P1-4 — live-check facts are grouped AFTER the static block and
     # carry the ⟳ marker: the fleet policy ("운영 사실은 가변 — live-check")
     # becomes a visual contract. Static rows keep their exact old shape so
