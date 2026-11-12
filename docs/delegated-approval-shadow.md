@@ -37,21 +37,65 @@ jinwon-int/ccc-node#2137.
 | L1 | `v0.L1.docs-test-only` | every path is docs (`docs/`, `*.md`, `changelog.d/`, `CHANGELOG*`, `README*`, `LICENSE*`, `pages/`) or tests (`*_test.py`, `*.test.sh`, `*.test.mjs`, `tests/`, `fixtures/`, `test_*.py`) |
 | L2 | `v0.L2.code` | anything else (non-live repo code PR merge) |
 
-Each row also carries `shadow_would` (`delegate` for L1/L2, `escalate` for L3),
-`human_decision: approve`, and `agreement`. "상향 오판" (an L3 the owner would
-have delegated) cannot be derived automatically; it is judged by hand from the
-rows during the Q5 review.
+Each approval row also carries `shadow_would` (`delegate` for L1/L2, `escalate`
+for L3), `human_decision: approve`, and `agreement`.
+
+## Requests and refusals (spec §10.2 5-d, schema v2)
+
+An approval row exists only when a person approved, so a refusal left nothing
+behind. The spec's "상향 오판" is **a shadow L1 the person refused**; with
+approvals alone it could not be counted (the Phase 1 window had 548 approval
+rows and no way to see a refusal). Two more row kinds record the other half.
+They are record-only too: nothing here changes whether an approval is submitted.
+
+| Row | Written by | Meaning |
+|---|---|---|
+| `kind: ask` | `delegated_approval_shadow.py ask --repo … --pr … --head …` | an agent asked the owner to approve this PR at this exact head. Same evidence and tier as an approval row, no approver |
+| `kind: decision` | `… decide --repo … --pr … --decision … --source …` | a person's non-approval for that head: `decline` (chose another option), `hold`, `closed-unmerged`. `reply-unclassified` only notes that an answer could not be classified |
+| no `kind` / `kind: approve` | `record` (unchanged call from `approve-via-relay.sh`) | the approval. v2 rows add `implicit_ask: true` when no `ask` was recorded for that head |
+
+- **No text is stored.** A decision row holds the class, the source
+  (`reply` · `github` · `manual`), the PR and the head. `--detail` accepts a
+  short class label (`[a-z0-9-]`), not a sentence. A session is kept as a
+  12-character digest.
+- **How an ask ended is derived in `summary`, not written**, so it does not
+  depend on write order or on a sweep job: the first approval or terminal
+  decision on the same head wins; a later ask or approval for the same PR at
+  another head means `superseded`; no answer for 24 h (the receipt validity,
+  Q4) means `expired`; otherwise `open`. `expired` is not a refusal (owner
+  decision 2026-11-12).
+- `ask`, `decide` and `record` are best-effort: quiet on stdout, exit 0, one
+  line on stderr. `CCC_DELEGATED_SHADOW=0` turns all three off.
+
+Not in this slice: the `gh-pr-flow` step that calls `ask`, the reply hook that
+classifies the owner's answer, and `reconcile` (PR outcomes read back from
+GitHub). Until they land, `ask` and `decide` are called by hand or not at all,
+and `implicit_ask` shows how many approvals had no recorded request.
 
 ## Review (Q5)
 
 ```bash
-python3 ~/.codex/skills/gh-pr-flow/scripts/delegated_approval_shadow.py summary --days 14
-# → total, by_tier, by_rule, agreement_rate (= L1+L2 share), escalation_rate, repos, first/last
+S=~/.codex/skills/gh-pr-flow/scripts/delegated_approval_shadow.py
+python3 "$S" summary --days 14          # this node, counted back from now
+python3 "$S" summary --since 2026-10-28T04:22:00+09:00 --until 2026-11-11T04:22:00+09:00 \
+  --ledger nodes/a.jsonl --ledger nodes/b.jsonl   # a fixed window over collected ledgers
+# → total, by_tier, by_rule, agreement_rate (= L1+L2 share), escalation_rate, repos, first/last,
+#   asks{total, by_resolution, l1, upward_misjudgement, reply_unclassified}, implicit_ask{…}
 ```
 
-Per node (each node approves from its own checkout); the hub aggregates by
-collecting the JSON over ssh when the window closes. The Phase 1 window is
-**14 days from the merge of the recorder PR** (Q5); Phase 2 (real L1
-delegation) needs agreement ≥ 95 % **and** zero 상향 오판, plus the Phase 2
-prerequisites in the spec (§6, Q7, Q10) — none of which this recorder changes.
-The classification fixture (Q11) is a separate PR fed by these rows.
+A ledger is per node (each node approves from its own checkout). **A window
+verdict uses `--since/--until` over every node's ledger**; `--days N` on one
+node counts back from the moment it runs and is not a verdict (spec §10.2
+"측정 방법"). Window edges need an explicit UTC offset.
+
+The Phase 1 window ran 2026-10-28 04:22 → 2026-11-11 04:22 KST. Its
+`agreement_rate` was 0.6734, which says how much of the approved work the
+matrix would have delegated, not how often it was wrong: L3 is the person's by
+design. The spec was amended on 2026-11-12 (§10.2, a2a-nexus#2549): Phase 2
+(real L1 delegation) now needs **5-a** zero misclassified L1, **5-b** L1
+approved-as-asked ≥ 95 % with at least 30 samples, **5-c** zero 상향 오판
+(`asks.upward_misjudgement`, plus reverts within 7 days), and **5-d** this
+refusal path implemented and verified — plus the prerequisites in the spec
+(§6, Q7, Q10), none of which this recorder changes. `agreement_rate` and
+`escalation_rate` stay in the report but are no longer the gate. The
+classification fixture (Q11) is a separate PR fed by these rows.
