@@ -44,7 +44,7 @@ for L3), `human_decision: approve`, and `agreement`.
 
 An approval row exists only when a person approved, so a refusal left nothing
 behind. The spec's "상향 오판" is **a shadow L1 the person refused**; with
-approvals alone it could not be counted (the Phase 1 window had 548 approval
+approvals alone it could not be counted (the Phase 1 window had 572 approval
 rows and no way to see a refusal). Two more row kinds record the other half.
 They are record-only too: nothing here changes whether an approval is submitted.
 
@@ -112,7 +112,7 @@ R=~/.codex/skills/gh-pr-flow/scripts/delegated_approval_reconcile.py
 # 1) every node's ledger into one directory (nodes from --node or CCC_FLEET_NODES;
 #    CCC_FLEET_SELF is read locally; CCC_FLEET_SSH overrides the ssh command)
 python3 "$R" collect --out ./ledgers
-# → nodes{status ok|no-ledger|unreachable, rows, dropped}, without_recorder, unreachable, complete
+# → nodes{status ok|no-ledger|unreachable, rows, dropped, sources}, without_recorder, unreachable, complete
 # 2) what GitHub shows for the same window, against those ledgers
 python3 "$R" reconcile --since 2026-10-28T04:22:00+09:00 --until 2026-11-11T04:22:00+09:00 \
   $(for f in ./ledgers/*.jsonl; do printf -- '--ledger %s ' "$f"; done)
@@ -140,9 +140,17 @@ python3 "$R" reconcile --since 2026-10-28T04:22:00+09:00 --until 2026-11-11T04:2
 - Nothing textual is kept: titles are read only for the PR number a revert
   names, reviews for their state, comments for the marker.
 
-Run on 2026-11-12 over the Phase 1 window: 12 nodes collected (one without a
-recorder), 630 merged and 3 closed-unmerged PRs in 16 repositories, 53 L1, none
-refused or reverted, 87 merges outside the ledgers (13 by bots, 10 of them L1).
+- **A ledger is in the home of the account that runs the agent**, which need
+  not be the account ssh logs in as. `collect` therefore reads the login
+  account's own state dir and then every home under `/home/*`, and reports how
+  many ledger files it read per node (`sources`). The login account must be
+  able to read them. (The first run only looked in the login account's home,
+  missed one node's ledger and reported that node as having no recorder.)
+
+Run on 2026-11-12 over the Phase 1 window: 12 nodes collected, all with a
+ledger; 572 approval rows; 636 merged and 3 closed-unmerged PRs in 17
+repositories, 53 L1, none refused or reverted, 70 merges outside the ledgers
+(18 by bots, 9 of them L1).
 
 ## Review (Q5)
 
@@ -161,7 +169,7 @@ node counts back from the moment it runs and is not a verdict (spec §10.2
 "측정 방법"). Window edges need an explicit UTC offset.
 
 The Phase 1 window ran 2026-10-28 04:22 → 2026-11-11 04:22 KST. Its
-`agreement_rate` was 0.6734, which says how much of the approved work the
+`agreement_rate` was 0.6783, which says how much of the approved work the
 matrix would have delegated, not how often it was wrong: L3 is the person's by
 design. The spec was amended on 2026-11-12 (§10.2, a2a-nexus#2549): Phase 2
 (real L1 delegation) now needs **5-a** zero misclassified L1, **5-b** L1
