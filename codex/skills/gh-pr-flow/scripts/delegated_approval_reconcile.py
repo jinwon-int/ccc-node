@@ -7,7 +7,9 @@ The shadow ledger (``delegated_approval_shadow.py``) is per node and only knows
 what went through the recorder. A window verdict needs two more things:
 
 ``collect``    every node's ledger in one place, with the nodes that have no
-               recorder or could not be reached named in the report.
+               recorder or could not be reached named in the report. A ledger
+               is in the home of the account that runs the agent, which need
+               not be the account ssh logs in as, so every home is searched.
 ``reconcile``  what GitHub shows for the same window: every PR closed in the
                recorded repositories, classified by the same path rules, with
                the outcome a person gave it. That is where a refusal shows up
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import glob
 import json
 import os
 import re
@@ -48,14 +51,33 @@ SCHEMA_RECONCILE = "ccc.delegated-approval-reconcile.v1"
 NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 REPO_RE = re.compile(r"jinwon-int/[A-Za-z0-9_.-]+")
 NO_LEDGER = "__NO_LEDGER__"
-# One fixed remote command: print the ledger, or a marker when the node has none. The path is
-# the recorder's default — its state dir under the home directory (same parts as
+SOURCES_MARK = "__LEDGER_SOURCES__"
+HOMES_GLOB = "/home/*"
+# The recorder's default location relative to a home directory (same parts as
 # ``shadow.DEFAULT_STATE_DIR``), then ``shadow.LEDGER_REL``.
 _STATE_REL = "/".join((".claude", "state"))
-REMOTE_CAT = (
-    f'f="${{CCC_STATE_DIR:-$HOME/{_STATE_REL}}}/{shadow.LEDGER_REL.as_posix()}"; '
-    f'if [ -f "$f" ]; then cat "$f"; else echo {NO_LEDGER}; fi'
-)
+_LEDGER_REL = f"{_STATE_REL}/{shadow.LEDGER_REL.as_posix()}"
+
+
+def remote_cat(homes_glob: str = HOMES_GLOB) -> str:
+    """One fixed POSIX-sh command: print every shadow ledger on the node, then how many there were.
+
+    The ledger lives in the home of the account that *runs the agent*. On a node where the agent
+    runs as an ordinary user that is not the account ssh logs in as, so the login account's own
+    state dir is tried first and then every home under ``homes_glob``. A node with no readable
+    ledger anywhere answers with the no-ledger marker. Nothing from the caller is interpolated.
+    """
+    return (
+        f'n=0; seen=" "; for f in "${{CCC_STATE_DIR:-$HOME/{_STATE_REL}}}/{shadow.LEDGER_REL.as_posix()}" '
+        f'{homes_glob}/"{_LEDGER_REL}"; do '
+        '[ -f "$f" ] && [ -r "$f" ] || continue; '
+        'case "$seen" in *" $f "*) continue ;; esac; '
+        'seen="$seen$f "; n=$((n+1)); cat "$f"; echo; done; '
+        f'if [ "$n" -gt 0 ]; then echo "{SOURCES_MARK} $n"; else echo {NO_LEDGER}; fi'
+    )
+
+
+REMOTE_CAT = remote_cat()
 PR_FIELDS = "number,title,author,additions,deletions,files,reviews,headRefOid,baseRefName,mergedAt,closedAt"
 HOLD_MARKER = "⛔ hold"
 REVERT_WINDOW_S = 7 * 86400
@@ -83,28 +105,48 @@ def _epoch(text: Optional[str]) -> Optional[float]:
 
 # ---- collect ---------------------------------------------------------------
 
+def local_ledgers(state_dir: Optional[Path], homes_glob: str = HOMES_GLOB) -> tuple[str, int]:
+    """This node's ledgers, the same way ``remote_cat`` finds them: own state dir, then every home."""
+    candidates = [shadow.ledger_path(state_dir)] + [Path(home) / _LEDGER_REL for home in sorted(glob.glob(homes_glob))]
+    seen: set = set()
+    parts: list[str] = []
+    for path in candidates:
+        key = os.path.abspath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            parts.append(Path(path).read_text(encoding="utf-8"))
+        except OSError:  # missing, or another account's file this one may not read
+            continue
+    return "\n".join(parts), len(parts)
+
+
 def fetch_ledger(
     node: str, *, self_node: str, ssh: list, timeout: int, state_dir: Optional[Path], runner: Runner,
-) -> tuple[str, str]:
-    """``(status, text)`` with status ``ok`` · ``no-ledger`` · ``unreachable``."""
+    homes_glob: str = HOMES_GLOB,
+) -> tuple[str, str, int]:
+    """``(status, text, sources)``: status ``ok`` · ``no-ledger`` · ``unreachable``; sources = ledger files read."""
     if node == self_node:
-        path = shadow.ledger_path(state_dir)
-        try:
-            return "ok", path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return "no-ledger", ""
-        except OSError:
-            return "unreachable", ""
-    argv = [*ssh, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}", node, REMOTE_CAT]
+        text, sources = local_ledgers(state_dir, homes_glob)
+        return ("ok", text, sources) if sources else ("no-ledger", "", 0)
+    argv = [*ssh, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}", node, remote_cat(homes_glob)]
     try:
         done = runner(argv)
     except (OSError, subprocess.SubprocessError):
-        return "unreachable", ""
+        return "unreachable", "", 0
     if done.returncode != 0:
-        return "unreachable", ""
+        return "unreachable", "", 0
     if done.stdout.strip() == NO_LEDGER:
-        return "no-ledger", ""
-    return "ok", done.stdout
+        return "no-ledger", "", 0
+    sources, kept = 1, []
+    for line in done.stdout.splitlines():
+        if line.startswith(SOURCES_MARK):
+            count = line[len(SOURCES_MARK):].strip()
+            sources = int(count) if count.isdigit() else sources
+        else:
+            kept.append(line)
+    return "ok", "\n".join(kept), sources
 
 
 def _valid_lines(text: str) -> tuple[list[str], int]:
@@ -127,15 +169,15 @@ def _valid_lines(text: str) -> tuple[list[str], int]:
 
 def collect(
     nodes: Iterable[str], out_dir: Path, *, self_node: str = "", ssh: Optional[list] = None, timeout: int = 15,
-    state_dir: Optional[Path] = None, runner: Runner = _run,
+    state_dir: Optional[Path] = None, runner: Runner = _run, homes_glob: str = HOMES_GLOB,
 ) -> dict:
     out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(out_dir, 0o700)
     report: dict = {"schema": SCHEMA_COLLECT, "out": str(out_dir), "nodes": {}, "ledgers": []}
     for node in nodes:
-        status, text = fetch_ledger(node, self_node=self_node, ssh=ssh or ["ssh"], timeout=timeout,
-                                    state_dir=state_dir, runner=runner)
-        entry = {"status": status, "rows": 0, "dropped": 0}
+        status, text, sources = fetch_ledger(node, self_node=self_node, ssh=ssh or ["ssh"], timeout=timeout,
+                                             state_dir=state_dir, runner=runner, homes_glob=homes_glob)
+        entry = {"status": status, "rows": 0, "dropped": 0, "sources": sources}
         if status == "ok":
             lines, entry["dropped"] = _valid_lines(text)
             entry["rows"] = len(lines)

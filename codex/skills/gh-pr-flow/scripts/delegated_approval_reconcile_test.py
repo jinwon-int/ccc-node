@@ -187,7 +187,8 @@ class CollectTest(unittest.TestCase):
             return answers[argv[-2]]
 
         out = self.tmp / "ledgers"
-        report = rc.collect(["alpha", "beta", "gamma", "here"], out, self_node="here", state_dir=state, runner=runner)
+        report = rc.collect(["alpha", "beta", "gamma", "here"], out, self_node="here", state_dir=state, runner=runner,
+                            homes_glob=str(self.tmp / "no-homes" / "*"))
         self.assertEqual({n: (e["status"], e["rows"], e["dropped"]) for n, e in report["nodes"].items()},
                          {"alpha": ("ok", 2, 2), "beta": ("no-ledger", 0, 0), "gamma": ("unreachable", 0, 0), "here": ("ok", 1, 0)})
         self.assertEqual((report["complete"], report["without_recorder"], report["unreachable"], report["rows"]),
@@ -196,9 +197,60 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(out / "alpha.jsonl").st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o700)
         self.assertEqual(len(seen), 3)  # the local node is read from disk, not over ssh
-        self.assertEqual(seen[0][-1], rc.REMOTE_CAT)  # one fixed remote command, the node name is its own argv item
+        self.assertEqual(seen[0][-1], rc.remote_cat(str(self.tmp / "no-homes" / "*")))  # one fixed command; the node name is its own argv item
         self.assertIn("BatchMode=yes", seen[0])
         self.assertEqual(len(sh.read_ledger(out / "alpha.jsonl")), 2)
+
+    def _ledger_in(self, home: Path, pr: int) -> None:
+        sh.append_ledger(home / ".claude" / "state" / sh.LEDGER_REL, {"repo": REPO, "pr": pr, "ts_epoch": pr})
+
+    def _remote(self, home: Path, homes: Path) -> str:
+        """Run the real remote command in sh, as the node would, with a private HOME and homes root."""
+        env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        return subprocess.run(["sh", "-c", rc.remote_cat(str(homes / "*"))], capture_output=True, text=True, env=env).stdout
+
+    def test_the_remote_command_finds_a_ledger_in_the_agent_users_home(self) -> None:
+        # The account ssh logs in as has no ledger; the agent runs as another user whose home has one.
+        homes, login = self.tmp / "homes", self.tmp / "login-home"
+        login.mkdir()
+        self._ledger_in(homes / "agent", 7)
+        out = self._remote(login, homes)
+        self.assertIn(f"{rc.SOURCES_MARK} 1", out)
+        self.assertIn('"pr": 7', out)
+        # Both accounts keep one: both are read, each once.
+        self._ledger_in(login, 8)
+        out = self._remote(login, homes)
+        self.assertIn(f"{rc.SOURCES_MARK} 2", out)
+        self.assertEqual((out.count('"pr": 7'), out.count('"pr": 8')), (1, 1))
+        # The login account lives under the homes root: its ledger must not be read twice.
+        out = self._remote(homes / "agent", homes)
+        self.assertIn(f"{rc.SOURCES_MARK} 1", out)
+        self.assertEqual(out.count('"pr": 7'), 1)
+        # Nothing anywhere.
+        empty = self.tmp / "empty-homes"
+        (empty / "someone").mkdir(parents=True)
+        self.assertEqual(self._remote(login.parent / "nobody", empty).strip(), rc.NO_LEDGER)
+
+    def test_a_node_with_two_ledgers_reports_both_and_keeps_the_marker_out(self) -> None:
+        answer = '{"repo": "jinwon-int/x", "pr": 1}\n\n{"repo": "jinwon-int/x", "pr": 2}\n\n' + f"{rc.SOURCES_MARK} 2\n"
+        out = self.tmp / "ledgers"
+        report = rc.collect(["alpha"], out, runner=lambda argv: done(answer))
+        self.assertEqual(report["nodes"]["alpha"], {"status": "ok", "rows": 2, "dropped": 0, "sources": 2})
+        self.assertNotIn(rc.SOURCES_MARK, (out / "alpha.jsonl").read_text(encoding="utf-8"))
+        report = rc.collect(["old"], out, runner=lambda argv: done('{"repo": "jinwon-int/x", "pr": 1}\n'))
+        self.assertEqual(report["nodes"]["old"]["sources"], 1)  # an answer without the marker is one ledger
+
+    def test_the_local_node_is_searched_the_same_way(self) -> None:
+        homes, state = self.tmp / "homes", self.tmp / "state"
+        self._ledger_in(homes / "agent", 7)
+        out = self.tmp / "ledgers"
+        report = rc.collect(["here"], out, self_node="here", state_dir=state, homes_glob=str(homes / "*"))
+        self.assertEqual(report["nodes"]["here"], {"status": "ok", "rows": 1, "dropped": 0, "sources": 1})
+        sh.append_ledger(sh.ledger_path(state), {"repo": REPO, "pr": 9, "ts_epoch": 1})
+        report = rc.collect(["here"], out, self_node="here", state_dir=state, homes_glob=str(homes / "*"))
+        self.assertEqual((report["nodes"]["here"]["rows"], report["nodes"]["here"]["sources"]), (2, 2))
+        report = rc.collect(["here"], out, self_node="here", state_dir=self.tmp / "none", homes_glob=str(self.tmp / "none" / "*"))
+        self.assertEqual((report["nodes"]["here"]["status"], report["without_recorder"]), ("no-ledger", ["here"]))
 
     def test_collected_ledgers_feed_summary_and_reconcile(self) -> None:
         row = sh.build_row(repo=REPO, pr=1, head="a" * 40, approver="seoseo-ai",
