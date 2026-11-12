@@ -139,6 +139,133 @@ def test_bridge_status_parser_handles_degraded_node() -> None:
     assert parsed["piri"] == "unknown"  # absent line -> unknown, never invented
 
 
+# -- frontend list (#2342) on a Telegram-retired node (#2771) ----------------
+
+RETIRED_STATUS_TEXT = """🔴 Bot status: unavailable
+   Process: dead (no PID file)
+   Service: unavailable (process not running)
+   Telegram: unavailable (process not running)
+"""
+
+REVIVED_STATUS_TEXT = BRIDGE_STATUS_TEXT
+
+
+def _write_health(home: Path, name: str, *, service: str = "available", age: int = 5) -> Path:
+    directory = home / f".ccc-{name}"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "health.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "service": {"state": service, "reason": "body text must not leak"},
+                "claude": {"state": "healthy", "last_error": "secret-ish body"},
+                "agent": {"state": "healthy"},
+                "process": {"pid": 4242, "mode": "daemon"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stamp = path.stat().st_mtime - age
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def _retired_collect(tmp_path: Path, status_text: str, frontends: str = "hande\n") -> dict[str, Any]:
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(exist_ok=True)
+    (claude_dir / "frontends").write_text(frontends, encoding="utf-8")
+    runner = _fake_runner(
+        {"ccc-bridge-locate": LOCATE_JSON, "--status": status_text, "agent-cron": SCHEDULER_JSON}
+    )
+    env = {**FLEET_ENV, "HOME": str(tmp_path)}
+    return collect_local(env=env, runner=runner, project_path=str(tmp_path))
+
+
+def test_retired_telegram_node_is_healthy_from_declared_frontend(tmp_path: Path) -> None:
+    _write_health(tmp_path, "hande")
+    frontends = "# telegram retired 2026-10-16\n# matrix  # retired\nhande\n"
+    service = _retired_collect(tmp_path, RETIRED_STATUS_TEXT, frontends)["sections"]["service"]
+    assert service["healthy"] is True
+    assert service["telegram"] == "retired (frontend list)"
+    assert "telegram_drift" not in service
+    assert set(service["frontends"]) == {"hande"}  # commented-out matrix is not declared
+    block = service["frontends"]["hande"]
+    assert block == {
+        "status": "ok",
+        "service": "available",
+        "claude": "healthy",
+        "agent": "healthy",
+        "pid": 4242,
+        "age_seconds": block["age_seconds"],
+        "stale": False,
+        "healthy": True,
+    }
+    # Body-free: free-text reason/last_error fields never reach the output.
+    assert "body text" not in json.dumps(service)
+    assert "secret-ish" not in json.dumps(service)
+
+
+def test_retired_telegram_revived_bridge_is_drift(tmp_path: Path) -> None:
+    _write_health(tmp_path, "hande")
+    service = _retired_collect(tmp_path, REVIVED_STATUS_TEXT)["sections"]["service"]
+    assert service["telegram"] == "retired (frontend list)"
+    assert service["telegram_drift"] == "retired but running"
+
+
+def test_retired_telegram_stale_or_down_frontend_is_unhealthy(tmp_path: Path) -> None:
+    _write_health(tmp_path, "hande", age=301)
+    service = _retired_collect(tmp_path, RETIRED_STATUS_TEXT)["sections"]["service"]
+    assert service["frontends"]["hande"]["stale"] is True
+    assert service["healthy"] is False
+
+    _write_health(tmp_path, "hande", service="unavailable")
+    service = _retired_collect(tmp_path, RETIRED_STATUS_TEXT)["sections"]["service"]
+    assert service["healthy"] is False
+
+
+def test_retired_telegram_missing_or_garbled_health_is_unknown(tmp_path: Path) -> None:
+    service = _retired_collect(tmp_path, RETIRED_STATUS_TEXT)["sections"]["service"]
+    assert service["frontends"]["hande"] == {"status": "unknown", "error": "health.json missing"}
+    assert service["healthy"] == "unknown"
+
+    (tmp_path / ".ccc-hande").mkdir(exist_ok=True)
+    (tmp_path / ".ccc-hande" / "health.json").write_text("{not json", encoding="utf-8")
+    service = _retired_collect(tmp_path, RETIRED_STATUS_TEXT)["sections"]["service"]
+    assert service["frontends"]["hande"]["error"] == "unparseable health.json"
+    assert service["healthy"] == "unknown"
+
+    # An explicitly unhealthy frontend wins over an unknown one.
+    _write_health(tmp_path, "matrix", service="unavailable")
+    service = _retired_collect(tmp_path, RETIRED_STATUS_TEXT, "hande matrix\n")["sections"]["service"]
+    assert service["healthy"] is False
+
+
+def test_ccc_frontends_env_wins_and_undeclared_keeps_legacy(tmp_path: Path) -> None:
+    _write_health(tmp_path, "matrix")
+    runner = _fake_runner(
+        {"ccc-bridge-locate": LOCATE_JSON, "--status": RETIRED_STATUS_TEXT, "agent-cron": SCHEDULER_JSON}
+    )
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "frontends").write_text("telegram\n", encoding="utf-8")
+    env = {**FLEET_ENV, "HOME": str(tmp_path), "CCC_FRONTENDS": "matrix"}
+    service = collect_local(env=env, runner=runner, project_path=str(tmp_path))["sections"]["service"]
+    assert set(service["frontends"]) == {"matrix"}
+    assert service["healthy"] is True
+
+    # Telegram still declared -> legacy start.sh verdict, untouched.
+    env = {**FLEET_ENV, "HOME": str(tmp_path)}
+    service = collect_local(env=env, runner=runner, project_path=str(tmp_path))["sections"]["service"]
+    assert "frontends" not in service
+    assert service["telegram"] == "unavailable (process not running)"
+    assert service["healthy"] is False
+
+    # No declaration at all -> legacy.
+    (tmp_path / ".claude" / "frontends").unlink()
+    service = collect_local(env=env, runner=runner, project_path=str(tmp_path))["sections"]["service"]
+    assert "frontends" not in service and service["healthy"] is False
+
+
 def test_policy_denied() -> None:
     with pytest.raises(NodeStatusError) as exc:
         node_status(env={"CCC_NODE_ISOLATION_PROFILE": "external"})
