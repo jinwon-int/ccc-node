@@ -27,7 +27,8 @@ Usage (inside an agent turn)::
     python -m telegram_bot.core.external_wait_cli register \
         --source detached-job --unit nightly-compare-20261101 \
         --log /root/.claude/state/nightly-compare-20261101.log \
-        --summary "read the compare log and report" [--timeout-seconds 7200]
+        --summary "read the compare log and report" [--timeout-seconds 7200] \
+        [--scope user] [--scheduled-at "05:00"]
     python -m telegram_bot.core.external_wait_cli list
     python -m telegram_bot.core.external_wait_cli cancel <wait_id>
     python -m telegram_bot.core.external_wait_cli ack <wait_id> [--note "cleaned up by hand"]
@@ -77,6 +78,16 @@ as one owner notice instead of a wake. A ``--timeout-seconds`` above the
 default registers notify-only from the start: no ⏳ line, no wake, notice on
 exit.
 
+Two optional flags say how to tell the unit is alive (#2728). ``--scope user``
+(default ``system``) is for a ``systemd-run --user`` unit: it is asked of
+``systemctl --user``, because the system manager cannot see it.
+``--scheduled-at <when>`` marks a job that a ``.timer`` launches later: while
+that timer is armed the job has not started, so a missing or quiet log is not
+``lost``. The text is for display only — any systemd calendar spec — and the
+timer unit, not the text, decides. Without these flags the probe is the system
+``.service`` alone, as before. ``lost`` is confirmed by a second probe a
+moment later, so one racing ``systemctl`` answer does not end the wait.
+
 A new registration for the same PR at a different head supersedes this
 conversation's older pending waits for that PR (#1110): a stale head must
 never wake the session with an outdated rollup. ``--keep-previous`` keeps
@@ -110,6 +121,7 @@ from telegram_bot.core.external_wait import (
     SOURCE_LOCAL_TASK,
     STATE_MONITORING,
     TERMINAL_SUPERSEDED,
+    UNIT_SCOPE_USER,
     ExternalWaitRegistry,
     ExternalWaitValidationError,
     default_registry_path,
@@ -121,9 +133,11 @@ from telegram_bot.core.external_wait import (
     validate_run_id,
     validate_run_label,
     validate_log_path,
+    validate_scheduled_at,
     validate_summary,
     validate_task_id,
     validate_unit_name,
+    validate_unit_scope,
 )
 from telegram_bot.core.external_wait_monitor import (
     DEFAULT_POLL_INTERVAL_SECONDS,
@@ -334,9 +348,17 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
         # measured (detached_jobs.py knows the unit's scope); otherwise it is
         # measured here: the current log size when the log already holds a
         # marker while the unit is running, else 0.
+        # #2728: which manager owns the unit, and whether a timer launches it.
+        scope = validate_unit_scope(args.get("scope"))
+        scheduled_at = validate_scheduled_at(args.get("scheduled_at"))
         raw_offset = args.get("log_offset")
         if raw_offset is None:
-            log_offset = detached_log_baseline(log_path, unit)
+            if scope == UNIT_SCOPE_USER or scheduled_at:
+                log_offset = detached_log_baseline(
+                    log_path, unit, user=scope == UNIT_SCOPE_USER, scheduled=bool(scheduled_at)
+                )
+            else:
+                log_offset = detached_log_baseline(log_path, unit)
         else:
             log_offset = int(raw_offset)
             if log_offset < 0:
@@ -367,6 +389,8 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
         log_path=log_path,
         notify_only=notify_only,
         log_offset=log_offset,
+        unit_scope=scope,
+        scheduled_at=scheduled_at,
     )
     if not wait_id:
         _emit({"ok": False, "code": "registry-error"})
@@ -388,6 +412,8 @@ def _register_detached_job(home: Path, args: dict[str, Any], route: dict[str, An
             "unit": unit,
             "log_path": log_path,
             "log_offset": log_offset,
+            "scope": scope,
+            **({"scheduled_at": scheduled_at} if scheduled_at else {}),
             "timeout_seconds": int(timeout),
             "source": SOURCE_DETACHED_JOB,
             "notify_only": notify_only,

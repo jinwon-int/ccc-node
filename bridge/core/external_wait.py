@@ -275,6 +275,62 @@ def validate_unit_name(unit: Any) -> str:
     return candidate
 
 
+#: Which systemd manager owns a detached unit (#2728). ``user`` is a
+#: ``systemd-run --user`` unit, invisible to the system manager.
+UNIT_SCOPE_SYSTEM = "system"
+UNIT_SCOPE_USER = "user"
+_SCHEDULED_AT_MAX_CHARS = 80
+
+
+def validate_unit_scope(scope: Any) -> str:
+    """``system`` (default, also for None/empty) or ``user`` (#2728)."""
+    candidate = str(scope or "").strip().lower() or UNIT_SCOPE_SYSTEM
+    if candidate not in (UNIT_SCOPE_SYSTEM, UNIT_SCOPE_USER):
+        raise ExternalWaitValidationError("scope must be 'system' or 'user'")
+    return candidate
+
+
+def validate_scheduled_at(scheduled_at: Any) -> str:
+    """When a timer-launched job is due (#2728): free text, kept for display.
+
+    A non-empty value marks the wait as *scheduled*: until its ``.timer`` is
+    gone the job has simply not started. The text is never parsed — the timer
+    unit is the source of truth — so any systemd calendar spec is accepted;
+    whitespace is collapsed and the length is capped like the hooks-side
+    registry does.
+    """
+    candidate = " ".join(str(scheduled_at or "").split())
+    if len(candidate) > _SCHEDULED_AT_MAX_CHARS or any(ord(ch) < 32 for ch in candidate):
+        raise ExternalWaitValidationError(
+            f"scheduled_at must be at most {_SCHEDULED_AT_MAX_CHARS} printable characters"
+        )
+    return candidate
+
+
+def detached_liveness_fields(unit_scope: Any, scheduled_at: Any) -> Dict[str, Any]:
+    """Record fields saying how to tell a detached unit is alive (#2728).
+
+    ``scope`` only for a user unit and ``scheduled_at`` only when given, so a
+    plain registration keeps the record shape it had before.
+    """
+    fields: Dict[str, Any] = {}
+    if validate_unit_scope(unit_scope) == UNIT_SCOPE_USER:
+        fields["scope"] = UNIT_SCOPE_USER
+    scheduled_text = validate_scheduled_at(scheduled_at)
+    if scheduled_text:
+        fields["scheduled_at"] = scheduled_text
+    return fields
+
+
+def _adopt_liveness_fields(rec: Dict[str, Any], fields: Dict[str, Any]) -> None:
+    """Give an open wait the liveness fields a repeated registration carries (#2728)."""
+    if fields:
+        # Without them the open wait would keep asking the wrong manager, or
+        # only the ``.service``, and still go lost.
+        rec.update(fields)
+        rec["updated_at"] = _utc_now_iso()
+
+
 def validate_log_offset(log_offset: Any) -> int:
     """A detached wait's marker baseline (#2740): a non-negative byte count, None = 0."""
     if log_offset is None:
@@ -464,8 +520,18 @@ class ExternalWaitRegistry:
         log_path: Any = None,
         notify_only: bool = False,
         log_offset: Any = None,
+        unit_scope: Any = None,
+        scheduled_at: Any = None,
     ) -> str:
         """Register one wait; returns its id (idempotent per natural key).
+
+        ``unit_scope`` and ``scheduled_at`` (#2728, detached jobs) tell the
+        monitor which systemd manager owns the unit and that a ``.timer``
+        launches it, so an armed timer or a ``--user`` unit counts as alive.
+        Stored as ``scope`` (only when ``user``) and ``scheduled_at`` (only
+        when given), the hooks-side registry's field names; a record without
+        them is judged exactly as before. Registering an open wait again with
+        either one updates that wait instead of being ignored.
 
         ``log_offset`` (#2740, detached jobs) is the log size below which an
         ``EXIT=`` marker belongs to an earlier run of the same unit and log;
@@ -487,6 +553,7 @@ class ExternalWaitRegistry:
         if source not in SOURCES:
             raise ExternalWaitValidationError(f"unknown wait source: {source}")
         extra: Dict[str, Any] = {}
+        liveness: Dict[str, Any] = {}
         natural: tuple
         if source == SOURCE_LOCAL_TASK:
             repo = ""
@@ -508,6 +575,8 @@ class ExternalWaitRegistry:
             # Stored only when there is history to skip, so records without it
             # keep their pre-#2740 shape.
             extra.update({"log_offset": offset} if offset else {})
+            liveness = detached_liveness_fields(unit_scope, scheduled_at)
+            extra.update(liveness)
             natural = (source, unit, log_path, int(user_id), int(chat_id))
         elif source == SOURCE_GITHUB_ACTIONS_RUN:
             repo = validate_repo(repo)
@@ -555,6 +624,7 @@ class ExternalWaitRegistry:
                 if rec.get("state") != STATE_MONITORING:
                     continue
                 if _natural_of(rec) == natural:
+                    _adopt_liveness_fields(rec, liveness)
                     return wait_id
             wait_id = uuid.uuid4().hex[:12]
             records[wait_id] = {

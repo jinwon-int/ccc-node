@@ -204,7 +204,26 @@ Two traps, both silent (#2710):
   user timer reads as **lost** and invites a needless re-run. It warns when
   `loginctl` reports `Linger=no` (the timer dies at logout; `loginctl
   enable-linger` keeps it). A hand-made `systemd-run --user` unit is
-  registered with `register --user` for the same reason.
+  registered with `register --user` for the same reason; `register --user`
+  also hands that scope to the bridge ⏳ wait it arms (#2728).
+- **A ⏳ wait on a job a timer starts later (#2728).** Do not `register` a
+  unit that only a `.timer` will start: use `schedule`, whose completion
+  notice needs no wait. Until this was fixed the bridge asked only the system
+  `.service`, found it inactive before the timer fired, and reported
+  `Detached job lost (no EXIT marker)` within minutes while the job was fine
+  (2026-11-09). If the conversation really must resume on such a job, arm the
+  wait by hand and say what keeps it alive:
+
+  ```bash
+  python -m telegram_bot.core.external_wait_cli register \
+    --source detached-job --unit <job> --log "$LOG" \
+    --scheduled-at "<when the timer fires>" [--scope user] \
+    --summary "<next step>" --timeout-seconds <seconds>
+  ```
+
+  `--scheduled-at` makes the monitor treat an armed `<job>.timer` as "not
+  started yet" instead of lost; `--scope user` asks `systemctl --user`. The
+  wait budget still applies: above 6 h it is notify-only, with no ⏳ line.
 
 To put the job's actual outcome in the notice ("7일 중 6일 통과", "설치 완료",
 the abort reason), have it write one line to a file and pass

@@ -42,6 +42,7 @@ from telegram_bot.core.external_wait import (
     TERMINAL_MONITOR_ERROR,
     TERMINAL_SUPERSEDED,
     TERMINAL_SUCCESS,
+    UNIT_SCOPE_USER,
     ExternalWaitRegistry,
 )
 
@@ -80,6 +81,11 @@ DETACHED_JOB_MAX_POLL_INTERVAL_SECONDS = 60.0
 #: Without an ``EXIT=`` marker a log this quiet, whose unit is gone, counts
 #: as lost — the same threshold the hooks-side ``detached_jobs.py`` uses.
 DETACHED_JOB_STALE_SECONDS = 900.0
+#: ``lost`` is never resumed, so one wrong ``systemctl`` answer would strand a
+#: job whose EXIT arrives later (#2728). Before confirming it the probe runs
+#: once more after this pause: long enough for a timer to hand over to its
+#: service, or for a slow ``systemctl`` call to recover.
+DETACHED_JOB_LOST_RECHECK_DELAY_SECONDS = 2.0
 #: A detached-job wait that reaches its deadline while the unit is still alive
 #: is not over, it was under-estimated (#2636). Instead of ending ``expired``
 #: (a wake with no result, and the real EXIT the next morning reaching nobody)
@@ -447,6 +453,9 @@ class DetachedJobState:
     log_exists: bool
     log_age_seconds: Optional[float]
     unit_active: bool
+    #: #2728: the ``.timer`` of a scheduled job is still armed — the job has
+    #: not started, which is alive, not lost.
+    timer_active: bool = False
 
 
 def read_exit_marker(log_path: str, start_offset: int = 0) -> Optional[int]:
@@ -480,14 +489,22 @@ def read_exit_marker(log_path: str, start_offset: int = 0) -> Optional[int]:
     return code
 
 
-def unit_is_active(unit: str) -> bool:
-    """Best-effort ``systemctl is-active``; absent systemctl means 'cannot tell' (False)."""
+def unit_is_active(unit: str, *, suffix: str = ".service", user: bool = False) -> bool:
+    """Best-effort ``systemctl is-active``; absent systemctl means 'cannot tell' (False).
+
+    Same meaning as the hooks-side ``detached_jobs.unit_is_active`` (#2728):
+    ``suffix=".timer"`` asks about a scheduled job that has not fired yet, and
+    ``user=True`` asks the caller's user manager — a ``systemd-run --user``
+    unit is invisible to the system manager.
+    """
     if not unit:
         return False
-    name = unit if unit.endswith(".service") else unit + ".service"
+    base = unit[: -len(".service")] if unit.endswith(".service") else unit
+    name = base if base.endswith(suffix) else base + suffix
+    argv = ["systemctl", "--user", "is-active", name] if user else ["systemctl", "is-active", name]
     try:
         proc = subprocess.run(
-            ["systemctl", "is-active", name],
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -498,7 +515,13 @@ def unit_is_active(unit: str) -> bool:
     return proc.stdout.decode("utf-8", "ignore").strip() == "active"
 
 
-def detached_log_baseline(log_path: str, unit: str) -> int:
+def _service_is_active(unit: str, user: bool) -> bool:
+    # A system-scope unit is asked exactly as before #2728 (one positional
+    # argument), so callers and test doubles written for that call still fit.
+    return unit_is_active(unit, user=True) if user else unit_is_active(unit)
+
+
+def detached_log_baseline(log_path: str, unit: str, *, user: bool = False, scheduled: bool = False) -> int:
     """Offset to record at registration so an earlier run's marker is ignored (#2740).
 
     Non-zero only when the log already ends a run (it holds an ``EXIT=`` marker)
@@ -506,8 +529,17 @@ def detached_log_baseline(log_path: str, unit: str) -> int:
     run's, and everything up to the current size is history. With the unit not
     running the marker may well be this run's own — a job that finished before
     it was registered — so it is accepted as before (0).
+
+    ``user`` / ``scheduled`` (#2728) say where to look: the user manager, and
+    for a scheduled job its ``.timer`` too — while that is armed the job has
+    not started, so any marker in the log is older.
     """
-    if read_exit_marker(log_path) is None or not unit_is_active(unit):
+    if read_exit_marker(log_path) is None:
+        return 0
+    alive = _service_is_active(unit, user)
+    if not alive and scheduled:
+        alive = unit_is_active(unit, suffix=".timer", user=user)
+    if not alive:
         return 0
     try:
         return int(os.path.getsize(log_path))
@@ -515,16 +547,29 @@ def detached_log_baseline(log_path: str, unit: str) -> int:
         return 0
 
 
-def inspect_detached_job(log_path: str, unit: str, log_offset: int = 0) -> DetachedJobState:
-    """Synchronous probe (run it in a worker thread): marker, log age, unit liveness."""
+def inspect_detached_job(
+    log_path: str, unit: str, log_offset: int = 0, *, user: bool = False, scheduled: bool = False
+) -> DetachedJobState:
+    """Synchronous probe (run it in a worker thread): marker, log age, unit liveness.
+
+    ``user`` asks the user manager instead of the system one; ``scheduled``
+    also asks about the unit's ``.timer`` when the service is not running
+    (#2728). Both default to the pre-#2728 probe.
+    """
     code = read_exit_marker(log_path, log_offset)
     try:
         age: Optional[float] = max(0.0, time.time() - os.path.getmtime(log_path))
         exists = True
     except OSError:
         age, exists = None, False
-    active = False if code is not None else unit_is_active(unit)
-    return DetachedJobState(exit_code=code, log_exists=exists, log_age_seconds=age, unit_active=active)
+    active = timer = False
+    if code is None:
+        active = _service_is_active(unit, user)
+        if not active and scheduled:
+            timer = unit_is_active(unit, suffix=".timer", user=user)
+    return DetachedJobState(
+        exit_code=code, log_exists=exists, log_age_seconds=age, unit_active=active, timer_active=timer
+    )
 
 
 def detached_job_terminal(
@@ -535,12 +580,13 @@ def detached_job_terminal(
     - ``EXIT=0`` → success; any other code → failure (code in the detail);
     - no marker, no log, unit gone → lost (nothing was ever written);
     - no marker, log quiet for ``stale_after`` and unit gone → lost;
-    - otherwise the job is running (a fresh log or a live unit).
+    - otherwise the job is running (a fresh log, a live unit, or — for a
+      scheduled job — a timer that has not fired yet, #2728).
     """
     if state.exit_code is not None:
         status = TERMINAL_SUCCESS if state.exit_code == 0 else TERMINAL_FAILURE
         return status, {"exit_code": int(state.exit_code)}
-    if state.unit_active:
+    if state.unit_active or state.timer_active:
         return None
     if not state.log_exists:
         return TERMINAL_LOST, {"reason": "no-log"}
@@ -1062,13 +1108,31 @@ class ExternalWaitMonitor:
         wait_id = record["wait_id"]
         notify_only = bool(record.get("notify_only"))
         expired = now >= float(record.get("expires_epoch") or 0)
-        try:
-            state = await asyncio.to_thread(
+        # #2728: only a record that says so is probed beyond the system
+        # ``.service``; one without these fields takes the same call as before.
+        probe_options: Dict[str, Any] = {}
+        if record.get("scope") == UNIT_SCOPE_USER:
+            probe_options["user"] = True
+        if record.get("scheduled_at"):
+            probe_options["scheduled"] = True
+
+        async def probe() -> DetachedJobState:
+            return await asyncio.to_thread(
                 self._inspect_detached_job,
                 str(record.get("log_path") or ""),
                 str(record.get("unit") or ""),
                 int(record.get("log_offset") or 0),
+                **probe_options,
             )
+
+        try:
+            state = await probe()
+            if (detached_job_terminal(state) or ("", {}))[0] == TERMINAL_LOST:
+                # ``lost`` is final and never resumed: confirm it once, so a
+                # timer handing over to its service, or one slow ``systemctl``
+                # answer, does not end a wait whose EXIT is still to come.
+                await asyncio.sleep(max(0.0, float(DETACHED_JOB_LOST_RECHECK_DELAY_SECONDS)))
+                state = await probe()
         except Exception:
             if notify_only and self._transport_errors.get(wait_id, 0) + 1 >= MAX_TRANSPORT_ERRORS:
                 # No conversation to wake for a notify-only watch: say so once.
