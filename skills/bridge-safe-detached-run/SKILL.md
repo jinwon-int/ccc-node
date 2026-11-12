@@ -181,7 +181,8 @@ has the wrapper call `detached_jobs.py notify --unit <job> --exit <rc>`: one
 body-free spool record the bridge delivers to the owner as `🔔 ccc-node
 [DetachedJob]` — **no ⏳ line, no wake**. The registry row carries
 `scheduled_at`/`notify_on_exit`; until the timer fires the SessionStart sweep
-lists the job as running with its ⏰ time (timer active, no log yet), not lost.
+lists the job as running with its ⏰ time (timer active — whether the log does
+not exist yet or still holds an earlier run's output, #2778), not lost.
 `--at` takes any systemd calendar spec (`systemd-analyze calendar "<spec>"` to
 check it). Hand-written units get the same announcement by appending
 `python3 ~/.claude/hooks/lib/detached_jobs.py notify --unit <job> --exit "$rc" --tier notice`
