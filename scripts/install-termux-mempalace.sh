@@ -2,7 +2,7 @@
 # Install the optional MemPalace verbatim layer on Android/Termux (#867).
 #
 # Native Android wheels are unavailable, so this creates a dedicated Debian 12
-# PRoot container and installs MemPalace 3.11.0 with sqlite_exact + CPU MiniLM.
+# PRoot container and installs MemPalace 3.12.0 with sqlite_exact + CPU MiniLM.
 # Existing palace data is never removed by this script.
 #
 #   install-termux-mempalace.sh --preview [--codex|--claude]
@@ -46,16 +46,17 @@ case "$HOME" in *:*) echo "HOME containing ':' is unsupported" >&2; exit 2 ;; es
 container="${CCC_TERMUX_MEMPALACE_CONTAINER:-ccc-mempalace}"
 case "$container" in ''|-*|*[!A-Za-z0-9_.-]*) echo "invalid container name" >&2; exit 2 ;; esac
 image="${CCC_TERMUX_MEMPALACE_IMAGE:-debian:12}"
-version="${CCC_TERMUX_MEMPALACE_VERSION:-3.11.0}"
+version="${CCC_TERMUX_MEMPALACE_VERSION:-3.12.0}"
 case "$version" in
-  3.11.0) ;;
+  3.12.0) ;;
   *) echo "unsupported MemPalace version: $version" >&2; exit 2 ;;
 esac
 # Managed pins this installer may upgrade in place. The venv must be on one of
 # these AND the installed lock must differ from the managed freeze only in its
-# mempalace== line (3.10.0 -> 3.11.0 ships the same dependency set); any other
+# mempalace== line (3.10.0 -> 3.11.0 -> 3.12.0 ship the same dependency set; 3.12.0
+# only raises requires-python to >=3.10, and the Debian 12 guest runs 3.11); any other
 # version or lock drift still fails closed (#867 in-place mutation guard).
-upgradable_from="3.10.0"
+upgradable_from="3.10.0 3.11.0"
 
 proot_cli="${CCC_TERMUX_MEMPALACE_PROOT_CLI:-$prefix/bin/proot-distro}"
 wrapper="$HOME/.local/bin/mempalace"

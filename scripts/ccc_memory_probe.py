@@ -184,7 +184,7 @@ def _safe_owned_directory(path: Path, mode: int) -> bool:
 # a node keeps the metadata version it was installed with until it upgrades.
 # ccc-memory.test.sh fails when an installer pin bump leaves this set behind
 # (#2514: the 3.11.0 bump in #2328 did, and both Termux nodes read "error").
-TERMUX_MEMPALACE_VERSIONS = frozenset({"3.10.0", "3.11.0"})
+TERMUX_MEMPALACE_VERSIONS = frozenset({"3.10.0", "3.11.0", "3.12.0"})
 
 
 def _termux_metadata_state(metadata: Path) -> tuple[str, str | None]:
