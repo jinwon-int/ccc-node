@@ -127,7 +127,47 @@ after the reviewed fix is integrated into the normal checkout.
   Matrix frontend that had been retired for four days. `UNVERIFIED` is
   confirmed over three runs instead of two (below). The limit itself is
   unchanged: raising it to the hande watch's 20 s would put the light-mode
-  worst case past the task timeout (see *Scheduling*).
+  worst case past the task timeout (see *Scheduling*). Inside a sweep the
+  limit no longer has to cover a handshake (next item).
+- **One ssh connection per node (#2766):** a sweep used to open three
+  connections to every node — Matrix, 「한데」, bridge — each a full key exchange
+  and login under that channel's own limit (10 s, 20 s, 30 s). From a far
+  watcher the handshake is nearly the whole cost of a probe, and it is the
+  part that stalls. Now the first probe of a node opens the connection
+  (OpenSSH `ControlMaster=auto`, `ControlPersist=120`) and the other two ride
+  it. The 「한데」 watch runs first, so the one handshake gets its 20 s limit and
+  the Matrix probe, which had the tightest limit and came first, has 10 s for
+  about a second of work. Rules (`scripts/lib/fleet-ssh-reuse.sh`):
+  - only the first attempt of a probe opens or rides the shared connection; a
+    retry always connects on its own (`ControlPath=none`), as every attempt did
+    before, so a shared connection that went stale costs one attempt and never
+    the verdict;
+  - the sockets live in a directory the run creates under `${TMPDIR:-/tmp}`
+    (mode 0700) and removes on exit after closing the connections; a channel
+    watch ignores a socket directory that is not its own and private;
+  - a node whose name is not a plain file name, or whose socket path would not
+    fit a unix socket, is probed without reuse; so is everything when the
+    directory cannot be made or the helper file is missing — never an error;
+  - `CCC_FLEET_SSH_REUSE=0` turns it off (no option is added to any ssh call).
+    `fleet-matrix-watch.sh` and `fleet-hande-watch.sh` run on their own
+    connect as before.
+
+  Verdicts, limits and retries are unchanged, and so is the worst-case time
+  of the probes: when no shared connection can be opened every probe connects
+  by itself as before. Two things differ in a report: the 「한데」 rows now come
+  before the Matrix rows, and closing the connections at the end takes about
+  0.01 s per node (bounded at 3 s per node should one not answer). Measured
+  2026-11-13 from the T2 watcher (medians of 6, seconds):
+
+  | | new connection | shared connection |
+  |---|---|---|
+  | Matrix probe, three slow-link nodes | 4.2–4.6 | 1.2–1.6 |
+  | Matrix probe, eight other nodes | 0.4–2.6 | 0.1–0.7 |
+  | ssh time of one run, 11 remote nodes × 3 channels | 82 | 42 |
+
+  In the 740 scheduled 15-minute runs from 2026-11-06 00:00 to 2026-11-13
+  17:00 KST the three slow-link nodes produced all 81 unanswered probe rows
+  (Matrix 32, 「한데」 27, bridge 22), spread over 55 runs; the others none.
   The health snapshot keeps `service.state=degraded` from one failed agent
   turn until the next turn succeeds, which on a quiet room can be days
   (ccc-node#2098). When that degraded state is explained only by an agent
@@ -217,7 +257,8 @@ script's output and exit codes are unchanged.
   600s after the start (`CCC_FLEET_DEADLINE`; the rest report
   `UNVERIFIED <node> inspection=deadline-600s`). The Matrix check keeps its own
   caps (at most 22s per node). Each of these defaults can be overridden by its
-  environment variable.
+  environment variable. The session in flight shares the node's one ssh
+  connection with the two channel watches (#2766, above).
 - **`--state-file PATH`** (or `CCC_FLEET_WATCH_STATE`) folds each run's
   verdicts into a per-node, per-channel state file
   (`scripts/fleet_watch_state.py`) and exits nonzero only when one of these
@@ -312,7 +353,10 @@ run expire instead of stopping the watch for hours (#2669; see
 `agent-cron.md` → Dead-holder locks). `--timeout-sec 840` sits above the light-mode worst case: the Matrix pass is at
 most about 264s, and the deadline stops new probes at 600s, after which at most
 one in-flight probe (≤ 65s) remains. It also stays below the 15-minute
-interval. A measured all-OK run of 12 nodes × 2 channels took about 53s. The
+interval. A measured all-OK run of 12 nodes × 2 channels took about 53s; with
+three channels, 88s with a connection per probe and 47s with one shared
+connection per node (2026-11-13, #2766 — the worst case is unchanged, since a
+node whose shared connection cannot be opened is probed as before). The
 first two runs after installation report every already-abnormal pair as
 `PENDING`, then `NEW` once. After that, chronic pairs stay `KNOWN` until their
 re-alert is due. Keep `fleet-doctor-sweep` daily for harness drift. Once the
