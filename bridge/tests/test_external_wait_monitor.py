@@ -962,3 +962,143 @@ async def test_idle_monitor_skips_registry_reads_until_state_changes(
     await monitor._tick()
     assert reads > reads_before_tick
     assert transport.calls
+
+
+# -- #2793: polling keeps running while a resume turn blocks ---------------------
+
+
+class PerPrTransport:
+    """Scripted per-PR outcomes; the last outcome of each PR repeats."""
+
+    def __init__(self, outcomes: dict) -> None:
+        self.outcomes = {pr: list(states) for pr, states in outcomes.items()}
+        self.calls: list[int] = []
+
+    async def fetch_pr_state(self, repo: str, pr_number: int) -> PrState:
+        self.calls.append(pr_number)
+        states = self.outcomes[pr_number]
+        return states.pop(0) if len(states) > 1 else states[0]
+
+
+async def _until(predicate, timeout: float = 5.0) -> None:
+    async def _spin() -> None:
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_spin(), timeout=timeout)
+
+
+def _fast_monitor(registry, transport, recorder, clock, **kwargs) -> ExternalWaitMonitor:
+    monitor = _monitor(registry, transport, recorder, clock, **kwargs)
+    monitor._tick_seconds = 0.01  # the constructor clamps to >= 1s
+    return monitor
+
+
+def _by_pr(registry: ExternalWaitRegistry) -> dict:
+    return {rec["pr_number"]: rec for rec in registry.records()}
+
+
+@pytest.mark.anyio
+async def test_polling_continues_and_wakes_stay_serial_while_a_resume_blocks(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    registry = _registry(tmp_path, clock)  # PR 123
+    pr124 = dict(
+        repo="jinwon-int/ccc-node", head_sha="abc1234", user_id=7, chat_id=70,
+        session_id="sess-1", summary="merge it", timeout_seconds=100_000,
+        poll_interval_seconds=30, now=1_000.0,
+    )
+    registry.register(pr_number=124, **pr124)
+    transport = PerPrTransport(
+        {123: [PrState("abc1234", "success")],
+         124: [PrState("abc1234", "pending"), PrState("abc1234", "success")]}
+    )
+    recorder = Recorder()
+    release = asyncio.Event()
+
+    async def blocking_resume(record: dict, prompt: str) -> bool:
+        recorder.resumes.append((record, prompt))
+        if record["pr_number"] == 123:
+            await release.wait()  # a whole Telegram agent turn
+        return True
+
+    monitor = _fast_monitor(registry, transport, recorder, clock, resumer=blocking_resume)
+    stop = asyncio.Event()
+    runner = asyncio.create_task(monitor.run(stop))
+    await _until(lambda: len(recorder.resumes) == 1)
+
+    # While PR 123's resume turn is blocked, PR 124 is polled again and ends.
+    clock.advance(120)
+    await _until(lambda: _by_pr(registry)[124]["state"] == TERMINAL_SUCCESS)
+    assert transport.calls.count(124) >= 2
+    # ...but its wake waits for the first resume: wakes stay serial.
+    await asyncio.sleep(0.05)
+    assert len(recorder.resumes) == 1
+    assert _by_pr(registry)[124]["wake"]["state"] == "pending"
+
+    release.set()
+    await _until(lambda: len(recorder.resumes) == 2)
+    await _until(lambda: _by_pr(registry)[124]["wake"]["state"] == "done")
+    assert [rec["pr_number"] for rec, _ in recorder.resumes] == [123, 124]
+    assert all(rec["wake"]["resumed"] for rec in registry.records())
+
+    stop.set()
+    await asyncio.wait_for(runner, timeout=2)  # both loops end on stop
+
+
+@pytest.mark.anyio
+async def test_a_failing_poll_pass_does_not_stop_wake_delivery(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    wait_id = registry.records()[0]["wait_id"]
+    assert registry.finish(wait_id, TERMINAL_SUCCESS, now=clock())
+
+    def broken_due(*, now=None):
+        raise RuntimeError("registry read failed")
+
+    registry.due = broken_due  # type: ignore[method-assign]
+    recorder = Recorder()
+    monitor = _fast_monitor(registry, FakeTransport([PrState("abc1234", "pending")]), recorder, clock)
+    stop = asyncio.Event()
+    with caplog.at_level("ERROR"):
+        runner = asyncio.create_task(monitor.run(stop))
+        await _until(lambda: len(recorder.resumes) == 1)
+        await _until(lambda: "poll pass failed" in caplog.text)
+        stop.set()
+        await asyncio.wait_for(runner, timeout=2)
+    assert registry.records()[0]["wake"]["resumed"] is True
+
+
+@pytest.mark.anyio
+async def test_cancelling_the_monitor_cancels_both_loops_and_the_resume(tmp_path: Path) -> None:
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    recorder = Recorder()
+    cancelled = asyncio.Event()
+
+    async def endless_resume(record: dict, prompt: str) -> bool:
+        recorder.resumes.append((record, prompt))
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return True
+
+    monitor = _fast_monitor(
+        registry, FakeTransport([PrState("abc1234", "success")]), recorder, clock, resumer=endless_resume
+    )
+    runner = asyncio.create_task(monitor.run(asyncio.Event()))
+    await _until(lambda: len(recorder.resumes) == 1)
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert cancelled.is_set()
+    names = {task.get_name() for task in asyncio.all_tasks()}
+    assert not names & {"external-wait-poll", "external-wait-wake"}
+    # The journaled start survives, so a restart closes it as
+    # resume_interrupted instead of replaying it (#2787).
+    assert registry.records()[0]["wake"]["state"] == "resuming"
