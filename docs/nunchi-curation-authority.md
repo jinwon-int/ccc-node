@@ -24,7 +24,7 @@ passes add and update, deletion is a human-confirmed proposal.
 |---|---|---|---|
 | ingest | distill pipeline (PreCompact / SessionEnd / auto-distill cron) | insert facts; `review=1` for G2 rank demotion and G3 ambiguous conflicts | `nunchi.py` `ingest` |
 | G1 progress→done | inside ingest | close the in-flight fact replaced by a completion fact of equal or higher rank | `nunchi.py` `_close_fact` (G1 branch) |
-| B2 correction | inside ingest | close the single best-matching open fact a `kind=correction` replaces (token overlap ≥ 0.5) | `nunchi.py` `_auto_supersede` |
+| B2 correction | inside ingest | close the single best-matching open fact a `kind=correction` replaces (token overlap ≥ 0.5), unless that best match outranks the correction or is a constraint — then nothing closes (#2739) | `nunchi.py` `_auto_supersede` |
 | observation TTL | ingest, `snapshot`, `assemble` | close `kind=observation` facts older than `NUNCHI_OBSERVATION_TTL_DAYS` (7; ≤0 disables) | `nunchi.py` `_close_expired_observations` |
 | task-progress TTL (opt-in, #2759) | same sweep step as the observation TTL | **off by default.** With `NUNCHI_TASK_PROGRESS_TTL_DAYS` > 0: close `kind=task-progress` facts older than that many days, except user-stated ones (`source_rank` 3), review-flagged ones and facts this sweep already closed once; one body-free `ttl_close` ledger row per close | `nunchi.py` `_close_expired_task_progress` |
 | judge-batch | hourly cron (`install-nunchi.sh`, managed marker) | `review=0` only, and only with `NUNCHI_JUDGE_APPLY=1`; supersede appears as proposal text | `judge-batch.py` `apply_clear` |
@@ -32,7 +32,10 @@ passes add and update, deletion is a human-confirmed proposal.
 | schema migration | first open | backfill derived columns (`mutability`) | `nunchi.py` `_migrate_gate_cols` |
 
 A lower-rank fact never closes a higher-rank one (G2), so an agent inference cannot bury a user
-statement through G1 or B2.
+statement through G1 or B2. B2 also never closes a constraint: constraints are retired only by the
+owner commands below (`constraints-triage`, `supersede`, `merge`). G1 skips a protected candidate
+and takes the next best; B2 instead closes nothing when its best match is protected, because the
+correction was aimed at that fact and the runner-up was not corrected (#2739).
 
 ### Task-progress TTL (#2759)
 
