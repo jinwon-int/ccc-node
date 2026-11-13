@@ -436,6 +436,84 @@ ok "special-character worker root counts exact argv only" '[ "$count" = 1 ]'
 kill -KILL "$EXACT_WORKER_PID" "$DECOY_WORKER_PID" 2>/dev/null || true
 wait "$EXACT_WORKER_PID" "$DECOY_WORKER_PID" 2>/dev/null || true
 
+# ---- 13. serving≠installed warning (#2791) — warn only, rc unchanged -------
+# shellcheck source=scripts/lib/a2a-native-worker-stale.sh
+. "$ROOT/scripts/lib/a2a-native-worker-stale.sh"
+STALE_DIR="$TMP/stale"
+mkdir -p "$STALE_DIR/scripts" "$STALE_DIR/wroot/dist"
+SUP_FILE="$STALE_DIR/scripts/a2a-termux-native-worker.sh"
+WJS="$STALE_DIR/wroot/dist/worker.js"
+: > "$SUP_FILE"; : > "$WJS"
+python3 -c 'import time; time.sleep(3600)' "$SUP_FILE" supervise --env-file x &
+SUP_FAKE=$!
+python3 -c 'import time; time.sleep(3600)' "$WJS" &
+W_FAKE=$!
+OWNED_PIDS+=("$SUP_FAKE" "$W_FAKE")
+sleep 0.3
+set_future_mtime() {
+    python3 -c 'import os, sys, time
+t = time.time() + 120
+for p in sys.argv[1:]:
+    os.utime(p, (t, t))' "$@"
+}
+line_for() { grep -F "file=$2" <<<"$1" | head -n1; }
+
+report=$(a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "files older than their processes are not stale" '! grep -qF "$STALE_DIR" <<<"$report"'
+
+set_future_mtime "$SUP_FILE" "$WJS"
+report=$(a2a_native_worker_stale_report "$STALE_DIR/wroot")
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+sup_line=$(line_for "$report" "$SUP_FILE")
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+w_line=$(line_for "$report" "$WJS")
+ok "newer supervise script is reported against its process" \
+    '[[ "$sup_line" == "kind=supervise pids=$SUP_FAKE started="*" file=$SUP_FILE" ]]'
+ok "newer worker.js is reported against its process" \
+    '[[ "$w_line" == "kind=worker pids=$W_FAKE started="*" file=$WJS" ]] && ! grep -q "installed=missing" <<<"$w_line"'
+
+report=$(a2a_native_worker_stale_report "$TMP/elsewhere")
+ok "worker_root limits workers but not the supervise loop" \
+    '! grep -qF "file=$WJS" <<<"$report" && grep -qF "file=$SUP_FILE" <<<"$report"'
+
+rm -f "$WJS"
+report=$(a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "a deleted worker.js is reported as installed=missing" \
+    'grep -F "file=$WJS" <<<"$report" | grep -q "installed=missing"'
+: > "$WJS"; set_future_mtime "$WJS"
+
+# Health integration: same rc with and without the warning; log + JSON carry it.
+: > "$A2A_SUPERVISOR_HEALTH_LOG"
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+quiet_out="$(A2A_NATIVE_WORKER_STALE_SLACK_SECONDS=999999999 \
+    bash "$HEALTH" --env-file "$ENVF" --no-self-heal --json $BIG_CAP 2>/dev/null)"
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+quiet_rc=$?
+out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal --json $BIG_CAP 2>/dev/null)"; rc=$?
+ok "stale warning never changes the health rc" '[ "$rc" = "$quiet_rc" ]'
+ok "json stale=[] when nothing is stale" \
+    'python3 -c '\''import json,sys; assert json.loads(sys.stdin.read().splitlines()[-1])["stale"] == []'\'' <<<"$quiet_out"'
+ok "json lists the stale supervise kind" \
+    'python3 -c '\''import json,sys; assert "supervise" in json.loads(sys.stdin.read().splitlines()[-1])["stale"]'\'' <<<"$out"'
+ok "health log records the stale process" \
+    'grep -qF "worker-stale: kind=supervise pids=$SUP_FAKE " "$A2A_SUPERVISOR_HEALTH_LOG"'
+
+stop_owned_supervisor
+start_owned_supervisor >/dev/null || true
+export A2A_TEST_CURL_MODE=up
+out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal $BIG_CAP 2>&1)"; rc=$?
+ok "healthy + stale stays rc=0 and flags the OK line" \
+    '[ "$rc" = 0 ] && grep -qE "^OK sup=[0-9]+ .* stale=supervise" <<<"$out" && grep -qF "WARN worker-stale: kind=supervise pids=$SUP_FAKE " <<<"$out"'
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+out="$(bash "$HEALTH" --env-file "$ENVF" --no-self-heal --quiet $BIG_CAP 2>&1)"
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+rc=$?
+ok "--quiet keeps a stale-but-healthy run silent" '[ "$rc" = 0 ] && [ -z "$out" ]'
+stop_owned_supervisor
+export A2A_TEST_CURL_MODE=down
+kill -KILL "$SUP_FAKE" "$W_FAKE" 2>/dev/null || true
+wait "$SUP_FAKE" "$W_FAKE" 2>/dev/null || true
+
 echo "----"
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

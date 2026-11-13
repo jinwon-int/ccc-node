@@ -2655,6 +2655,34 @@ bump2357 uptodate-installer-fixed
 run2357 >/dev/null 2>&1; rc=$?
 ok "a clean refresh clears the once-per-SHA marker" \
   '[ "$rc" = 0 ] && same_as_checkout "$SBIN" && [ ! -e "$STATE/self-update.a2a-handlers-notified" ]'
+
+# --- #2791: Termux-native worker serving≠installed is logged, never acted on --
+# The native worker is no systemd unit (#2138 gate/restart cannot reach it), so
+# a worker older than the dist/worker.js it runs only earns a log line.
+cp "$HERE/lib/a2a-native-worker-stale.sh" "$TMP/seed/scripts/lib/"
+bump2357 native-worker-stale
+NW2791="$TMP/nw-2791/dist/worker.js"; mkdir -p "${NW2791%/*}"; : > "$NW2791"
+python3 -c 'import time; time.sleep(600)' "$NW2791" &
+NW2791_PID=$!
+sleep 0.3
+python3 -c 'import os, sys, time; t = time.time() + 120; os.utime(sys.argv[1], (t, t))' "$NW2791"
+nw_line() { grep -F "native-worker-stale kind=worker pids=$NW2791_PID " "$STATE/self-update.log" | grep -F "file=$NW2791 tick=$1 action=none (#2791)"; }
+: > "$STATE/self-update.log"; rm -f "$TMP/spool"/*.json
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 run2357 2>&1)"; rc=$?
+ok "changed tick logs a stale native worker without failing" '[ "$rc" = 0 ] && nw_line changed >/dev/null'
+ok "stale native worker is log-only: not on stdout, no notification" \
+  '! grep -q "native-worker-stale" <<<"$out" && ! { compgen -G "$TMP/spool/*.json" >/dev/null && grep -l "native-worker" "$TMP/spool"/*.json >/dev/null 2>&1; } && kill -0 "$NW2791_PID"'
+: > "$STATE/self-update.log"
+TERMUX_VERSION=0.118.0 run2357 >/dev/null 2>&1; rc=$?
+ok "auto mode checks on Termux (up-to-date tick)" '[ "$rc" = 0 ] && nw_line up-to-date >/dev/null'
+: > "$STATE/self-update.log"
+TERMUX_VERSION='' PREFIX=/usr run2357 >/dev/null 2>&1; rc=$?
+ok "auto mode stays silent off Termux" '[ "$rc" = 0 ] && ! grep -q "native-worker-stale" "$STATE/self-update.log"'
+: > "$STATE/self-update.log"
+TERMUX_VERSION=0.118.0 CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=0 run2357 >/dev/null 2>&1; rc=$?
+ok "CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=0 disables the check" '[ "$rc" = 0 ] && ! grep -q "native-worker-stale" "$STATE/self-update.log"'
+kill -KILL "$NW2791_PID" 2>/dev/null || true; wait "$NW2791_PID" 2>/dev/null || true
 rm -f "$CLAUDE/self-update.services"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"

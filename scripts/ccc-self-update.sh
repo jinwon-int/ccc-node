@@ -2053,8 +2053,34 @@ a2a_handlers_refresh() { # <tick: changed|up-to-date>
   [ "$refreshed" -gt 0 ] && A2A_HANDLER_NOTE=", A2A 핸들러 갱신 ${refreshed}곳"
   return 0
 }
+# Termux-native A2A worker serving≠installed warning (#2791). That worker is
+# not a systemd unit, so the #2138 gate/restart never reaches it: after a
+# changed supervise script (this repo) or a redeployed
+# ~/a2a-broker-worker/dist/worker.js it keeps serving the old code. Log-only —
+# no restart, no notification, never fails the tick.
+#   CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK  auto (default: Termux only) | 1 | 0
+native_worker_stale_check() { # <tick>
+  local mode="${CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK:-auto}" lib report line
+  case "$mode" in
+    0) return 0 ;;
+    1) ;;
+    *) [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]] || return 0 ;;
+  esac
+  lib="$REPO/scripts/lib/a2a-native-worker-stale.sh"
+  [ -r "$lib" ] || return 0
+  # shellcheck source=scripts/lib/a2a-native-worker-stale.sh
+  . "$lib"
+  report="$(a2a_native_worker_stale_report)"
+  [ -n "$report" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] && log "native-worker-stale $line tick=$1 action=none (#2791)"
+  done <<<"$report"
+  return 0
+}
+
 a2a_handlers_tick() { # <tick: changed|up-to-date> — refresh + once-per-SHA failure notice
   local tick="$1" short context
+  native_worker_stale_check "$tick"
   A2A_HANDLER_FAILED_DESTS=""; A2A_HANDLER_NOTE=""
   a2a_handlers_refresh "$tick"
   if [ -z "$A2A_HANDLER_FAILED_DESTS" ]; then

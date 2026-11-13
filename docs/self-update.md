@@ -97,6 +97,19 @@ rather than composing the steps ad hoc.
    `~/.claude/state/self-update.a2a-handlers-notified` so twice-daily
    up-to-date ticks log `a2a-handlers notify=suppressed reason=already-notified`
    instead of re-paging); a clean pass clears the marker.
+5c. warn when the Termux-native A2A worker serves older code than installed
+   (#2791). That worker (`a2a-termux-native-worker.sh supervise` +
+   `~/a2a-broker-worker/dist/worker.js`) is no systemd unit, so step 6 and the
+   #2138 worker gate never reach it. On the same ticks as 5b (changed and
+   settled up-to-date), `scripts/lib/a2a-native-worker-stale.sh` compares each
+   such process's start time with the mtime of the file it actually runs and
+   logs `native-worker-stale kind=<supervise|worker> pids=… started=…
+   installed=<UTC|missing> file=… tick=… action=none (#2791)` when the file is
+   newer or gone. **Log-only**: no restart, no notification, no exit-code
+   change. Default `auto` checks only on Termux; force with
+   `CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1`, disable with `0`. The
+   5-minute `a2a-termux-native-worker-health.sh` cron reports the same state
+   (docs/a2a-claude-worker.md).
 6. restarts each service listed in the operator allowlist, verifies it is
    active again, and then watches it for a stability window (#2742,
    `CCC_SELF_UPDATE_RESTART_STABLE_SECONDS`, default 15 s per service). One
@@ -446,6 +459,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_PRE_RESTART_SETTLE_SECONDS` | `11` | wait before the pre-restart idle recheck when a gated health file exists, so a just-admitted turn reaches `health.json` (integer 0..60; `0` = recheck immediately, #2667) |
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_A2A_HANDLERS` | `1` | set to `0` to skip refreshing drifted installed A2A handler copies (#2357) |
+| `CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK` | `auto` | Termux-native A2A worker serving≠installed log line (step 5c, #2791): `auto` = Termux only, `1` = always, `0` = off. Never restarts or notifies |
 | `CCC_A2A_HANDLER_SYSTEM_DEST` | `/usr/local/sbin` | system destination of the installed A2A handlers checked by the refresh step and by `ccc-doctor` (tests point it at a temp dir); the home destination is always `$HOME/a2a-broker-worker` |
 | `CCC_SELF_UPDATE_NOTIFY` | `all` | which owner notices are queued (#2589). `all` (also any unknown value): every notice. `failures`, and `none`/`off` (same behaviour): only the success notices — update completed (`ok-*`) and pending activation reconciled (`reconciled-*`) — are muted, each logged as `notify=suppressed reason=operator-notify-<mode> dedup=… class=info`; every failure, stall, warning, recovery and incomplete activation (e.g. `prepare-fail-*`, `fail-*`, `pending-*`, `stalled-*`) is still pushed and logged as `notify=pushed mode=<mode> class=alert`. `silent`: deliberate full mute — alerts are suppressed too (`class=alert` in the log line) and every run logs `notify=warning mode=silent` and warns on stderr. `status` prints the effective mode. Equivalent operator file: `~/.claude/self-update.notify` (first non-comment line) |
 | `CCC_NODE` | unset | node name in the queued `SelfUpdate` record. Resolution: `CCC_NODE` → first line of `$STATE_DIR/node.txt` (seeded by `setup.sh`, #2541) → `hostname -s`. `localhost` (what Termux reports) and empty values are never used; with no real source the record says `unknown-node` and the run logs `notify node=unknown-node reason=no-node-identity` and warns on stderr (#2589) |
