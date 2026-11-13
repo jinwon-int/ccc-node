@@ -175,7 +175,7 @@
       "name": "code-graph",
       "source": "skills/code-graph",
       "status": "active",
-      "tree_sha256": "9d6845f14dcf7e6616beaf429fc0bef177757ee336b18d9e1d6d9b424753fac9"
+      "tree_sha256": "4716d0cf5a5ab46dabe8302e2ce3efdc43899c6b655db15034c2a179bec93ff4"
     },
     {
       "audience": "claude",
