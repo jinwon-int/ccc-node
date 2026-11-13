@@ -213,7 +213,7 @@ _EMPTY_COMPLETION_MARKER = "empty-completion"
 # #2808: marker for a turn that failed on Cloudflare's 403 block page before
 # producing anything (see sdk_text.is_edge_block_message).
 _EDGE_BLOCK_MARKER = "edge-block"
-# The block lasted tens of seconds on gwakga (three failures in 26 s), so the
+# The block lasted tens of seconds on one node (three failures in 26 s), so the
 # single bounded retry waits a little before it goes out.
 _EDGE_BLOCK_RETRY_DELAY_SECONDS = 30.0
 
