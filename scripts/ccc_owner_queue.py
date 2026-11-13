@@ -16,8 +16,14 @@ queue at once. This script gathers it, read-only by default:
 Output is Markdown (default) or JSON (``--json``). ``--update-issue
 OWNER/REPO#N`` rewrites only the block between the ``owner-queue`` markers in
 that issue's body; without ``--apply`` it prints what it would write and
-changes nothing. Sending the list anywhere else (a digest, an alert) is out of
-scope here — that is a provider send and needs its own approval.
+changes nothing.
+
+``--digest`` adds one owner-only ``tier=info`` push-spool record
+(``event=OwnerQueue``) that the fleet-alerts relay holds for its daily
+09:00 KST digest — the same path as ``spans-rollup.py``. It too is a dry run
+unless ``--apply``, writes nothing when the queue is empty, and is
+de-duplicated per KST day and node. Turning it on (adding ``--digest`` to a
+scheduled run) is a provider send and needs its own owner approval.
 
 The repository owner (organisation) is fleet data, so it is never hardcoded:
 pass ``--owner`` or set ``CCC_OWNER_QUEUE_OWNER``.
@@ -29,8 +35,11 @@ import datetime as dt
 import json
 import os
 import re
+import secrets
+import socket
 import subprocess
 import sys
+from pathlib import Path
 from typing import Callable, Sequence
 
 START = "<!-- owner-queue:start -->"
@@ -182,6 +191,91 @@ def update_issue(target: str, block: str, apply: bool, run: Runner = gh) -> str:
     return "updated"
 
 
+# --- digest delivery (#2617 decision 2) ---------------------------------------
+
+NOTIFY_EVENT = "OwnerQueue"
+_KST = dt.timezone(dt.timedelta(hours=9))
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_node() -> str:
+    """Same order as spans-rollup.py / cost-ledger-weekly.py: CCC_NODE, state/node.txt, hostname."""
+    node = os.environ.get("CCC_NODE", "").strip()
+    if node:
+        return node
+    state = os.environ.get("CCC_STATE_DIR", "").strip()
+    if state:
+        try:
+            text = (Path(state) / "node.txt").read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except OSError:
+            pass
+    return socket.gethostname().split(".")[0] or "node"
+
+
+def _state_dir() -> Path:
+    claude_dir = os.environ.get("CCC_CLAUDE_DIR") or str(Path.home() / ".claude")
+    return Path(os.environ.get("CCC_STATE_DIR") or Path(claude_dir) / "state").expanduser()
+
+
+def push_spool_dir() -> Path:
+    """Same resolution order as the other spool writers (agent-cron, spans-rollup)."""
+    raw = os.environ.get("CCC_PUSH_SPOOL")
+    return Path(raw).expanduser() if raw else _state_dir() / "telegram-spool"
+
+
+def issue_url(target: str | None) -> str | None:
+    m = _TARGET.match(target or "")
+    return f"https://github.com/{m.group(1)}/issues/{m.group(2)}" if m else None
+
+
+def build_digest_text(items: list[dict], link: str | None = None) -> str:
+    """At most three short lines: the relay digest shows the first line + 2 details.
+
+    Only counts, repo#number and age — no titles, so the digest stays short and
+    carries nothing beyond what the tracking issue already shows.
+    """
+    review = [i for i in items if i["kind"].startswith("review-wait")]
+    action = [i for i in items if i["kind"] == "owner-action"]
+    lines = [f"📋 오너 할 일 {len(items)}건 — 승인 대기 PR {len(review)} · owner-action {len(action)}"]
+    if items:
+        lines.append("가장 오래된 것: " + " · ".join(
+            f"{i['repo']}#{i['number']} {_age(i['age_hours'])}" for i in items[:2]))
+    if link:
+        lines.append(f"전체 목록: {link}")
+    return "\n".join(lines)
+
+
+def write_digest(items: list[dict], node: str, apply: bool, link: str | None = None,
+                 now: dt.datetime | None = None) -> str:
+    """One owner-only ``tier=info`` record (0600, atomic rename); nothing when empty."""
+    if not items:
+        return "skipped (queue empty)"
+    now = now or dt.datetime.now(dt.timezone.utc)
+    stamp = now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "ts": stamp,
+        "event": NOTIFY_EVENT,
+        "node": node,
+        "text": build_digest_text(items, link),
+        "dedup": f"{NOTIFY_EVENT}:{now.astimezone(_KST):%Y-%m-%d}:{node}",
+        "tier": "info",
+    }
+    if not apply:
+        return "would-spool (dry-run; pass --apply to write)"
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import ccc_secure_fs
+
+    spool = push_spool_dir()
+    spool.mkdir(parents=True, exist_ok=True)
+    name = f"{stamp.replace(':', '-')}-{NOTIFY_EVENT}-{os.getpid()}-{secrets.token_hex(4)}.json"
+    ccc_secure_fs.atomic_write_text(
+        spool / name, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", mode=0o600)
+    return f"spooled {name}"
+
+
 def main(argv: Sequence[str] | None = None, run: Runner = gh) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--owner", default=os.environ.get("CCC_OWNER_QUEUE_OWNER", ""),
@@ -190,7 +284,11 @@ def main(argv: Sequence[str] | None = None, run: Runner = gh) -> int:
     ap.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
     ap.add_argument("--update-issue", metavar="OWNER/REPO#N",
                     help="rewrite the owner-queue block in this issue (dry-run unless --apply)")
-    ap.add_argument("--apply", action="store_true", help="actually write --update-issue")
+    ap.add_argument("--digest", action="store_true",
+                    help="queue one tier=info push-spool record for the fleet-alerts daily digest "
+                         "(dry-run unless --apply; nothing when the queue is empty)")
+    ap.add_argument("--node", default=None, help="node name for the digest record (default: resolved)")
+    ap.add_argument("--apply", action="store_true", help="actually write --update-issue / --digest")
     args = ap.parse_args(argv)
     if not args.owner:
         print("ccc_owner_queue: --owner (or CCC_OWNER_QUEUE_OWNER) is required", file=sys.stderr)
@@ -213,6 +311,14 @@ def main(argv: Sequence[str] | None = None, run: Runner = gh) -> int:
         except (RuntimeError, ValueError, KeyError) as exc:
             print(f"ccc_owner_queue: {exc}", file=sys.stderr)
             return 1
+    if args.digest:
+        try:
+            result = write_digest(items, args.node or resolve_node(), args.apply,
+                                  issue_url(args.update_issue))
+        except (OSError, ImportError) as exc:
+            print(f"ccc_owner_queue: digest spool failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"digest: {result}", file=sys.stderr)
     return 0
 
 
