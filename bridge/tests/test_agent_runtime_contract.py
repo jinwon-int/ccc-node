@@ -519,6 +519,25 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(error, ErrorEvent)
         self.assertEqual(cast(ErrorEvent, error).message, "Custom error text")
 
+    async def test_cloudflare_block_page_403_is_retryable(self) -> None:
+        """#2808: the 403 Cloudflare block page is transient; a plain 403 is not."""
+        from claude_agent_sdk import ResultMessage
+
+        runtime = ClaudeRuntime()
+        session = await runtime.start_or_resume(SessionRequest(working_directory="/tmp", model="sonnet"))
+
+        def retryable(result: str) -> bool:
+            active = _ActiveTurn(queue=asyncio.Queue(), approval_handler=deny_approval, generation=1)
+            session._complete_turn(active, ResultMessage(
+                subtype="success", result=result, api_error_status=403, terminal_reason=None,
+                stop_reason="end_turn", duration_ms=0, duration_api_ms=0, is_error=True,
+                num_turns=1, session_id="test-session",
+            ))
+            return cast(ErrorEvent, active.queue.get_nowait()).retryable
+
+        self.assertTrue(retryable("Failed to authenticate. API Error: 403 Attention Required! | Cloudflare"))
+        self.assertFalse(retryable("Failed to authenticate. API Error: 403 Forbidden"))
+
         await runtime.close()
 
 

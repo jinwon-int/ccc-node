@@ -132,6 +132,9 @@ class TurnEventState:
     terminal_result_text: str | None = None
     active_tools: dict[str, str] = field(default_factory=dict)
     active_tool_ids: set[str] = field(default_factory=set)
+    # #2808: any tool started in this turn. A failed turn is only replayed
+    # when it never reached a tool, so a retry can not repeat a side effect.
+    tool_started: bool = False
     delegated_tasks_active: int = 0
     delegated_tasks_oldest_started_at: float | None = None
     delegated_tasks_last_activity_at: float | None = None
@@ -258,6 +261,7 @@ class TurnEventState:
         if isinstance(event, MessageCompletedEvent):
             return MessageCompletedTransition(event)
         if isinstance(event, ToolStartedEvent):
+            self.tool_started = True
             self.active_tool_ids.add(event.tool_call_id)
             label = tool_label(event.tool_name, dict(event.arguments))
             if label is not None:
