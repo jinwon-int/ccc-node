@@ -320,6 +320,39 @@ async def test_approval_round_trip_allow_deny_and_timeout(tmp_path: Path) -> Non
         await _stop(served)
 
 
+async def test_steward_approval_names_the_tool_and_its_arguments(tmp_path: Path) -> None:
+    # family-messenger #619: the bot draws the card's target/what/impact lines from these.
+    served = await _serve(tmp_path, approval_timeout_s=5)
+    outcomes: list[str] = []
+
+    async def asks(job: Any, sink: Any) -> TurnResult:
+        outcomes.append(
+            await sink.steward_approval_outcome(
+                "room op",
+                action="mcp__steward__room_invite",
+                arguments={"room": "family", "device": "kid-1"},
+            )
+        )
+        return TurnResult(text="done", session_id="s")
+
+    served.runner.behaviour = asks
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-10s", "invite"))
+        ask = await bot.recv_kind("approval")
+        assert ask["action"] == "mcp__steward__room_invite"
+        assert ask["arguments"] == {"room": "family", "device": "kid-1"}
+        assert ask["description"] == "room op" and ask["turn_id"] == "t-10s"
+        await bot.send({"type": "deny", "turn_id": "t-10s", "approval_id": ask["approval_id"]})
+        resolved = await bot.recv_kind("approval-resolved")
+        assert resolved["approval_id"] == ask["approval_id"] and resolved["allowed"] is False
+        assert (await bot.recv_kind("result"))["status"] == "complete"
+        assert outcomes == ["deny"]
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
 async def test_runner_exception_is_uncertain_not_a_crash(tmp_path: Path) -> None:
     served = await _serve(tmp_path)
 
@@ -974,6 +1007,11 @@ async def test_self_job_cannot_ask_for_approval_and_says_so(tmp_path: Path) -> N
 
     async def asks(job: Any, sink: Any) -> TurnResult:
         outcomes.append(await sink.approval_outcome("Bash: git push"))
+        outcomes.append(
+            await sink.steward_approval_outcome(
+                "room op", action="mcp__steward__room_close", arguments={"room": "r"}
+            )
+        )
         outcomes.append(str((await sink.tool("room_status", {}))["error"]))
         return TurnResult(text="done", session_id="s")
 
@@ -986,8 +1024,9 @@ async def test_self_job_cannot_ask_for_approval_and_says_so(tmp_path: Path) -> N
         transport.enqueue_self_job("agent", "resume", key="wait:4")
         denied = await bot.recv_kind("notice")
         assert denied["text"].startswith("⚠️ Denied") and "Bash: git push" in denied["text"]
+        assert "room op" in (await bot.recv_kind("notice"))["text"]
         assert (await bot.recv_kind("notice"))["text"] == "done"
-        assert outcomes == ["unavailable", "no_active_turn"]
+        assert outcomes == ["unavailable", "unavailable", "no_active_turn"]
         await bot.close()
     finally:
         await _stop(served)

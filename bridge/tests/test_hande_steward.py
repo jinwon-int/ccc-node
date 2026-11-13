@@ -369,6 +369,34 @@ async def test_steward_call_asks_the_owner_for_write_tools(tmp_path: Path) -> No
     assert all(r["action"] == "tool_use" for r in rows)
 
 
+class _StewardFrameSink(_ApprovingSink):
+    """A hande turn sink that also takes the steward tool name and arguments (#619)."""
+
+    def __init__(self, answers: list[str]) -> None:
+        super().__init__(answers)
+        self.frames: list[tuple[str, str, dict[str, str]]] = []
+
+    async def steward_approval_outcome(self, text: str, *, action: str, arguments: Any) -> str:
+        self.frames.append((text, action, dict(arguments)))
+        return self.answers.pop(0)
+
+
+async def test_steward_approval_sends_the_tool_name_and_arguments(tmp_path: Path) -> None:
+    # family-messenger #619: with the qualified name and arguments in the frame the bot
+    # draws the approval card's target/what/impact lines; the prompt stays as description.
+    bot = _bot(tmp_path)
+    sink = _StewardFrameSink(["deny"])
+    bot._active_sink = sink
+    bot._steward_identity = (7, 7)
+    out = await bot._steward_call("room_create", {"room": "test-room", "mode": "silent"})
+    assert out == {"ok": False, "error": "approval_deny"}
+    assert sink.prompts == [] and sink.tools == []
+    [(text, action, arguments)] = sink.frames
+    assert action == "mcp__steward__room_create"
+    assert arguments == {"room": "test-room", "mode": "silent"}
+    assert "도구: room_create" in text and "room=test-room mode=silent" in text
+
+
 async def test_steward_approve_all_asks_for_read_only_too(tmp_path: Path) -> None:
     bot = _bot(tmp_path, steward_tools_approve_all=True)
     sink = _ApprovingSink(["allow"])
