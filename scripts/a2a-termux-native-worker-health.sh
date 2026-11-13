@@ -19,6 +19,11 @@
 # (safe from any cron entry), or --no-tunnel-recovery to keep only the spawn
 # behavior and leave a DOWN tunnel flagged for a human.
 #
+# Every run also warns when the supervise loop or a worker serves older code
+# than the file it runs (serving≠installed, #2791): health-log `worker-stale:`
+# lines, `stale=` on the OK line, `"stale"` in --json. Warning only — the rc is
+# unchanged and nothing is restarted.
+#
 # Exit codes (fail-closed with distinct rc so cron logs are self-explanatory):
 #   0   healthy, spawned a fresh supervisor, or recovered a dead tunnel
 #   2   env validation failure, or missing --env-file
@@ -32,6 +37,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="$SCRIPT_DIR/a2a-termux-native-worker.sh"
 # shellcheck source=scripts/lib/a2a-supervisor-identity.sh
 . "$SCRIPT_DIR/lib/a2a-supervisor-identity.sh"
+# shellcheck source=scripts/lib/a2a-native-worker-stale.sh
+. "$SCRIPT_DIR/lib/a2a-native-worker-stale.sh"
 
 LOCAL_PORT=18790
 
@@ -63,6 +70,11 @@ RESTART_TS_FILE="${A2A_TUNNEL_RESTART_TS_FILE:-$LOCK.tunnel_restart_ts}"
 # runs both is exactly the pile-up scenario the cap-detector must catch.
 CANONICAL_SIG='a2a-termux-native-worker\.sh[[:space:]]+supervise'
 LEGACY_SIG='native-worker-supervisor\.sh'
+
+# serving≠installed (#2791): comma-separated kinds (supervise,worker) whose
+# running process is older than the file it runs. Warning only — never changes
+# rc and never restarts anything.
+STALE_KINDS=""
 
 log() {
     printf '%s [health:%d] %s\n' "$(date '+%F %T%z')" "$$" "$*" >> "$LOG"
@@ -224,12 +236,12 @@ emit_json() {
     local sup_pid="$1" sup_count="$2" sup_pids_csv="$3" \
           workers="$4" tunnel="$5" action="$6" rc="$7"
     python3 - "$sup_pid" "$sup_count" "$sup_pids_csv" "$workers" \
-        "$tunnel" "$action" "$rc" "$MAX_SUPERVISORS" "$LOCK" <<'PY'
+        "$tunnel" "$action" "$rc" "$MAX_SUPERVISORS" "$LOCK" "$STALE_KINDS" <<'PY'
 import datetime
 import json
 import sys
 
-sup_pid, sup_count, sup_pids, workers, tunnel, action, rc, maximum, lock = sys.argv[1:]
+sup_pid, sup_count, sup_pids, workers, tunnel, action, rc, maximum, lock, stale = sys.argv[1:]
 payload = {
     "schema": "a2a-native-worker-health.v1",
     "supervisor_pid": int(sup_pid) if sup_pid else None,
@@ -241,6 +253,7 @@ payload = {
     "rc": int(rc),
     "max_supervisors": int(maximum),
     "lock": lock,
+    "stale": [kind for kind in stale.split(",") if kind],
     "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
@@ -383,7 +396,16 @@ main() {
     # Comma-separated PID list for the JSON emitter.
     sup_pids_csv=$(printf '%s\n' "${_pids[@]}" | paste -sd, -)
 
-    log "state sup_pid=${sup_pid:-none} sup_count=$sup_count workers=$workers tunnel=$tunnel"
+    local stale_report stale_line
+    stale_report=$(a2a_native_worker_stale_report "$worker_root")
+    STALE_KINDS=$(sed -n 's/^kind=\([a-z]*\) .*/\1/p' <<<"$stale_report" | awk '!seen[$0]++' | paste -sd, -)
+
+    log "state sup_pid=${sup_pid:-none} sup_count=$sup_count workers=$workers tunnel=$tunnel stale=${STALE_KINDS:-none}"
+    while IFS= read -r stale_line; do
+        [[ -n "$stale_line" ]] || continue
+        log "worker-stale: $stale_line (serving older than installed; not restarted, #2791)"
+        (( quiet )) || printf 'WARN worker-stale: %s (not restarted, #2791)\n' "$stale_line"
+    done <<<"$stale_report"
 
     # ---- cap check first: refuse to self-heal on top of a pile-up ----
     if (( sup_count > MAX_SUPERVISORS )); then
@@ -448,8 +470,9 @@ main() {
         # Tunnel UP — clear any pending down-streak so the next down episode
         # starts its debounce from zero.
         (( self_heal && tunnel_recovery )) && reset_tunnel_down_streak
-        (( quiet )) || printf 'OK sup=%s workers=%s tunnel=%s (cap=%s/%s)\n' \
-            "$sup_pid" "$workers" "$tunnel" "$sup_count" "$MAX_SUPERVISORS"
+        (( quiet )) || printf 'OK sup=%s workers=%s tunnel=%s (cap=%s/%s)%s\n' \
+            "$sup_pid" "$workers" "$tunnel" "$sup_count" "$MAX_SUPERVISORS" \
+            "${STALE_KINDS:+ stale=$STALE_KINDS}"
         (( emit_json_flag )) && emit_json "$sup_pid" "$sup_count" "$sup_pids_csv" \
             "$workers" "$tunnel" ok 0
         return 0

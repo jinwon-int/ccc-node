@@ -189,6 +189,17 @@ the legacy `~/.hermes/scripts/native-worker-supervisor.sh` pattern) and
 refuses to self-heal on top of an existing pile-up. `--max-supervisors N`
 overrides the default cap of 1.
 
+Serving≠installed warning (#2791): every run also compares the supervise
+loop and each `$A2A_WORKER_ROOT/dist/worker.js` worker with the file it runs.
+When that file is newer than the process (or gone) the health log gets
+`worker-stale: kind=<supervise|worker> pids=… started=… installed=… file=…`,
+the `OK` line ends with `stale=<kinds>` (plus a `WARN worker-stale:` line
+unless `--quiet`), and `--json` carries `"stale": [...]` (`[]` when current).
+It is a warning only — the rc does not change and nothing is restarted; a
+redeployed `worker.js` or changed supervise script still needs a manual
+supervisor restart. Process age comes from `CLOCK_BOOTTIME`, because Android
+denies `/proc/uptime` and `/proc/stat` to Termux.
+
 ## No-provider adapter smoke
 
 Before any real provider canary, run the bridge with a fake Claude binary so the JSON contract, executable path, and Node runtime are proven without spending provider quota:
