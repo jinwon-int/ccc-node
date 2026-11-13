@@ -9,7 +9,7 @@ from the Claude SessionEnd/SessionStart hook distiller:
 | Installed path | `~/.hermes/auto-distill/` | `~/.claude/hooks/` |
 | Trigger | operator-managed cron | Claude lifecycle hooks |
 | Input | Piri and/or Claude interactive session logs | current Claude transcript |
-| Output | unverified `AUTO.md` candidates | local/Wiki-candidate memory sinks |
+| Output | node-local `AUTO.md` candidates (no human review since #2186); `kept` ones feed nunchi for session injection ([below](#nunchi-feed-2186--replaces-the-human-automd-review)) | local/Wiki-candidate memory sinks |
 
 The managed source was brought into ccc-node after a Piri node silently chose
 Claude for at least 96 consecutive runs because the hand-deployed script only
