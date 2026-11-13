@@ -49,6 +49,12 @@
       "reason": "Operator procedure executed from Claude sessions against codex bridge config"
     },
     {
+      "pattern": "skills/code-graph/**",
+      "compatibility": "claude-only",
+      "audience": "shared",
+      "reason": "Stdlib-only static call/import graph helper (#2707 stage 1); runtime-neutral script, no codex managed counterpart yet"
+    },
+    {
       "pattern": "skills/debug-long-running-agent-tasks/**",
       "compatibility": "claude-only",
       "audience": "shared",
