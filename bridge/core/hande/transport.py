@@ -188,8 +188,11 @@ class _Client:
             try:
                 self.writer.write(data)
                 await asyncio.wait_for(self.writer.drain(), SEND_DRAIN_TIMEOUT_S)
-            except (OSError, asyncio.TimeoutError, ConnectionError):
+            except (OSError, asyncio.TimeoutError, ConnectionError) as error:
                 self.closed = True
+                logger.warning(
+                    "hande: send failed (%s); dropping the connection", type(error).__name__
+                )
                 self._drop()
                 return False
         return True

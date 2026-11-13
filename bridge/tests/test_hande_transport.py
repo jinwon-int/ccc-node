@@ -436,7 +436,7 @@ async def _read_until_closed(bot: FakeBot) -> set[str]:
 
 
 async def test_bot_that_stops_reading_is_dropped_and_a_new_bot_is_served(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # #2740: a send that timed out only marked the client closed. The socket
     # stayed open, so the bot never saw ``worker_gone``; turns it sent next on
@@ -457,6 +457,7 @@ async def test_bot_that_stops_reading_is_dropped_and_a_new_bot_is_served(
         assert served.transport.health_signals()["connected"] is False
         assert served.transport.active is False
         assert served.runner.cancelled == ["t-30"], "its turn ends as worker_gone"
+        assert "send failed (TimeoutError); dropping the connection" in caplog.text
         # The bot's side: what was buffered, then end of stream. No result.
         assert await _read_until_closed(bot) == {"interim"}
         await bot.close()
