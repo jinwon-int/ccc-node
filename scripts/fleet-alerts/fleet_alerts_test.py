@@ -961,6 +961,15 @@ class ReplyChoiceCardTest(_Base):
         for bad in ("1. ok p3tw6n\n2. hold p3tw6n", "123. ok p3tw6n", "1.ok p3tw6n", "1. ok p3tw6n please", "- ok p3tw6n"):
             self.assertIsNone(reply.parse_reply(bad), bad)
 
+    def test_recommended_tag_after_the_marker_parses(self) -> None:
+        # an agent relays the card as ``1. (권장) ok <id>`` (#2782) and the owner echoes it back
+        self.assertEqual(reply.parse_reply("1. (권장) ok p3tw6n"), ("ok", "p3tw6n"))
+        self.assertEqual(reply.parse_reply("2) (recommended) HOLD #P3TW6N"), ("hold", "p3tw6n"))
+        self.assertEqual(reply.parse_reply("(권장) ok p3tw6n"), ("ok", "p3tw6n"))
+        for bad in ("1. ok p3tw6n (권장)", "1. (권장)(권장) ok p3tw6n", "1. (권장)ok p3tw6n", "(권장) 1. ok p3tw6n",
+                    "1. (추천) ok p3tw6n", "1. (권장) ok p3tw6n — 확인만", "1. (권장) ok p3tw6n\n2. hold p3tw6n"):
+            self.assertIsNone(reply.parse_reply(bad), bad)
+
     def test_choice_block_items_round_trip_through_the_parser(self) -> None:
         block = outbox.reply_choices("p3tw6n")
         lines = block.split("\n")

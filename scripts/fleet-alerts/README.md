@@ -147,7 +147,11 @@ digest>:<alertedAt>`, the "cleared" notice resolves it). Keys are split with
 re-notify rows end with a `[답변 필요] 하나만 선택` block (`1. ok <id>` /
 `2. hold <id>`, #2700): 「한데」 draws it as a single-choice card whose
 [보내기] sends the one line `1. ok <id>`, which the parser accepts like the
-typed form (Matrix shows a plain numbered list). The Matrix sender reads it through
+typed form (Matrix shows a plain numbered list). One `(권장)`/`(recommended)`
+tag right after the number is also accepted (`1. (권장) ok <id>`), because
+agents relaying the card mark their recommended option that way (#2782) and the
+owner echoes it back verbatim; anywhere else the tag still rejects the line.
+The Matrix sender reads it through
 the transport's normal admission (owner sender, decrypted text, verified
 pinned device); the 「한데」 lane reads it from the relay bot's `turn` frame
 (`sender` = `@<device>:hande`, MLS-authenticated — devices of the owner actor
