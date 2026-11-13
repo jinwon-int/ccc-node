@@ -73,6 +73,7 @@ ok "memory check reports healthy nunchi and MemPalace scalars" '[ "$rc" = 0 ] &&
   and .mempalace.status == "ok" and .mempalace.integrity == "ok" and .mempalace.embeddings == 1
   and .mempalace.index == {status:"ok", sqlite_count:1, hnsw_count:1, divergence:0}
   and .mempalace.refresh.status == "ok" and .mempalace.refresh.age_seconds == 10
+  and .mempalace.refresh.duration_seconds == 10 and .mempalace.refresh.slow == false
 '\'' >/dev/null <<<"$out"'
 ok "memory readiness JSON never exposes snapshot, fact or refresh bodies" '! grep -q "PROBE_SECRET_BODY\|PROBE_SECRET_FACT\|PROBE_SECRET_REFRESH" <<<"$out"'
 
@@ -387,7 +388,8 @@ out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_s
 ok "failed refresh diagnostics stay bounded and body-free" '[ "$rc" = 0 ] && jq -e '\''
   .mempalace.status == "degraded" and (.mempalace.reasons | index("refresh-error")) != null
   and .mempalace.refresh == {status:"error", provider:"codex", exit_code:17, age_seconds:10,
-    index_status:{state:"absent", sqlite:-1, hnsw:-1}}
+    index_status:{state:"absent", sqlite:-1, hnsw:-1},
+    duration_seconds:10, running_seconds:null, slow:false}
 '\'' >/dev/null <<<"$out" && ! grep -q "PROBE_SECRET_REFRESH_ERROR" <<<"$out"'
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$probe_nunchi/mempalace-refresh.status.json"
 
@@ -548,6 +550,36 @@ with tempfile.TemporaryDirectory() as root:
     ):
         path.write_text(json.dumps(record), encoding="utf-8")
         assert probe.mempalace_refresh_probe(path, 200)["status"] == record["state"]
+
+    # #2722 C: refresh duration + slow flag are additive and never move status.
+    def refresh(record, now=2000, threshold=None):
+        path.write_text(json.dumps(record), encoding="utf-8")
+        env = {} if threshold is None else {"CCC_NUNCHI_MEMPALACE_REFRESH_SLOW_SEC": threshold}
+        with mock.patch.dict(os.environ, env, clear=False):
+            if threshold is None:
+                os.environ.pop("CCC_NUNCHI_MEMPALACE_REFRESH_SLOW_SEC", None)
+            return probe.mempalace_refresh_probe(path, now)
+
+    fast = refresh({**valid, "started_at": 1000, "finished_at": 1159})
+    assert (fast["status"], fast["duration_seconds"], fast["running_seconds"], fast["slow"]) == ("ok", 159, None, False), fast
+    slow = refresh({**valid, "started_at": 100, "finished_at": 1451})
+    assert (slow["status"], slow["duration_seconds"], slow["slow"]) == ("ok", 1351, True), slow
+    edge = refresh({**valid, "started_at": 1000, "finished_at": 1600})
+    assert edge["duration_seconds"] == 600 and edge["slow"] is False, edge
+    assert refresh({**valid, "state": "error", "exit_code": 124, "started_at": 100, "finished_at": 1000})["slow"] is True
+    assert refresh({**valid, "started_at": 1000, "finished_at": 1159}, threshold="120")["slow"] is True
+    for bad in ("0", "-5", "abc", ""):
+        assert refresh({**valid, "started_at": 1000, "finished_at": 1159}, threshold=bad)["slow"] is False, bad
+    running = refresh({**valid, "state": "running", "started_at": 1000, "finished_at": 0, "exit_code": -1})
+    assert (running["status"], running["duration_seconds"], running["running_seconds"], running["slow"]) == ("running", None, 1000, True), running
+    young = refresh({**valid, "state": "running", "started_at": 1990, "finished_at": 0, "exit_code": -1})
+    assert (young["running_seconds"], young["slow"]) == (10, False), young
+    for record in ({k: v for k, v in valid.items() if k != "finished_at"}, {**valid, "started_at": None}):
+        got = refresh(record)
+        assert (got["status"], got["duration_seconds"], got["running_seconds"], got["slow"]) == ("invalid", None, None, False), got
+    path.unlink()
+    gone = probe.mempalace_refresh_probe(path, 2000)
+    assert (gone["status"], gone["duration_seconds"], gone["slow"]) == ("missing", None, False), gone
 PY
 rc=$?
 ok "repair and refresh parsers reject every malformed state invariant" '[ "$rc" = 0 ]'

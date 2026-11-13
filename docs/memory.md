@@ -369,6 +369,15 @@ repair-status` drawer comparison. Missing, failed, stale, malformed, or
 provider-mismatched refreshes and an unknown, `DIVERGED` or malformed index state degrade
 readiness even when SQLite is readable and recently touched.
 
+The probe also reports how long the refresh took (#2722 C), because a long
+sweep keeps `mempalace search` failing while `status` stays `ok`:
+`mempalace.refresh.duration_seconds` (`finished_at - started_at` of a finished
+record), `running_seconds` (`now - started_at` while `running`), each `null`
+otherwise, and `slow` (that span exceeds
+`CCC_NUNCHI_MEMPALACE_REFRESH_SLOW_SEC`, default 600; an unset, non-integer or
+non-positive value uses the default). These keys are observability only — they
+never change `status` or add a readiness reason.
+
 After a successful refresh the wrapper also runs the read-only `mempalace
 repair-status` (bounded by `CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TIMEOUT_SEC`,
 1-120 s, default 30) and records its verdict in the status as

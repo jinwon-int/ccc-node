@@ -465,13 +465,36 @@ def refresh_index_status(doc: dict[str, object]) -> dict[str, object]:
     return {"state": state, "sqlite": sqlite_count, "hnsw": hnsw_count}
 
 
+_REFRESH_SLOW_DEFAULT_SEC = 600
+
+
+def refresh_slow_threshold() -> int:
+    """Seconds after which a refresh counts as ``slow`` (#2722 C).
+
+    ``CCC_NUNCHI_MEMPALACE_REFRESH_SLOW_SEC``; unset, non-integer or <= 0
+    falls back to 600 so a typo can never make every refresh look slow.
+    """
+    raw = (os.environ.get("CCC_NUNCHI_MEMPALACE_REFRESH_SLOW_SEC") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return _REFRESH_SLOW_DEFAULT_SEC
+    return value if value > 0 else _REFRESH_SLOW_DEFAULT_SEC
+
+
 def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
+    # duration_seconds/running_seconds/slow are additive observability (#2722
+    # C): a long sweep blocks `mempalace search` while `status` stays `ok`.
+    # They never feed `status` or the readiness reasons.
     payload: dict[str, object] = {
         "status": "missing",
         "provider": "unknown",
         "exit_code": -1,
         "age_seconds": -1,
         "index_status": {"state": "absent", "sqlite": -1, "hnsw": -1},
+        "duration_seconds": None,
+        "running_seconds": None,
+        "slow": False,
     }
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -516,12 +539,24 @@ def mempalace_refresh_probe(path: Path, now: int) -> dict[str, object]:
     # but reject farther-future records instead of making them look fresh.
     if reference > now + 300 or started > now + 300:
         return {**payload, "status": "invalid"}
+    # The writer stamps started_at once it owns the refresh lock and
+    # finished_at when the sweep/mine exits, so a finished record's span is the
+    # refresh itself; a running record's span is time since that lock.
+    if state == "running":
+        duration, running = None, max(0, now - started)
+        elapsed = running
+    else:
+        duration, running = finished - started, None
+        elapsed = duration
     return {
         "status": state,
         "provider": provider,
         "exit_code": exit_code,
         "age_seconds": max(0, now - reference),
         "index_status": refresh_index_status(doc),
+        "duration_seconds": duration,
+        "running_seconds": running,
+        "slow": elapsed > refresh_slow_threshold(),
     }
 
 
