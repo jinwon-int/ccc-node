@@ -36,6 +36,7 @@ class PersistFailureTest(unittest.TestCase):
             "append_run_history", "apply_retry_transition", "apply_run_limit",
             "commit_run_state", "release_for_run", "quarantine_persist_failure",
             "notification_base", "headless_metadata", "parse_schedule", "load_doc", "record_failure_alarm",
+            "_refresh_locked_task",
         ):
             self._saved[name] = getattr(agent_cron, name)
 
@@ -68,6 +69,10 @@ class PersistFailureTest(unittest.TestCase):
         agent_cron.notification_base = lambda t: {"policy": "none"}
         agent_cron.headless_metadata = lambda t, execute=False: {"command": "true"}
         agent_cron.parse_schedule = lambda *a, **k: {"kind": "cron"}
+        # The post-lock re-read (#2741) succeeds here: these tests are about
+        # the commit after the run, and must not read the default store.
+        agent_cron._refresh_locked_task = lambda tid, at: {
+            "task": task, "due": True, "status": "due", "scheduledAt": "2026-01-01T00:00:00Z"}
 
         def boom(*_a, **_k):
             raise OSError("store is unwritable")
@@ -119,6 +124,27 @@ class PersistFailureTest(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertEqual(self.released, [])
         self.assertEqual(len(self.quarantined), 1)
+
+    def test_store_unreadable_before_the_run_releases_without_running(self) -> None:
+        # #2741: the re-read after the lock is taken happens before any work,
+        # so a store that cannot be read there is reported and the lock is
+        # released (the occurrence stays due) -- not quarantined, not run.
+        ran = []
+        agent_cron.run_headless = lambda t: ran.append(t) or {"exitCode": 0, "stdout": "", "stderr": ""}
+
+        def unreadable(*_a, **_k):
+            raise RuntimeError("task store load failed before run: invalid")
+
+        agent_cron._refresh_locked_task = unreadable
+        result, _as_json, rc = agent_cron.run_execute({}, "probe", None, True)
+        self.assertEqual(result["mode"], "run-execute")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "store-error")
+        self.assertIn("load failed before run", result["error"])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(ran, [])
+        self.assertEqual(len(self.released), 1)
+        self.assertEqual(self.quarantined, [])
 
 
 class PersistQuarantineLockTest(unittest.TestCase):

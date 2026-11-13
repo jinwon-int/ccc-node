@@ -2287,6 +2287,29 @@ def record_failure_alarm(task_id, task, run_id, status, failure_class, at, immed
         return {'state': 'error', 'error': short_text(str(e), 300)}
 
 
+def _refresh_locked_task(task_id, plan_at):
+    """Re-read one task under its held run lock and re-plan only it (#2741).
+
+    Returns {'task': None} when the task is gone, otherwise the fresh task with
+    its due verdict, status and scheduledAt at the tick's `at`. Planning only
+    this task keeps the per-run cost flat (scheduler_execute already avoided an
+    all-tasks replan per run). A store that cannot be read raises.
+    """
+    with store_lock():
+        fresh, errors = load_doc()
+    if errors:
+        raise RuntimeError('task store load failed before run: ' + '; '.join(str(e) for e in errors)[:2000])
+    if not isinstance(fresh, dict):
+        raise RuntimeError('task store load failed before run: root is not an object')
+    task = task_by_id(fresh, task_id)
+    if task is None:
+        return {'task': None}
+    _plan, row = run_plan_for({'tasks': [task]}, task_id, plan_at)
+    row = row or {}
+    return {'task': task, 'due': bool(row.get('due')), 'status': row.get('status'),
+            'scheduledAt': row.get('scheduledAt')}
+
+
 def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None):  # noqa: C901 -- #348 baseline hotspot
     task = task_by_id(data, task_id)
     if not task:
@@ -2324,12 +2347,52 @@ def run_execute(data, task_id, at_value, as_json, plan_row=None, plan_at=None): 
     restore_term = install_termination_handler()
     try:
         acquired, lock = acquire_for_run(task_id, task, run_id, scheduled_at, at)
+    except Exception as e:
+        # #2741: one task's unusable lock (guard/lock file permissions, a
+        # directory in its place, a full disk) is that task's failure. Raised
+        # out of here it reached scheduler_plan's blanket handler, which
+        # reported the whole tick as `scheduler-error`, dropped the results of
+        # tasks already run and never started the rest. Nothing was acquired,
+        # so nothing needs releasing; the occurrence stays due.
+        restore_term()
+        return {**base, 'ok': False, 'status': 'lock-error', 'runId': run_id,
+                'lock': {'state': 'error', 'path': str(lock_path(task_id)), 'error': short_text(str(e))},
+                'mutations': mutation_flags(False, False, False)}, as_json, 1
     except BaseException:
         restore_term()
         raise
     if not acquired:
         restore_term()
         return {**base, 'ok': False, 'status': 'locked' if lock.get('state') in {'held','stale'} else lock.get('state','lock-error'), 'runId': run_id, 'lock': lock, 'mutations': mutation_flags(False, False, False)}, as_json, 1
+    # #2741: `data` is the store as this process read it — for a scheduler
+    # tick, before the earlier due tasks ran, which can take many minutes. In
+    # that window the task may have been disabled, removed, rescheduled or run
+    # by a manual `run` (which committed its own runCount/runHistory). Only now,
+    # holding the lock that every run of this task takes, is its definition and
+    # run state stable, so decide and run from a fresh read.
+    try:
+        refreshed = _refresh_locked_task(task_id, plan_at)
+    except Exception as e:
+        refreshed = {'error': short_text(str(e))}
+    if refreshed.get('task') is None or not refreshed.get('due'):
+        early_release = release_for_run(task_id, run_id)
+        restore_term()
+        if refreshed.get('error'):
+            skip = {'ok': False, 'status': 'store-error', 'error': refreshed['error']}
+        elif refreshed.get('task') is None:
+            skip = {'ok': True, 'status': 'removed'}
+        else:
+            # disabled / run-limit-reached say why; anything else (already
+            # run, rescheduled, waiting on retry backoff) is simply not due.
+            planned = refreshed.get('status')
+            skip = {'ok': True, 'status': planned if planned in {'disabled', 'run-limit-reached'} else 'not-due'}
+        return {**base, **skip, 'runId': run_id, 'staleDefinition': True,
+                'lock': {'state': lock.get('state'), 'path': lock.get('path'), 'release': early_release},
+                'mutations': mutation_flags(True, False, False)}, as_json, 0 if skip['ok'] and early_release.get('ok') else 1
+    task = refreshed['task']
+    if refreshed.get('scheduledAt'):
+        scheduled_at = refreshed['scheduledAt']
+    base = {**base, 'scheduledAt': scheduled_at, 'notification': notification_base(task)}
     if _TERMINATION['signum'] is not None:
         # Asked to stop before this run started: nothing ran, so nothing is
         # recorded and the occurrence stays due for the next tick.

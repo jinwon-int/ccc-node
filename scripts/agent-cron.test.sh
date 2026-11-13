@@ -1307,5 +1307,84 @@ ok "#2741 SIGTERM: the next task is not started and stays due" 'jq -e ".tasks[] 
 { out="$(CCC_AGENT_CRON_STORE="$TERM_STORE" CCC_PUSH_SPOOL="$TERM_SPOOL" bash "$CMD" run term-next --json --at 2026-01-01T00:02:10Z)"; rc=$?; }
 ok "#2741 SIGTERM: a later run in a fresh process is unaffected" '[ "$rc" = 0 ] && jq -e ".ok == true and .status == \"success\" and (has(\"terminatedBySignal\") | not)" <<<"$out" >/dev/null'
 
+# ── #2741: a run re-reads its task after taking the lock ──
+# A tick plans from the store it read at start, then runs its due tasks one by
+# one; a long run gives an operator (or another run) minutes to change a later
+# task. Each test's first task is a command that makes that change itself, so
+# the race is deterministic: the second task must run from the store as it is
+# once its lock is held, not from the tick-start snapshot.
+rr_setup() {  # rr_setup <dir> <mutation argv as one shell string>
+  mkdir -p "$1"
+  python3 - "$1" "$2" "$CMD" <<'PY'
+import json, sys
+d, mutation, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+store = f'{d}/tasks.json'
+tasks = [
+    {"id": "rr-mutator", "schedule": "* * * * *", "prompt": "mutate", "enabled": True, "notify": "none",
+     "lastRunAt": "2026-01-01T00:00:00Z",
+     "payload": {"kind": "command", "argv": ["sh", "-c", f"CCC_AGENT_CRON_STORE='{store}' bash '{cmd}' {mutation} >/dev/null"]}},
+    {"id": "rr-victim", "schedule": "* * * * *", "prompt": "victim", "enabled": True, "notify": "none",
+     "lastRunAt": "2025-12-31T23:59:00Z", "maxRuns": 5,
+     "payload": {"kind": "command", "argv": ["sh", "-c", f"echo ran >> '{d}/victim-ran'"]}},
+]
+open(store, 'w', encoding='utf-8').write(json.dumps({"version": 1, "tasks": tasks}))
+PY
+}
+rr_tick() { CCC_AGENT_CRON_STORE="$1/tasks.json" CCC_PUSH_SPOOL="$1/spool" bash "$CMD" scheduler --execute --json --at 2026-01-01T00:01:10Z; }
+rr_runs() { if [ -e "$1/victim-ran" ]; then wc -l < "$1/victim-ran" | tr -d ' '; else echo 0; fi; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+victim_q='.results[] | select(.taskId == "rr-victim")'
+
+RR="$TMP/reread-disable"; rr_setup "$RR" "disable rr-victim"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(rr_tick "$RR")"
+ok "#2741 re-read: a task disabled during the tick does not run" '[ "$(rr_runs "$RR")" = 0 ] && jq -e "[$victim_q] | length == 1 and .[0].status == \"disabled\" and .[0].ok == true" <<<"$out" >/dev/null'
+ok "#2741 re-read: the disabled task keeps no lock and no run record" '[ ! -e "$RR/locks/rr-victim.lock" ] && jq -e ".tasks[] | select(.id == \"rr-victim\") | .enabled == false and .lastRunAt == \"2025-12-31T23:59:00Z\" and ((.runHistory // []) | length) == 0" "$RR/tasks.json" >/dev/null'
+
+RR="$TMP/reread-remove"; rr_setup "$RR" "remove rr-victim"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(rr_tick "$RR")"
+ok "#2741 re-read: a task removed during the tick does not run" '[ "$(rr_runs "$RR")" = 0 ] && jq -e "[$victim_q] | length == 1 and .[0].status == \"removed\" and .[0].ok == true" <<<"$out" >/dev/null && [ ! -e "$RR/locks/rr-victim.lock" ] && jq -e "[.tasks[] | select(.id == \"rr-victim\")] | length == 0" "$RR/tasks.json" >/dev/null'
+
+RR="$TMP/reread-edit"; rr_setup "$RR" "edit rr-victim --schedule 'at 2027-01-01T00:00:00Z'"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(rr_tick "$RR")"
+ok "#2741 re-read: a task rescheduled out of the window during the tick does not run" '[ "$(rr_runs "$RR")" = 0 ] && jq -e "[$victim_q] | length == 1 and .[0].status == \"not-due\"" <<<"$out" >/dev/null && [ ! -e "$RR/locks/rr-victim.lock" ]'
+
+RR="$TMP/reread-same"; rr_setup "$RR" "run rr-victim --json --at 2026-01-01T00:01:10Z"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(rr_tick "$RR")"
+ok "#2741 re-read: an occurrence already run manually during the tick is not run twice" '[ "$(rr_runs "$RR")" = 1 ] && jq -e "[$victim_q] | length == 1 and .[0].status == \"not-due\"" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"rr-victim\") | .runCount == 1 and (.runHistory | length) == 1" "$RR/tasks.json" >/dev/null'
+
+RR="$TMP/reread-count"; rr_setup "$RR" "run rr-victim --json --at 2026-01-01T00:00:30Z"
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(rr_tick "$RR")"
+ok "#2741 re-read: a run after a concurrent manual run keeps its runCount and history" '[ "$(rr_runs "$RR")" = 2 ] && jq -e "[$victim_q] | .[0].status == \"success\" and .[0].runLimit.runCount == 2" <<<"$out" >/dev/null && jq -e ".tasks[] | select(.id == \"rr-victim\") | .runCount == 2 and ([.runHistory[].scheduledAt] == [\"2026-01-01T00:00:00Z\", \"2026-01-01T00:01:00Z\"])" "$RR/tasks.json" >/dev/null'
+
+# ── #2741: one task's lock error does not abort the tick ──
+# acquire_for_run ran outside any handler, so an unreadable lock guard (here a
+# directory where the guard file belongs) escaped to scheduler_plan's blanket
+# handler: the tick reported `scheduler-error`, dropped the results of tasks it
+# had already run and never started the rest.
+LE="$TMP/lock-error"; mkdir -p "$LE/locks/le-broken.guard"
+python3 - "$LE" <<'PY'
+import json, sys
+d = sys.argv[1]
+tasks = [
+    {"id": "le-broken", "schedule": "* * * * *", "prompt": "broken", "enabled": True, "notify": "none",
+     "lastRunAt": "2026-01-01T00:00:00Z", "payload": {"kind": "command", "argv": ["sh", "-c", f"echo ran >> '{d}/broken-ran'"]}},
+    {"id": "le-good", "schedule": "* * * * *", "prompt": "good", "enabled": True, "notify": "none",
+     "lastRunAt": "2026-01-01T00:00:00Z", "payload": {"kind": "command", "argv": ["sh", "-c", f"echo ran >> '{d}/good-ran'"]}},
+]
+open(f'{d}/tasks.json', 'w', encoding='utf-8').write(json.dumps({"version": 1, "tasks": tasks}))
+PY
+# shellcheck disable=SC2034  # read via eval inside ok()
+out="$(CCC_AGENT_CRON_STORE="$LE/tasks.json" CCC_PUSH_SPOOL="$LE/spool" bash "$CMD" scheduler --execute --json --at 2026-01-01T00:01:10Z)"
+ok "#2741 lock error: the tick still completes and runs the other due task" 'jq -e ".mode == \"scheduler-execute-one-shot\" and .executedActions == 2" <<<"$out" >/dev/null && [ -s "$LE/good-ran" ] && jq -e ".tasks[] | select(.id == \"le-good\") | .lastStatus == \"success\"" "$LE/tasks.json" >/dev/null'
+ok "#2741 lock error: the broken task is reported, not run, and stays due" 'jq -e ".results[] | select(.taskId == \"le-broken\") | .ok == false and .status == \"lock-error\" and .lock.state == \"error\" and (.lock.error | length) > 0 and .mutations.lockAcquire == false" <<<"$out" >/dev/null && [ ! -e "$LE/broken-ran" ] && jq -e ".tasks[] | select(.id == \"le-broken\") | .lastRunAt == \"2026-01-01T00:00:00Z\"" "$LE/tasks.json" >/dev/null'
+# shellcheck disable=SC2034  # read via eval inside ok()
+{ out="$(CCC_AGENT_CRON_STORE="$LE/tasks.json" CCC_PUSH_SPOOL="$LE/spool" bash "$CMD" run le-broken --json --at 2026-01-01T00:01:10Z)"; rc=$?; }
+ok "#2741 lock error: a manual run reports it as a run-execute lock error" '[ "$rc" = 1 ] && jq -e ".mode == \"run-execute\" and .taskId == \"le-broken\" and .status == \"lock-error\"" <<<"$out" >/dev/null'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

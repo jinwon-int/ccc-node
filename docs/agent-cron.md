@@ -384,6 +384,29 @@ scripts/agent-cron.sh edit a2a-broker-worker-watch --lock-timeout-sec 600 --json
 
 Read-only/status modes never acquire locks, execute prompts, write bridge spools, install timers, edit crontab/systemd, send Telegram, call providers, or touch remotes. Execution mode may write task history and owner-only redacted spool entries, but still does not install timers or call Telegram/provider APIs directly. `add`/`remove`/`enable`/`disable` mutate only the validated task store via the same atomic private write path.
 
+### Edits during a tick, and per-task lock errors (#2741)
+
+A tick plans from the store it read at start and then runs its due tasks one
+after another, so a later task can be edited long before its turn. Every run
+therefore re-reads its task from the store **after taking the task's run lock**
+(re-planning only that task at the tick's `at`) and decides from that:
+
+- disabled, removed, rescheduled out of the window, or already run for this
+  occurrence (for example by a manual `run` while the tick was busy) — the run
+  does not start, the lock is released, nothing is recorded. The result carries
+  `staleDefinition: true` and `status` `disabled`, `run-limit-reached`,
+  `removed` or `not-due`;
+- still due — it runs with the fresh definition, and its `runCount`/`runHistory`
+  continue from the stored values, so a concurrent manual run is not overwritten;
+- the store cannot be read at that point — `status: store-error`, the lock is
+  released and the occurrence stays due.
+
+An exception while taking one task's lock (an unreadable guard or lock file, a
+directory in its place, a full disk) is that task's result — `status:
+lock-error`, `lock.state: error` with the message — and the tick goes on with
+its other due tasks. Before, it aborted the whole tick as `scheduler-error`,
+dropping the results of tasks already run and never starting the rest.
+
 ### Hang guards
 
 A tick that never returns is the failure mode to design against: `Type=oneshot`
