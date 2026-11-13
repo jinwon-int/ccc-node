@@ -99,6 +99,10 @@ TURN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # The bot bounds replies itself (reply_max_bytes, 8 KiB by default); this is the
 # port ceiling so a huge reply never ends the connection.
 MAX_RESULT_TEXT_BYTES = 256 * 1024
+# How long one outbound frame may wait for the bot to take it. A bot that has
+# stopped reading for this long is treated as gone and its connection is
+# dropped, so it sees ``worker_gone`` and reconnects (#2740).
+SEND_DRAIN_TIMEOUT_S = 5.0
 NOTICE_DROP_LOG = 32
 # Notices raised while no bot is connected (#2563): the bridge posts its startup
 # banner ~2 s after start and the bot reconnects ~10 s later, and a background
@@ -183,11 +187,26 @@ class _Client:
                 return False
             try:
                 self.writer.write(data)
-                await asyncio.wait_for(self.writer.drain(), 5)
+                await asyncio.wait_for(self.writer.drain(), SEND_DRAIN_TIMEOUT_S)
             except (OSError, asyncio.TimeoutError, ConnectionError):
                 self.closed = True
+                self._drop()
                 return False
         return True
+
+    def _drop(self) -> None:
+        """End the connection now; the read loop sees EOF and tears the client down.
+
+        Marking the client closed is not enough (#2740): the socket stayed open,
+        so the bot never saw ``worker_gone`` and kept sending turns on it. Each
+        of those ran and its answer was dropped, while a second connection was
+        accepted next to it. ``abort`` rather than ``close``: the peer is not
+        reading, so a graceful close would wait on a buffer that cannot flush.
+        """
+        try:
+            self.writer.transport.abort()
+        except Exception:
+            logger.debug("hande: dropping the connection failed", exc_info=True)
 
     async def close(self) -> None:
         self.closed = True
@@ -202,6 +221,8 @@ class _ActiveTurn:
     def __init__(self, turn_id: str, job: Mapping[str, Any]) -> None:
         self.turn_id = turn_id
         self.job = job
+        # The connection that sent it; None for a self-job.
+        self.client: _Client | None = None
         self.task: asyncio.Task[Any] | None = None
         self.approvals: dict[str, asyncio.Future[bool]] = {}
         # One steward tool call at a time per turn (the bot's rule): tool_id -> outcome.
@@ -1091,7 +1112,7 @@ class HandeTransport:
             client.closed = True
             if self._held is not None and self._held[0] is client:
                 self._held = None  # the bot re-offers it after reconnecting
-            await self._abandon_turn("worker_gone")
+            await self._abandon_turn("worker_gone", client)
             if self._client is client:
                 self._client = None
             await client.close()
@@ -1176,6 +1197,7 @@ class HandeTransport:
             await client.send({"type": "rejected", "turn_id": turn_id, "reason": reason})
             return True
         turn = _ActiveTurn(turn_id, job)
+        turn.client = client
         if active is not None:
             # A self-job is running: hold the owner's turn instead of refusing
             # it (``rejected`` would end the message as ``uncertain``); the
@@ -1524,10 +1546,12 @@ class HandeTransport:
                 turn.task.cancel()
         return True
 
-    async def _abandon_turn(self, reason: str) -> None:
+    async def _abandon_turn(self, reason: str, client: _Client) -> None:
         turn = self._active
         if turn is None or turn.self_job:
             return  # a self-job belongs to no client; it posts through the next one
+        if turn.client is not client:
+            return  # another connection's turn: this client's teardown does not end it
         logger.warning("hande: client gone during turn %s (%s)", turn.turn_id, reason)
         for future in turn.approvals.values():
             if not future.done():

@@ -214,6 +214,11 @@ watchdog (family-messenger#426).
   reconnects and logs `agent_started`. Expected; the self-update idle gate keeps it off
   a running turn. A turn that was in flight at that moment is reported `uncertain` by
   the bot's inbox rule, never re-run.
+- **A bot that stops reading is dropped.** If the bot does not take an outbound frame
+  within 5 s (its process is frozen, or it is blocked while output piles up past the
+  socket buffers), the bridge aborts the connection instead of keeping it half-open
+  (#2740). The bot sees the same `agent_worker_gone` as above and reconnects; the turn
+  in flight is cancelled on the bridge and reported `uncertain` by the bot.
 - **health.json wording.** The transport block is still named `telegram` (shared
   schema, #2312); the service reason names the channel (`Hande: hande responder socket:
   no bot connected` until the bot connects, then `available`). `start.sh --path <root>

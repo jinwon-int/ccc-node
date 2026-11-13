@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from telegram_bot.contracts.transport import TurnResult
+from telegram_bot.core.hande import transport as hande_transport
 from telegram_bot.core.hande.transport import (
     MAX_IN_FRAME_BYTES,
     SCREEN_DELEGATION_RULES,
@@ -403,6 +404,120 @@ async def test_second_client_is_refused_while_first_is_alive(tmp_path: Path) -> 
         assert (await bot.recv_kind("result"))["text"] == "echo:still mine"
         await bot.close()
         await intruder.close()
+    finally:
+        await _stop(served)
+
+
+def _flooding(release: asyncio.Event) -> Any:
+    """A chatty turn: far more interim output than the socket buffers hold."""
+
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        if job["body"] == "flood":
+            for _ in range(400):
+                await sink.interim("x" * 8000)
+        await release.wait()
+        return TurnResult(text=f"echo:{job['body']}", session_id="s")
+
+    return behaviour
+
+
+async def _read_until_closed(bot: FakeBot) -> set[str]:
+    """Frame kinds the bot can still read; returns once its stream has ended."""
+
+    kinds: set[str] = set()
+    while True:
+        try:
+            line = await asyncio.wait_for(bot.reader.readline(), 5)
+        except ConnectionError:
+            return kinds
+        if not line.endswith(b"\n"):
+            return kinds  # end of stream (a frame cut short by the drop is not a frame)
+        kinds.add(json.loads(line)["type"])
+
+
+async def test_bot_that_stops_reading_is_dropped_and_a_new_bot_is_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2740: a send that timed out only marked the client closed. The socket
+    # stayed open, so the bot never saw ``worker_gone``; turns it sent next on
+    # that connection ran and their answers were dropped.
+    monkeypatch.setattr(hande_transport, "SEND_DRAIN_TIMEOUT_S", 0.3)
+    served = await _serve(tmp_path, interim_frames=True)
+    release = asyncio.Event()
+    served.runner.behaviour = _flooding(release)
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        await bot.send(bot.turn("t-30", "flood"))  # ... and never reads
+        for _ in range(250):
+            if served.transport._client is None and not served.transport.active:
+                break
+            await asyncio.sleep(0.02)
+        assert served.transport._client is None, "the stalled connection is torn down"
+        assert served.transport.health_signals()["connected"] is False
+        assert served.transport.active is False
+        assert served.runner.cancelled == ["t-30"], "its turn ends as worker_gone"
+        # The bot's side: what was buffered, then end of stream. No result.
+        assert await _read_until_closed(bot) == {"interim"}
+        await bot.close()
+
+        release.set()
+        bot2 = await FakeBot.connect(served.path)
+        await bot2.send(bot2.turn("t-31", "again"))
+        assert (await bot2.recv_kind("result"))["text"] == "echo:again"
+        assert [job["event_id"] for job in served.runner.jobs] == ["t-30", "t-31"]
+        await bot2.close()
+    finally:
+        await _stop(served)
+
+
+async def test_teardown_of_one_connection_leaves_another_connections_turn_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2740: the read loop of a connection already marked closed can end while
+    # the next bot's turn is running. That turn is not this connection's to
+    # abandon. ``_drop`` is disabled to hold the first socket open, as it was
+    # before the fix.
+    monkeypatch.setattr(hande_transport, "SEND_DRAIN_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(hande_transport._Client, "_drop", lambda self: None)
+    served = await _serve(tmp_path, interim_frames=True)
+    release = asyncio.Event()
+    release.set()
+    served.runner.behaviour = _flooding(release)
+    try:
+        stale = await FakeBot.connect(served.path)
+        await _connected(served)
+        await stale.send(stale.turn("t-40", "flood"))  # ... and never reads
+        for _ in range(250):
+            if not served.transport.health_signals()["connected"] and not served.transport.active:
+                break
+            await asyncio.sleep(0.02)
+        assert served.transport.health_signals()["connected"] is False
+
+        release.clear()
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        await bot.send(bot.turn("t-41", "mine"))
+        for _ in range(100):
+            if served.transport.health_signals()["active_turn"] == "t-41":
+                break
+            await asyncio.sleep(0.02)
+        assert served.transport.health_signals()["active_turn"] == "t-41"
+
+        await stale.close()  # the first connection finally goes away
+        await asyncio.sleep(0.3)
+        assert served.runner.cancelled == []
+        assert served.transport.health_signals()["active_turn"] == "t-41"
+        assert served.transport.health_signals()["connected"] is True
+        release.set()
+        assert (await bot.recv_kind("result")) == {
+            "type": "result",
+            "turn_id": "t-41",
+            "status": "complete",
+            "text": "echo:mine",
+            "session_id": "s",
+        }
+        await bot.close()
     finally:
         await _stop(served)
 
