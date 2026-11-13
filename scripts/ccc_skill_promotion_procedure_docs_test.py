@@ -98,11 +98,43 @@ class Ledger:
         return [row for row in self.rows if row.get("kind") == promotion._PROCEDURE_DOCS_KIND]
 
 
+def write_config_file(home: Path, text: str) -> None:
+    """The publisher's `~/.config/ccc-node/skill-promotion.env`, owner-only."""
+    path = home / ".config" / "ccc-node" / "skill-promotion.env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+
+
 class ProcedureSource(unittest.TestCase):
+    def setUp(self) -> None:
+        # `_config` falls back to `Path.home()` and reads its config file, so an
+        # empty env would see the running node's real publisher settings (#2779).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+
+    def config_env(self, **extra: str) -> dict[str, str]:
+        return {"HOME": str(self.home), **extra}
+
     def test_env_opt_in_and_default(self) -> None:
-        self.assertIsNone(promotion._config({}).procedure_docs_dir)
-        cfg = promotion._config({"CCC_SKILL_PROMOTION_PROCEDURE_DOCS_DIR": "/srv/nexus-docs"})
+        self.assertIsNone(promotion._config(self.config_env()).procedure_docs_dir)
+        cfg = promotion._config(self.config_env(CCC_SKILL_PROMOTION_PROCEDURE_DOCS_DIR="/srv/nexus-docs"))
         self.assertEqual(cfg.procedure_docs_dir, Path("/srv/nexus-docs"))
+
+    def test_default_ignores_the_running_nodes_config_file(self) -> None:
+        # #2779: a publisher node whose real HOME carries a docs dir setting.
+        with tempfile.TemporaryDirectory() as raw:
+            node_home = Path(raw)
+            write_config_file(node_home, "CCC_SKILL_PROMOTION_PROCEDURE_DOCS_DIR=/srv/node-docs\n")
+            with mock.patch.dict(os.environ, {"HOME": str(node_home)}):
+                # The leak this suite must not depend on: an empty env reads it.
+                self.assertEqual(promotion._config({}).procedure_docs_dir, Path("/srv/node-docs"))
+                self.assertIsNone(promotion._config(self.config_env()).procedure_docs_dir)
+
+    def test_config_file_sets_the_docs_dir(self) -> None:
+        write_config_file(self.home, "CCC_SKILL_PROMOTION_PROCEDURE_DOCS_DIR=/srv/file-docs\n")
+        self.assertEqual(promotion._config(self.config_env()).procedure_docs_dir, Path("/srv/file-docs"))
 
     def test_unset_reads_the_nexus_dir_exactly_as_before(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
