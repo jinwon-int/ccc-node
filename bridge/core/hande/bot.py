@@ -174,7 +174,13 @@ class HandeBot(HandeWaitStatusMixin, MatrixBot):
         shown = " ".join(f"{key}={value}" for key, value in arguments.items()) or "(없음)"
         prompt = f"⚠️ 한데 방 운영 도구 승인 요청\n도구: {name}\n인수: {shown}"
         try:
-            outcome = await self._ask_approval(sink, prompt)
+            # family-messenger #619: a hande sink names the tool and its arguments in
+            # the approval frame, so the bot can draw the target/what/impact card lines.
+            ask = getattr(sink, "steward_approval_outcome", None)
+            if callable(ask):
+                outcome = str(await ask(prompt, action=qualified(name), arguments=dict(arguments)))
+            else:
+                outcome = await self._ask_approval(sink, prompt)
         except asyncio.CancelledError:
             self._record_approval_answered(asked, "cancelled", actor_user_id=None)
             raise

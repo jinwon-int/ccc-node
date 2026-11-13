@@ -363,6 +363,24 @@ class _HandeSink:
     async def approval_outcome(self, text: str) -> str:
         """``allow``/``deny``/``timeout``/``unavailable`` (what ``MatrixBot._ask_approval`` prefers)."""
 
+        return await self._approval_round_trip(text, "approval", {})
+
+    async def steward_approval_outcome(
+        self, text: str, *, action: str, arguments: Mapping[str, str]
+    ) -> str:
+        """Same round trip for one steward room tool, naming the tool and its arguments.
+
+        The bot builds the approval card's target/what/impact lines from
+        ``action`` (``mcp__steward__room_*``) and ``arguments`` (family-messenger
+        #619); ``text`` stays as the description for clients that ignore them.
+        Arguments are identifier-shaped and checked before this point.
+        """
+
+        return await self._approval_round_trip(text, action, dict(arguments))
+
+    async def _approval_round_trip(
+        self, text: str, action: str, arguments: dict[str, str]
+    ) -> str:
         if not self._live():
             return "unavailable"
         approval_id = secrets.token_urlsafe(18)
@@ -373,9 +391,9 @@ class _HandeSink:
             "type": "approval",
             "turn_id": self._turn.turn_id,
             "approval_id": approval_id,
-            "action": "approval",
+            "action": action,
             "description": text,
-            "arguments": {},
+            "arguments": arguments,
         }
         if len(_frame_bytes(frame)) > 60_000:
             # Never truncate what the owner is asked to approve.
@@ -482,6 +500,12 @@ class _SelfJobSink:
                 self._room, NOTICE_SELF_JOB_APPROVAL.format(text=_bounded_text(text, 2048))
             )
         return "unavailable"
+
+    async def steward_approval_outcome(
+        self, text: str, *, action: str, arguments: Mapping[str, str]
+    ) -> str:
+        del action, arguments
+        return await self.approval_outcome(text)
 
     async def approval(self, description: str, arguments: Any) -> bool:
         del arguments
