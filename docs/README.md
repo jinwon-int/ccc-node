@@ -12,6 +12,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`agent-cron.md`](agent-cron.md) | Durable local task definitions, due/lock/run/scheduler commands. |
 | [`a2a-broker-worker-watch.md`](a2a-broker-worker-watch.md) | Broker-side worker staleness watch: pages long-stale A2A workers from `GET /workers` (#2086). |
 | [`fleet-merge-metrics.md`](fleet-merge-metrics.md) | Read-only merge-pipeline metrics per repo (merge-queue wait, effective batch size, CI runs by event); baseline for the 2026-10 batching change (#2302). |
+| [`fleet-ssh-mesh.md`](fleet-ssh-mesh.md) | Per-node fleet SSH keys in a full mesh: external node table (tailnet address resolved at run time), `collect/scan/build/push/verify` phases, managed blocks with backups, `push --dry-run` (#2687). |
 | [`skill-autosave.md`](skill-autosave.md) | Hermes-style auto-skillification: skill-review hook, daily sweep cron, Telegram approval flow. |
 | [`nunchi-recall.md`](nunchi-recall.md) | State-aware recall for `nunchi.py recall`/`dialectic`: recency re-rank, recent-state window, optional model2vec vectors, the STALE regression bench (#2464), `--as-of` point-in-time recall, `[#id]` citation footer and `why` provenance (#2466). |
 | [`nunchi-conflict-sweep.md`](nunchi-conflict-sweep.md) | `nunchi.py conflict-sweep`: batched-LLM pass that flags vocabulary-disjoint state conflicts `review=1` only (never closes), with an idempotent pair ledger and judge-batch protection (#2464 제안 2). |
