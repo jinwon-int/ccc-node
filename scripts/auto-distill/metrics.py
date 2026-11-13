@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
-"""TM-2380 카나리 관측 — V2 심의 입력 산출.
+"""TM-2380 카나리 관측 — 파이프라인 지표 + 과거 사람 판정 집계.
 
 Managed with auto-distill.py by ``scripts/install-auto-distill.sh``.
+
+#2186 이후 상태 (오너 결정 2026-10-08, 2026-11-09 유지 판정):
+  AUTO.md 사람 검토는 **폐지됐다.** 게이트를 통과한 ``kept`` 후보는 사람 판정 없이
+  ``claude/hooks/nunchi/auto-distill-feed.py`` 로 nunchi에 자동 공급되고
+  (``evidence = auto-distill:...``), SessionStart ``assemble`` 이 ``·auto`` 줄로
+  세션에 주입한다. TM-2380의 "V2 자동 승격은 오너 명시 승인 필요" 조건도 이
+  결정으로 갈음됐다 (``docs/auto-distill.md`` 의 nunchi feed 절).
+
+  그래서 auto-distill 유지·중단의 현행 근거는 사람 판정이 아니라 **nunchi 사용량**
+  이다 — ``·auto`` 줄이 실린 세션 비율(``assemble`` 선택 비율), ``recall`` 결과 중
+  auto-distill 행이 섞인 비율과 고유 id 수 (#2186 4단계 측정). 이 스크립트는
+  그 지표를 재지 않는다.
+
+  아래 사람 판정 집계와 출력 키(``judged``/``gate_precision``/``gate_loss`` 등)는
+  옛 AUTO.md·감사로그를 계속 읽기 위해, 그리고 과거 기록 참고용으로만 남긴다.
+  새 판정을 요청하지 않으며, 그 수치를 V2/운영 판단 근거로 쓰지 않는다.
+
+이하는 폐지 전(TM-2380 V2 심의 시절)의 설계 근거다 — 역사 기록으로 보존한다.
 
 왜 통과율만으로는 안 되는가 (2026-08-22 실측):
   함의검증은 **인용 정확도**를 재고 **지속 가치**는 재지 않으며, 실무에서 역상관한다.
@@ -16,8 +34,8 @@ Managed with auto-distill.py by ``scripts/install-auto-distill.sh``.
   **사람이 AUTO.md에 남긴 판정**을 함께 읽는다. 판정이 없으면 그 사실을 드러낸다 —
   판정 없는 통과율을 V2 근거로 쓰는 것이 정확히 이 도구가 막으려는 실수다.
 
-판정 남기는 법 (사람):
-  AUTO.md 항목의 `**상태**: unverified` 를 아래 중 하나로 바꾼다.
+판정 형식 (폐지 전 사람 판정 — 옛 AUTO.md 파싱용, 새로 남기지 않는다):
+  AUTO.md 항목의 `**상태**: unverified` 가 아래 중 하나로 바뀌어 있으면 판정으로 센다.
     promoted      정본으로 승격했다 (= 올릴 만했다)
     discarded     버렸다 (= 올릴 만하지 않았다)
     fix-citation  내용은 맞으나 인용이 부실하다 (= 올릴 만한데 게이트가 옳게 막았다)
@@ -57,7 +75,7 @@ def _current_pipeline(default=6):
 
 CURRENT = _current_pipeline()
 
-# 사람 판정 → 그 항목이 '올릴 만했는가'
+# 과거 사람 판정(#2186으로 폐지) → 그 항목이 '올릴 만했는가'
 VALUABLE = {"promoted": True, "fix-citation": True, "discarded": False}
 
 
@@ -171,7 +189,7 @@ def main():  # noqa: C901 - report assembly mirrors the deployed collector
             if c:
                 per_session_pass.append(k / c)
 
-    # ── 사람 판정 ────────────────────────────────────────────────────
+    # ── 과거 사람 판정 (#2186으로 폐지, 옛 기록 파싱용) ─────────────────────
     verdicts = []
     for n in NODES:
         verdicts += read_verdicts(n)
@@ -210,9 +228,9 @@ def main():  # noqa: C901 - report assembly mirrors the deployed collector
     if legacy:
         print("구버전 파이프라인 실행 %d건 제외 (현행 v%d 만 집계)" % (legacy, CURRENT))
     if not tot["sessions"]:
-        # 파이프라인 실행이 없어도 사람 판정은 계속 본다 — 이미 게시된 항목의
-        # 판정은 파이프라인 재가동과 무관하게 V2 심의의 근거이기 때문이다.
-        print("현행 파이프라인 실행 기록 없음 — 아래 판정 지표만 유효하다.")
+        # 파이프라인 실행이 없어도 과거 사람 판정 집계는 계속 보여 준다 —
+        # 옛 AUTO.md 기록 참고용이다 (사람 검토는 #2186으로 폐지).
+        print("현행 파이프라인 실행 기록 없음 — 아래는 과거 사람 판정 집계(참고용)뿐이다.")
     print("세션 %d · 후보 %d · 통과 %d · 격리 %d · 폐기 %d"
           % (tot["sessions"], tot["candidates"], tot["kept"], tot["quarantined"], tot["dropped"]))
     if tot["sessions"]:
@@ -227,17 +245,19 @@ def main():  # noqa: C901 - report assembly mirrors the deployed collector
             print("  ⚠ 편차가 크다 — 단일 회차로 결론짓지 말 것")
 
     print()
-    print("─ 사람 판정 (V2 심의의 실제 근거) " + "─" * 26)
+    print("─ 사람 판정 (#2186으로 폐지 — 과거 기록 참고용) " + "─" * 14)
+    print("  AUTO.md 사람 검토는 폐지됐다. kept 후보는 nunchi로 자동 공급된다 —")
+    print("  현행 근거는 nunchi 사용량(assemble `·auto` 선택 비율, recall 적중)이다.")
     print("판정 완료 %d건 (현행 v%d) · 미판정 %d건" % (len(judged), CURRENT, len(unjudged)))
     if judged_legacy:
         print("  구버전 구성 항목 %d건은 지표에서 제외 — 참고용으로만 본다" % len(judged_legacy))
     if not judged:
         print()
-        print("  ⚠ 판정이 0건이다. **통과율만으로 V2를 심의할 수 없다** —")
-        print("    함의검증은 인용 정확도를 재고 지속 가치는 재지 않으며 역상관한다.")
-        print("    AUTO.md 항목의 `**상태**` 를 promoted/discarded/fix-citation 으로 바꿔라.")
+        print("  과거 판정이 0건이다. 새 판정은 요청하지 않는다 (#2186) —")
+        print("    함의검증 통과율은 지속 가치를 재지 않으므로 그것만으로 판단하지 말고,")
+        print("    nunchi 사용량 지표(assemble `·auto` 선택 비율, recall 적중)를 본다.")
         if judged_legacy:
-            print("    (구버전 판정 %d건이 있으나 구성이 달라 현행 심의 근거가 아니다)"
+            print("    (구버전 판정 %d건이 있으나 구성이 달라 현행 집계에서 제외했다)"
                   % len(judged_legacy))
         return 0
 
@@ -263,8 +283,8 @@ def main():  # noqa: C901 - report assembly mirrors the deployed collector
         # 미판정"이 저커버리지 경고의 가장 흔한 진입 상태라 None 비교로 죽으면
         # 보고서 전체가 안 나온다.
         if loss is not None and loss > 0.5:
-            print("  ⚠ 게이트가 가치 있는 항목을 절반 넘게 막고 있다 —")
-            print("    승격 판정에 가치 축을 넣기 전에는 V2 자동 승격을 켜면 안 된다.")
+            print("  ⚠ 과거 판정 기준으로 게이트가 가치 있는 항목을 절반 넘게 막았다 —")
+            print("    (참고용: V2 승인 조건은 #2186으로 갈음됨, 격리분은 nunchi에 들어가지 않는다)")
     promoted = sum(1 for v in judged if v["status"] == "promoted")
     if promoted and cost:
         print("승격 1건당 비용: $%.4f" % (cost / promoted))

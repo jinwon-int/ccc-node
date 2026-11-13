@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
-"""Stage one human-gated Wiki PR from the full TM-2380 canary roster.
+"""RETIRED by #2186 -- do not schedule.  Historical TM-2380 Wiki AUTO.md collector.
 
+Retirement notice: the owner decision of 2026-10-08 (#2186) abolished the human
+verdict step on Wiki AUTO.md.  Gate survivors (``kept``) now reach agents
+through the nunchi feed (``claude/hooks/nunchi/auto-distill-feed.py``, see the
+"nunchi feed" section of ``docs/auto-distill.md``), and canonical Wiki records
+are written by agents through ``wiki-record`` after verification.  This
+collector is kept for reference only: do not put it on cron, do not run
+``--apply``/``--submit`` for routine work, and do not reopen human verdicts on
+AUTO.md.  Its behaviour and exit codes are unchanged.
+
+Original purpose: stage one human-gated Wiki PR from the full canary roster.
 The extractor deliberately writes node-local AUTO.md files.  This collector is
 run from one designated node: it reads every explicitly mapped output, merges
 unseen stable keys into one Wiki worktree, and can invoke ``wiki-agent pr``
@@ -349,7 +359,12 @@ def submit_pr(args: argparse.Namespace, worktree: Path) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="RETIRED by #2186 -- do not schedule. See docs/auto-distill.md "
+        "(nunchi feed section).",
+    )
     ap.add_argument("--local", action="append", default=[], metavar="NODE=PATH")
     ap.add_argument("--remote", action="append", default=[], metavar="NODE=SSH_HOST")
     ap.add_argument("--empty", action="append", default=[], metavar="NODE")
@@ -372,6 +387,13 @@ def run(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.submit and not args.apply:
         raise PublishError("--submit requires --apply")
+    if args.apply:
+        # Notice only (#2186): behaviour and exit codes stay unchanged.
+        print(
+            "publish_wiki: warning: retired by #2186 (AUTO.md human review "
+            "abolished; kept candidates feed nunchi) -- do not schedule",
+            file=sys.stderr,
+        )
     if args.ssh_timeout <= 0:
         raise PublishError("--ssh-timeout must be positive")
 
