@@ -167,6 +167,17 @@
       "tree_sha256": "2dea48f4a649cf82cdd7485e6ce676517e1065541b42ed0c179e892c1dc385f7"
     },
     {
+      "audience": "shared",
+      "classification": "claude-only",
+      "description": "Use when you need who-calls-what or blast-radius answers for a jinwon-int Python repo — callers/callees of a function, a module's imports, or the files that depend on a changed file (e.g. choosing review-packet files). Builds a local per-commit ast call/import graph; calls are tagged exact or name-match.",
+      "files": 4,
+      "managed": false,
+      "name": "code-graph",
+      "source": "skills/code-graph",
+      "status": "active",
+      "tree_sha256": "4716d0cf5a5ab46dabe8302e2ce3efdc43899c6b655db15034c2a179bec93ff4"
+    },
+    {
       "audience": "claude",
       "classification": "claude-only",
       "description": "Inject extra memory/snapshot content into codex bridge sessions via the CCC_CODEX_MEMORY_LOADER extension point — wrap the base loader, merge JSON, wire .env, restart, and verify the materialize chain. Use when adding a new memory source to codex session startup without touching ccc-node managed files.",
