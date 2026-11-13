@@ -373,6 +373,130 @@ async def test_expired_wait_notifies_without_resume(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_expiry_asks_github_once_more_before_expiring(tmp_path: Path) -> None:
+    """#2740 ⑤: a deadline reached late (node down, loop held up) still sees a
+    result that arrived in the meantime instead of expiring blind."""
+    clock = Clock(9_999.0)
+    registry = _registry(tmp_path, clock, timeout_seconds=600)
+    transport = FakeTransport([PrState("abc1234", "success")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock)
+
+    await monitor._tick()
+
+    record = registry.records()[0]
+    assert transport.calls == [("jinwon-int/ccc-node", 123)]
+    assert record["terminal_status"] == TERMINAL_SUCCESS
+    assert len(recorder.notifications) == 1
+    assert "CI green" in recorder.notifications[0][1]
+    assert len(recorder.resumes) == 1
+    assert record["wake"] == {"state": "done", "attempts": 0, "resumed": True}
+
+
+@pytest.mark.anyio
+async def test_expiry_final_poll_read_error_still_expires(tmp_path: Path) -> None:
+    clock = Clock(9_999.0)
+    registry = _registry(tmp_path, clock, timeout_seconds=600)
+    transport = FakeTransport([TransportError("rate-limit")])
+    recorder = Recorder()
+    monitor = _monitor(registry, transport, recorder, clock)
+
+    await monitor._tick()
+
+    record = registry.records()[0]
+    assert len(transport.calls) == 1
+    assert record["terminal_status"] == TERMINAL_EXPIRED
+    assert len(recorder.notifications) == 1
+    assert "expired" in recorder.notifications[0][1]
+    assert recorder.resumes == []
+
+
+@pytest.mark.anyio
+async def test_restart_during_resume_turn_does_not_replay_it(tmp_path: Path) -> None:
+    """#2740 ②: the bridge dies while the Telegram continuation turn runs.
+
+    The wake must not be left ``pending``: the next process would send the same
+    notice and run the same continuation again. It is closed as a dropped
+    promise (``resume_interrupted``) for the owner to check instead.
+    """
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    first = Recorder()
+    resume_started = asyncio.Event()
+
+    async def endless_resume(record: dict, prompt: str) -> bool:
+        first.resumes.append((record, prompt))
+        resume_started.set()
+        await asyncio.Event().wait()  # the turn is still running when we die
+        return True
+
+    monitor = _monitor(
+        registry,
+        FakeTransport([PrState("abc1234", "success")]),
+        first,
+        clock,
+        resumer=endless_resume,
+    )
+    tick = asyncio.create_task(monitor._tick())
+    await asyncio.wait_for(resume_started.wait(), timeout=5)
+
+    wait_id = registry.records()[0]["wait_id"]
+    in_flight = registry.get(wait_id)["wake"]
+    assert in_flight["state"] == "resuming"
+    assert registry.pending_wakes() == []
+    assert registry.acknowledge(wait_id) == "wake-pending"  # still the bridge's
+
+    tick.cancel()  # process death mid-turn: nothing after the await runs
+    with pytest.raises(asyncio.CancelledError):
+        await tick
+    assert len(first.notifications) == 1 and len(first.resumes) == 1
+
+    restarted = ExternalWaitRegistry(default_registry_path(tmp_path), clock=clock)
+    second = Recorder()
+    recovered = _monitor(restarted, FakeTransport([]), second, clock)
+    restarted.reconcile_on_start()
+    for _ in range(3):
+        await recovered._tick()
+        clock.advance(600)
+
+    assert second.notifications == []
+    assert second.resumes == []
+    wake = restarted.get(wait_id)["wake"]
+    assert wake["state"] == "done"
+    assert wake["resumed"] is False
+    assert wake["skip_reason"] == "resume_interrupted"
+    assert [rec["wait_id"] for rec in restarted.dropped_promises()] == [wait_id]
+    assert restarted.acknowledge(wait_id) == "acked"
+
+
+@pytest.mark.anyio
+async def test_wake_taken_before_resume_start_does_not_run_continuation(tmp_path: Path) -> None:
+    """The resume-start journal is a compare-and-set: a wake that stopped being
+    ``pending`` between the drain read and the start is not continued."""
+    clock = Clock()
+    registry = _registry(tmp_path, clock)
+    recorder = Recorder()
+
+    async def notify_then_take(chat_id: int, text: str) -> bool:
+        recorder.notifications.append((chat_id, text))
+        # Another drain finished this wake while the notice was in flight.
+        registry.mark_wake(registry.records()[0]["wait_id"], delivered=True, resumed=True)
+        return True
+
+    monitor = _monitor(
+        registry,
+        FakeTransport([PrState("abc1234", "success")]),
+        recorder,
+        clock,
+        notifier=notify_then_take,
+    )
+    await monitor._tick()
+
+    assert len(recorder.notifications) == 1
+    assert recorder.resumes == []
+
+
+@pytest.mark.anyio
 async def test_resume_is_skipped_when_session_moved_on(tmp_path: Path) -> None:
     clock = Clock()
     registry = _registry(tmp_path, clock)

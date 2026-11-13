@@ -137,6 +137,16 @@ WAKE_RETRY_MAX_DELAY_SECONDS = 900.0
 #: ``wake.skip_reason`` recorded when delivery gave up (unless the wake already
 #: carried one): the owner was never told and nothing continued.
 SKIP_NOTIFY_FAILED = "notify_failed"
+#: ``wake.state`` while the continuation turn runs (#2740). Journaled after
+#: the notification landed and before the resumer is awaited, so a bridge that
+#: dies mid-turn leaves this state rather than ``pending``: ``pending`` would
+#: make the next process send the same notice and run the same continuation a
+#: second time.
+WAKE_STATE_RESUMING = "resuming"
+#: ``wake.skip_reason`` for a continuation that started but whose process
+#: ended before the turn reported back (#2740). It is not re-run; it surfaces
+#: as a dropped promise so the owner can check what the turn got done.
+SKIP_RESUME_INTERRUPTED = "resume_interrupted"
 #: An active-turn route entry older than this is stale. Turns clear their
 #: entry on exit; the TTL is only a crash backstop.
 ACTIVE_ROUTE_TTL_SECONDS = 6 * 60 * 60
@@ -1000,6 +1010,33 @@ class ExternalWaitRegistry:
 
         self._mutate(_do)
 
+    def mark_resume_started(self, wait_id: str, *, now: Optional[float] = None) -> Optional[bool]:
+        """Journal that this wake's continuation is about to run (#2740).
+
+        Moves a ``pending`` wake to ``resuming`` in one durable write, so a
+        restart during the continuation turn does not replay it (see
+        ``reconcile_on_start``). Returns True for that transition, False when
+        the wake is gone or no longer ``pending`` (someone else already owns
+        it: do not run the continuation), and None when the registry write
+        failed (fail-open: the caller may still run it, as before #2740).
+        """
+        now_value = self._clock() if now is None else float(now)
+
+        def _do(records):
+            rec = records.get(wait_id)
+            wake = rec.get("wake") if rec is not None else None
+            if not isinstance(wake, dict) or wake.get("state") != "pending":
+                return False
+            rec["wake"] = {
+                "state": WAKE_STATE_RESUMING,
+                "attempts": int(wake.get("attempts") or 0),
+                "resume_started_epoch": now_value,
+            }
+            rec["updated_at"] = _utc_now_iso()
+            return True
+
+        return self._mutate(_do)
+
     def dropped_promises(self) -> List[Dict[str, Any]]:
         """Terminal records whose promise never continued.
 
@@ -1049,7 +1086,7 @@ class ExternalWaitRegistry:
             wake = rec.get("wake")
             if not isinstance(wake, dict):
                 return ACK_NO_WAKE
-            if wake.get("state") == "pending":
+            if wake.get("state") in ("pending", WAKE_STATE_RESUMING):
                 return ACK_WAKE_PENDING
             if isinstance(wake.get("manual_ack"), dict):
                 return ACK_ALREADY
@@ -1082,6 +1119,19 @@ class ExternalWaitRegistry:
                     wake = rec.get("wake")
                     if isinstance(wake, dict) and wake.get("state") == "pending":
                         wake.pop("next_attempt_epoch", None)
+                    elif isinstance(wake, dict) and wake.get("state") == WAKE_STATE_RESUMING:
+                        # The previous process died inside the continuation
+                        # turn (#2740). Its notice already went out and the
+                        # turn may have done part of the work, so running it
+                        # again would duplicate both. Close it as a dropped
+                        # promise instead; the owner checks and acks it.
+                        rec["wake"] = {
+                            **wake,
+                            "state": "done",
+                            "resumed": False,
+                            "skip_reason": SKIP_RESUME_INTERRUPTED,
+                        }
+                        rec["updated_at"] = _utc_now_iso()
                     continue
                 if rec.get("source") == SOURCE_LOCAL_TASK:
                     # No provider session survives a restart, so the task's
