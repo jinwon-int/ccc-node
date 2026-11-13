@@ -1477,3 +1477,81 @@ async def test_attachment_answers_are_accepted_without_any_waiting_turn(tmp_path
         await bot.close()
     finally:
         await _stop(served)
+
+
+# --- #2813: a failed turn's reason names the cause ---------------------------
+
+FABLE_LIMIT = "You've reached your Fable limit. Switch to another model, or manage usage"
+CLOUDFLARE_403 = "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare"
+
+
+async def test_failed_turn_result_carries_a_human_reason(tmp_path: Path) -> None:
+    served = await _serve(tmp_path)
+    details = iter([FABLE_LIMIT, CLOUDFLARE_403, None])
+
+    async def fails(job: Any, sink: Any) -> TurnResult:
+        return TurnResult(
+            text="❌ Processing failed: …",
+            session_id="s-err",
+            status="error",
+            error_detail=next(details),
+        )
+
+    served.runner.behaviour = fails
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-81", "x"))
+        assert await bot.recv_kind("result") == {
+            "type": "result",
+            "turn_id": "t-81",
+            "status": "uncertain",
+            "reason": f"사용 한도 초과 — {FABLE_LIMIT}",
+            "session_id": "s-err",
+        }
+        await bot.send(bot.turn("t-82", "y"))
+        assert (await bot.recv_kind("result"))["reason"] == "Claude API 일시 차단(Cloudflare 403)"
+        # No cause known: the bare status, as before #2813.
+        await bot.send(bot.turn("t-83", "z"))
+        assert (await bot.recv_kind("result"))["reason"] == "error"
+        assert served.transport.health_signals()["turns_uncertain"] == 3
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_uncertain_result_without_a_cause_keeps_its_status(tmp_path: Path) -> None:
+    served = await _serve(tmp_path)
+
+    async def unsure(job: Any, sink: Any) -> TurnResult:
+        return TurnResult(text="", session_id=None, status="uncertain")
+
+    served.runner.behaviour = unsure
+    try:
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-84", "x"))
+        assert (await bot.recv_kind("result"))["reason"] == "uncertain"
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_failed_self_job_notice_names_the_cause(tmp_path: Path) -> None:
+    runner = FakeRunner()
+
+    async def fails(job: Any, sink: Any) -> TurnResult:
+        return TurnResult(text="", session_id=None, status="error", error_detail=FABLE_LIMIT)
+
+    runner.behaviour = fails
+    transport = _self_job_transport(tmp_path, runner)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:81")
+        notice = await bot.recv_kind("notice")
+        assert notice["text"] == hande_transport.NOTICE_SELF_JOB_UNCERTAIN.format(
+            reason=f"사용 한도 초과 — {FABLE_LIMIT}"
+        )
+        await bot.close()
+    finally:
+        await _stop(served)

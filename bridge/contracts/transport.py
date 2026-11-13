@@ -65,12 +65,17 @@ class TurnResult:
     ``streamed`` says the text already reached the conversation incrementally
     (the transport then only closes the turn). ``status`` is ``"complete"`` or
     ``"uncertain"``; an uncertain turn is never re-run automatically.
+    ``error_detail`` is the provider-normalized cause of a turn that did not
+    complete (``None`` otherwise or when unknown). It is kept apart from
+    ``text`` because a failed turn's text may also carry partial answer text;
+    a transport that reports failures (hande, #2813) words it for people.
     """
 
     text: str
     session_id: str | None
     streamed: bool = False
     status: str = "complete"  # or "uncertain"
+    error_detail: str | None = None
 
 
 class TurnRunner(Protocol):

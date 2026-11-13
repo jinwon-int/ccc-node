@@ -51,6 +51,8 @@ class TransportContractRelocationTests(unittest.TestCase):
                 ("session_id", dataclasses.MISSING),
                 ("streamed", False),
                 ("status", "complete"),
+                # #2813: additive, defaulted — existing constructors unchanged.
+                ("error_detail", None),
             ],
         )
         with self.assertRaises(dataclasses.FrozenInstanceError):
