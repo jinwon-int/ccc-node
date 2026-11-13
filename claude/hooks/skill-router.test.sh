@@ -23,6 +23,9 @@ export CODEX_HOME="$HOME/.codex"
 export CCC_STATE_DIR="$CCC_CLAUDE_DIR/state"
 export CCC_SKILL_LISTING_CORE="$TMP/core.txt"
 unset CCC_SKILL_ROUTER
+# Hermetic against the runner: a test started from inside an agent session (or a
+# print-mode pipeline) inherits its entrypoint marker.
+unset CLAUDE_CODE_ENTRYPOINT CCC_SKILL_ROUTER_UNATTENDED CCC_SKILL_ROUTER_SKIP_ENTRYPOINTS
 SKILLS="$CCC_CLAUDE_DIR/skills"; mkdir -p "$SKILLS" "$CODEX_HOME/skills" "$CCC_STATE_DIR"
 chmod 700 "$CCC_CLAUDE_DIR"
 
@@ -285,6 +288,73 @@ print("bad: " + "; ".join(bad) if bad else "unit-ok")
 PY
 )"
 ok "#2748: surface matching, concept grouping, pruned synonyms, noise/generic, question and probe rules ($out)" '[ "$out" = unit-ok ]'
+
+# ---- #2748: unattended runs are skipped, every silent prompt leaves a reason ----------------
+# Measured on the fleet: 95 % of all suggestions went to print-mode runs (timers,
+# pipelines) where nobody picks a skill. The hook stays silent there and counts why.
+SKIPS="$CCC_STATE_DIR/skill-router/skips.jsonl"
+REQ="텔레그램 브리지 재시작 안전하게 돌려서 확인까지 해줘"
+sug_rows() { wc -l < "$CCC_STATE_DIR/skill-router/suggestions.jsonl"; }
+reason_count() { jq -c --arg r "$1" 'select(.reason == $r)' "$SKIPS" 2>/dev/null | wc -l; }
+run_hook "$REQ" sess-u0
+ok "#2748: baseline — the request routes when no entrypoint marker is set" '[ "$(names | head -1)" = bridge-restart-detached ]'
+rm -f "$SKIPS"; before="$(sug_rows)"
+export CLAUDE_CODE_ENTRYPOINT=sdk-cli
+run_hook "$REQ" sess-u1
+ok "#2748: a print-mode run (sdk-cli) gets no suggestion" '[ "$rc" = 0 ] && [ -z "$out" ]'
+ok "#2748: … writes no suggestion row and no last-session file" \
+  '[ "$(sug_rows)" = "$before" ] && [ ! -e "$CCC_STATE_DIR/skill-router/last-sess-u1.json" ]'
+ok "#2748: … and leaves one skip row with reason unattended" '[ "$(reason_count unattended)" = 1 ]'
+ok "#2748: the skip ledger is body-free (reason + ts only) and owner-only" \
+  'jq -e "keys == [\"reason\",\"ts\"]" "$SKIPS" >/dev/null && ! grep -q "브리지" "$SKIPS" && [ "$(stat -c %a "$SKIPS")" = 600 ]'
+CCC_SKILL_ROUTER_UNATTENDED=allow run_hook "$REQ" sess-u2
+ok "#2748: CCC_SKILL_ROUTER_UNATTENDED=allow lets a pipeline opt in" '[ "$(names | head -1)" = bridge-restart-detached ]'
+CCC_SKILL_ROUTER_SKIP_ENTRYPOINTS="" run_hook "$REQ" sess-u3
+ok "#2748: an empty skip list turns the rule off" '[ "$(names | head -1)" = bridge-restart-detached ]'
+for ep in cli sdk-py sdk-ts SDK-PY; do
+  CLAUDE_CODE_ENTRYPOINT="$ep" run_hook "$REQ" "sess-u-$ep"
+  ok "#2748: entrypoint $ep keeps routing (attended CLI, bridges, SDK agents)" '[ "$(names | head -1)" = bridge-restart-detached ]'
+done
+CLAUDE_CODE_ENTRYPOINT=sdk-py CCC_SKILL_ROUTER_SKIP_ENTRYPOINTS="sdk-cli, SDK-PY" run_hook "$REQ" sess-u4
+ok "#2748: the skip list is configurable (comma/space separated, case-insensitive)" '[ -z "$out" ] && [ "$(reason_count unattended)" = 2 ]'
+CLAUDE_CODE_ENTRYPOINT=sdk-cli CCC_SKILL_ROUTER=0 run_hook "$REQ" sess-u5
+ok "#2748: the kill switch still wins and counts nothing" '[ -z "$out" ] && [ "$(reason_count unattended)" = 2 ]'
+unset CLAUDE_CODE_ENTRYPOINT
+# the other silent paths are counted too — the report needs the denominator
+# (ledger timestamps are whole seconds: start this window on a fresh one)
+rm -f "$SKIPS"; sleep 1
+run_hook "네" sess-s1
+run_hook "2637 2638 2639 승인" sess-s2
+run_hook "/doctor --fix now please" sess-s3
+run_hook "Reply with exactly: pong" sess-s4
+run_hook "zqaax zqabx zqacx zqadx zqaex zqafx zqagx 처리해줘" sess-s5
+run_hook "$REQ" sess-s6
+ok "#2748: short / approval / slash-command / probe / no-candidates each leave their reason" \
+  '[ "$(jq -r .reason "$SKIPS" | sort | tr "\n" " ")" = "approval no-candidates probe short slash-command " ]'
+ok "#2748: a prompt that got a suggestion leaves no skip row" '[ "$(wc -l < "$SKIPS")" = 5 ]'
+out="$(python3 "$MOD" report --days 7 --json)"
+ok "#2748: report carries skip counts and a suggestion rate over scored prompts (1 of 2)" \
+  'jq -e ".skipped[\"no-candidates\"] == 1 and .skipped.short == 1 and .prompts_scored == 2 and .suggestion_rate == 0.5" <<<"$out" >/dev/null'
+out="$(python3 "$MOD" report --days 7)"
+ok "#2748: text report prints scored prompts and the reasons" 'grep -q "prompts scored" <<<"$out" && grep -q "no suggestion, by reason" <<<"$out" && grep -q "short×1" <<<"$out"'
+rm -f "$SKIPS"
+out="$(python3 "$MOD" report --days 7 --json)"
+ok "#2748: without a skip ledger the report gives no rate instead of a wrong one" \
+  'jq -e ".prompts_scored == null and .suggestion_rate == null and .skipped == {}" <<<"$out" >/dev/null'
+# the ledger is a counter: past the cap the older half goes, the hook stays silent and fast
+python3 - "$SKIPS" <<'PY'
+import sys
+row = '{"reason": "short", "ts": "2026-01-01T00:00:00Z"}\n'
+open(sys.argv[1], "w").write(row * (600 * 1024 // len(row)))
+PY
+big="$(wc -l < "$SKIPS")"
+run_hook "네" sess-s7
+ok "#2748: an oversized skip ledger is halved, the new row appended, the file stays owner-only" \
+  '[ "$(wc -l < "$SKIPS")" -lt "$big" ] && [ "$(wc -l < "$SKIPS")" -gt $((big / 2 - 2)) ] && [ "$(tail -1 "$SKIPS" | jq -r .reason)" = short ] && [ "$(stat -c %a "$SKIPS")" = 600 ]'
+chmod 500 "$CCC_STATE_DIR/skill-router"
+CLAUDE_CODE_ENTRYPOINT=sdk-cli run_hook "$REQ" sess-s8
+ok "#2748: an unwritable state dir never fails the hook" '[ "$rc" = 0 ] && [ -z "$out" ]'
+chmod 700 "$CCC_STATE_DIR/skill-router"
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

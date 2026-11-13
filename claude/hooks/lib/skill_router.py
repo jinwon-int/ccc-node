@@ -30,7 +30,17 @@ candidate has to earn its line:
 * the shared concepts must cover ``MIN_COVERAGE`` of the prompt's
   ``COVERAGE_WINDOW`` heaviest concepts, so a long prompt is not out of reach;
 * pure questions need one more concept; probes, pasted documents,
-  approvals and option echoes are skipped.
+  approvals and option echoes are skipped;
+* unattended print runs (``claude -p`` started by a timer or a pipeline —
+  ``CLAUDE_CODE_ENTRYPOINT`` in ``CCC_SKILL_ROUTER_SKIP_ENTRYPOINTS``, default
+  ``sdk-cli``) are skipped: nobody there picks a skill, the prompt is machine
+  text, and on a real fleet they produced 95 % of all suggestions (#2748). A
+  pipeline that does want routing sets ``CCC_SKILL_ROUTER_UNATTENDED=allow``.
+
+Every prompt the hook sees leaves one body-free row in ``skips.jsonl`` unless it
+got a suggestion: the reason it was skipped, or ``no-candidates`` when it was
+scored and nothing qualified. ``report`` turns them into the denominator the
+suggestion rate needs.
 
 The index spans every runtime's skill root, but ``suggest`` only offers the
 skills the *calling* runtime can invoke (#2658): a Codex-only name suggested
@@ -47,8 +57,9 @@ Two more commands reuse the same index:
   so an unroutable description never installs unattended.
 * ``report`` — joins the body-free suggestion ledger with the skill-usage
   ledger: how often a suggestion was followed, what was invoked without one,
-  what keeps being suggested and never used. The numbers that decide the
-  later tiering/consolidation layers.
+  what keeps being suggested and never used, and — from the skip ledger — how
+  many prompts were scored at all and why the rest were not. The numbers that
+  decide the later tiering/consolidation layers.
 
 Contract (matches the other hook libs): stdlib only, fail-open on every
 malformed input, body-free ledgers (never the prompt text), owner-only files.
@@ -189,6 +200,16 @@ SHARED_RUNTIMES = frozenset({"extra"})
 
 STATE_SUBDIR = "skill-router"
 SUGGESTIONS_FILE = "suggestions.jsonl"
+#: One row per prompt that got no suggestion: {"ts", "reason"} — never the prompt.
+SKIPS_FILE = "skips.jsonl"
+#: The skip ledger is a counter, not an archive: past this size the older half goes.
+MAX_SKIPS_BYTES = 512 * 1024
+#: ``CLAUDE_CODE_ENTRYPOINT`` values of runs nobody attends. ``sdk-cli`` is print
+#: mode (``claude -p``): timers and pipelines. Bridges and SDK agents (``sdk-py``,
+#: ``sdk-ts``) and the interactive CLI (``cli``) keep routing.
+DEFAULT_SKIP_ENTRYPOINTS = ("sdk-cli",)
+#: Reasons in the order ``report`` prints them; ``no-candidates`` is a scored prompt.
+SKIP_REASONS = ("unattended", "short", "long", "slash-command", "approval", "choice-echo", "probe", "no-candidates")
 INDEX_FILE = "index.json"
 OFF_FILE = "skill-router.off"
 
@@ -845,10 +866,43 @@ def router_enabled(env: Optional[Dict[str, str]] = None) -> bool:
     return not os.path.exists(off)
 
 
+def unattended(env: Optional[Dict[str, str]] = None) -> bool:
+    """True for a run nobody attends (print mode by default), unless the caller opted in."""
+    env = os.environ if env is None else env
+    if (env.get("CCC_SKILL_ROUTER_UNATTENDED") or "").strip().lower() in {"allow", "1", "true", "yes", "on"}:
+        return False
+    entrypoint = (env.get("CLAUDE_CODE_ENTRYPOINT") or "").strip().lower()
+    if not entrypoint:
+        return False
+    raw = env.get("CCC_SKILL_ROUTER_SKIP_ENTRYPOINTS")
+    skip = DEFAULT_SKIP_ENTRYPOINTS if raw is None else tuple(t for t in re.split(r"[\s,]+", raw.strip().lower()) if t)
+    return entrypoint in skip
+
+
+def _note_skip(sdir: str, reason: str) -> None:
+    """One body-free row for a prompt that got no suggestion. Never raises, never blocks the turn."""
+    try:
+        path = os.path.join(sdir, SKIPS_FILE)
+        try:
+            if os.path.getsize(path) > MAX_SKIPS_BYTES:
+                with open(path, "r", encoding="utf-8") as handle:
+                    lines = handle.readlines()
+                _write_private(path, "".join(lines[len(lines) // 2:]))
+        except OSError:
+            pass
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _append_private(path, json.dumps({"reason": reason, "ts": ts}, sort_keys=True))
+    except Exception:  # noqa: BLE001 — a counter must never cost a turn
+        pass
+
+
 def cmd_suggest(argv: List[str]) -> int:
     """UserPromptSubmit hook body: hook JSON on stdin, hookSpecificOutput (or nothing) on stdout."""
     env = os.environ
     if not router_enabled(env):
+        return 0
+    if unattended(env):
+        _note_skip(state_dir(env), "unattended")
         return 0
     try:
         raw = sys.stdin.read(65536)
@@ -860,7 +914,9 @@ def cmd_suggest(argv: List[str]) -> int:
     prompt = payload.get("prompt") or payload.get("user_prompt") or ""
     if not isinstance(prompt, str):
         return 0
-    if _skip_reason(prompt):
+    reason = _skip_reason(prompt)
+    if reason:
+        _note_skip(state_dir(env), reason)
         return 0
     runtime = suggest_runtime(env)
     if runtime is None:
@@ -871,6 +927,7 @@ def cmd_suggest(argv: List[str]) -> int:
     allowed = [doc["name"] for doc in runtime_docs(index, runtime)]
     rows = candidates_for(prompt, index, exclude=core_names(env), allowed=allowed)
     if not rows:
+        _note_skip(state_dir(env), "no-candidates")
         return 0
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     names = [row["name"] for row in rows]
@@ -972,8 +1029,18 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def build_report(suggestions: List[Dict[str, Any]], usage: List[Dict[str, Any]], *, since: str) -> Dict[str, Any]:
+def build_report(suggestions: List[Dict[str, Any]], usage: List[Dict[str, Any]], *, since: str,
+                 skips: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     sug = [r for r in suggestions if str(r.get("ts") or "") >= since]
+    skipped: Dict[str, int] = {}
+    for rec in skips or []:
+        if str(rec.get("ts") or "") >= since and isinstance(rec.get("reason"), str):
+            skipped[rec["reason"]] = skipped.get(rec["reason"], 0) + 1
+    # Scored = the prompts the matcher actually looked at. Counted from the first
+    # skip row in the window: suggestions older than the skip ledger have no denominator.
+    first_skip = min((str(r.get("ts") or "") for r in skips or [] if str(r.get("ts") or "") >= since), default=None)
+    sug_counted = [r for r in sug if first_skip is not None and str(r.get("ts") or "") >= first_skip]
+    scored = len(sug_counted) + skipped.get("no-candidates", 0) if first_skip is not None else None
     use = [r for r in usage if str(r.get("ts") or "") >= since and r.get("tool") == "Skill"]
     suggested_counts: Dict[str, int] = {}
     for rec in sug:
@@ -1008,6 +1075,9 @@ def build_report(suggestions: List[Dict[str, Any]], usage: List[Dict[str, Any]],
         "distinct_used": len(used_counts),
         "suggested_never_used": suggested_never_used,
         "used_never_suggested": used_never_suggested,
+        "skipped": skipped,
+        "prompts_scored": scored,
+        "suggestion_rate": round(len(sug_counted) / scored, 3) if scored else None,
     }
 
 
@@ -1016,7 +1086,8 @@ def cmd_report(argv: List[str]) -> int:
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
     sdir = state_dir()
     usage_path = os.path.join(os.path.dirname(sdir), "skill-usage", "usage.jsonl")
-    report = build_report(_read_jsonl(os.path.join(sdir, SUGGESTIONS_FILE)), _read_jsonl(usage_path), since=since)
+    report = build_report(_read_jsonl(os.path.join(sdir, SUGGESTIONS_FILE)), _read_jsonl(usage_path), since=since,
+                          skips=_read_jsonl(os.path.join(sdir, SKIPS_FILE)))
     if "--json" in argv:
         sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n")
         return 0
@@ -1026,6 +1097,11 @@ def cmd_report(argv: List[str]) -> int:
     rate = report["hit_rate"]
     sys.stdout.write(f"  followed a suggestion    : {report['invocations_following_a_suggestion']}" + (f" ({rate:.0%})\n" if rate is not None else "\n"))
     sys.stdout.write(f"  distinct suggested/used  : {report['distinct_suggested']}/{report['distinct_used']}\n")
+    if report["prompts_scored"]:
+        sys.stdout.write(f"  prompts scored           : {report['prompts_scored']} (suggestion rate {report['suggestion_rate']:.0%})\n")
+    if report["skipped"]:
+        order = [r for r in SKIP_REASONS if r in report["skipped"]] + sorted(set(report["skipped"]) - set(SKIP_REASONS))
+        sys.stdout.write("  no suggestion, by reason : " + ", ".join(f"{r}×{report['skipped'][r]}" for r in order) + "\n")
     if report["suggested_never_used"]:
         sys.stdout.write("  suggested, never used    : " + ", ".join(f"{n}×{c}" for n, c in report["suggested_never_used"]) + "\n")
     if report["used_never_suggested"]:
