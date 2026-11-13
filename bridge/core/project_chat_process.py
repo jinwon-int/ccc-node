@@ -73,7 +73,7 @@ from telegram_bot.core.request_lifecycle import (
 )
 from telegram_bot.core.usage import claude_endpoint_host
 from telegram_bot.core.usage_meter import MODE_INTERACTIVE
-from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE
+from telegram_bot.core.sdk_text import TERMINAL_STALL_NOTICE, is_edge_block_message
 from telegram_bot.core.skill_advice import (
     advise_turn,
     finish_advice_turn,
@@ -210,6 +210,13 @@ _RETRYABLE_ADMISSION_CLASSES = frozenset({"silent", "network", "timeout"})
 # right remedy for both.
 _EMPTY_COMPLETION_MARKER = "empty-completion"
 
+# #2808: marker for a turn that failed on Cloudflare's 403 block page before
+# producing anything (see sdk_text.is_edge_block_message).
+_EDGE_BLOCK_MARKER = "edge-block"
+# The block lasted tens of seconds on gwakga (three failures in 26 s), so the
+# single bounded retry waits a little before it goes out.
+_EDGE_BLOCK_RETRY_DELAY_SECONDS = 30.0
+
 
 def _admission_retry_class(response: ChatResponse) -> str | None:
     """The retryable failure class of a turn, else ``None``.
@@ -221,7 +228,7 @@ def _admission_retry_class(response: ChatResponse) -> str | None:
     under the follower turn, so resending only queues a duplicate.
     """
     marker = getattr(response, "failure_class", None) or ""
-    if marker == _EMPTY_COMPLETION_MARKER:
+    if marker in (_EMPTY_COMPLETION_MARKER, _EDGE_BLOCK_MARKER):
         return marker
     prefix, _, cls = marker.partition("/")
     if prefix != "admission-timeout":
@@ -612,6 +619,10 @@ class ProjectChatProcessMixin:
             retry_class,
             retry_grace,
         )
+        if retry_class == _EDGE_BLOCK_MARKER:
+            # #2808: give the edge block a moment to clear. /stop still
+            # cancels the turn here (CancelledError propagates).
+            await asyncio.sleep(_EDGE_BLOCK_RETRY_DELAY_SECONDS)
         retried = await self._process_agent_message(
             user_message=user_message,
             user_id=user_id,
@@ -1910,8 +1921,19 @@ class ProjectChatProcessMixin:
                     failure_class="danso_task_paused",
                     failure_code=terminal_error.code,
                 )
+            # #2808: Cloudflare's 403 block page is a transient edge block.
+            # Mark it retryable only when the turn produced nothing yet — no
+            # answer text, no interim text, no tool call — so the bounded
+            # retry in process_message can never repeat a side effect.
+            edge_block = (
+                is_edge_block_message(terminal_error.message)
+                and not content
+                and not output.interim_delivered
+                and not turn_state.tool_started
+            )
+            label = " (temporary edge block)" if is_edge_block_message(terminal_error.message) else ""
             return ChatResponse(
-                content=f"❌ Processing failed: {terminal_error.message}",
+                content=f"❌ Processing failed{label}: {terminal_error.message}",
                 success=False,
                 error=terminal_error.message,
                 session_id=session.session_id,
@@ -1919,6 +1941,7 @@ class ProjectChatProcessMixin:
                 # Always deliver it even when interim text was streamed.
                 streamed=False,
                 failure_code=terminal_error.code,
+                failure_class=_EDGE_BLOCK_MARKER if edge_block else None,
             )
         if not content and not streamed:
             # #775: a successful terminal result without user-visible

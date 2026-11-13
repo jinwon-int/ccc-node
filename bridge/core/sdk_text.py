@@ -263,3 +263,16 @@ def _detect_numbered_options(text: str) -> bool:
     pattern = r"^\s*\d+\.\s+.+$"
     matches = re.findall(pattern, text, re.MULTILINE)
     return len(matches) >= 2
+
+
+# #2808: an HTTP 403 whose body is Cloudflare's "Attention Required!" block
+# page. Seen on 2026-11-13 on three nodes within 30 minutes; the same
+# conversation's next turn succeeded minutes later, so it is a transient edge
+# block, not a revoked credential. A plain 403 without the block page is not
+# matched and keeps the old non-retryable path.
+_EDGE_BLOCK_RE = re.compile(r"\b403\b.*attention required.*cloudflare", re.IGNORECASE | re.DOTALL)
+
+
+def is_edge_block_message(message: Optional[str]) -> bool:
+    """True for a provider error that is Cloudflare's 403 block page (#2808)."""
+    return bool(message) and _EDGE_BLOCK_RE.search(message or "") is not None

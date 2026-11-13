@@ -30,7 +30,7 @@ from .agent_runtime import (
     ToolCompletedEvent,
     ToolStartedEvent,
 )
-from .sdk_text import _extract_stream_text_delta
+from .sdk_text import _extract_stream_text_delta, is_edge_block_message
 
 if TYPE_CHECKING:
     from .claude_runtime import _ActiveTurn
@@ -221,7 +221,10 @@ class ClaudeSessionTurnEventsMixin:
                 ErrorEvent(
                     self._error_code(message.subtype),
                     text,
-                    retryable=message.api_error_status in _RETRYABLE_HTTP_STATUSES,
+                    retryable=(
+                        message.api_error_status in _RETRYABLE_HTTP_STATUSES
+                        or is_edge_block_message(text)  # #2808 Cloudflare 403 block page
+                    ),
                 )
             )
         else:
