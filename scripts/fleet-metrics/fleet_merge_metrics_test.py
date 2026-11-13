@@ -87,6 +87,28 @@ class GroupSummaryTests(unittest.TestCase):
         s = m.summarize_groups([run("pull_request", 0, 1)], merged_prs=4)
         self.assertEqual((s["groups"], s["effective_batch"], s["group_wall_min_median"]), (0, None, None))
 
+    def test_capped_runs_restrict_batch_to_covered_window(self):
+        # #2302: 30 days of PRs but the capped run list reaches back only to
+        # minute 100. Dividing all 6 PRs by the 2 groups seen read 3.0; only
+        # the 2 PRs merged inside the covered window belong in the numerator.
+        prs = [pr(n, 0, merged) for n, merged in enumerate([10, 20, 30, 40, 120, 130])]
+        runs = [run("merge_group", 100, 105, head="gh-readonly-queue/main/pr-4-aaaa0001"),
+                run("merge_group", 125, 131, head="gh-readonly-queue/main/pr-5-bbbb0002")]
+        uncapped = m.summarize_groups(runs, merged_prs=len(prs), prs=prs, capped=False)
+        self.assertEqual((uncapped["effective_batch"], uncapped["batch_since"]), (3.0, None))
+        capped = m.summarize_groups(runs, merged_prs=len(prs), prs=prs, capped=True)
+        self.assertEqual(capped["effective_batch"], 1.0)
+        self.assertEqual(capped["batch_merged_prs"], 2)
+        self.assertEqual(capped["batch_since"], (T0 + dt.timedelta(minutes=100)).isoformat())
+
+    def test_summarize_passes_cap_through(self):
+        prs = [pr(1, 0, 10), pr(2, 0, 120)]
+        runs = [run("merge_group", 100, 105, head="gh-readonly-queue/main/pr-2-cafe0002")] * m.RUNS_LIST_CAP
+        s = m.summarize("r", prs, runs, 30, T0)
+        self.assertTrue(s["runs_capped"])
+        self.assertEqual((s["effective_batch"], s["batch_merged_prs"]), (1.0, 1))
+        self.assertIn("| 1.0* |", m.render_markdown([s], 30))
+
 
 class RenderTests(unittest.TestCase):
     def test_markdown_has_rows_and_error_line(self):

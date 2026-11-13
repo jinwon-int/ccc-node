@@ -141,8 +141,17 @@ def summarize_runs(runs: list[dict]) -> dict:
             "ci_minutes_total": round(sum(b["minutes"] for b in by_ev.values()), 1), "by_event": summary}
 
 
-def summarize_groups(runs: list[dict], merged_prs: int) -> dict:
-    """Merge-queue groups from merge_group runs' head refs (grouped by the speculative sha)."""
+def summarize_groups(runs: list[dict], merged_prs: int, prs: list[dict] | None = None,
+                     capped: bool = False) -> dict:
+    """Merge-queue groups from merge_group runs' head refs (grouped by the speculative sha).
+
+    When the run list hit ``RUNS_LIST_CAP`` the groups cover only the window
+    back to the oldest fetched run, while ``merged_prs`` covers the whole
+    ``--days`` window — dividing them overstated the batch (30-day ccc-node
+    read 2.05 against ≈0.95 uncapped, #2302). With ``capped`` and ``prs``
+    the numerator is restricted to PRs merged since that oldest run, and
+    ``batch_since`` records the window actually measured.
+    """
     groups: dict[str, dict] = defaultdict(lambda: {"runs": 0, "failed": 0, "start": None, "end": None})
     for r in runs:
         if r.get("event") != "merge_group":
@@ -159,7 +168,14 @@ def summarize_groups(runs: list[dict], merged_prs: int) -> dict:
         if e and (g["end"] is None or e > g["end"]):
             g["end"] = e
     walls = [(iso(g["end"]) - iso(g["start"])).total_seconds() / 60 for g in groups.values() if g["start"] and g["end"]]
+    batch_since = None
+    starts = [iso(r["run_started_at"]) for r in runs if r.get("run_started_at")]
+    if capped and prs is not None and starts:
+        cover = min(starts)
+        batch_since = cover.isoformat()
+        merged_prs = sum(1 for p in prs if iso(p["mergedAt"]) >= cover)
     return {"groups": len(groups), "effective_batch": round(merged_prs / len(groups), 2) if groups else None,
+            "batch_merged_prs": merged_prs, "batch_since": batch_since,
             "group_wall_min_median": _r1(statistics.median(walls)) if walls else None,
             "group_wall_min_p90": _r1(pct(walls, 0.9)),
             "groups_with_failed_run": sum(1 for g in groups.values() if g["failed"])}
@@ -169,7 +185,7 @@ def summarize(repo: str, prs: list[dict], runs: list[dict], days: int, since: dt
     out = {"repo": repo, "days": days, "since": since.isoformat()}
     out.update(summarize_prs(prs, days))
     out.update(summarize_runs(runs))
-    out.update(summarize_groups(runs, out["merged_prs"]))
+    out.update(summarize_groups(runs, out["merged_prs"], prs=prs, capped=out["runs_capped"]))
     return out
 
 
@@ -188,12 +204,13 @@ def render_markdown(results: list[dict], days: int) -> str:
         cap = "≥" if r["runs_capped"] else ""
         lines.append(
             f"| {r['repo']} | {r['merged_prs']} | {r['merged_per_day']} | {r['cycle_min_median']}/{r['cycle_min_p90']} "
-            f"| {r['queued_prs']} | {r['queue_wait_min_median']}/{r['queue_wait_min_p90']} | {r['groups']} | {r['effective_batch']} "
+            f"| {r['queued_prs']} | {r['queue_wait_min_median']}/{r['queue_wait_min_p90']} | {r['groups']} | {r['effective_batch']}{'*' if r.get('batch_since') else ''} "
             f"| {r['group_wall_min_median']}/{r['group_wall_min_p90']} | {r['queue_evictions_est']} | {cap}{r['runs_total']} "
             f"| {cap}{r['ci_minutes_total']} | {pr_ev.get('fail_rate')} |")
     lines.append(f"| **합계** | **{int(tot_prs)}** | **{round(tot_prs / days, 1) if days else '-'}** | | | | | | | | | **≥{round(tot_min)}** | |")
     lines.append("")
-    lines.append(f"측정 {dt.datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')} · `/actions/runs` 1,000건 상한(≥ 표시) · 축출≈제거 이벤트−큐 PR(랜딩도 제거 이벤트를 남김)")
+    lines.append(f"측정 {dt.datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')} · `/actions/runs` 1,000건 상한(≥ 표시) · 축출≈제거 이벤트−큐 PR(랜딩도 제거 이벤트를 남김)"
+                 " · 배치* = run 상한으로 잘린 창(가장 오래된 run 이후 머지 PR ÷ 그룹)")
     return "\n".join(lines)
 
 

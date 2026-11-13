@@ -53,3 +53,16 @@ Change applied 2026-10-14 08:16 KST (owner approval; #2302): `min_entries_to_mer
 (a2a-nexus also `max_entries 1→5`). Verification on 2026-10-28 with
 `--repos ccc-node,family-messenger,a2a-nexus --days 14`: keep if effective batch ≥ 1.3,
 otherwise restore the backed-up rulesets.
+
+**Result — reverted 2026-11-13 13:21 KST (owner approval; #2302).** The D+14 run was
+missed and measured late on 2026-11-13. Windows that did not hit the run cap gave an
+effective batch of ≈ 0.9–1.0 (4 days: ccc-node 0.95, family-messenger 0.87, a2a-nexus
+0.88), below 1.3, so all three rulesets went back to the 2026-10-14 backup values
+(`min_entries_to_merge 1`, wait 0; a2a-nexus `max_entries 1`). PRs enqueued back-to-back
+did land together, but most PRs arrive alone and only paid the 3-minute wait.
+
+The 30-day run of the same day read 2.05 / 5.45 / 1.95 — inflated, because the capped
+run list covered only the last few days while the numerator counted every PR merged in
+30 days. The script now restricts the numerator to PRs merged since the oldest fetched
+run when `/actions/runs` hits the cap, marks that value `*` in the table and records the
+window in `batch_since`. Prefer a window short enough not to hit the cap.
