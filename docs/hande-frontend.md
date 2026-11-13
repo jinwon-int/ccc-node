@@ -205,6 +205,22 @@ that does not declare `hande` an unreadable file is reported as not applicable.
 Doctor does not alert; relay outages are announced once, off-host, by the relay
 watchdog (family-messenger#426).
 
+## Doctor: `hande bridge status`
+
+The bridge side of the same pair: doctor finds `python -m telegram_bot --path <home>`
+processes whose environment has `CCC_CHANNEL=hande`, takes `<home>` from that process
+(a user unit is not under `/root`; with no process, the doctor's own `$HOME`), and runs
+`bridge/start.sh --path <home> --channel hande --status`, graded like `bridge status`:
+
+| Condition | Class |
+|---|---|
+| `hande` declared, `Bot status: available` | 정상 |
+| `hande` declared, `unavailable` / `degraded` / no or unrecognized output | 경고 |
+| more than one hande bridge process | 경고 (degraded, PIDs listed) |
+| `hande` declared, the only candidate processes belong to another account (environment unreadable) | 경고 (unknown — run as root or as that account) |
+| a hande bridge runs but `hande` is not in `~/.claude/frontends` | 경고 (drift) |
+| `hande` not declared and no hande bridge running | no row |
+
 ## Operational notes
 
 - **Restarting the bridge bounces the bot once.** The bot connects to the responder
@@ -279,4 +295,4 @@ leaving it enrolled but stopped), delete the CF token.
 | Live preview (edited bubble) | the port has no edit frame; progress lines are `interim` (`interim_frames`) | family-messenger#423 |
 | Attachments: the bot side, voice | the bridge accepts `turn.attachment` (#2606, `attachment_frames`); the bot still drops `file-v1-*`/`file-v2-*` messages before the responder until its sender lands. Voice notes are not part of the contract | family-messenger#636 |
 | Termux self-update restart-cmd (`~/.claude/self-update.restart-cmd`) | the repo script follows `bridge-current` for `ccc-hande-bridge` since #2526; a node whose restart-cmd is still a pre-#2526 wrapper restarts Matrix only — check with `termux-restart-frontends.sh --dry-run` (`hande_running=` must appear) | #2526 (closed), per-node check |
-| doctor bridge-status probe for the hande unit | doctor judges the **bot** side (`hande bot health`, below) but still has no verdict for the `ccc-hande-bridge` unit itself | #2380 follow-up |
+| doctor bridge-status probe for the hande unit | closed: `hande bridge status` judges the `ccc-hande-bridge` unit next to `hande bot health` (see [Doctor: `hande bridge status`](#doctor-hande-bridge-status)) | #2380 (done) |

@@ -1201,6 +1201,7 @@ class Doctor:
         self.check_bridge_runtime_config()
         self.check_bridge_status()
         self.check_hande_bot_health()
+        self.check_hande_bridge_status()
         self.check_bridge_boot_path()
         self.check_bridge_memory_guard()
         self.check_continuation_state()
@@ -2127,6 +2128,91 @@ class Doctor:
             self.add("정상", "bridge status", "telegram retired (frontend list)", "none")
         else:
             self.add("경고", "bridge status", "bridge/start.sh missing or not executable", "not all nodes run the Telegram bridge; install/check only if needed")
+
+    @staticmethod
+    def _proc_environ(pid: str) -> bytes:
+        return Path(f"/proc/{pid}/environ").read_bytes()
+
+    def hande_bridge_processes(self) -> tuple[list[tuple[str, str | None]], list[str]]:
+        """Live hande bridge processes as ``(pid, --path)``, plus unreadable PIDs.
+
+        A bridge process is ``python -m telegram_bot --path <home>`` whatever its
+        channel; only ``CCC_CHANNEL=hande`` in its environment marks the hande
+        unit. That unit is often a *user* unit, so its home comes from its own
+        ``--path``, never from the Telegram process or ``/root``. A PID whose
+        environment cannot be read (another account's process seen by a
+        non-root doctor) is returned separately, never guessed.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "pid=,command="], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            return [], []
+        found: list[tuple[str, str | None]] = []
+        unknown: list[str] = []
+        for line in out.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if not pid.isdigit() or "telegram_bot" not in command or "--path" not in command:
+                continue
+            try:
+                environ = self._proc_environ(pid)
+            except FileNotFoundError:
+                continue  # exited between ps and the read
+            except OSError:
+                unknown.append(pid)
+                continue
+            if b"CCC_CHANNEL=hande" in environ.split(b"\0"):
+                found.append((pid, self.bridge_home_of(command)))
+        return found, unknown
+
+    def check_hande_bridge_status(self) -> None:
+        """Probe the ``ccc-hande-bridge`` unit itself (#2380).
+
+        ``hande bot health`` judges the native relay bot; this judges the
+        bridge that serves its responder socket, through the same
+        ``start.sh --status`` output as the Telegram probe. No row on a node
+        that neither declares ``hande`` nor runs a hande bridge.
+        """
+        item = "hande bridge status"
+        declared = self.frontends()
+        expected = declared is not None and "hande" in declared
+        procs, unknown = self.hande_bridge_processes()
+        pids = " ".join(pid for pid, _ in procs)
+        if not expected:
+            if procs:
+                self.add("경고", item, f"running but hande not in frontend list (PID: {pids})",
+                         "add `hande` to ~/.claude/frontends, or stop/disable ccc-hande-bridge")
+            return
+        if len(procs) > 1:
+            self.add("경고", item, f"degraded (multiple hande bridge processes: {pids})",
+                     "inspect each ccc-hande-bridge unit (system and --user) and keep one")
+            return
+        if not procs and unknown:
+            self.add("경고", item, f"unknown (environment unreadable for PID: {' '.join(unknown)})",
+                     "run the doctor as root or as the account that runs ccc-hande-bridge")
+            return
+        start = self.repo / "bridge/start.sh"
+        if not os.access(start, os.X_OK):
+            self.add("경고", item, "bridge/start.sh missing or not executable",
+                     "restore bridge/start.sh in this checkout, then rerun")
+            return
+        home = (procs[0][1] if procs else None) or os.path.expanduser("~")
+        try:
+            out = subprocess.run(
+                ["bash", str(start), "--path", home, "--channel", "hande", "--status"],
+                text=True, capture_output=True, timeout=20,
+            )
+        except Exception:
+            self.add("경고", item, "no status output",
+                     "run bridge/start.sh --path <home> --channel hande --status manually")
+            return
+        klass, status = self.bridge_status_verdict(out.returncode, out.stdout + out.stderr)
+        action = "none" if klass == "정상" else (
+            "check the ccc-hande-bridge unit (systemctl [--user] status ccc-hande-bridge; "
+            "Termux: sv status ccc-hande-bridge) and its health.json"
+        )
+        self.add(klass, item, status, action)
 
     @staticmethod
     def checkout_root_of(command: str) -> str | None:

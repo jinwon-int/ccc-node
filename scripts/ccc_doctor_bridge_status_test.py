@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+import subprocess
 import sys
 import unittest
 
@@ -444,6 +445,100 @@ class BridgeStatusVerdictTest(unittest.TestCase):
 
         self.assertEqual(doctor.distill_readiness, "disabled")
         self.assertIn("global off-switch active", doctor.rows[-1].status)
+
+
+class HandeBridgeStatusTest(unittest.TestCase):
+    """#2380: the ccc-hande-bridge unit gets its own `hande bridge status` row."""
+
+    ITEM = "hande bridge status"
+    ALIVE = "📡 Channel: hande (health: /home/u/.ccc-hande/health.json)\n🟢 Bot status: available\n   Hande: healthy\n"
+    DEAD = "🔴 Bot status: unavailable\n   Process: dead (no Hande frontend for this --path)\n"
+    MULTI = "🟡 Bot status: degraded\n   Process: alive (multiple Hande frontends: 11 12)\n"
+
+    def _doctor(self, tmp: Path, start_output: str, procs, unknown=()) -> Doctor:
+        repo = tmp / "repo"
+        (repo / "bridge").mkdir(parents=True)
+        start = repo / "bridge/start.sh"
+        # Records its argv so the probed --path can be asserted.
+        start.write_text(f'#!/usr/bin/env bash\necho "$*" > "{tmp}/argv"\ncat <<\'OUT\'\n{start_output}OUT\n')
+        start.chmod(0o755)
+        (tmp / ".claude").mkdir()
+        doctor = Doctor(repo, tmp / ".claude", "settings")
+        doctor.hande_bridge_processes = lambda: (list(procs), list(unknown))  # type: ignore[method-assign]
+        return doctor
+
+    def _rows(self, doctor: Doctor):
+        return [row for row in doctor.rows if row.item == self.ITEM]
+
+    def _run(self, frontends: str, start_output: str, procs, unknown=()):
+        with TemporaryDirectory() as raw, patch.dict("os.environ", {"CCC_FRONTENDS": frontends}):
+            tmp = Path(raw)
+            doctor = self._doctor(tmp, start_output, procs, unknown)
+            doctor.check_hande_bridge_status()
+            argv = (tmp / "argv").read_text().split() if (tmp / "argv").exists() else None
+            return self._rows(doctor), argv
+
+    def test_alive_is_normal_and_probes_the_hande_process_home(self) -> None:
+        rows, argv = self._run("hande", self.ALIVE, [("4242", "/home/u")])
+        self.assertEqual([(r.klass, r.status, r.action) for r in rows], [("정상", "available", "none")])
+        self.assertEqual(argv, ["--path", "/home/u", "--channel", "hande", "--status"])
+
+    def test_dead_unit_warns_unavailable_from_doctor_home(self) -> None:
+        with patch.dict("os.environ", {"HOME": "/home/doctor"}):
+            rows, argv = self._run("matrix hande", self.DEAD, [])
+        self.assertEqual([(r.klass, r.status) for r in rows], [("경고", "unavailable")])
+        self.assertIn("ccc-hande-bridge", rows[0].action)
+        self.assertEqual(argv[:2], ["--path", "/home/doctor"])
+
+    def test_degraded_status_output_warns(self) -> None:
+        rows, _ = self._run("hande", self.MULTI, [("11", "/home/u")])
+        self.assertEqual([(r.klass, r.status) for r in rows], [("경고", "degraded")])
+
+    def test_multiple_hande_processes_warn_without_probe(self) -> None:
+        rows, argv = self._run("hande", self.ALIVE, [("11", "/home/a"), ("12", "/root")])
+        self.assertEqual([(r.klass, r.status) for r in rows], [("경고", "degraded (multiple hande bridge processes: 11 12)")])
+        self.assertIsNone(argv)
+
+    def test_running_but_not_listed_is_drift(self) -> None:
+        rows, argv = self._run("matrix", self.ALIVE, [("4242", "/home/u")])
+        self.assertEqual([(r.klass, r.status) for r in rows], [("경고", "running but hande not in frontend list (PID: 4242)")])
+        self.assertIsNone(argv)
+
+    def test_not_configured_and_not_running_adds_no_row(self) -> None:
+        rows, argv = self._run("telegram", self.DEAD, [], unknown=["99"])
+        self.assertEqual(rows, [])
+        self.assertIsNone(argv)
+
+    def test_unreadable_environment_is_unknown_not_crash(self) -> None:
+        rows, argv = self._run("hande", self.ALIVE, [], unknown=["77"])
+        self.assertEqual([(r.klass, r.status) for r in rows], [("경고", "unknown (environment unreadable for PID: 77)")])
+        self.assertIn("root", rows[0].action)
+        self.assertIsNone(argv)
+
+    def test_process_discovery_reads_channel_and_home_from_each_process(self) -> None:
+        ps = (
+            "  10 /opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /root\n"
+            "  20 /opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /home/u\n"
+            "  30 /opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /home/v\n"
+            "  40 /opt/ccc-node/bridge/venv/bin/python -m telegram_bot --path /home/w\n"
+            "  50 /usr/bin/claude --print\n"
+        )
+        environs = {"10": b"HOME=/root\0", "20": b"HOME=/home/u\0CCC_CHANNEL=hande\0BOT_DATA_DIR=/home/u/.ccc-hande\0"}
+
+        def fake_environ(pid: str) -> bytes:
+            if pid == "30":
+                raise PermissionError(13, "Permission denied")
+            if pid == "40":
+                raise FileNotFoundError(2, "gone")
+            return environs[pid]
+
+        doctor = Doctor(Path.cwd(), Path.cwd() / ".claude", "settings")
+        doctor._proc_environ = fake_environ  # type: ignore[method-assign]
+        completed = subprocess.CompletedProcess(["ps"], 0, stdout=ps, stderr="")
+        with patch("ccc_doctor.subprocess.run", return_value=completed):
+            self.assertEqual(doctor.hande_bridge_processes(), ([("20", "/home/u")], ["30"]))
+        with patch("ccc_doctor.subprocess.run", side_effect=OSError("no ps")):
+            self.assertEqual(doctor.hande_bridge_processes(), ([], []))
 
 
 if __name__ == "__main__":
