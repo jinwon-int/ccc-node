@@ -853,7 +853,12 @@ class ExternalWaitMonitor:
         self._provisional_greens: Dict[str, int] = {}
         self._resume_count = 0
         self._resume_day = ""
-        self._idle_identity: Optional[tuple] = None
+        # Per-loop idle fast path (#2793): ``"poll"`` and ``"wake"`` each keep
+        # the registry identity they last proved idle.
+        self._idle_identity: Dict[str, Optional[tuple]] = {}
+        # Set by the poll loop after each poll so a wake it journaled is
+        # delivered without waiting out the wake loop's sleep (#2793).
+        self._wake_kick = asyncio.Event()
 
     # -- configuration helpers ---------------------------------------------------
     @staticmethod
@@ -881,34 +886,86 @@ class ExternalWaitMonitor:
         rearmed = self._registry.reconcile_on_start()
         if rearmed:
             logger.info("External-wait monitor re-armed %d wait(s) after restart", rearmed)
+        # Polling and wake delivery are two loops (#2793): on Telegram a wake
+        # awaits a whole resume turn (minutes), and with one loop no other wait
+        # was polled meanwhile. Wakes stay strictly serial within the wake
+        # loop. The two never mutate the same record: the poll loop only
+        # touches ``monitoring`` records, the wake loop only terminal ones,
+        # and ``finish`` hands a record over in one atomic registry write.
+        # The TaskGroup cancels and awaits both when ``run`` is cancelled, and
+        # returns once both have seen ``stop_event`` (an in-flight resume turn
+        # still finishes first, as before).
+        self._wake_kick = asyncio.Event()  # bound to this run's event loop
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._loop(stop_event, "poll", self._poll_pass), name="external-wait-poll")
+            group.create_task(
+                self._loop(stop_event, "wake", self._wake_pass, kick=self._wake_kick),
+                name="external-wait-wake",
+            )
+
+    async def _loop(
+        self,
+        stop_event: asyncio.Event,
+        lane: str,
+        step: Callable[[], Awaitable[None]],
+        *,
+        kick: Optional[asyncio.Event] = None,
+    ) -> None:
         while not stop_event.is_set():
+            if kick is not None:
+                kick.clear()  # a kick set during this pass re-runs it at once
             try:
-                await self._tick()
+                await step()
             except Exception:
-                logger.exception("External-wait monitor tick failed (continuing)")
+                logger.exception("External-wait monitor %s pass failed (continuing)", lane)
+            waiters = [asyncio.ensure_future(stop_event.wait())]
+            if kick is not None:
+                waiters.append(asyncio.ensure_future(kick.wait()))
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=self._tick_seconds)
-            except asyncio.TimeoutError:
-                pass
+                await asyncio.wait(waiters, timeout=self._tick_seconds, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for waiter in waiters:
+                    waiter.cancel()
+                await asyncio.gather(*waiters, return_exceptions=True)
 
     async def _tick(self) -> None:
-        # Idle fast path: a previous tick proved the registry holds no
-        # monitoring record and no pending wake. Time alone cannot create
-        # work in that state, so until the file identity changes (any
-        # register/mutate rewrites it atomically), the tick is one os.stat
-        # instead of two full read+parse passes — this loop runs every 5s
-        # forever, and the registry is empty most of a node's life.
+        """One sequential poll pass then wake pass (tests drive this directly)."""
+        await self._poll_pass()
+        await self._wake_pass()
+
+    # Idle fast path: a previous pass proved the registry holds no monitoring
+    # record and no pending wake. Time alone cannot create work in that state,
+    # so until the file identity changes (any register/mutate rewrites it
+    # atomically), a pass is one os.stat instead of a full read+parse — these
+    # loops run every 5s forever, and the registry is empty most of a node's
+    # life. Each loop keeps its own identity (#2793), taken after its own pass
+    # from the file as it is then, so work the other loop created meanwhile
+    # (a terminal poll journaling a wake) is either seen by that read or
+    # changes the identity.
+    def _idle_unchanged(self, lane: str) -> bool:
+        identity = self._idle_identity.get(lane)
+        return identity is not None and identity == self._registry.state_file_identity()
+
+    def _remember_idle(self, lane: str) -> None:
         idle = getattr(self._registry, "idle_snapshot_identity", None)
-        if idle is not None and self._idle_identity is not None:
-            if self._idle_identity == self._registry.state_file_identity():
-                return
+        self._idle_identity[lane] = idle() if idle is not None else None
+
+    async def _poll_pass(self) -> None:
+        if self._idle_unchanged("poll"):
+            return
         for record in self._registry.due(now=self._clock()):
             await self._poll_one(record)
+            self._wake_kick.set()
+        self._remember_idle("poll")
+
+    async def _wake_pass(self) -> None:
+        if self._idle_unchanged("wake"):
+            return
         # Only wakes whose retry delay has passed (#2740): draining every
         # pending wake on every tick spent all attempts within a minute.
         for record in self._registry.due_wakes(now=self._clock()):
             await self._deliver_wake(record)
-        self._idle_identity = idle() if idle is not None else None
+        self._remember_idle("wake")
 
     # -- polling ------------------------------------------------------------------
     async def _poll_one(self, record: Dict[str, Any]) -> None:
