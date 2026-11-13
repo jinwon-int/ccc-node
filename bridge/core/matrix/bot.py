@@ -261,11 +261,22 @@ class MatrixConfigError(RuntimeError):
 
 
 def _turn_result(
-    text: str, session_id: str | None, *, streamed: bool = False, status: str = "complete"
+    text: str,
+    session_id: str | None,
+    *,
+    streamed: bool = False,
+    status: str = "complete",
+    error_detail: str | None = None,
 ) -> TurnResult:
     """Build the transport's ``TurnResult`` (kept as the call sites' one constructor)."""
 
-    return TurnResult(text=text, session_id=session_id, streamed=streamed, status=status)
+    return TurnResult(
+        text=text,
+        session_id=session_id,
+        streamed=streamed,
+        status=status,
+        error_detail=error_detail,
+    )
 
 
 TransportFactory = Callable[[Mapping[str, Any], Any], Any]
@@ -2753,7 +2764,17 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         if content.strip() and not streamed and await self._send_formatted(room_id, content):
             streamed = True
         self._enqueue_deliverables(room_id, content)
-        return _turn_result(content, response.session_id, streamed=streamed, status=status)
+        # #2813: the cause travels apart from ``content`` — a stalled turn's
+        # content also holds the partial answer. ``error`` is the provider
+        # message for a terminal failure (or a short bridge code).
+        detail = getattr(response, "error", None) if status != "complete" else None
+        return _turn_result(
+            content,
+            response.session_id,
+            streamed=streamed,
+            status=status,
+            error_detail=str(detail) if detail else None,
+        )
 
     def _enqueue_deliverables(self, room_id: str, content: str) -> None:
         """Queue the files an answer names for the room, after the answer (#2001).

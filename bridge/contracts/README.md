@@ -131,7 +131,7 @@ seam instead of a fourth duck-typed copy.
 | --- | --- |
 | `TurnRunner` | What a frontend hands to the transport: `run(job, sink=, session_id=, room_kind=) -> TurnResult`, `cancel(job)`; optional `stop_idle`, `turn_closed`, `delivered` hooks looked up with `getattr` |
 | `TurnSink` | What a running turn may do to its conversation: `typing`, `interim`, `status`, `approval` (fail closed) |
-| `TurnResult` | `text`, `session_id`, `streamed=False`, `status="complete"|"uncertain"` — frozen |
+| `TurnResult` | `text`, `session_id`, `streamed=False`, `status="complete"|"uncertain"`, `error_detail=None` (cause of a non-complete turn, kept apart from `text`; #2813) — frozen |
 | `TransportPort` | The transport's lifecycle (`open`/`run`/`close`) plus `enqueue_notice` and `room_kind` |
 
 Rules, same as above: no `nio`, `telegram` or bridge configuration imports;

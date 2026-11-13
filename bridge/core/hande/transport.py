@@ -83,6 +83,7 @@ from telegram_bot.contracts.transport import TurnResult, TurnRunner
 
 from . import outbound
 from .attachments import AttachmentFrameError, parse_frame_attachment
+from .failure_reason import failure_reason
 from .state import (
     DEFAULT_SOCKET_MODE,
     DEFAULT_STATUS_INTERIM_INTERVAL_S,
@@ -1004,8 +1005,8 @@ class HandeTransport:
         else:
             self._self_jobs_uncertain += 1
             if not turn.cancelled:  # a /stop is answered by the held turn
-                if result is not None:
-                    reason = reason or str(getattr(result, "status", "uncertain"))
+                if result is not None and not reason:
+                    reason = _result_reason(result)
                 await self._post_notice(
                     room, NOTICE_SELF_JOB_UNCERTAIN.format(reason=reason or "uncertain")
                 )
@@ -1287,8 +1288,11 @@ class HandeTransport:
             )
         else:
             self._turns_uncertain += 1
-            if result is not None:
-                reason = reason or str(getattr(result, "status", "uncertain"))
+            # Machine codes set above (``cancelled``/``worker_gone``/``error``
+            # from an exception) stay as they are: the bot compares
+            # ``reason == "cancelled"``. Only a returned failure is worded.
+            if result is not None and not reason:
+                reason = _result_reason(result)
             await client.send(
                 {
                     "type": "result",
@@ -1590,6 +1594,18 @@ class HandeTransport:
             logger.debug("hande runner.cancel failed", exc_info=True)
         if turn.task is not None and not turn.task.done():
             turn.task.cancel()
+
+
+def _result_reason(result: Any) -> str:
+    """The ``reason`` of a returned, non-complete ``TurnResult`` (#2813).
+
+    The bot prints it verbatim in ``…확인하지 못했습니다(<reason>)``, so the
+    provider cause (``error_detail``) becomes one sanitized human line; without
+    one it stays the bare status, as before.
+    """
+
+    status = str(getattr(result, "status", "uncertain") or "uncertain")
+    return failure_reason(status, getattr(result, "error_detail", None))
 
 
 def _with_lines(result: Any, lines: list[str]) -> Any:

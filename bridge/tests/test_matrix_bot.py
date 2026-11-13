@@ -564,6 +564,38 @@ async def test_failed_turn_does_not_persist_session(tmp_path: Path, matrix_confi
     assert "session_id" not in manager.rows[bot.ids.user_id(OWNER)]
 
 
+@pytest.mark.anyio
+async def test_failed_turn_carries_the_error_apart_from_partial_text(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    """#2813: the cause travels in ``error_detail``; ``text`` may hold a partial answer."""
+
+    bot, _chat, _manager = _bot(tmp_path)
+    response = ChatResponse(
+        content="partial answer\n\n⚠️ stalled",
+        success=False,
+        error="You've reached your Fable limit. Switch to another model, or manage usage",
+        session_id="s-err",
+    )
+    result = await bot._finish(response, DM_ROOM)
+    assert result.status == "error"
+    assert result.text == "partial answer\n\n⚠️ stalled"
+    assert result.error_detail == (
+        "You've reached your Fable limit. Switch to another model, or manage usage"
+    )
+
+
+@pytest.mark.anyio
+async def test_completed_or_causeless_turn_has_no_error_detail(
+    tmp_path: Path, matrix_config: dict[str, Any]
+) -> None:
+    bot, _chat, _manager = _bot(tmp_path)
+    done = await bot._finish(ChatResponse(content="ok", error="stale", session_id="s"), DM_ROOM)
+    assert done.status == "complete" and done.error_detail is None
+    causeless = await bot._finish(ChatResponse(content="expired", success=False), DM_ROOM)
+    assert causeless.status == "error" and causeless.error_detail is None
+
+
 # --- commands ----------------------------------------------------------------
 
 
