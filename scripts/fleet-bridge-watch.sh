@@ -100,6 +100,11 @@
 #                    #2569): bridge process/health, native bot, notice_frames.
 #                    CCC_FLEET_HANDE_TIMEOUT per-attempt probe limit in seconds
 #                    (default 20, 1–30, #2673).
+#   CCC_FLEET_SSH_REUSE set to 0 to open a new ssh connection for every probe.
+#                    By default a run opens one connection per node and the
+#                    three channel probes share it (#2766, lib/fleet-ssh-reuse.sh):
+#                    sockets in a private directory under ${TMPDIR:-/tmp} that
+#                    is removed on exit; a retry always connects on its own.
 #   CCC_FLEET_DEGRADED_RECHECK_DELAY seconds before a degraded node is asked
 #                    again (default 75, capped at 300); CCC_FLEET_DEGRADED_RECHECK=0
 #                    pages on the first answer instead
@@ -837,15 +842,31 @@ RETRY_DELAY="${CCC_FLEET_RETRY_DELAY:-10}"
 case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=10 ;; esac
 [ "$RETRY_DELAY" -le 120 ] || RETRY_DELAY=120
 
-fail=0
-if [ "${CCC_FLEET_MATRIX:-1}" = 1 ]; then
-  bash "$(dirname "$0")/fleet-matrix-watch.sh" || fail=1
+# One ssh connection per node for the whole run (#2766): the first probe of a
+# node opens it and the other two channels ride it, so a run pays one handshake
+# per node instead of three. The helper carries the measurements and the
+# safety rules; without it (a copied script) every probe connects on its own.
+# shellcheck source=scripts/lib/fleet-ssh-reuse.sh
+if . "$(dirname "$0")/lib/fleet-ssh-reuse.sh" 2>/dev/null; then
+  fleet_ssh_reuse_start
+  trap fleet_ssh_reuse_stop EXIT
+else
+  fleet_ssh_reuse_opts() { FLEET_SSH_REUSE=(); }
+  unset CCC_FLEET_SSH_MUX_DIR
 fi
+
+fail=0
 # 「한데」 frontend (#2569): bridge, native bot and notice_frames. One node's hande
 # bridge was down 14.7 h on 2026-10-27/28 while this sweep stayed page=no.
 # The node list is this script's own (fleet-hande-watch.sh carries none).
+# It runs before the Matrix watch (#2766): whichever watch is first pays the
+# node's handshake, and this one allows it 20s where the Matrix watch allows
+# 10s — the limit a far watcher kept missing for a channel retired on the node.
 if [ "${CCC_FLEET_HANDE:-1}" = 1 ]; then
   CCC_FLEET_NODES="$NODES" bash "$(dirname "$0")/fleet-hande-watch.sh" || fail=1
+fi
+if [ "${CCC_FLEET_MATRIX:-1}" = 1 ]; then
+  bash "$(dirname "$0")/fleet-matrix-watch.sh" || fail=1
 fi
 # probe_node <node> <doctor-flag>: sets $out and $probe_rc, retrying transport
 # failures only (see RETRIES above).
@@ -866,7 +887,10 @@ $PROBE"
     if [ "$1" = "$SELF" ]; then
       out=$(printf '%s' "$payload" | sh -s 2>/dev/null)
     else
-      out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$1" sh -s 2>/dev/null)
+      # First attempt: the node's shared connection (#2766). A retry connects
+      # on its own, so a stale shared connection cannot decide the verdict.
+      fleet_ssh_reuse_opts "$1" "$attempt"
+      out=$(printf '%s' "$payload" | timeout "$node_budget" "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 ${FLEET_SSH_REUSE[@]+"${FLEET_SSH_REUSE[@]}"} "$1" sh -s 2>/dev/null)
     fi
     probe_rc=$?
     [ -n "$out" ] && break

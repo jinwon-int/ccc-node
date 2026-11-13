@@ -16,6 +16,13 @@ case "$RETRIES" in ''|*[!0-9]*) RETRIES=1 ;; esac
 case "$RETRY_DELAY" in ''|*[!0-9]*) RETRY_DELAY=2 ;; esac
 [ "$RETRIES" -le 1 ] || RETRIES=1
 [ "$RETRY_DELAY" -le 2 ] || RETRY_DELAY=2
+# Shared connection (#2766): inside a fleet-bridge-watch run the first attempt
+# rides the connection the 「한데」 watch already opened to the node, so the 10s
+# limit covers the probe (about a second) rather than a new handshake. A retry
+# and a standalone run connect on their own, as before. A copy of this script
+# without the helper runs without reuse.
+# shellcheck source=scripts/lib/fleet-ssh-reuse.sh
+. "$ROOT/scripts/lib/fleet-ssh-reuse.sh" 2>/dev/null || fleet_ssh_reuse_opts() { FLEET_SSH_REUSE=(); }
 
 fail=0
 for node in $NODES; do
@@ -24,7 +31,8 @@ for node in $NODES; do
     if [ "$node" = "$SELF" ]; then
       out=$(python3 "$PROBE" 2>/dev/null); rc=$?
     else
-      out=$(timeout 10 "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 "$node" python3 - < "$PROBE" 2>/dev/null); rc=$?
+      fleet_ssh_reuse_opts "$node" "$attempt"
+      out=$(timeout 10 "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=8 ${FLEET_SSH_REUSE[@]+"${FLEET_SSH_REUSE[@]}"} "$node" python3 - < "$PROBE" 2>/dev/null); rc=$?
     fi
     [ -n "$out" ] && break
     attempt=$((attempt + 1))
