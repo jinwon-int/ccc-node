@@ -6,10 +6,13 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 _PATH = pathlib.Path(__file__).with_name("ccc_owner_queue.py")
 _SPEC = importlib.util.spec_from_file_location("ccc_owner_queue", _PATH)
@@ -164,6 +167,91 @@ class MainTest(unittest.TestCase):
         with redirect_stderr(err):
             self.assertEqual(oq.main(["--owner", "o"], boom), 1)
         self.assertIn("auth", err.getvalue())
+
+
+class DigestTest(unittest.TestCase):
+    """--digest: one tier=info push-spool record for the 09:00 KST digest (#2617 decision 2)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.spool = pathlib.Path(self.tmp.name) / "spool"
+        self.env = mock.patch.dict(os.environ, {"CCC_PUSH_SPOOL": str(self.spool), "CCC_NODE": "n1"})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def _items(self):
+        stub = StubGh(review=[_raw("o/a", 1, "2026-10-30T03:00:00Z"), _raw("o/b", 2, "2026-11-01T01:00:00Z")],
+                      labeled=[_raw("o/c", 3, "2026-10-31T03:00:00Z")])
+        return oq.collect("o", "owner-action", stub, NOW)
+
+    def _files(self):
+        return sorted(self.spool.glob("*.json")) if self.spool.exists() else []
+
+    def test_text_is_short_counts_only(self):
+        text = oq.build_digest_text(self._items(), "https://github.com/o/r/issues/9")
+        lines = text.splitlines()
+        self.assertLessEqual(len(lines), 3)
+        self.assertEqual(lines[0], "📋 오너 할 일 3건 — 승인 대기 PR 2 · owner-action 1")
+        self.assertEqual(lines[1], "가장 오래된 것: o/a#1 2d 0h · o/c#3 1d 0h")
+        self.assertEqual(lines[2], "전체 목록: https://github.com/o/r/issues/9")
+        self.assertNotIn(" t ", text)  # no titles
+
+    def test_dry_run_writes_nothing(self):
+        self.assertTrue(oq.write_digest(self._items(), "n1", apply=False).startswith("would-spool"))
+        self.assertEqual(self._files(), [])
+
+    def test_empty_queue_writes_nothing_even_with_apply(self):
+        self.assertEqual(oq.write_digest([], "n1", apply=True), "skipped (queue empty)")
+        self.assertEqual(self._files(), [])
+
+    def test_apply_writes_one_owner_only_info_record(self):
+        result = oq.write_digest(self._items(), "n1", apply=True, link=None, now=NOW)
+        files = self._files()
+        self.assertEqual(len(files), 1)
+        self.assertEqual(result, f"spooled {files[0].name}")
+        self.assertIn("-OwnerQueue-", files[0].name)
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+        rec = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(rec["event"], "OwnerQueue")
+        self.assertEqual(rec["tier"], "info")
+        self.assertEqual(rec["node"], "n1")
+        # NOW = 2026-11-01 03:00 UTC = 12:00 KST → KST date, once per day per node
+        self.assertEqual(rec["dedup"], "OwnerQueue:2026-11-01:n1")
+        self.assertEqual(rec["ts"], "2026-11-01T03:00:00Z")
+        self.assertTrue(rec["text"].startswith("📋 오너 할 일 3건"))
+
+    def test_main_digest_flags(self):
+        stub = StubGh(review=[_raw("o/a", 1, "2026-10-31T01:00:00Z")], body="x")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(oq.main(["--owner", "o", "--digest"], stub), 0)
+        self.assertIn("digest: would-spool", err.getvalue())
+        self.assertEqual(self._files(), [])
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(oq.main(["--owner", "o", "--digest", "--apply",
+                                      "--update-issue", "o/r#9"], stub), 0)
+        self.assertIn("digest: spooled", err.getvalue())
+        rec = json.loads(self._files()[0].read_text(encoding="utf-8"))
+        self.assertEqual(rec["node"], "n1")  # CCC_NODE
+        self.assertIn("전체 목록: https://github.com/o/r/issues/9", rec["text"])
+
+    def test_without_digest_flag_nothing_is_spooled(self):
+        stub = StubGh(review=[_raw("o/a", 1, "2026-10-31T01:00:00Z")])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(oq.main(["--owner", "o", "--apply"], stub), 0)
+        self.assertEqual(self._files(), [])
+
+    def test_node_resolution_order(self):
+        with mock.patch.dict(os.environ, {"CCC_NODE": ""}):
+            state = pathlib.Path(self.tmp.name) / "state"
+            state.mkdir()
+            (state / "node.txt").write_text("from-file\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CCC_STATE_DIR": str(state)}):
+                self.assertEqual(oq.resolve_node(), "from-file")
 
 
 if __name__ == "__main__":
