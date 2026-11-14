@@ -28,6 +28,10 @@
   `~/.claude/settings*.json` is `경고`. See *Non-harness account hooks* below.
 - **Always-on budget** (`#2384`): always-on injection per source (chars/bytes, share of
   the provider cap); over cap is `경고`, or `수동필요` under `--strict`. See *Always-on budget* below.
+- **Time zone database** (`#2815`): whether Python can resolve IANA zone names here. A node
+  with no OS database and no `tzdata` package (Termux) is `경고` — agent-cron then accepts
+  only UTC and rejects `--timezone <IANA name>`. Read-only; the action names the package to
+  install. See *Nodes without a time zone database* in `docs/agent-cron.md`.
 
 The report is Markdown and classifies rows as:
 

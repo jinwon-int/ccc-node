@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import ccc_secure_fs as _secure_fs
+from agent_cron_lib import NO_TZ_DATABASE_REMEDY, tz_database_available
 from ccc_memory_guidance import (
     STALE_MEMORY_READ_LIMIT,
     memory_stack_span,
@@ -1230,6 +1231,7 @@ class Doctor:
         self.check_self_update_stall()
         self.check_a2a_handler_drift()
         self.check_agent_cron_prompt_success()
+        self.check_timezone_database()
         self.check_push_spool_dwell()
         self.check_dns_resolver_mode()
         self.check_worker_claude_cli_floor()
@@ -3774,6 +3776,28 @@ class Doctor:
             return None
         basis = "last-success" if successes else "no-success-since-first-run"
         return f"node-prompt({basis}={int(age_days)}d)"
+
+    def check_timezone_database(self) -> None:
+        """Warn when this node cannot resolve IANA time zone names (#2815).
+
+        Python resolves a zone from the OS database or the ``tzdata`` package.
+        Termux ships neither, so on those nodes ``agent-cron.sh add --timezone
+        Asia/Seoul`` — the documented example — was rejected, and read like a
+        typo (``unknown timezone``). A 10-minute watchdog registration was
+        rolled back that way on 2026-11-14; the same node cannot hold a local-
+        time cron expression at all. agent-cron uses the same probe, so this row
+        and the `add` error always agree. Read-only; installing a package is the
+        operator's call, so the action text names it and nothing is repaired.
+        """
+        item = "timezone database"
+        if tz_database_available():
+            self.add("정상", item, "zones=available", "none")
+            return
+        self.add(
+            "경고", item, "zones=none (only UTC resolves)",
+            f"{NO_TZ_DATABASE_REMEDY}; until then agent-cron rejects `--timezone <IANA name>` "
+            "and local-time schedules must be written in UTC",
+        )
 
     def check_agent_cron_prompt_success(self) -> None:
         """Warn when prompt tasks have not succeeded for > D days (#1821).

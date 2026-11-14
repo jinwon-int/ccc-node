@@ -135,5 +135,38 @@ class AgentCronPromptSuccessCheck(unittest.TestCase):
             self.assertEqual(doctor.rows[-1].klass, "정상")
 
 
+class TimezoneDatabaseCheck(unittest.TestCase):
+    """#2815: a node with no time zone database must say so before `add` fails."""
+
+    ITEM = "timezone database"
+
+    def row(self, available: bool):
+        with TemporaryDirectory() as temp:
+            doctor = Doctor(Path.cwd(), Path(temp) / ".claude", "settings")
+            with patch("ccc_doctor.tz_database_available", return_value=available):
+                doctor.check_timezone_database()
+        row = doctor.rows[-1]
+        self.assertEqual(row.item, self.ITEM)
+        return row
+
+    def test_database_present_is_ok(self) -> None:
+        row = self.row(True)
+        self.assertEqual((row.klass, row.status, row.action), ("정상", "zones=available", "none"))
+
+    def test_missing_database_warns_with_the_remedy(self) -> None:
+        row = self.row(False)
+        self.assertEqual(row.klass, "경고")  # non-fatal: UTC schedules still work
+        self.assertIn("only UTC resolves", row.status)
+        self.assertIn("tzdata", row.action)
+        self.assertIn("--timezone", row.action)
+
+    def test_verdict_uses_the_scheduler_probe(self) -> None:
+        # The row must come from the same probe agent-cron's resolver uses, so
+        # doctor and `add` can never disagree about this node.
+        import agent_cron_lib
+        import ccc_doctor
+        self.assertIs(ccc_doctor.tz_database_available, agent_cron_lib.tz_database_available)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,8 +6,10 @@ These exercise the deterministic cron/retry math that previously lived inline in
 agent_cron.py and had only indirect CLI-level coverage via agent-cron.test.sh.
 """
 
+import importlib.util
 import os
 import random
+import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_cron_lib as lib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _dt(y, mo, d, h, mi):
@@ -426,6 +430,56 @@ class ScheduleKindsTest(unittest.TestCase):
     def test_unknown_timezone_fails_closed(self):
         with self.assertRaises(ValueError):
             lib.parse_schedule('@daily', 'Mars/OlympusMons')
+
+    def test_unknown_timezone_message_names_the_bad_name(self):
+        # A wrong name on a node that has a database is still "unknown timezone".
+        with self.assertRaisesRegex(ValueError, r'^unknown timezone: Mars/OlympusMons$'):
+            lib.resolve_timezone('Mars/OlympusMons')
+        with self.assertRaisesRegex(ValueError, r'^unknown timezone: \.\./etc/passwd$'):
+            lib.resolve_timezone('../etc/passwd')
+
+    def test_missing_tz_database_is_not_reported_as_a_typo(self):
+        # #2815: on a node with no time zone database a valid name was rejected
+        # as "unknown timezone". PYTHONTZPATH='' is Python's documented way to
+        # ignore the OS database; without the tzdata package nothing resolves.
+        if importlib.util.find_spec('tzdata') is not None:
+            self.skipTest('the tzdata package is installed; cannot simulate a node without a database')
+        code = (
+            'import sys\n'
+            'sys.path.insert(0, sys.argv[1])\n'
+            'import agent_cron_lib as lib\n'
+            'print(lib.tz_database_available())\n'
+            'print(lib.resolve_timezone("utc")[1], lib.resolve_timezone(None)[1])\n'
+            'for name in ("Asia/Seoul", "Mars/OlympusMons"):\n'
+            '    try:\n'
+            '        lib.resolve_timezone(name)\n'
+            '    except ValueError as error:\n'
+            '        print(error)\n'
+            'print(lib.parse_schedule("every 10m")["kind"])\n'
+            'try:\n'
+            '    lib.parse_schedule("every 10m", "Asia/Seoul")\n'
+            'except ValueError as error:\n'
+            '    print("interval:", error)\n'
+        )
+        env = {**os.environ, 'PYTHONTZPATH': ''}
+        result = subprocess.run([sys.executable, '-c', code, HERE], env=env,
+                                capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], 'False')
+        self.assertEqual(lines[1], 'UTC UTC')  # UTC never needs the database
+        for line, name in ((lines[2], 'Asia/Seoul'), (lines[3], 'Mars/OlympusMons')):
+            self.assertIn('no time zone database on this node', line)
+            self.assertIn(f'cannot resolve {name}', line)
+            self.assertIn('tzdata', line)
+            self.assertNotIn('unknown timezone', line)
+        self.assertEqual(lines[4], 'interval')  # no timezone given -> still schedulable
+        self.assertIn('no time zone database on this node', lines[5])
+
+    def test_tz_database_available_on_a_normal_node(self):
+        if not lib.tz_database_available():
+            self.skipTest('this interpreter has no time zone database')
+        self.assertEqual(lib.resolve_timezone('Asia/Seoul')[1], 'Asia/Seoul')
 
     def test_cron_kind_marked(self):
         self.assertEqual(lib.parse_schedule('@daily')['kind'], 'cron')
