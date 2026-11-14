@@ -12,7 +12,7 @@ import re
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 OCCURRENCE_SCAN_LIMIT = 1000
 # One comma-separated term: `*`, `N`, `N-M`, or any of those with a `/S` step.
@@ -34,13 +34,44 @@ SHORTHAND = {
 }
 
 
+# A zone every IANA database carries. `resolve_timezone` probes it to tell "this
+# name is wrong" from "this node has no time zone database at all" (#2815).
+TZ_DATABASE_PROBE = 'Etc/UTC'
+NO_TZ_DATABASE_REMEDY = 'install the Python `tzdata` package (python3 -m pip install tzdata) or use UTC'
+
+
+def tz_database_available():
+    """True when this interpreter can resolve IANA zone names.
+
+    Python reads zones from the OS database (``zoneinfo.TZPATH``) and falls back
+    to the ``tzdata`` package. A node with neither — Termux ships none — resolves
+    only UTC, which `resolve_timezone` handles without the database.
+    """
+    try:
+        ZoneInfo(TZ_DATABASE_PROBE)
+    except Exception:
+        return False
+    return True
+
+
 def resolve_timezone(name):
-    """Resolve a task timezone name to a tzinfo, fail-closed on unknown names."""
+    """Resolve a task timezone name to a tzinfo, fail-closed on unknown names.
+
+    Both failures stay `ValueError` (callers report `invalid-schedule`), but the
+    message says which one it is: a valid name such as ``Asia/Seoul`` on a node
+    without a time zone database is not a typo, and the remedy differs (#2815).
+    """
     label = (name or 'UTC').strip() or 'UTC'
     if label.upper() == 'UTC':
         return timezone.utc, 'UTC'
     try:
         return ZoneInfo(label), label
+    except ZoneInfoNotFoundError as e:
+        if not tz_database_available():
+            raise ValueError(
+                f'no time zone database on this node (cannot resolve {label}): {NO_TZ_DATABASE_REMEDY}'
+            ) from e
+        raise ValueError(f'unknown timezone: {label}') from e
     except Exception as e:
         raise ValueError(f'unknown timezone: {label}') from e
 

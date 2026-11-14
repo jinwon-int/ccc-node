@@ -1468,5 +1468,29 @@ dn_out="$(DN_PROBE_HOST='' dn_json "$dn/resolv.stub" "$dn/bin/getent-fail" "$dn/
 ok "empty probe host disables the resolution probe" \
   'jq -e ".rows[] | select(.item == \"dns resolution\" and .class == \"정상\") | .status | contains(\"해당 없음\")" <<<"$dn_out" >/dev/null'
 
+# --- timezone database (#2815) ----------------------------------------------
+# A node without a time zone database (Termux) rejected `agent-cron add
+# --timezone Asia/Seoul` as "unknown timezone". PYTHONTZPATH='' makes Python
+# ignore the OS database, which reproduces that node unless the tzdata package
+# happens to be installed here. The row must be a non-fatal 경고 that names the
+# remedy; with the host's database it is 정상.
+tzf="$(make_fixture tz-database standalone)"
+# shellcheck disable=SC2034  # tz_out is read via eval inside ok()
+tz_out="$(run_doctor "$tzf" --json)"
+if python3 -c 'import zoneinfo; zoneinfo.ZoneInfo("Etc/UTC")' 2>/dev/null; then
+  ok "timezone database row is 정상 when IANA names resolve" \
+    'jq -e ".rows[] | select(.item == \"timezone database\" and .class == \"정상\") | .status == \"zones=available\"" <<<"$tz_out" >/dev/null'
+else
+  echo "skip: this host has no time zone database (정상 case)"
+fi
+if PYTHONTZPATH='' python3 -c 'import zoneinfo; zoneinfo.ZoneInfo("Etc/UTC")' 2>/dev/null; then
+  echo "skip: the tzdata package is installed; cannot simulate a node without a database"
+else
+  # shellcheck disable=SC2034  # tz_out is read via eval inside ok()
+  tz_out="$(PYTHONTZPATH='' run_doctor "$tzf" --json)"
+  ok "missing timezone database is a 경고 naming tzdata and the rejected flag" \
+    'jq -e ".rows[] | select(.item == \"timezone database\" and .class == \"경고\") | (.status | contains(\"only UTC resolves\")) and (.action | contains(\"tzdata\") and contains(\"--timezone\"))" <<<"$tz_out" >/dev/null'
+fi
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

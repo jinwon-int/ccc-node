@@ -81,6 +81,26 @@ Hermes and OpenClaw schedulers):
 - Unknown timezones and malformed expressions fail closed as
   `invalid-schedule` in `due`/`status` output; `due` rows expose `scheduleKind`.
 
+### Nodes without a time zone database (#2815)
+
+IANA names are resolved by Python's `zoneinfo`, which reads the OS database and
+falls back to the `tzdata` package. A node with neither — Termux ships none —
+resolves **only UTC**, for every schedule form (an interval such as `every 10m`
+is rejected too once `--timezone` is given):
+
+```
+$ agent-cron.sh add nightly --schedule "0 9 * * *" --timezone Asia/Seoul --prompt …
+{"ok": false, "error": "invalid schedule bounds: no time zone database on this node (cannot resolve Asia/Seoul): install the Python `tzdata` package (python3 -m pip install tzdata) or use UTC"}
+```
+
+- A wrong name on a node that *has* a database keeps the old message,
+  `unknown timezone: <name>`. On a node without one, both a wrong and a valid
+  name get the "no time zone database" message — the node cannot tell them apart.
+- Until `tzdata` is installed, omit `--timezone` (UTC) and write local-time
+  schedules in UTC (`0 9 * * *` KST is `0 0 * * *` UTC).
+- `ccc-doctor` reports the same condition as the `timezone database` row
+  (`경고`, non-fatal). Both use `agent_cron_lib.tz_database_available()`.
+
 ## Payload kinds
 
 Each task runs one payload (default: `prompt`, backward compatible):

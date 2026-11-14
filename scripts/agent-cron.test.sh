@@ -112,6 +112,27 @@ JSON
 out="$(CCC_AGENT_CRON_STORE="$BAD_TZ" bash "$CMD" due --json 2>&1)"; rc=$?
 ok "unknown timezone fails closed as invalid-schedule" 'grep -q "invalid-schedule" <<<"$out" && grep -q "unknown timezone" <<<"$out"'
 
+# #2815: a node with no time zone database (Termux) rejected the documented
+# `--timezone Asia/Seoul` as "unknown timezone". PYTHONTZPATH='' makes Python
+# ignore the OS database; unless the tzdata package is installed here that is
+# the same node. `add` must say the database is missing, write nothing, and
+# still accept the same task without --timezone.
+if PYTHONTZPATH='' python3 -c 'import zoneinfo; zoneinfo.ZoneInfo("Etc/UTC")' 2>/dev/null; then
+  echo "skip: the tzdata package is installed; cannot simulate a node without a time zone database"
+else
+  NO_TZDB="$TMP/no-tzdb.json"
+  printf '{"version":1,"tasks":[]}\n' > "$NO_TZDB"
+  out="$(PYTHONTZPATH='' CCC_AGENT_CRON_STORE="$NO_TZDB" bash "$CMD" add tz-task --schedule "every 10m" --prompt p --timezone Asia/Seoul --json 2>&1)"; rc=$?
+  ok "add --timezone on a node without a tz database names the missing database, not a typo" \
+    '[ "$rc" = 2 ] && grep -q "no time zone database on this node" <<<"$out" && grep -q "tzdata" <<<"$out" && ! grep -q "unknown timezone" <<<"$out"'
+  ok "the rejected add leaves the store untouched" '[ "$(tr -d "[:space:]" < "$NO_TZDB")" = "{\"version\":1,\"tasks\":[]}" ]'
+  out="$(PYTHONTZPATH='' CCC_AGENT_CRON_STORE="$NO_TZDB" bash "$CMD" add tz-task --schedule "every 10m" --prompt p --json 2>&1)"; rc=$?
+  ok "the same task without --timezone registers on that node" '[ "$rc" = 0 ] && grep -q '"'"'"ok": true'"'"' <<<"$out"'
+  out="$(PYTHONTZPATH='' CCC_AGENT_CRON_STORE="$BAD_TZ" bash "$CMD" due --json 2>&1)"; rc=$?
+  ok "a stored non-UTC zone on that node still fails closed as invalid-schedule" \
+    'grep -q "invalid-schedule" <<<"$out" && grep -q "no time zone database on this node" <<<"$out"'
+fi
+
 KINDS="$TMP/kinds.json"
 cat > "$KINDS" <<'JSON'
 {"version":1,"tasks":[
