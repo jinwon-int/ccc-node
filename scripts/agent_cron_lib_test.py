@@ -14,10 +14,11 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_cron_lib as lib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _dt(y, mo, d, h, mi):
