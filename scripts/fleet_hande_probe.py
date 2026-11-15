@@ -13,8 +13,17 @@ One verdict per node, read from ``/proc`` and the bridge's own health.json:
   (absence on purpose: fleet_watch_state.py treats RETIRED as normal).
 * DOWN   no-process / bot-no-process / health-unavailable / crash-loop
 * DEGRADED health-degraded / bot-disconnected / transport-error / notices-off
+           / jwt-refresh-stale
 * UNVERIFIED … — the evidence could not be read; never claimed healthy.
 * OK     available / degraded-stale-error
+
+``jwt-refresh-stale`` (family-messenger#822): the native bot's CF Access JWT
+file (``--access-jwt-file``) has not been rewritten for ``JWT_STALE_SECS``.
+The refresh runs every 12 h and the token lives 730 h; when the refresh stops
+(family-messenger#799: a timer with no next elapse) nothing else says so until
+the bot is answered 403 a month later. Only the file's mtime is read — never
+its contents, never the bot's environment. A file that is missing or cannot
+be stat'ed leaves the verdict alone: a 403 then reaches the bridge health.
 
 Nothing it prints carries message bodies, config values or paths beyond the
 verdict. stdlib only; Linux (system and user units) and Android/Termux.
@@ -33,6 +42,9 @@ STALE_ERROR_SECS = 3600
 CRASH_LOOP_STREAK = 2
 CRASH_WINDOW_SECS = 60
 NO_BOT_MARK = "no bot connected"
+# 3 missed 12 h refreshes; the 730 h token then still has ~694 h left.
+JWT_STALE_SECS = 36 * 3600
+JWT_FLAG = b"--access-jwt-file"
 PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
 
 
@@ -60,16 +72,33 @@ def _is_native_bot(argv: list[bytes]) -> bool:
     return bool(argv) and os.path.basename(os.fsdecode(argv[0])) == "native-mls-bot"
 
 
-def _scan(proc_root: Path) -> tuple[list[tuple[int, list[bytes]]], bool, bool]:
-    """(hande bridge processes, a native bot is running, inspection was uncertain)."""
+def _jwt_path(argv: list[bytes]) -> Path | None:
+    """The bot's ``--access-jwt-file <path>`` / ``--access-jwt-file=<path>``, if absolute."""
+
+    for i, arg in enumerate(argv):
+        if arg == JWT_FLAG and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith(JWT_FLAG + b"="):
+            value = arg[len(JWT_FLAG) + 1 :]
+        else:
+            continue
+        path = Path(os.fsdecode(value))
+        return path if path.is_absolute() else None
+    return None
+
+
+def _scan(proc_root: Path) -> tuple[list[tuple[int, list[bytes]]], bool, bool, set[Path]]:
+    """(hande bridge processes, a native bot is running, inspection was uncertain,
+    the native bots' JWT files)."""
 
     bridges: list[tuple[int, list[bytes]]] = []
     bot = False
     uncertain = False
+    jwt_files: set[Path] = set()
     try:
         processes = list(proc_root.iterdir())
     except OSError:
-        return bridges, bot, True
+        return bridges, bot, True, jwt_files
     for proc in processes:
         if not proc.name.isdigit():
             continue
@@ -78,6 +107,9 @@ def _scan(proc_root: Path) -> tuple[list[tuple[int, list[bytes]]], bool, bool]:
             continue
         if _is_native_bot(argv):
             bot = True
+            jwt = _jwt_path(argv)
+            if jwt is not None:
+                jwt_files.add(jwt)
             continue
         if not _is_bridge(argv):
             continue
@@ -92,7 +124,20 @@ def _scan(proc_root: Path) -> tuple[list[tuple[int, list[bytes]]], bool, bool]:
             bridges.append((int(proc.name), env or []))
         elif env is None and not cgroup:
             uncertain = True
-    return bridges, bot, uncertain
+    return bridges, bot, uncertain, jwt_files
+
+
+def _jwt_stale(jwt_files: set[Path], now: float, max_jwt_age: int) -> bool:
+    """Whether any bot JWT file is older than ``max_jwt_age`` (mtime only)."""
+
+    for path in jwt_files:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue  # missing / no permission: not evidence of a stalled refresh
+        if now - mtime > max_jwt_age:
+            return True
+    return False
 
 
 def default_markers() -> list[Path]:
@@ -223,8 +268,9 @@ def probe(
     now: float | None = None,
     max_age: int = 120,
     max_error_age: int = STALE_ERROR_SECS,
+    max_jwt_age: int = JWT_STALE_SECS,
 ) -> Verdict:
-    bridges, bot, uncertain = _scan(proc_root)
+    bridges, bot, uncertain, jwt_files = _scan(proc_root)
     if len(bridges) > 1:
         return "UNVERIFIED", "multiple-processes"
     if not bridges:
@@ -249,15 +295,21 @@ def probe(
     config, _ = _read_json(_env_path(env, b"CCC_HANDE_CONFIG_PATH"))
     if config is None:
         return "UNVERIFIED", "hande-config"
-    return _runtime_verdict(data, config, observed, max_error_age)
+    verdict = _runtime_verdict(data, config, observed, max_error_age)
+    if verdict[0] == "OK" and _jwt_stale(jwt_files, observed, max_jwt_age):
+        return "DEGRADED", "jwt-refresh-stale"
+    return verdict
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
     parser.add_argument("--stale-error-secs", type=int, default=STALE_ERROR_SECS)
+    parser.add_argument("--jwt-stale-secs", type=int, default=JWT_STALE_SECS)
     args = parser.parse_args()
-    status, reason = probe(args.proc_root, max_error_age=args.stale_error_secs)
+    status, reason = probe(
+        args.proc_root, max_error_age=args.stale_error_secs, max_jwt_age=args.jwt_stale_secs
+    )
     print(f"HANDE_STATUS={status}")
     print(f"HANDE_REASON={reason}")
     print("PROBE_COMPLETE=1")

@@ -48,10 +48,17 @@ class HandeProbeTest(unittest.TestCase):
         )
         (target / "cgroup").write_text("0::/\n")
 
-    def bot(self) -> None:
-        target = self.proc / str(BOT)
+    def bot(self, pid: int = BOT, *, jwt_arg: list[bytes] | None = None) -> None:
+        target = self.proc / str(pid)
         target.mkdir()
-        (target / "cmdline").write_bytes(b"/opt/native-relay-bot/bin/native-mls-bot\0http://r\0")
+        argv = [b"/opt/native-relay-bot/bin/native-mls-bot", b"http://r", *(jwt_arg or [])]
+        (target / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
+
+    def jwt(self, name: str = "jwt", *, age: int = 0) -> Path:
+        path = self.root / name
+        path.write_text("never-read")
+        os.utime(path, (self.now - age, self.now - age))
+        return path
 
     def health(
         self, pid: int = BRIDGE, *, state: str = "available", transport: dict | None = None,
@@ -159,6 +166,45 @@ class HandeProbeTest(unittest.TestCase):
             json.dumps({"running": True, "streak": 3, "started_at": self.now - 5})
         )
         self.assertEqual(self.run_probe(), ("DOWN", "crash-loop"))
+
+    def test_jwt_refresh_stale_is_degraded(self) -> None:
+        # family-messenger#799/#822: the 12 h refresh stopped and nothing said so.
+        hour = 3600
+        jwt = self.jwt(age=13 * hour)
+        self.bridge()
+        self.bot(jwt_arg=[b"--access-jwt-file", os.fsencode(jwt)])
+        self.health()
+        self.assertEqual(self.run_probe(), ("OK", "available"))
+        os.utime(jwt, (self.now - 37 * hour, self.now - 37 * hour))
+        self.assertEqual(self.run_probe(), ("DEGRADED", "jwt-refresh-stale"))
+        self.assertEqual(
+            probe.probe(self.proc, fs_roots=[self.fs], markers=[], now=self.now, max_jwt_age=40 * hour),
+            ("OK", "available"),
+        )
+
+    def test_jwt_flag_equals_form_and_any_stale_bot(self) -> None:
+        fresh, old = self.jwt("fresh"), self.jwt("old", age=48 * 3600)
+        self.bridge()
+        self.bot(jwt_arg=[b"--access-jwt-file=" + os.fsencode(fresh)])
+        self.health()
+        self.assertEqual(self.run_probe(), ("OK", "available"))
+        self.bot(4201, jwt_arg=[b"--access-jwt-file", os.fsencode(old)])
+        self.assertEqual(self.run_probe(), ("DEGRADED", "jwt-refresh-stale"))
+
+    def test_jwt_check_never_overrides_or_invents(self) -> None:
+        self.bridge()
+        self.bot(jwt_arg=[b"--access-jwt-file", os.fsencode(self.root / "missing")])
+        self.health()
+        self.assertEqual(self.run_probe(), ("OK", "available"), "missing file is not evidence")
+        old = self.jwt(age=48 * 3600)
+        self.bot(4201, jwt_arg=[b"--access-jwt-file", b"relative/jwt"])
+        self.assertEqual(self.run_probe(), ("OK", "available"), "relative path is ignored")
+        self.bot(4202, jwt_arg=[b"--access-jwt-file", os.fsencode(old)])
+        self.write_config(notice_frames=False)
+        self.assertEqual(self.run_probe(), ("DEGRADED", "notices-off"), "an earlier verdict wins")
+        self.write_config(notice_frames=True)
+        self.health(state="unavailable")
+        self.assertEqual(self.run_probe(), ("DOWN", "health-unavailable"))
 
     def test_only_hande_bridges_count(self) -> None:
         self.bridge(4300, channel="matrix")

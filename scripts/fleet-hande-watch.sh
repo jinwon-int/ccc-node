@@ -83,7 +83,7 @@ for node in $NODES; do
   status=$(printf '%s\n' "$out" | sed -n 's/^HANDE_STATUS=//p' | head -1)
   reason=$(printf '%s\n' "$out" | sed -n 's/^HANDE_REASON=//p' | head -1)
   case "$status:$reason" in
-    OK:available|OK:degraded-stale-error|RETIRED:not-installed|DOWN:no-process|DOWN:bot-no-process|DOWN:health-unavailable|DOWN:crash-loop|DEGRADED:health-degraded|DEGRADED:bot-disconnected|DEGRADED:transport-error|DEGRADED:notices-off|UNVERIFIED:multiple-processes|UNVERIFIED:process-inspection|UNVERIFIED:data-directory|UNVERIFIED:health-unreadable|UNVERIFIED:health-shape|UNVERIFIED:health-pid|UNVERIFIED:health-pid-restarting|UNVERIFIED:health-stale|UNVERIFIED:hande-config) ;;
+    OK:available|OK:degraded-stale-error|RETIRED:not-installed|DOWN:no-process|DOWN:bot-no-process|DOWN:health-unavailable|DOWN:crash-loop|DEGRADED:health-degraded|DEGRADED:bot-disconnected|DEGRADED:transport-error|DEGRADED:notices-off|DEGRADED:jwt-refresh-stale|UNVERIFIED:multiple-processes|UNVERIFIED:process-inspection|UNVERIFIED:data-directory|UNVERIFIED:health-unreadable|UNVERIFIED:health-shape|UNVERIFIED:health-pid|UNVERIFIED:health-pid-restarting|UNVERIFIED:health-stale|UNVERIFIED:hande-config) ;;
     *) echo "UNVERIFIED $node channel=hande inspection=malformed-result"; fail=1; continue ;;
   esac
   echo "$status $node channel=hande reason=$reason"

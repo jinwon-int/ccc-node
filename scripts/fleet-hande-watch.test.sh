@@ -49,6 +49,12 @@ assert test "$rc" = 1
 assert grep -qx 'DOWN delta channel=hande reason=no-process' <<< "$out"
 assert grep -qx 'DEGRADED eps channel=hande reason=notices-off' <<< "$out"
 
+# family-messenger#822: a stalled JWT refresh is a known DEGRADED verdict, not malformed.
+printf 'HANDE_STATUS=DEGRADED\nHANDE_REASON=jwt-refresh-stale\nPROBE_COMPLETE=1\n' > "$TMP/reply/eps"
+set +e; out=$(run 'eps'); rc=$?; set -e
+assert test "$rc" = 1
+assert grep -qx 'DEGRADED eps channel=hande reason=jwt-refresh-stale' <<< "$out"
+
 # A reply outside the known vocabulary is never echoed as a verdict.
 printf 'HANDE_STATUS=OK\nHANDE_REASON=whatever\nPROBE_COMPLETE=1\n' > "$TMP/reply/eps"
 set +e; out=$(run 'eps'); rc=$?; set -e
