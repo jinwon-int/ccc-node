@@ -2236,12 +2236,14 @@ def verbatim_excerpts(query, n=3):
 # Ways a synthesis answer says "the evidence does not contain this". The
 # dialectic prompt asks for the literal "기록 없음", but backends paraphrase it
 # (gwakga answered "질문한 내용에 대한 근거 기록이 없습니다" for q6, which a
-# literal match scored as a SUCCESS). Counting only the literal form makes
-# retrieval look better than it is, so the gate matches the family. Kept
+# literal match scored as a SUCCESS; seoseo's 2026-11-16 q44 refusal
+# "…는 근거에 없습니다" graded FABRICATED the same way). Counting only the
+# literal form makes retrieval look better than it is, so the gate matches the
+# family. Kept
 # byte-identical to bench.sh's NUNCHI_BENCH_NO_RECORD_RE default; nunchi.test.sh
 # asserts the two stay in sync.
 NO_RECORD_RE = re.compile(
-    "기록 없음|기록이 없|근거가 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없",
+    "기록 없음|기록이 없|근거가 없|근거에 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없",
     re.IGNORECASE,
 )
 
