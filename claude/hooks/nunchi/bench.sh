@@ -119,7 +119,7 @@ INVALID_RE="${NUNCHI_BENCH_INVALID_RE:-Not logged in|Please run /login|Invalid A
 # asks for the literal "기록 없음", but backends paraphrase it, and a literal
 # match scored those paraphrases as successes. Kept byte-identical to
 # nunchi.py's NO_RECORD_RE; nunchi.test.sh asserts the two stay in sync.
-NO_RECORD_RE="${NUNCHI_BENCH_NO_RECORD_RE:-기록 없음|기록이 없|근거가 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없}"
+NO_RECORD_RE="${NUNCHI_BENCH_NO_RECORD_RE:-기록 없음|기록이 없|근거가 없|근거에 없|근거 기록이 없|찾을 수 없|확인할 수 없|정보가 없}"
 # #2531 — the partial-gap wording nunchi.py's NO_RECORD_RULE gives a missing
 # detail (nunchi.py PARTIAL_GAP_PHRASE; nunchi.test.sh asserts it matches).
 PARTIAL_GAP_RE="${NUNCHI_BENCH_PARTIAL_GAP_RE:-근거에 포함되지 않}"
