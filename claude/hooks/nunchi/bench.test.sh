@@ -793,7 +793,7 @@ answers = {
     "gap refusal": "주유(juyu)의 Tailscale IP는 근거에 포함되지 않음.\n- 노드 목록에 주유가 없다.",
     "body-only gap": "주유(juyu)의 Tailscale IP는 100.64.0.9이다.\n- 등록일은 근거에 포함되지 않음",
     "geungeo-e refusal": "T3 브로커를 맡은 노드가 어디인지는 근거에 없습니다.\n\n근거 검색 결과에는 기록이 없습니다.",
-    "body-only geungeo-e": "T3 브로커는 jingun이 맡는다.\n- 이관 일자는 근거에 없습니다",
+    "body-only geungeo-e": "T3 브로커는 node-x가 맡는다.\n- 이관 일자는 근거에 없습니다",
 }
 print("stub metrics" if cmd == "metrics" else answers.get(q, "?"))
 PY
@@ -810,7 +810,7 @@ ok "a negative control refused with the partial-gap wording is CORRECT-REJECT (#
   'grep -q "^## n1 .*grade=CORRECT-REJECT$" "$lb_out"'
 ok "a fabricated conclusion stays FABRICATED despite a gap phrase in the body (#2531)" \
   'grep -q "^## n2 .*grade=FABRICATED$" "$lb_out"'
-# seoseo 2026-11-16 q44: "…는 근거에 없습니다" on the conclusion line is a refusal,
+# 2026-11-16 weekly bench q44: "…는 근거에 없습니다" on the conclusion line is a refusal,
 # but NO_RECORD_RE only knew "근거가 없", so a correct rejection graded FABRICATED
 # and hard-failed the node's gate.
 ok "a negative control refused as '근거에 없습니다' is CORRECT-REJECT" \
