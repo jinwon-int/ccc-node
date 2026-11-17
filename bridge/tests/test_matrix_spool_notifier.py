@@ -609,3 +609,80 @@ async def test_direct_events_share_dedup_and_rate_limit(tmp_path: Path) -> None:
     assert len(enqueued) == 1, "duplicate dedup key archived without a second send"
     assert (sent / "b-mail.json").exists()
     assert relay.posted == [] and (tmp_path / "spool" / "c-ops.json").exists(), "1/min budget shared"
+
+
+# --- named room: a record may target one of the bridge's own rooms ---------------
+
+NEWS = "nclex-news"
+
+
+@pytest.mark.anyio
+async def test_named_room_record_goes_to_that_room_without_header_in_relay_mode(tmp_path: Path) -> None:
+    """A local writer targets a served alert room; it never reaches the fleet relay."""
+    t, enqueued = _transport({DIRECT: "direct", NEWS: "direct"})
+    notifier = MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path)), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    news = {"event": "NclexNews", "room": NEWS, "text": "📰 NCLEX 뉴스\n본문", "dedup": "nclex-news:a"}
+    alert = {"event": "health-alert", "text": "Telegram polling failed", "dedup": "h1"}
+    _record(tmp_path, "a-news.json", news)
+    _record(tmp_path, "b-alert.json", alert)
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert enqueued == [(NEWS, "📰 NCLEX 뉴스\n본문")]
+    assert [p["text"] for p in relay.posted] == [PushNotifier._format(alert)]
+    assert (sent / "a-news.json").exists()
+
+
+@pytest.mark.anyio
+async def test_named_room_record_in_room_mode(tmp_path: Path) -> None:
+    t, enqueued = _transport({DIRECT: "direct", NEWS: "direct"})
+    notifier = MatrixSpoolNotifier(_settings(tmp_path), t)
+    other = {"event": "mail", "text": "메일", "dedup": "m"}
+    _record(tmp_path, "a-news.json", {"event": "NclexNews", "room": NEWS, "text": "뉴스", "dedup": "n"})
+    _record(tmp_path, "b-mail.json", other)
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain(DIRECT, sent)
+    assert enqueued == [(NEWS, "뉴스"), (DIRECT, PushNotifier._format(other))]
+
+
+@pytest.mark.anyio
+async def test_unserved_named_room_falls_back_to_the_owner_room_never_a_new_destination(tmp_path: Path) -> None:
+    t, enqueued = _transport({DIRECT: "direct"})
+    notifier = MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path)), t)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    rec = {"event": "NclexNews", "room": "!elsewhere:hs", "text": "뉴스", "dedup": "n"}
+    _record(tmp_path, "a-news.json", rec)
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert enqueued == [(DIRECT, PushNotifier._format(rec))] and relay.posted == []
+
+
+@pytest.mark.anyio
+async def test_named_room_record_waits_for_the_transport_and_is_not_relay_pending(tmp_path: Path) -> None:
+    notifier = MatrixSpoolNotifier(_relay_settings(tmp_path, _secret(tmp_path), push_fleet_relay_direct_events=""), None)
+    relay = _FakeRelay()
+    notifier._relay = relay
+    _record(tmp_path, "a-news.json", {"event": "NclexNews", "room": NEWS, "text": "뉴스", "dedup": "n"})
+    _record(tmp_path, "b-alert.json", {"event": "health-alert", "text": "down", "dedup": "h"})
+    sent = tmp_path / "spool" / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    await notifier._drain("", sent)
+    assert len(relay.posted) == 1 and (tmp_path / "spool" / "a-news.json").exists()
+    assert notifier.pending_count() == 1 and notifier.pending_count(relay_only=True) == 0
+    t, enqueued = _transport({DIRECT: "direct", NEWS: "direct"})
+    notifier.attach_transport(t)
+    await notifier._drain("", sent)
+    assert enqueued == [(NEWS, "뉴스")]
+
+
+def test_record_room_shape() -> None:
+    from telegram_bot.core.matrix.bot import _record_room
+
+    assert _record_room({"room": " nclex-news "}) == "nclex-news"
+    for bad in (None, 3, "", "  ", "a b", "x" * 256):
+        assert _record_room({"room": bad}) is None
