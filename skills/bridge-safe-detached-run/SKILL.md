@@ -189,6 +189,21 @@ check it). Hand-written units get the same announcement by appending
 after their `EXIT=` line. Non-systemd nodes (Termux): `schedule` exits 3 —
 use the `setsid`/`nohup` fallback with a sleep-until and the same `notify`.
 
+**A reboot erases it (#2827).** The timer is transient: it lives only under
+`/run/systemd/transient/` and is gone after any reboot — manual, unattended
+`Automatic-Reboot`, a provider maintenance or a power cut — so the job never
+runs and the owner's promised check silently does not happen (same property as
+#2287 for `systemd-run` timers in general). Use `schedule` for waits that
+cannot cross a reboot. For a wait that spans nights or days, write a persistent
+unit pair under `/etc/systemd/system/` (or `~/.config/systemd/user/`) with
+`Persistent=true` on the timer and the same `EXIT=`/`notify` tail, and remove it
+after it fires. Before rebooting a node, list its transient timers
+(`ls /run/systemd/transient/*.timer /run/user/*/systemd/transient/*.timer`),
+save each `systemctl cat`, and re-create them after boot. A row whose `--at`
+is a single instant records `scheduled_epoch`, so the SessionStart sweep keeps
+it for a week after it was due (not after it was registered) and a vanished
+timer shows up as `lost`; a recurring spec keeps the registration-time week.
+
 Two traps, both silent (#2710):
 
 - **Tier.** A notice without a tier is `info`: the fleet receiver holds it for
