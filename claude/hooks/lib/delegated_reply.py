@@ -63,6 +63,10 @@ def find_recorder():
         if path and path.is_file():
             spec = importlib.util.spec_from_file_location("delegated_approval_shadow", path)
             if spec and spec.loader:
+                # Never leave a __pycache__ next to the recorder: it sits in the managed Codex skill
+                # tree, where an unexpected directory fails the installer closed (#2826). The hook
+                # wrapper already runs with -B; this covers a direct run of this file.
+                sys.dont_write_bytecode = True
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 return module

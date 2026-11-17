@@ -44,6 +44,10 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# This file runs from the installed (managed) skill directory. Importing its sibling must not write
+# a __pycache__ there — the Codex skill installer refuses a tree with an unexpected directory and
+# setup.sh then fails closed with `unsafe_target` (#2826).
+sys.dont_write_bytecode = True
 import delegated_approval_shadow as shadow  # noqa: E402
 
 SCHEMA_COLLECT = "ccc.delegated-approval-collect.v1"
