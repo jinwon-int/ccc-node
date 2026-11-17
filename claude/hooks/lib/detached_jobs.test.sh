@@ -555,6 +555,61 @@ out="$(ASKED_LOG="$ASKED" python3 "$MOD" sweep "$R2778")"
 ok "#2778: a record without scheduled_at is judged as before (lost) and no timer is asked about" \
   'grep -q "소식 없음" <<<"$out" && grep -q "plain2778.service" "$ASKED" && ! grep -q "\.timer" "$ASKED"'
 
+# ---- #2827: a scheduled job's week runs from its due time ---------------------
+# The age cap measured every record from started_at, so a reminder armed 19 days
+# ahead left the sweep after 7 — and when a reboot then took its transient timer
+# nothing said `lost`. The cap now starts at the due time.
+ok "#2827: calendar_instant reads one-shot instants (zone, UTC, local) and refuses recurring specs" \
+  'py_dj "import detached_jobs as d; from datetime import datetime; from zoneinfo import ZoneInfo
+assert d.calendar_instant(\"2026-12-02 09:00:00 Asia/Seoul\") == datetime(2026,12,2,9,0,0,tzinfo=ZoneInfo(\"Asia/Seoul\")).timestamp()
+assert d.calendar_instant(\"2026-12-02  09:00 UTC\") == 1796202000
+assert d.calendar_instant(\"2026-12-02 09:00\") == datetime(2026,12,2,9,0).astimezone().timestamp()
+for bad in [\"05:00\", \"Mon *-*-* 05:00\", \"2026-12-02 09:00 Not/AZone\", \"2026-13-40 09:00\", \"\"]:
+    assert d.calendar_instant(bad) is None, bad"'
+
+R2827="$TMP/reg2827.jsonl"; NOW="$(date +%s)"; DAY=86400
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+exit 3
+SH
+# Registered 19 days ago, due 12 days from now, timer gone (reboot): must stay visible as lost.
+printf '{"unit":"far2827","log":"%s","started_at":%s,"scheduled_at":"2099-01-01 00:00:00 UTC","scheduled_epoch":%s,"notify_on_exit":true}\n' \
+  "$TMP/far2827.log" "$((NOW - 19*DAY))" "$((NOW + 12*DAY))" > "$R2827"
+out="$(python3 "$MOD" sweep "$R2827")"
+ok "#2827: a job registered 19 days ago and due in 12 is still swept — as lost once its timer is gone" \
+  'grep -q "far2827" <<<"$out" && grep -q "소식 없음" <<<"$out"'
+
+# A row written before scheduled_epoch existed: the due time comes from its spec.
+due_spec="$(TZ=UTC date -d "@$((NOW + 12*DAY))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || python3 -c "import time,sys;print(time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(int(sys.argv[1]))))" "$((NOW + 12*DAY))")"
+printf '{"unit":"legacy2827","log":"%s","started_at":%s,"scheduled_at":"%s UTC","notify_on_exit":true}\n' \
+  "$TMP/legacy2827.log" "$((NOW - 19*DAY))" "$due_spec" > "$R2827"
+out="$(python3 "$MOD" sweep "$R2827")"
+ok "#2827: a legacy row with no scheduled_epoch takes its due time from scheduled_at" 'grep -q "legacy2827" <<<"$out"'
+
+# Due 8 days ago and never acked: archived noise, as any other week-old record.
+printf '{"unit":"past2827","log":"%s","started_at":%s,"scheduled_at":"x","scheduled_epoch":%s}\n' \
+  "$TMP/past2827.log" "$((NOW - 9*DAY))" "$((NOW - 8*DAY))" > "$R2827"
+out="$(python3 "$MOD" sweep "$R2827")"
+ok "#2827: a scheduled job due more than a week ago is dropped" '[ -z "$out" ]'
+
+# A recurring spec has no single due time: the started_at rule still applies.
+printf '{"unit":"recur2827","log":"%s","started_at":%s,"scheduled_at":"Mon *-*-* 05:00"}\n' \
+  "$TMP/recur2827.log" "$((NOW - 8*DAY))" > "$R2827"
+out="$(python3 "$MOD" sweep "$R2827")"
+ok "#2827: a recurring spec keeps the started_at age rule" '[ -z "$out" ]'
+
+# schedule writes the due epoch for a one-shot instant, and none for a recurring one.
+write_exec_stub "$TMP/bin/systemd-run" <<'SH'
+exit 0
+SH
+: > "$R2827"
+python3 "$MOD" schedule --unit due2827 --at "2030-01-02 03:04:05 Asia/Seoul" --log "$TMP/due2827.log" --registry "$R2827" -- true >/dev/null 2>&1
+python3 "$MOD" schedule --unit rec2827 --at "05:00" --log "$TMP/rec2827.log" --registry "$R2827" -- true >/dev/null 2>&1
+ok "#2827: schedule records scheduled_epoch for a one-shot --at and omits it for a recurring one" \
+  'python3 -c "import json,sys; from datetime import datetime; from zoneinfo import ZoneInfo
+rows={r[\"unit\"]:r for r in (json.loads(l) for l in open(sys.argv[1]) if l.strip())}
+assert rows[\"due2827\"][\"scheduled_epoch\"]==int(datetime(2030,1,2,3,4,5,tzinfo=ZoneInfo(\"Asia/Seoul\")).timestamp())
+assert \"scheduled_epoch\" not in rows[\"rec2827\"]" "$R2827"'
+
 # The summary line format is load-bearing: validate-harness.sh's
 # suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
 # reads as a suite that asserted nothing.

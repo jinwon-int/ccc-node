@@ -68,7 +68,9 @@ expectation -- ``--expect 90m`` / ``--until "05:30"`` -- and decides:
 ``systemd-run --on-calendar`` transient timer whose wrapper appends the
 ``EXIT=`` marker and emits one body-free spool notice through ``notify``
 instead of a wake. ``notify`` writes that spool record on its own too, for
-hand-written units.
+hand-written units. A transient timer does not survive a reboot (#2827): use
+``schedule`` only for waits that cannot cross one, and a persistent
+``Persistent=true`` unit for waits spanning nights or days.
 
 Usage::
 
@@ -100,7 +102,7 @@ import shlex
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # Same reasoning as pending_promises: this block sits high in the memory
@@ -119,7 +121,10 @@ MAX_ROWS_PER_SECTION = 5
 STALE_SECONDS = 900
 
 # Never surface a record forever. A job nobody acked within a week is archived
-# noise, not live context.
+# noise, not live context. A scheduled job counts its week from the time it is
+# due to fire, not from when it was registered (#2827): a reminder armed 19 days
+# ahead used to leave the sweep after 7, so a reboot that then took its
+# transient timer raised no `lost` at all.
 MAX_AGE_SECONDS = 7 * 24 * 3600
 
 STATE_DONE = "done"
@@ -438,7 +443,58 @@ def classify_one(rec: Dict[str, Any], *, now: Optional[float] = None) -> Tuple[s
     return STATE_LOST, None
 
 
+_CALENDAR_INSTANT_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2}(?::\d{2})?)(?:\s+([A-Za-z][A-Za-z0-9_+/-]*))?"
+)
+
+
+def calendar_instant(spec: str) -> Optional[float]:
+    """Epoch of a one-shot systemd calendar spec, else None (#2827).
+
+    Only absolute instants are understood — ``YYYY-MM-DD HH:MM[:SS]`` with an
+    optional zone name (``Asia/Seoul``, ``UTC``); without one it is the node's
+    local clock, as systemd reads it. Recurring or relative specs
+    (``05:00``, ``Mon *-*-* 05:00``) have no single due time and return None.
+    """
+    m = _CALENDAR_INSTANT_RE.fullmatch(" ".join(str(spec or "").split()))
+    if not m:
+        return None
+    date, clock, zone = m.groups()
+    try:
+        naive = datetime.fromisoformat(f"{date}T{clock}")
+    except ValueError:
+        return None
+    if not zone:
+        return naive.astimezone().timestamp()
+    if zone.upper() == "UTC":
+        return naive.replace(tzinfo=timezone.utc).timestamp()
+    try:
+        from zoneinfo import ZoneInfo
+
+        return naive.replace(tzinfo=ZoneInfo(zone)).timestamp()
+    except Exception:  # unknown zone or no tz database: no due time, not a crash
+        return None
+
+
+def scheduled_due(rec: Dict[str, Any]) -> Optional[float]:
+    """When a scheduled record is due: the recorded epoch, else its parsed spec."""
+    if not rec.get("scheduled_at"):
+        return None
+    try:
+        due = float(rec.get("scheduled_epoch") or 0)
+    except (TypeError, ValueError):
+        due = 0.0
+    if due > 0:
+        return due
+    return calendar_instant(str(rec.get("scheduled_at") or ""))
+
+
 def _too_old(rec: Dict[str, Any], now: float) -> bool:
+    # A scheduled job is not old before it has even fired: its week runs from
+    # the due time (#2827). A spec with no single due time keeps the old rule.
+    due = scheduled_due(rec)
+    if due is not None:
+        return (now - due) > MAX_AGE_SECONDS
     try:
         started = float(rec.get("started_at") or 0)
     except (TypeError, ValueError):
@@ -769,6 +825,8 @@ _SCHEDULE_USAGE = (
     "usage: detached_jobs.py schedule --unit U --at \"<systemd calendar>\" --log PATH"
     " [--summary S] [--workdir W] [--tier T (default notice)] [--fail-tier T]"
     " [--result-file P] [--user] [--print] -- <command…>\n"
+    "note: the timer is transient and a reboot erases it (#2827) — for a wait that\n"
+    "spans nights or days use a persistent Persistent=true unit instead.\n"
 )
 
 
@@ -860,6 +918,10 @@ def cmd_schedule(argv: List[str]) -> int:
         "notify_on_exit": True,
         "tier": tier,
     }
+    due = calendar_instant(at)
+    if due is not None:
+        # The sweep's week starts here, not at registration (#2827).
+        rec["scheduled_epoch"] = int(due)
     if baseline:
         rec["log_offset"] = baseline
     if user:
