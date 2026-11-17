@@ -485,6 +485,29 @@ and leave classic protection (required checks, approval count,
    the PR is merged, `main` contains the change, and the remote branch is gone.
    If the PR links an issue with a closing keyword, verify that issue is closed.
 
+   If you worked in a separate worktree, remove it — yours only, and only
+   when it is clean:
+
+   ```bash
+   git -C <worktree> status --porcelain    # must print nothing
+   git worktree remove <worktree>          # never --force
+   git worktree list
+   ```
+
+   Uncommitted or unpushed work in it means stop and report, not `--force`.
+   On a shared host `git worktree list` also shows other sessions' worktrees;
+   leave every path you did not create.
+
+   Then record the outcome where the work was tracked. When the PR references
+   an issue without a closing keyword, or the issue stays open on purpose
+   (owner or device confirmation pending, more slices to come), comment on it
+   with the merge commit SHA and what remains, and release your issue claim
+   (`state=released`) once your part is done. Close the issue only when
+   nothing remains.
+
+   A queue eviction is not a merge: keep the branch and the worktree, and
+   report the failing run instead of cleaning up.
+
 ## Relay-held `jinon86` exact-head merge fallback
 
 Use this only when all of the following are true:
