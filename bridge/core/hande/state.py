@@ -24,6 +24,7 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "steward_tools_approve_all": false,
       "attachment_frames": false,
       "attachment_out_frames": false,
+      "skill_frames": false,
       "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
     }
 
@@ -173,6 +174,7 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         "wait_status_frames",
         "attachment_frames",
         "attachment_out_frames",
+        "skill_frames",
     ):
         value = config.get(key, key == "steward_tools")  # steward tools default on
         if type(value) is not bool:

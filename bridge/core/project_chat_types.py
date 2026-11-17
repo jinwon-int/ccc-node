@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
 from telegram_bot.core.request_lifecycle import RequestLifecycle
@@ -67,6 +67,9 @@ class ChatResponse:
     # restart-only auto-resume retry (#1880) read it; it never drives the
     # generic bounded retry above.
     failure_code: Optional[str] = None
+    # #2833: skills the turn loaded (names only, bounded; see
+    # ``core/skill_display.py``). Set on a successful completion only.
+    skills: Tuple[str, ...] = ()
 
 
 @dataclass
