@@ -107,6 +107,14 @@ so the account name is not an identity.
      && gh api -X DELETE repos/OWNER/REPO/git/refs/heads/BRANCH
    ```
 
+   If you worked in a separate worktree, remove it — yours only, and only when
+   `git -C WORKTREE status --porcelain` prints nothing: `git worktree remove
+   WORKTREE` (never `--force`), then `git worktree list`. Leave every worktree
+   you did not create. When the PR references an issue that stays open,
+   comment on it with the merge commit SHA and what remains, and release your
+   issue claim once your part is done. After a queue eviction keep the branch
+   and the worktree and report the failing run.
+
 Under strict up-to-date protection, merging one PR flips its siblings to
 `BEHIND`. Refresh via REST (older `gh` builds lack `gh pr update-branch`):
 `gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/update-branch`, wait for CI on
