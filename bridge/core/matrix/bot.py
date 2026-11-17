@@ -343,6 +343,17 @@ class _NotificationRoute:
             raise RuntimeError(f"no Matrix route for chat_id {chat_id}")
 
 
+def _record_room(data: dict) -> Optional[str]:
+    """A spool record's optional ``room`` target (room-id shape only), else None."""
+    room = data.get("room")
+    if not isinstance(room, str):
+        return None
+    room = room.strip()
+    if not room or len(room) > 255 or any(ch.isspace() for ch in room):
+        return None
+    return room
+
+
 class MatrixSpoolNotifier:
     """Polls the channel-neutral push spool and delivers records to the owner room.
 
@@ -414,7 +425,32 @@ class MatrixSpoolNotifier:
         self._transport = transport
 
     def _is_direct(self, data: dict) -> bool:
-        return self.relay_mode and str(data.get("event") or "") in self.direct_events
+        # A record that names a room is personal by construction (it was written
+        # for that room), so in relay mode it never goes to the fleet room.
+        return self.relay_mode and (
+            str(data.get("event") or "") in self.direct_events or _record_room(data) is not None
+        )
+
+    def _named_room(self, data: dict) -> Optional[str]:
+        """The record's own ``room`` when this transport already serves it.
+
+        A local writer (cron job, script) can target one of the bridge's
+        configured rooms — e.g. a 「한데」 alert room next to the owner room —
+        instead of the owner room. Only rooms in ``policy.rooms`` qualify; any
+        other name falls back to the normal routing (owner room / relay), so a
+        record can never open a new destination.
+        """
+        named = _record_room(data)
+        if named is None or self._transport is None:
+            return None
+        try:
+            rooms = self._transport.policy.rooms
+        except Exception:
+            return None
+        if named in rooms:
+            return named
+        logger.warning("Matrix spool record names a room this bridge does not serve; using the default route")
+        return None
 
     def pending_count(self, relay_only: bool = False) -> int:
         """Records still waiting in the consumed spool (0 when the dir is absent).
@@ -426,7 +462,7 @@ class MatrixSpoolNotifier:
             files = [p for p in self.spool_dir.glob("*.json") if p.is_file()]
         except OSError:
             return 0
-        if not (relay_only and self.relay_mode and self.direct_events):
+        if not (relay_only and self.relay_mode):
             return len(files)
         count = 0
         for p in files:
@@ -535,7 +571,8 @@ class MatrixSpoolNotifier:
             elif self.relay_mode:
                 outcome = await self._deliver_relay(p, data)
             else:
-                outcome = await self._deliver_room(room, data)
+                named = self._named_room(data)
+                outcome = await self._deliver_room(named or room, data, raw=named is not None)
             if outcome == "stop":
                 return  # keep file; stop this cycle to preserve order
             if outcome == "sent":
@@ -543,10 +580,15 @@ class MatrixSpoolNotifier:
                 self._sent_times.append(now)
             self._archive(p, sent_dir)  # "sent" or "archive" (poison)
 
-    async def _deliver_room(self, room: str, data: dict) -> str:
-        """Owner-room delivery as the agent (pre-#2182 behaviour)."""
+    async def _deliver_room(self, room: str, data: dict, raw: bool = False) -> str:
+        """Owner-room delivery as the agent (pre-#2182 behaviour).
+
+        ``raw`` (a record that named its room) posts the text without the
+        ``🔔 ccc-node [event]`` header — the room is that writer's own channel.
+        """
         try:
-            self._transport.enqueue_notice(room, PushNotifier._format(data))
+            text = (data.get("text") or "").strip() if raw else PushNotifier._format(data)
+            self._transport.enqueue_notice(room, text)
         except ValueError as e:
             # A room this process may never write (not-allowed/too long)
             # stays failing forever — archive instead of looping on it.
@@ -567,6 +609,10 @@ class MatrixSpoolNotifier:
         """
         if self._transport is None:
             return "defer"
+        named = self._named_room(data)
+        if named is not None:
+            outcome = await self._deliver_room(named, data, raw=True)
+            return "defer" if outcome == "stop" else outcome
         try:
             room = self._owner_room()
         except Exception:
