@@ -25,5 +25,8 @@ HERE="${BASH_SOURCE[0]%/*}"; [ "$HERE" != "${BASH_SOURCE[0]}" ] || HERE=.
 [ -r "$HERE/lib/delegated_reply.py" ] || exit 0
 input="$(cat 2>/dev/null)"; [ -n "$input" ] || exit 0
 [ ${#input} -le 262144 ] || exit 0
-printf '%s' "$input" | timeout "${CCC_DELEGATED_REPLY_TIMEOUT:-3}" python3 "$HERE/lib/delegated_reply.py" >/dev/null 2>&1 || true
+# -B: the classifier imports the recorder from the managed Codex skill tree. A bytecode cache written
+# there (a 0755 __pycache__ under umask 022) makes the next setup.sh fail closed with
+# `ccc-codex-skills: unsafe_target`, so self-update rolls back on every tick (#2826).
+printf '%s' "$input" | timeout "${CCC_DELEGATED_REPLY_TIMEOUT:-3}" python3 -B "$HERE/lib/delegated_reply.py" >/dev/null 2>&1 || true
 exit 0

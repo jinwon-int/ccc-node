@@ -1346,7 +1346,8 @@ class Doctor:
         if code in ("unsafe_codex_home", "unsafe_target"):
             self.add(
                 "수동필요", "managed Codex skills", f"unsafe layout ({code})",
-                "fix CODEX_HOME/skills to owner-only 0700 with no symlink, then rerun",
+                "fix CODEX_HOME/skills to owner-only 0700 with no symlink, then rerun"
+                " (a stray __pycache__ inside a managed skill counts — delete it, #2826)",
             )
         elif code == "unmanaged_collision":
             self.add(

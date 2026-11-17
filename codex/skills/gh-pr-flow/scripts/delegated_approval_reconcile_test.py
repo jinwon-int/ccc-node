@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -306,6 +307,29 @@ class CliTest(unittest.TestCase):
         code, out, err = self._run(["reconcile", "--repo", REPO, "--since", "2026-11-06T00:00:00", "--until", "2026-11-07T00:00:00Z"])
         self.assertEqual((code, out), (2, ""))
         self.assertIn("offset", err)
+
+
+
+class NoBytecodeCacheTest(unittest.TestCase):
+    """#2826: this script runs from the managed skill directory and must not leave a __pycache__ there.
+
+    The Codex skill installer refuses a managed tree with an unexpected directory (`unsafe_target`),
+    so a cache written on import made every later setup.sh — and self-update — fail closed.
+    """
+
+    def test_running_from_a_copied_tree_leaves_no_cache(self):
+        src = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("delegated_approval_reconcile.py", "delegated_approval_shadow.py"):
+                shutil.copy(src / name, Path(tmp) / name)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+            proc = subprocess.run(
+                [sys.executable, str(Path(tmp) / "delegated_approval_reconcile.py"), "--help"],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()),
+                             ["delegated_approval_reconcile.py", "delegated_approval_shadow.py"])
 
 
 if __name__ == "__main__":

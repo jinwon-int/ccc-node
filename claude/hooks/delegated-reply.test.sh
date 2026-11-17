@@ -153,5 +153,23 @@ printf 'broken {{{\n' >>"$LEDGER"
 send '2'
 ok "a corrupt ledger line does not stop the hook" '[ "$rc" = 0 ] && [ -z "$out" ] && [ "$(decisions)" = "41:decline:other-option:reply" ]'
 
+# --- the hook leaves no bytecode cache next to the recorder (#2826) ---
+# The recorder is imported from the managed Codex skill tree. A __pycache__ written there (0755 under
+# umask 022) made the next setup.sh fail with `ccc-codex-skills: unsafe_target` and self-update roll back.
+# PYTHONDONTWRITEBYTECODE is cleared so the hook's own guard is what is being tested.
+for how in wrapper direct; do
+  rm -rf "$TMP/rec"; mkdir -p "$TMP/rec"
+  cp "$ROOT/codex/skills/gh-pr-flow/scripts/delegated_approval_shadow.py" "$TMP/rec/"
+  reset; on; ask ccc-node 41 a; say "$ONE"
+  python3 -c 'import json,sys; print(json.dumps({"prompt": "2", "session_id": "s", "transcript_path": sys.argv[1]}))' "$TR" >"$TMP/payload.json"
+  if [ "$how" = wrapper ]; then
+    (umask 022; env -u PYTHONDONTWRITEBYTECODE CCC_DELEGATED_RECORDER_DIR="$TMP/rec" bash "$HOOK" <"$TMP/payload.json" >/dev/null 2>&1)
+  else
+    (umask 022; env -u PYTHONDONTWRITEBYTECODE CCC_DELEGATED_RECORDER_DIR="$TMP/rec" python3 "$HERE/lib/delegated_reply.py" <"$TMP/payload.json" >/dev/null 2>&1)
+  fi
+  ok "$how: the recorder was imported from the copied tree (decision recorded)" '[ "$(decisions)" = "41:decline:other-option:reply" ]'
+  ok "$how: no __pycache__ or .pyc is left next to the recorder" '[ -z "$(find "$TMP/rec" -name __pycache__ -o -name "*.pyc")" ]'
+done
+
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
