@@ -206,7 +206,7 @@ def test_ledger_cross_check_flags_over_target_and_missing_ledger(env):
 
 
 def test_ledger_cross_check_buckets_turns_by_end_time_across_midnight(env, capsys):
-    # Live case (yukson/gwakga 2026-11-16): a turn that starts 23:59 and ends
+    # Live case (two fleet nodes, 2026-11-16): a turn that starts 23:59 and ends
     # 00:01 is a start-day span but a next-day ledger row (ts = turn end).
     late_in_day = AFTER_DAY - 60  # 23:59 KST of DAY
     env.write_spans("2026-11-05", [turn(BEFORE_DAY, out=300, cost=0.3, duration_ms=120_000)])
