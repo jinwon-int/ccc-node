@@ -67,6 +67,9 @@ ENTRY_CLASS = "metrics/span-rollup"
 NOTIFY_EVENT = "SpansRollup"
 #: Issue #2684 completion target for span totals vs the cost ledger.
 DISCREPANCY_TARGET_PCT = 5.0
+#: How far before the KST day the ledger cross-check looks for turns that
+#: started earlier but finished inside the day (one day >> any turn's runtime).
+TURN_END_LOOKBACK_SEC = 24 * 3600
 TOP_TOOLS_IN_ENTRY = 20
 TOP_A2A_CLASSES = 5
 #: A day file larger than this is not read (a sane day is a few MB at most).
@@ -198,6 +201,42 @@ def read_spans(
                 continue
             spans.append(clean)
     return spans, stats
+
+
+def turn_end_ts(span: Mapping[str, Any]) -> Optional[float]:
+    """``start_ts + duration_ms`` — when the turn finished, i.e. when the bridge
+    wrote its cost-ledger row (that row's ``ts``)."""
+    ts = span.get("start_ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    ms = span.get("duration_ms")
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not math.isfinite(ms) or ms < 0:
+        ms = 0
+    return float(ts) + float(ms) / 1000.0
+
+
+def read_ledger_turns(
+    spans_dir: Path, start: float, end: float, sanitize: Callable[[object], Optional[dict]]
+) -> list[dict]:
+    """Turn spans that *finished* inside ``[start, end)`` — the cost-ledger basis.
+
+    The day rollup buckets spans by ``start_ts``, but the ledger stamps a row
+    when the turn ends, so a turn that crosses midnight lands on different days
+    on the two sides (one-turn drift that exceeds the 5 % target on quiet days).
+    The cross-check therefore re-selects turns by end time, reading from one
+    lookback day earlier so a turn that started the previous day is seen.
+    Read stats are not touched: they describe the start-time window.
+    """
+    lo = start - TURN_END_LOOKBACK_SEC
+    spans, _ = read_spans(utc_files_for_window(spans_dir, lo, end), lo, end, sanitize)
+    out = []
+    for span in spans:
+        if span.get("kind") != "turn":
+            continue
+        finished = turn_end_ts(span)
+        if finished is not None and start <= finished < end:
+            out.append(span)
+    return out
 
 
 def _num(value: Any) -> float:
@@ -346,9 +385,12 @@ def _pct_diff(span_value: float, ledger_value: float) -> Optional[float]:
     return round(100.0 * abs(span_value - ledger_value) / ledger_value, 2)
 
 
-def cross_check(turns: list[dict], ledger: Optional[dict]) -> dict:
+def cross_check(turns: list[dict], ledger: Optional[dict], turn_basis: str = "start") -> dict:
     """Span turn totals vs the cost ledger for the same window.
 
+    ``turns`` should be the turns that *finished* in the window
+    (``read_ledger_turns``, ``turn_basis="end"``): the ledger stamps a row at
+    turn end, so start-bucketed turns drift by one across midnight.
     The ledger writes a row only for a turn that carries cost, so the span side
     counts turns with ``ccc.cost_usd > 0``. Its ``in`` excludes cache tokens
     while ``gen_ai.usage.input_tokens`` includes them, so the cache share is
@@ -381,13 +423,20 @@ def cross_check(turns: list[dict], ledger: Optional[dict]) -> dict:
         "target_pct": DISCREPANCY_TARGET_PCT,
         "within_target": worst is not None and worst < DISCREPANCY_TARGET_PCT,
         "ledger_corrupt_lines": ledger.get("corrupt_lines", 0),
+        "turn_basis": turn_basis,
         "note": "node totals; ledger counts priced turns only, input excludes cache",
     }
 
 
 def build_summary(day: date, node: str, spans: list[dict], read_stats: dict,
-                  ledger: Optional[dict]) -> dict:
+                  ledger: Optional[dict], ledger_turns: Optional[list[dict]] = None) -> dict:
+    """``ledger_turns`` (turns by end time) feeds only the ledger cross-check;
+    without it the check falls back to the start-bucketed day turns."""
     turns = [s for s in spans if s.get("kind") == "turn"]
+    if ledger_turns is None:
+        check = cross_check(turns, ledger, "start")
+    else:
+        check = cross_check(ledger_turns, ledger, "end")
     tools = [s for s in spans if s.get("kind") == "tool"]
     summary: dict[str, Any] = {
         "schema": "ccc.spans-rollup.v1",
@@ -412,7 +461,7 @@ def build_summary(day: date, node: str, spans: list[dict], read_stats: dict,
             "error_type": _count(turns, lambda s: s.get("error.type")),
         },
         "skills": _count(spans, lambda s: s.get("ccc.skill")),
-        "cost_ledger_check": cross_check(turns, ledger),
+        "cost_ledger_check": check,
         "read": read_stats,
     }
     summary["totals"]["tool_error_rate_pct"] = _rate(
@@ -680,7 +729,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     start, end = kst_day_window(day)
     spans, stats = read_spans(utc_files_for_window(spans_dir, start, end), start, end, sanitize)
-    summary = build_summary(day, node, spans, stats, read_cost_ledger(ledger_path, start, end))
+    summary = build_summary(day, node, spans, stats, read_cost_ledger(ledger_path, start, end),
+                            read_ledger_turns(spans_dir, start, end, sanitize))
 
     if args.dry_run:
         if args.json:

@@ -205,6 +205,46 @@ def test_ledger_cross_check_flags_over_target_and_missing_ledger(env):
     assert "⚠" in rollup.build_digest_text(summarize(env))
 
 
+def test_ledger_cross_check_buckets_turns_by_end_time_across_midnight(env, capsys):
+    # Live case (yukson/gwakga 2026-11-16): a turn that starts 23:59 and ends
+    # 00:01 is a start-day span but a next-day ledger row (ts = turn end).
+    late_in_day = AFTER_DAY - 60  # 23:59 KST of DAY
+    env.write_spans("2026-11-05", [turn(BEFORE_DAY, out=300, cost=0.3, duration_ms=120_000)])
+    env.write_spans("2026-11-06", [
+        turn(IN_DAY, out=200, cost=0.2),
+        turn(late_in_day, out=700, cost=0.7, duration_ms=120_000),
+    ])
+    env.ledger_row(BEFORE_DAY + 120, 0.3, [{"model": "m", "cost_usd": 0.3, "in": 100, "out": 300}])
+    env.ledger_row(IN_DAY + 9, 0.2, [{"model": "m", "cost_usd": 0.2, "in": 100, "out": 200}])
+    env.ledger_row(late_in_day + 120, 0.7, [{"model": "m", "cost_usd": 0.7, "in": 100, "out": 700}])
+
+    # Start-bucketed comparison (the old behaviour) drifts by the crossing turns.
+    legacy = summarize(env)["cost_ledger_check"]
+    assert legacy["turn_basis"] == "start"
+    assert legacy["metrics"]["output_tokens"] == {"spans": 900, "ledger": 500, "diff_pct": 80.0}
+    assert legacy["within_target"] is False
+
+    assert env.run("--dry-run", "--json") == 0
+    summary = json.loads(capsys.readouterr().out)
+    check = summary["cost_ledger_check"]
+    assert check["turn_basis"] == "end"
+    assert check["metrics"]["turns"] == {"spans": 2, "ledger": 2, "diff_pct": 0.0}
+    assert check["metrics"]["output_tokens"] == {"spans": 500, "ledger": 500, "diff_pct": 0.0}
+    assert check["max_diff_pct"] == 0.0 and check["within_target"] is True
+    # The day rollup itself stays start-bucketed: the 23:59 turn belongs to DAY.
+    assert summary["totals"]["turns"] == 2
+    assert summary["read"]["outside_window"] == 1  # the previous-day 23:59 turn
+    assert summary["read"]["files_read"] == 2
+
+
+def test_turn_end_ts_tolerates_missing_or_bad_duration():
+    assert rollup.turn_end_ts({"start_ts": 100.0, "duration_ms": 2500}) == 102.5
+    assert rollup.turn_end_ts({"start_ts": 100.0}) == 100.0
+    assert rollup.turn_end_ts({"start_ts": 100.0, "duration_ms": -5}) == 100.0
+    assert rollup.turn_end_ts({"start_ts": 100.0, "duration_ms": True}) == 100.0
+    assert rollup.turn_end_ts({"start_ts": "x"}) is None
+
+
 def test_models_skills_outcomes_and_a2a(env):
     env.write_spans("2026-11-06", [
         turn(IN_DAY, model="m-a", **{"ccc.skill": "gh-pr-flow"}),
