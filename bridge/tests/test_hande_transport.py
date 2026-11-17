@@ -1555,3 +1555,57 @@ async def test_failed_self_job_notice_names_the_cause(tmp_path: Path) -> None:
         await bot.close()
     finally:
         await _stop(served)
+
+
+# --- #2833: ``result.skills`` (skill_frames) -------------------------------
+
+
+async def _skills_result_frame(
+    tmp_path: Path, skills: tuple[str, ...], **config: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    served = await _serve(tmp_path, **config)
+    try:
+
+        async def behaviour(job: Any, sink: Any) -> TurnResult:
+            return TurnResult(text="done", session_id="s", skills=skills)
+
+        served.runner.behaviour = behaviour
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-1", "hi"))
+        frame = await bot.recv_kind("result")
+        health = served.transport.health_signals()
+        await bot.close()
+        return frame, health
+    finally:
+        await _stop(served)
+
+
+async def test_result_carries_skills_only_with_skill_frames(tmp_path: Path) -> None:
+    frame, health = await _skills_result_frame(
+        tmp_path, ("gh-pr-flow", "wiki-record"), skill_frames=True
+    )
+    assert frame["skills"] == ["gh-pr-flow", "wiki-record"]
+    assert health["skill_frames"] is True
+    assert health["skill_results"] == 1
+
+
+async def test_result_without_skill_frames_is_unchanged(tmp_path: Path) -> None:
+    frame, health = await _skills_result_frame(tmp_path, ("gh-pr-flow",))
+    assert frame == {
+        "type": "result",
+        "turn_id": "t-1",
+        "status": "complete",
+        "text": "done",
+        "session_id": "s",
+    }
+    assert health["skill_frames"] is False
+
+
+async def test_result_skills_empty_or_invalid(tmp_path: Path) -> None:
+    frame, health = await _skills_result_frame(tmp_path, (), skill_frames=True)
+    assert "skills" not in frame
+    assert health["skill_results"] == 0
+    frame, _ = await _skills_result_frame(
+        tmp_path, ("ok-skill", "/etc/passwd", "ok-skill"), skill_frames=True
+    )
+    assert frame["skills"] == ["ok-skill"]

@@ -23,6 +23,7 @@ from telegram_bot.core.agent_runtime import (
     approval_target_kind,
 )
 from telegram_bot.core.heartbeat import tool_label
+from telegram_bot.core.skill_display import MAX_TURN_SKILLS, skill_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +136,9 @@ class TurnEventState:
     # #2808: any tool started in this turn. A failed turn is only replayed
     # when it never reached a tool, so a retry can not repeat a side effect.
     tool_started: bool = False
+    # #2833: skills this turn loaded (``Skill`` calls and ``SKILL.md`` reads),
+    # names only, first-seen order, bounded — the hande ``result.skills``.
+    skills_used: list[str] = field(default_factory=list)
     delegated_tasks_active: int = 0
     delegated_tasks_oldest_started_at: float | None = None
     delegated_tasks_last_activity_at: float | None = None
@@ -236,6 +240,17 @@ class TurnEventState:
             self.delegated_tasks_oldest_started_at = observed_at
         return DelegatedTaskLifecycleTransition(event)
 
+    def _record_skill(self, tool_name: str, arguments: dict[str, object]) -> None:
+        """Remember a loaded skill's name (#2833): first-seen order, bounded."""
+
+        skill = skill_name(tool_name, arguments)
+        if (
+            skill is not None
+            and skill not in self.skills_used
+            and len(self.skills_used) < MAX_TURN_SKILLS
+        ):
+            self.skills_used.append(skill)
+
     def observe(
         self,
         event: AgentEvent,
@@ -263,7 +278,9 @@ class TurnEventState:
         if isinstance(event, ToolStartedEvent):
             self.tool_started = True
             self.active_tool_ids.add(event.tool_call_id)
-            label = tool_label(event.tool_name, dict(event.arguments))
+            arguments = dict(event.arguments)
+            self._record_skill(event.tool_name, arguments)
+            label = tool_label(event.tool_name, arguments)
             if label is not None:
                 self.active_tools[event.tool_call_id] = label
             return ToolStartedTransition(event, label)

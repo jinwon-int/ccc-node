@@ -29,7 +29,9 @@ Frames out (to the bot)::
     {"type":"control","turn_id":…,"accepted":bool}
     {"type":"rejected","turn_id":…,"reason":…}
     {"type":"result","turn_id":…,"status":"complete"|"uncertain",
-     "text":…,"session_id":…[,"reason":…]}
+     "text":…,"session_id":…[,"reason":…][,"skills":["gh-pr-flow",…]]}
+                                         # #2833 ``skills``: complete only, names
+                                         # only, ≤8; only with skill_frames on
     {"type":"notice","room":…,"text":…[,"kind":"status"]}   # no turn; kind
                                          # status = external-wait line (#2590)
     {"type":"attachment","turn_id":…,"attachment":{"v":1,"path":…,"kind":…,
@@ -80,6 +82,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 from telegram_bot.contracts.transport import TurnResult, TurnRunner
+from telegram_bot.core.skill_display import bounded_skills
 
 from . import outbound
 from .attachments import AttachmentFrameError, parse_frame_attachment
@@ -576,6 +579,10 @@ class HandeTransport:
             self.c.get("wait_status_interval_s") or DEFAULT_WAIT_STATUS_INTERVAL_S
         )
         self._wait_status_sent = 0
+        # #2833: the turn's skill names as ``result.skills`` (family-messenger#834
+        # draws them as chips). Off by default: turn it on after the bot and apps.
+        self.skill_frames = bool(self.c.get("skill_frames"))
+        self._skill_results = 0
         # #2602: ``⏳`` lines re-posted right after an interim (status_frames).
         self._status_resent = 0
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
@@ -1076,6 +1083,8 @@ class HandeTransport:
             "status_frames": self.status_frames,
             "wait_status_frames": self.wait_status_frames,
             "wait_status_sent": self._wait_status_sent,
+            "skill_frames": self.skill_frames,
+            "skill_results": self._skill_results,
             "status_resent": self._status_resent,
             "attachment_frames": self.attachment_frames,
             "attachments_ignored": self._attachments_ignored,
@@ -1277,15 +1286,18 @@ class HandeTransport:
                 await client.send(
                     {"type": "session", "turn_id": turn.turn_id, "session_id": session_id}
                 )
-            await client.send(
-                {
-                    "type": "result",
-                    "turn_id": turn.turn_id,
-                    "status": "complete",
-                    "text": text,
-                    "session_id": session_id,
-                }
-            )
+            frame: dict[str, Any] = {
+                "type": "result",
+                "turn_id": turn.turn_id,
+                "status": "complete",
+                "text": text,
+                "session_id": session_id,
+            }
+            skills = bounded_skills(getattr(result, "skills", ()) or ()) if self.skill_frames else ()
+            if skills:
+                frame["skills"] = list(skills)
+                self._skill_results += 1
+            await client.send(frame)
         else:
             self._turns_uncertain += 1
             # Machine codes set above (``cancelled``/``worker_gone``/``error``
@@ -1622,6 +1634,7 @@ def _with_lines(result: Any, lines: list[str]) -> Any:
             session_id=getattr(result, "session_id", None),
             streamed=bool(getattr(result, "streamed", False)),
             status=str(getattr(result, "status", "complete")),
+            skills=tuple(getattr(result, "skills", ()) or ()),
         )
 
 

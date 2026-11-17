@@ -53,6 +53,8 @@ class TransportContractRelocationTests(unittest.TestCase):
                 ("status", "complete"),
                 # #2813: additive, defaulted — existing constructors unchanged.
                 ("error_detail", None),
+                # #2833: additive, defaulted — the turn's skill names.
+                ("skills", ()),
             ],
         )
         with self.assertRaises(dataclasses.FrozenInstanceError):

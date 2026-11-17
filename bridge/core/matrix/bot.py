@@ -51,6 +51,7 @@ from telegram_bot.contracts.transport import (  # noqa: F401 (TransportPort re-e
 from telegram_bot.core import restart_handoff, session_resume, tool_policy
 from telegram_bot.core import revert as revert_ops
 from telegram_bot.core.claude_default_model import claude_default_model
+from telegram_bot.core.skill_display import bounded_skills
 from telegram_bot.core.memory_distill import MemoryDistillMixin
 from telegram_bot.memory.distill_types import DistillTrigger
 from telegram_bot.core.agent_runtime import ApprovalDecision, ApprovalRequestEvent
@@ -267,6 +268,7 @@ def _turn_result(
     streamed: bool = False,
     status: str = "complete",
     error_detail: str | None = None,
+    skills: tuple[str, ...] = (),
 ) -> TurnResult:
     """Build the transport's ``TurnResult`` (kept as the call sites' one constructor)."""
 
@@ -276,6 +278,7 @@ def _turn_result(
         streamed=streamed,
         status=status,
         error_detail=error_detail,
+        skills=skills,
     )
 
 
@@ -2820,6 +2823,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             streamed=streamed,
             status=status,
             error_detail=str(detail) if detail else None,
+            skills=bounded_skills(getattr(response, "skills", ())) if status == "complete" else (),
         )
 
     def _enqueue_deliverables(self, room_id: str, content: str) -> None:

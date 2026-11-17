@@ -76,6 +76,9 @@ class TurnResult:
     streamed: bool = False
     status: str = "complete"  # or "uncertain"
     error_detail: str | None = None
+    # #2833: skills the turn loaded, names only (``core/skill_display.py``).
+    # A transport may show them; hande sends them as ``result.skills``.
+    skills: tuple[str, ...] = ()
 
 
 class TurnRunner(Protocol):

@@ -2036,6 +2036,7 @@ class ProjectChatProcessMixin:
             success=True,
             session_id=session.session_id,
             streamed=streamed,
+            skills=tuple(turn_state.skills_used),
         )
 
     async def _handle_turn_timeout(

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Optional
 
+from telegram_bot.core.skill_display import skill_name
+
 
 def _truncate(text: str, limit: int) -> str:
     value = " ".join(str(text or "").split())
@@ -29,6 +31,14 @@ def format_duration(seconds: float) -> str:
 
 def tool_label(name: Optional[str], tool_input: Any = None) -> Optional[str]:
     """Return a short, non-secret-ish label for the current SDK tool call."""
+    # #2833: a loaded skill shows as its name, not ``Skill`` / ``Read: …/SKILL.md``.
+    skill = skill_name(name, tool_input)
+    if skill is not None:
+        return f"📘 {skill}"
+    return _tool_summary_label(name, tool_input)
+
+
+def _tool_summary_label(name: Optional[str], tool_input: Any) -> Optional[str]:
     if not name:
         return None
     if not isinstance(tool_input, dict):
