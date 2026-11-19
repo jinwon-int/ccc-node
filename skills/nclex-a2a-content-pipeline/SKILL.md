@@ -19,8 +19,12 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
   (`--manifest F --dry-run` → `--verify`). **edge secret은 브로커가 있는 노드의
   로컬 env에서만 읽는다** — T1(로컬 브로커)=브로커 노드 env의
   `BROKER_EDGE_SECRET`(로컬 터널 `http://127.0.0.1:<port>`), T2(원격 브로커)=브로커
-  호스트 a2a-nexus 체크아웃 `packages/broker/.env`의 `EDGE_SECRET`(**브로커
-  호스트에서 SSH로 실행**, 값 이동·출력 금지).
+  호스트에서 SSH로 실행한다(값 이동·출력 금지). gwakga(T2)는 2026-11 현재
+  `/root/.a2a-broker-edge.env`가 정본이다(SECLED/#2086 B1). 이 파일은 값 사본이
+  아니라 **source할 때 실행 중인 브로커 컨테이너에서 값을 읽는 셸 식**이다. 그래서
+  `(set -a; . /root/.a2a-broker-edge.env; set +a; <명령>)`처럼 source한 서브셸에서
+  `A2A_EDGE_SECRET` env로만 넘긴다. 옛 경로 `packages/broker/.env`의 `EDGE_SECRET`은
+  그 호스트에 없을 수 있으니, 쓰기 전에 변수 이름만 확인한다(`sed -E 's/=.*/=<redacted>/'`).
 - 신뢰 워커는 keyring `refs/a2a-public-keyring.json` 등록 노드만 — 레인별 등록
   목록은 키링 파일이 정본이고 저자 노드는 구조적 제척. **미등록 노드의 PASS는
   `a2a/receipts`에서 무효** — 디스패치 전 등록 여부를 확인한다.
@@ -59,12 +63,24 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
      (성공을 놓치는 것보다 오탐 종료가 안전).
    - 모든 종료 경로(타임아웃·네트워크 실패 포함)에 결과 파일을 쓴다 —
      **결과 파일이 없으면 워처는 끝까지 살아 있었던 것이 아니다**.
-   - secret은 `--secret-file`(argv·출력 노출 없음, env 스타일 파일은
-     `FILE:VAR_NAME` 추출)로만 전달한다.
-   예: `watch-task.sh --broker "$BROKER_URL" --task-id "$LANE_ID" \
+   - secret은 argv·출력에 노출하지 않는다. 방법은 두 가지다. 값이 글자 그대로
+     적힌 파일이면 `--secret-file`(첫 줄, 또는 env 스타일 파일의 `FILE:VAR_NAME`)을
+     쓴다. 그렇지 않으면 source한 서브셸의 `A2A_EDGE_SECRET` env로 넘긴다.
+     `FILE:VAR_NAME`은 `sed`로 `VAR=` 뒤 **글자를 그대로** 읽는다. 그래서 값이
+     `$(…)` 같은 셸 식으로 계산되는 파일(gwakga `/root/.a2a-broker-edge.env`)에서는
+     식 문자열이 그대로 헤더에 들어가 첫 폴링이 HTTP 401(`http_error`)로 끝난다
+     (2026-11-19 nclex#1049 실측).
+   예(값이 글자 그대로 있는 워커 노드 env):
+     `watch-task.sh --broker "$BROKER_URL" --task-id "$LANE_ID" \
      --requester-id <manifest requester.id> --requester-role <requester.role> \
      --secret-file <env-file>:BROKER_EDGE_SECRET \
      --out /root/nclex-dispatch/watch-<lane>.json`
+   예(gwakga T2 — source한 서브셸에서 env로 넘기고 백그라운드로 띄운다):
+     `(set -a; . /root/.a2a-broker-edge.env; set +a; nohup watch-task.sh \
+     --broker http://127.0.0.1:8787 --task-id "$LANE_ID" --requester-id <id> \
+     --requester-role analyst --out <dir>/watch-<lane>.json > <dir>/watch-<lane>.log 2>&1 &)`
+     — 괄호 밖에서 `cd … && nohup … &`로 쓰면 `cd`까지 백그라운드로 묶여 로그
+     경로가 어긋난다.
 4. **`review_verdict_failed`이면 먼저 GET `/tasks/:id` 와 `/tasks/:id/diagnostics`를 본다.**
    (`review_verdict_failed`는 status가 아니라 result/error의 **코드**다 — 그때
    status는 `failed`로 온다. 상태 어휘와 판정 코드를 혼합하지 않는 것도 #1389 교훈.)
