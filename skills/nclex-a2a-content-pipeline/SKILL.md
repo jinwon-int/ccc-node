@@ -19,7 +19,7 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
   (`--manifest F --dry-run` → `--verify`). **edge secret은 브로커가 있는 노드의
   로컬 env에서만 읽는다** — T1(로컬 브로커)=브로커 노드 env의
   `BROKER_EDGE_SECRET`(로컬 터널 `http://127.0.0.1:<port>`), T2(원격 브로커)=브로커
-  호스트에서 SSH로 실행한다(값 이동·출력 금지). gwakga(T2)는 2026-11 현재
+  호스트에서 SSH로 실행한다(값 이동·출력 금지). T2 브로커 호스트는 2026-11 현재
   `/root/.a2a-broker-edge.env`가 정본이다(SECLED/#2086 B1). 이 파일은 값 사본이
   아니라 **source할 때 실행 중인 브로커 컨테이너에서 값을 읽는 셸 식**이다. 그래서
   `(set -a; . /root/.a2a-broker-edge.env; set +a; <명령>)`처럼 source한 서브셸에서
@@ -67,7 +67,7 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
      적힌 파일이면 `--secret-file`(첫 줄, 또는 env 스타일 파일의 `FILE:VAR_NAME`)을
      쓴다. 그렇지 않으면 source한 서브셸의 `A2A_EDGE_SECRET` env로 넘긴다.
      `FILE:VAR_NAME`은 `sed`로 `VAR=` 뒤 **글자를 그대로** 읽는다. 그래서 값이
-     `$(…)` 같은 셸 식으로 계산되는 파일(gwakga `/root/.a2a-broker-edge.env`)에서는
+     `$(…)` 같은 셸 식으로 계산되는 파일(T2 브로커 호스트의 `/root/.a2a-broker-edge.env`)에서는
      식 문자열이 그대로 헤더에 들어가 첫 폴링이 HTTP 401(`http_error`)로 끝난다
      (2026-11-19 nclex#1049 실측).
    예(값이 글자 그대로 있는 워커 노드 env):
@@ -75,7 +75,7 @@ description: Drive a jinwon-int/nclex content PR through the full narrow-gate A2
      --requester-id <manifest requester.id> --requester-role <requester.role> \
      --secret-file <env-file>:BROKER_EDGE_SECRET \
      --out /root/nclex-dispatch/watch-<lane>.json`
-   예(gwakga T2 — source한 서브셸에서 env로 넘기고 백그라운드로 띄운다):
+   예(T2 브로커 호스트 — source한 서브셸에서 env로 넘기고 백그라운드로 띄운다):
      `(set -a; . /root/.a2a-broker-edge.env; set +a; nohup watch-task.sh \
      --broker http://127.0.0.1:8787 --task-id "$LANE_ID" --requester-id <id> \
      --requester-role analyst --out <dir>/watch-<lane>.json > <dir>/watch-<lane>.log 2>&1 &)`
