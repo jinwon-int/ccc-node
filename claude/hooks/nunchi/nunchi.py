@@ -591,7 +591,7 @@ def _close_expired_task_progress(c):
 
 
 # #2838 — optional idle sweep for session-scoped constraints. Measured
-# 2026-11-20 on yukson: 629 of 810 open constraints were `session:*`, 625 of
+# 2026-11-20 on one node: 629 of 810 open constraints were `session:*`, 625 of
 # them from sessions with no transcript activity for 7+ days, and they took 20
 # of the 49 snapshot constraint lines (the block fills newest-first, #2216).
 # A constraint like "the APK expires 11-18" or "this session needs an
