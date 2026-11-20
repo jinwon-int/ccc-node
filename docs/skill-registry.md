@@ -113,12 +113,25 @@ fleet-skills retirement procedure live in
 
 ## Usage telemetry & monthly audit
 
-`claude/hooks/skill-usage-log.sh` (PostToolUse `Read|Skill`) appends one
+`claude/hooks/skill-usage-log.sh` (PostToolUse `Read|Skill|Bash`) appends one
 owner-only line per skill load to
 `$CCC_CLAUDE_DIR/state/skill-usage/usage.jsonl` — the Skill tool and Read of
 any `*/skills/*/SKILL.md` both count, which is how bridge-resolved skills
 actually load. Best-effort by contract: every failure exits 0 and never
 blocks a read.
+
+A Bash reader of one skill's `SKILL.md` counts too (`tool: "Bash"`, #2748):
+`cat`/`head`/`tail`/`sed`/`less`/`awk`/`grep`/`rg` naming
+`skills/<name>/SKILL.md` inside its own command segment. Agents load skill
+bodies this way most often — on one node in 14 days 63 of 88 loads went
+through Bash, none of them in the ledger before. Not counted: other commands
+in the same call (`git add`, `diff`, `cp`), `sed -i`/`perl -i`, a redirect
+into a `SKILL.md`, heredoc bodies, `pending-skills/<draft>/SKILL.md`, and
+`<name>` placeholders. The row carries the skill name only, never the
+command text. A payload without `SKILL.md` exits before any `jq` runs, so
+ordinary Bash calls cost a few milliseconds. `skill_router.py report` still
+counts only `tool: "Skill"` rows as follow-through; Bash rows feed the
+curator, promotion and monthly audits.
 
 Codex also records successful command reads through this logger; see
 [Codex capture rules and audience boundaries](codex-skill-telemetry.md). Usage

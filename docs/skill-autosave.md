@@ -1276,7 +1276,7 @@ or deletes anything:
 The Skill-tool store above cannot see the Read path — how bridge-resolved and
 file-invoked skills actually load — so the stale judgement takes the UNION of
 `skill-autosave-usage.json` and `state/skill-usage/usage.jsonl` (the
-`skill-usage-log.sh` Read|Skill ledger, also fed by the Piri extension, [Codex read capture](codex-skill-telemetry.md) and [Danso read capture](danso-skill-telemetry.md); lines
+`skill-usage-log.sh` Read|Skill|Bash ledger (Bash = a reader of one `SKILL.md`, #2748), also fed by the Piri extension, [Codex read capture](codex-skill-telemetry.md) and [Danso read capture](danso-skill-telemetry.md); lines
 now carry a `runtime` field). A skill with a row in either within the window
 stays active, and a fresh `usage.jsonl` row reactivates a stale one. Rows older
 than the skill's `created_at` are ignored (an earlier same-name skill).
