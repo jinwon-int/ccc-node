@@ -68,6 +68,11 @@ Age sweeps (TTL):
     review-flagged facts. Each close is recorded body-free in the `ttl_close`
     ledger and a fact is closed by age at most once, so clearing valid_to
     reopens it for good. `metrics` reports the counts.
+  - NUNCHI_SESSION_CONSTRAINT_TTL_DAYS (default 0 = OFF, same parsing) closes
+    open `session:*` constraints once their session has produced no fact of
+    any kind for that many days (#2838). Same exemptions, ledger and
+    reopen-once rule as the task-progress TTL; node/person constraints are
+    never touched. The only unattended path that closes a constraint.
   - snapshot.md and backend-health.json are replaced atomically (same-dir
     temp file + os.replace, UTF-8); the health read-modify-write is
     serialized by an flock on a `.lock` sidecar.
@@ -106,7 +111,8 @@ Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
   No path deletes a fact row; "removing" means closing (valid_to), which is
   reversible. Tier 1 unattended passes (ingest, judge-batch cron, snapshot)
   only add facts, close under a deterministic gate (G1, B2, observation TTL,
-  opt-in task-progress TTL) and set/clear review flags. Tier 2 bulk closes
+  opt-in task-progress TTL, opt-in session-constraint idle TTL) and set/clear
+  review flags. Tier 2 bulk closes
   (review-stale, constraints-triage) are owner-invoked and dry-run by default;
   conflict-sweep only flags; g5-legacy-close only sets because/kind on the G5
   legacy backlog; reattribute-unknown only moves provable subject=node rows
@@ -584,6 +590,68 @@ def _close_expired_task_progress(c):
     return len(ids)
 
 
+# #2838 — optional idle sweep for session-scoped constraints. Measured
+# 2026-11-20 on one node: 629 of 810 open constraints were `session:*`, 625 of
+# them from sessions with no transcript activity for 7+ days, and they took 20
+# of the 49 snapshot constraint lines (the block fills newest-first, #2216).
+# A constraint like "the APK expires 11-18" or "this session needs an
+# independent re-review" stops meaning anything once its session is over.
+# DEFAULT OFF, same parser and posture as the task-progress TTL: enabling it
+# (e.g. NUNCHI_SESSION_CONSTRAINT_TTL_DAYS=7) is a per-node owner decision.
+_SESSION_CONSTRAINT_TTL_DAYS = _float_env("NUNCHI_SESSION_CONSTRAINT_TTL_DAYS", "0")
+# Idle age `metrics` reports against whether or not the sweep is on (#2838's
+# measurement used 7 days), so the owner can size a TTL before enabling one.
+_SESSION_CONSTRAINT_REFERENCE_IDLE_DAYS = 7
+# A session counts as idle when the newest fact of ANY kind it ever produced is
+# older than the cutoff — a session still writing facts keeps all of its
+# constraints, however old the individual constraint is.
+_SESSION_IDLE_SQL = (
+    "(SELECT MAX(g.created_at) FROM peer_facts g WHERE g.observed = f.observed) < ?")
+
+
+def _session_constraint_ttl_days():
+    """Effective idle TTL in days, or 0.0 when the sweep is off."""
+    ttl = _SESSION_CONSTRAINT_TTL_DAYS
+    return ttl if math.isfinite(ttl) and ttl > 0 else 0.0
+
+
+def _close_idle_session_constraints(c):
+    """Sweep: close open `session:*` constraints of idle sessions (#2838).
+
+    Same close and ledger as the task-progress TTL (valid_to only, nothing
+    deleted, one body-free `ttl_close` row). This is the only Tier 1 path that
+    closes a constraint, and it is opt-in. Never closed:
+      - constraints observed on a node or person peer (anything not session:*);
+      - source_rank >= 3 — G2: an owner statement is not buried by an age rule;
+      - review = 1 — the fact is waiting on a human/judge verdict;
+      - a fact this sweep (or any TTL sweep) already closed once — a reopen by
+        the owner stands.
+    Returns the closed count.
+    """
+    ttl = _session_constraint_ttl_days()
+    cutoff = _age_cutoff(ttl) if ttl else None
+    if not cutoff:
+        return 0
+    c.execute(_TTL_LEDGER_SQL)
+    ids = [r[0] for r in c.execute(
+        "SELECT f.id FROM peer_facts f"
+        " WHERE f.kind='constraint' AND f.valid_to IS NULL"
+        " AND (f.observed >= 'session:' AND f.observed < 'session;')"
+        " AND COALESCE(f.source_rank, 1) < 3 AND COALESCE(f.review, 0) = 0"
+        " AND f.id NOT IN (SELECT fact_id FROM ttl_close)"
+        " AND " + _SESSION_IDLE_SQL, (cutoff,))]
+    if not ids:
+        return 0
+    stamp = now()
+    c.executemany(
+        "INSERT INTO ttl_close(fact_id, kind, ttl_days, closed_at)"
+        " VALUES(?, 'constraint', ?, ?)", [(i, ttl, stamp) for i in ids])
+    c.executemany(
+        "UPDATE peer_facts SET valid_to=? WHERE id=? AND valid_to IS NULL",
+        [(stamp, i) for i in ids])
+    return len(ids)
+
+
 def _sweep_expired_observations(c):
     """#1478 — the snapshot/assemble variant of the TTL sweep: opportunistic.
 
@@ -592,13 +660,15 @@ def _sweep_expired_observations(c):
     stall for the full busy timeout) because an `ingest` holds the write lock.
     Waits at most NUNCHI_SQLITE_SWEEP_TIMEOUT_MS, then logs one stderr line
     and leaves the connection read-only for the rest of the run. Returns True
-    when the sweep committed. The opt-in task-progress TTL (#2759) rides the
-    same transaction, so it shares the lock-contention posture exactly.
+    when the sweep committed. The opt-in task-progress TTL (#2759) and the
+    opt-in session-constraint idle TTL (#2838) ride the same transaction, so
+    they share the lock-contention posture exactly.
     """
     try:
         c.execute(f"PRAGMA busy_timeout={int(_SQLITE_SWEEP_TIMEOUT_MS)}")
         _close_expired_observations(c)
         _close_expired_task_progress(c)
+        _close_idle_session_constraints(c)
         c.commit()
         return True
     except sqlite3.OperationalError as exc:
@@ -3864,6 +3934,20 @@ def metrics():
             "SELECT COUNT(*) FROM ttl_close WHERE kind='task-progress'").fetchone()[0]
     except sqlite3.OperationalError:
         tp_ttl_closed = 0  # no ledger yet: the sweep has never been enabled here
+    # #2838 — session-scoped constraints, and how many belong to sessions idle
+    # past the reference age (reported whether or not the sweep is on).
+    sc_open = c.execute(
+        "SELECT COUNT(*) FROM peer_facts f WHERE f.valid_to IS NULL AND f.kind='constraint'"
+        " AND (f.observed >= 'session:' AND f.observed < 'session;')").fetchone()[0]
+    sc_idle = c.execute(
+        "SELECT COUNT(*) FROM peer_facts f WHERE f.valid_to IS NULL AND f.kind='constraint'"
+        " AND (f.observed >= 'session:' AND f.observed < 'session;') AND " + _SESSION_IDLE_SQL,
+        (_age_cutoff(_SESSION_CONSTRAINT_REFERENCE_IDLE_DAYS),)).fetchone()[0]
+    try:
+        sc_ttl_closed = c.execute(
+            "SELECT COUNT(*) FROM ttl_close WHERE kind='constraint'").fetchone()[0]
+    except sqlite3.OperationalError:
+        sc_ttl_closed = 0  # no ledger yet: no TTL sweep has ever been enabled here
     print(f"facts_total={total}")
     print(f"facts_open={open_}")
     print(f"facts_closed={closed}")
@@ -3875,6 +3959,10 @@ def metrics():
     print(f"task_progress_open_over_{_TASK_PROGRESS_REFERENCE_AGE_DAYS}d={tp_old}")
     print(f"task_progress_ttl_days={_task_progress_ttl_days():g}")
     print(f"task_progress_ttl_closed={tp_ttl_closed}")
+    print(f"session_constraint_open={sc_open}")
+    print(f"session_constraint_open_idle_over_{_SESSION_CONSTRAINT_REFERENCE_IDLE_DAYS}d={sc_idle}")
+    print(f"session_constraint_ttl_days={_session_constraint_ttl_days():g}")
+    print(f"session_constraint_ttl_closed={sc_ttl_closed}")
     # #2759 — legacy rows stored before the node identity resolved (#2541).
     # `reattribute-unknown --apply` brings this to 0; it must then stay there.
     print(f"observed_unknown_open={_reattr_unknown_counts(c)[1]}")
