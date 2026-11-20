@@ -80,7 +80,11 @@ from telegram_bot.core.external_wait import (
     default_registry_path,
     render_waits,
 )
-from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
+from telegram_bot.core.external_wait_monitor import (
+    DEFAULT_RESUME_DAILY_CAP,
+    ExternalWaitMonitor,
+    GhCliTransport,
+)
 from telegram_bot.core.lifecycle_loops import (
     run_health_alerts_probe,
     run_session_resource_guard,
@@ -1555,7 +1559,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
                 "CCC_EXTERNAL_WAIT_RESUME", default=True
             ),
             resume_daily_cap=ExternalWaitMonitor.env_int(
-                "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=10
+                "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=DEFAULT_RESUME_DAILY_CAP
             ),
         )
 

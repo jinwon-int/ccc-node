@@ -11,6 +11,7 @@ from telegram_bot.utils.channel_environment import (
     channel_selection_blank_overlay,
     without_channel_selection,
 )
+from telegram_bot.utils import dotenv_fallback
 from telegram_bot.utils.config import Settings, bind_config
 from telegram_bot.utils.logging_setup import setup_logging
 from telegram_bot.utils.wrapper_environment import (
@@ -858,6 +859,9 @@ def main() -> None:
 
     settings = load_runtime_settings()
     os.environ.update(settings.hook_policy_environment())
+    # #2841: unit/wrapper launches skip start.sh's .env export, so the
+    # os.environ-only switches (external-wait caps, ...) read .env here.
+    dotenv_fallback.install_from_settings(settings)
     bot = create_bot(settings)
 
     bot.validate_runtime_paths()

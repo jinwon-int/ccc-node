@@ -45,6 +45,7 @@ from telegram_bot.core.external_wait import (
     UNIT_SCOPE_USER,
     ExternalWaitRegistry,
 )
+from telegram_bot.utils import dotenv_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,9 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 MAX_POLL_INTERVAL_SECONDS = 300.0
 MAX_TRANSPORT_ERRORS = 3
 DEFAULT_TIMEOUT_SECONDS = 6 * 60 * 60
-DEFAULT_RESUME_DAILY_CAP = 10
+#: Auto-resumes per UTC day (#2841: 10 was exhausted by ordinary PR traffic
+#: — one PR registers CI, actions-run and merge-queue waits).
+DEFAULT_RESUME_DAILY_CAP = 30
 #: A merge-queue wait whose PR was never seen in the queue is only judged
 #: evicted after this grace (the agent may register a moment before GitHub
 #: shows the entry); afterwards it ends ``evicted`` with reason never-enqueued.
@@ -863,7 +866,8 @@ class ExternalWaitMonitor:
     # -- configuration helpers ---------------------------------------------------
     @staticmethod
     def env_flag(name: str, *, default: bool) -> bool:
-        raw = os.environ.get(name)
+        # Process env first, then the bridge ``.env`` layers (#2841).
+        raw = dotenv_fallback.lookup(name)
         if raw is None:
             return default
         return raw.strip().lower() not in {"0", "false", "no", "off"}
@@ -871,7 +875,7 @@ class ExternalWaitMonitor:
     @staticmethod
     def env_int(name: str, *, default: int, minimum: int = 0) -> int:
         try:
-            return max(minimum, int(os.environ.get(name, "") or default))
+            return max(minimum, int(dotenv_fallback.lookup(name) or default))
         except ValueError:
             return default
 
