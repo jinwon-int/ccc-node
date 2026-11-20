@@ -66,7 +66,11 @@ from telegram_bot.core.external_wait import (
 from telegram_bot.core.claude_audience_sidecar import record_bridge_started_turn
 from telegram_bot.core.continuation import ContinuationQueue, default_queue_path
 from telegram_bot.core.continuation_monitor import ContinuationMonitor
-from telegram_bot.core.external_wait_monitor import ExternalWaitMonitor, GhCliTransport
+from telegram_bot.core.external_wait_monitor import (
+    DEFAULT_RESUME_DAILY_CAP,
+    ExternalWaitMonitor,
+    GhCliTransport,
+)
 from telegram_bot.core.webhook_nudge import build_from_env as build_webhook_nudge_server
 from telegram_bot.core.turn_watchdog import DEFAULT_NOTIFY_MINUTES, TurnAgeWatchdog
 from telegram_bot.core.codex_app_server import live_app_server_clients
@@ -1660,7 +1664,7 @@ class BotLifecycleMixin(MemoryDistillMixin):
                 "CCC_EXTERNAL_WAIT_RESUME", default=True
             ),
             resume_daily_cap=ExternalWaitMonitor.env_int(
-                "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=10
+                "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=DEFAULT_RESUME_DAILY_CAP
             ),
         )
 

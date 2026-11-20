@@ -30,6 +30,7 @@ from telegram_bot.utils.settings_memory import MemorySettingsMixin
 from telegram_bot.utils.settings_voice import VoiceSettingsMixin
 from telegram_bot.utils.channel_environment import drop_blank_channel_selection
 from telegram_bot.utils.wrapper_environment import select_wrapper_environment
+from telegram_bot.utils.dotenv_fallback import select_operational_values
 
 BOT_PACKAGE_DIR = Path(__file__).resolve().parent.parent
 
@@ -209,9 +210,26 @@ class Config(
         # #1771: wrapper-only keys are not settings fields; keep the allowlisted
         # subset of the merged sources so spawn sites can hand it to children.
         loaded._wrapper_environment = select_wrapper_environment(merged)
+        # #2841: the .env layers only (process values are read live), reduced
+        # to non-credential CCC_* names, for the os.environ-only operational
+        # switches; installed by the entry point, never exported.
+        loaded._dotenv_operational = select_operational_values(
+            {**fallback_values, **project_values}
+        )
         return loaded
 
     _wrapper_environment: dict[str, str] = PrivateAttr(default_factory=dict)
+    _dotenv_operational: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    def dotenv_operational_environment(self) -> dict[str, str]:
+        """Return the ``CCC_*`` operational keys of the ``.env`` layers (#2841).
+
+        Project ``.env`` overrides the package fallback; the process
+        environment is deliberately absent because ``dotenv_fallback.lookup``
+        consults it first, live.
+        """
+
+        return dict(self._dotenv_operational)
 
     def wrapper_environment(self) -> dict[str, str]:
         """Return the allowlisted wrapper-only keys from the merged sources.

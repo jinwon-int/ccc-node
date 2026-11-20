@@ -724,9 +724,12 @@ waits — records without a `user_id` (legacy) included, as on Telegram; a wait
 registered by someone else is reported as not found, never cancelled.
 
 Flags: `CCC_EXTERNAL_WAIT_ENABLED` (default on), `CCC_EXTERNAL_WAIT_RESUME`
-(default on), `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 10 continuations
-per day; beyond the cap the rollup is still delivered, only the
-auto-continuation is skipped).
+(default on), `CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP` (default 30 continuations
+per UTC day; beyond the cap the rollup is still delivered, only the
+auto-continuation is skipped). These `env_flag`/`env_int` switches are read
+from the process environment first and then from the bridge `.env` layers
+(project `.env` over the package fallback, #2841), so a unit or `run-*`
+wrapper that bypasses `start.sh` still honours a value written to `.env`.
 
 ## Memory promotion (#2004)
 

@@ -201,6 +201,8 @@ class VoiceProviderConfigTests(unittest.TestCase):
         source_wrapper_env = source_utils / "wrapper_environment.py"
         # ...and the channel-selection leaf module (#2177).
         source_channel_env = source_utils / "channel_environment.py"
+        # ...and the .env operational-switch fallback leaf module (#2841).
+        source_dotenv_fallback = source_utils / "dotenv_fallback.py"
         source_runtime_check = Path(__file__).resolve().parents[1] / "runtime_config_check.py"
         with TemporaryDirectory() as td:
             root = Path(td)
@@ -218,6 +220,7 @@ class VoiceProviderConfigTests(unittest.TestCase):
             shutil.copy2(source_session_guard, utils / "session_resource_guard.py")
             shutil.copy2(source_wrapper_env, utils / "wrapper_environment.py")
             shutil.copy2(source_channel_env, utils / "channel_environment.py")
+            shutil.copy2(source_dotenv_fallback, utils / "dotenv_fallback.py")
             shutil.copy2(source_runtime_check, package / "runtime_config_check.py")
 
             project_root = root / "project"
