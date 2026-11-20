@@ -80,6 +80,26 @@ ok "task-progress TTL writes peer_facts as valid_to only" \
 ok "doc names the task-progress TTL knob and its default" \
   'grep -qF "NUNCHI_TASK_PROGRESS_TTL_DAYS" "$DOC" && grep -qF "off by default" "$DOC"'
 
+# ---- rule 3c-2: session-constraint idle TTL (#2838) is off by default, ages only
+# session:* constraints, and never an owner statement, a flagged or a reopened fact ------
+sc_src="$(python3 - "$NP" <<'PY'
+import ast, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for node in ast.parse(src).body:
+    if isinstance(node, ast.FunctionDef) and node.name == "_close_idle_session_constraints":
+        print(ast.get_source_segment(src, node))
+PY
+)"
+ok "_close_idle_session_constraints function found" '[ -n "$sc_src" ]'
+ok "session-constraint TTL default is off (\"0\")" \
+  'grep -qF "_SESSION_CONSTRAINT_TTL_DAYS = _float_env(\"NUNCHI_SESSION_CONSTRAINT_TTL_DAYS\", \"0\")" "$NP"'
+ok "session-constraint TTL selects session:* constraints only and excludes rank 3, review and already-swept rows" \
+  'grep -qF "kind='"'"'constraint'"'"' AND f.valid_to IS NULL" <<<"$sc_src" && grep -qF "f.observed >= '"'"'session:'"'"' AND f.observed < '"'"'session;'"'"'" <<<"$sc_src" && grep -qF "COALESCE(f.source_rank, 1) < 3" <<<"$sc_src" && grep -qF "COALESCE(f.review, 0) = 0" <<<"$sc_src" && grep -qF "f.id NOT IN (SELECT fact_id FROM ttl_close)" <<<"$sc_src"'
+ok "session-constraint TTL writes peer_facts as valid_to only" \
+  '[ "$(grep -oE "UPDATE peer_facts SET [a-z_=?, ]+" <<<"$sc_src")" = "UPDATE peer_facts SET valid_to=? " ]'
+ok "doc names the session-constraint TTL knob as the opt-in exception to owner-only constraint retirement" \
+  'grep -qF "NUNCHI_SESSION_CONSTRAINT_TTL_DAYS" "$DOC" && grep -qF "session-constraint idle TTL, which ages only \`session:*\` constraints" "$DOC"'
+
 # ---- rule 3d: reattribute-unknown (#2759) moves provable subject=node rows from the legacy
 # 'unknown' peer to the node name; `observed` is the only thing it rewrites about a fact ---
 reattr_src="$(python3 - "$NP" <<'PY'

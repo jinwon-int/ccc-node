@@ -27,13 +27,15 @@ passes add and update, deletion is a human-confirmed proposal.
 | B2 correction | inside ingest | close the single best-matching open fact a `kind=correction` replaces (token overlap ≥ 0.5), unless that best match outranks the correction or is a constraint — then nothing closes (#2739) | `nunchi.py` `_auto_supersede` |
 | observation TTL | ingest, `snapshot`, `assemble` | close `kind=observation` facts older than `NUNCHI_OBSERVATION_TTL_DAYS` (7; ≤0 disables) | `nunchi.py` `_close_expired_observations` |
 | task-progress TTL (opt-in, #2759) | same sweep step as the observation TTL | **off by default.** With `NUNCHI_TASK_PROGRESS_TTL_DAYS` > 0: close `kind=task-progress` facts older than that many days, except user-stated ones (`source_rank` 3), review-flagged ones and facts this sweep already closed once; one body-free `ttl_close` ledger row per close | `nunchi.py` `_close_expired_task_progress` |
+| session-constraint idle TTL (opt-in, #2838) | same sweep step as the observation TTL | **off by default.** With `NUNCHI_SESSION_CONSTRAINT_TTL_DAYS` > 0: close `kind=constraint` facts observed on a `session:*` peer once that session has produced no fact of any kind for that many days, except user-stated ones (`source_rank` 3), review-flagged ones and facts a TTL sweep already closed once; one body-free `ttl_close` row (`kind=constraint`) per close. Never touches a node or person constraint | `nunchi.py` `_close_idle_session_constraints` |
 | judge-batch | hourly cron (`install-nunchi.sh`, managed marker) | `review=0` only, and only with `NUNCHI_JUDGE_APPLY=1`; supersede appears as proposal text | `judge-batch.py` `apply_clear` |
 | conflict-sweep (opt-in) | daily cron when installed with `install-nunchi.sh --conflict-sweep` (#2479) | `review=1` on the newer fact plus a `conflict_sweep` ledger row; never closes | `nunchi.py` `conflict_sweep` |
 | schema migration | first open | backfill derived columns (`mutability`) | `nunchi.py` `_migrate_gate_cols` |
 
 A lower-rank fact never closes a higher-rank one (G2), so an agent inference cannot bury a user
 statement through G1 or B2. B2 also never closes a constraint: constraints are retired only by the
-owner commands below (`constraints-triage`, `supersede`, `merge`). G1 skips a protected candidate
+owner commands below (`constraints-triage`, `supersede`, `merge`) and, opt-in per node, by the
+session-constraint idle TTL, which ages only `session:*` constraints (#2838). G1 skips a protected candidate
 and takes the next best; B2 instead closes nothing when its best match is protected, because the
 correction was aimed at that fact and the runner-up was not corrected (#2739).
 
@@ -65,6 +67,31 @@ that class.
 - **Visibility.** `nunchi.py metrics` prints `task_progress_open`, `task_progress_open_over_30d`
   (reported with the TTL off too, to size the decision), `task_progress_ttl_days` (0 = off) and
   `task_progress_ttl_closed` (ledger count). The weekly bench sheet records them.
+
+### Session-constraint idle TTL (#2838)
+
+A constraint stored under a `session:<id>` peer is usually about that session: "the APK expires
+11-18 16:15", "this review needs an independent re-check on another node". The snapshot fills its
+constraint block newest-first (#2216), so those rules keep taking budget after the session is
+over. On 2026-11-20 on one node, 629 of 810 open constraints were `session:*`; 625 of them came
+from sessions with no transcript activity for 7+ days, and they held 20 of the 49 snapshot
+constraint lines.
+
+- **Off unless set.** Same parsing as the task-progress TTL: `NUNCHI_SESSION_CONSTRAINT_TTL_DAYS`
+  unset, `0`, negative, non-finite or unparsable means no sweep. Enabling it (for example `7`) is
+  a per-node owner decision and works the same way: one environment line in the crontab above the
+  managed lines.
+- **Idle, not old.** The age that counts is the session's newest fact of any kind, not the
+  constraint's own age: a session that is still producing facts keeps every constraint it has.
+- **What it never closes.** Constraints on any peer that is not `session:*` (node and person rules
+  are the durable layer), user-stated ones (`source_rank` 3, G2), review-flagged ones, and other
+  kinds.
+- **Reversible, once.** Same `ttl_close` ledger as the task-progress TTL, rows with
+  `kind=constraint`; clearing `valid_to` reopens a fact for good. The failure posture (busy lock →
+  skipped, one stderr line) is shared.
+- **Visibility.** `nunchi.py metrics` prints `session_constraint_open`,
+  `session_constraint_open_idle_over_7d` (reported with the TTL off too),
+  `session_constraint_ttl_days` (0 = off) and `session_constraint_ttl_closed`.
 
 ## Tier 2 — owner-invoked bulk passes (dry run by default)
 

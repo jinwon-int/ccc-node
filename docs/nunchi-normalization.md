@@ -35,8 +35,9 @@ never blocking, when another writer holds the lock):
 |---|---|---|---|
 | `observation` | `NUNCHI_OBSERVATION_TTL_DAYS` | 7 (`<=0` disables) | — |
 | `task-progress` | `NUNCHI_TASK_PROGRESS_TTL_DAYS` | **0 = off** (#2759) | user-stated (`source_rank` 3), review-flagged, already reopened once |
+| `constraint` on a `session:*` peer, session idle | `NUNCHI_SESSION_CONSTRAINT_TTL_DAYS` | **0 = off** (#2838) | node/person constraints, user-stated (`source_rank` 3), review-flagged, already reopened once |
 
-The task-progress sweep is opt-in per node. Closing sets `valid_to` only and is
+The task-progress and session-constraint sweeps are opt-in per node. Closing sets `valid_to` only and is
 recorded in the body-free `ttl_close` ledger; see
 [nunchi-curation-authority.md](nunchi-curation-authority.md#task-progress-ttl-2759)
 for the rules, the undo statement and the `metrics` counters.

@@ -1790,5 +1790,94 @@ while kill -0 "$holder" 2>/dev/null; do sleep 0.2; done
 NUNCHI_TASK_PROGRESS_TTL_DAYS=30 NUNCHI_OBSERVATION_TTL_DAYS=0 tp python3 "$NP" snapshot --limit 5 >/dev/null 2>&1
 ok "#2759 the next uncontended tick performs the sweep" '[ "$(tp_open TP-LOCK-OLD)" = 0 ]'
 
+# ---- #2838: optional idle TTL for session:* constraints (default OFF) -------
+# Private DB. A session is idle when the newest fact of ANY kind it produced is
+# older than the TTL; node/person constraints are never aged.
+sc_home="$TMP/sc-home"; mkdir -p "$sc_home"
+SCDB="$sc_home/facts.db"; SCSNAP="$sc_home/snapshot.md"
+sc() { NUNCHI_DB="$SCDB" NUNCHI_SNAPSHOT="$SCSNAP" NUNCHI_OBSERVATION_TTL_DAYS=0 "$@"; }
+scq() { python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])" "$SCDB" "$1"; }
+sc_open() { scq "SELECT COUNT(*) FROM peer_facts WHERE fact='$1' AND valid_to IS NULL"; }
+sc_row() {  # sc_row <fact> <observed> <kind> <created_at> <source_rank> <review>
+  python3 - "$SCDB" "$@" <<'PY'
+import sqlite3, sys
+db, fact, observed, kind, created, rank, review = sys.argv[1:8]
+c = sqlite3.connect(db)
+c.execute("INSERT INTO peer_facts(observer,observed,kind,fact,valid_from,dedup,created_at,source_rank,review)"
+          " VALUES('family-assistant',?,?,?,?,?,?,?,?)",
+          (observed, kind, fact, created, "sc-" + fact, created, int(rank), int(review)))
+c.commit()
+PY
+}
+sc python3 "$NP" init >/dev/null 2>&1
+old=2020-01-01T00:00:00+00:00
+sc_row SC-IDLE-INFERRED  session:idle-1   constraint "$old" 1 0
+sc_row SC-IDLE-MEASURED  session:idle-1   constraint "$old" 2 0
+sc_row SC-IDLE-USER      session:idle-1   constraint "$old" 3 0
+sc_row SC-IDLE-REVIEW    session:idle-1   constraint "$old" 1 1
+sc_row SC-IDLE-DECISION  session:idle-1   decision   "$old" 1 0
+sc_row SC-ACTIVE-OLD     session:active-1 constraint "$old" 1 0
+sc_row SC-ACTIVE-NEW     session:active-1 context    "$young" 1 0
+sc_row SC-NODE-OLD       peer-node        constraint "$old" 1 0
+sc python3 "$NP" init >/dev/null 2>&1  # backfill derived columns before the lock-free reads below
+sc python3 "$NP" snapshot --limit 5 >/dev/null 2>&1; rc=$?
+ok "#2838 default (unset): idle-session constraints stay open" \
+  '[ "$rc" = 0 ] && [ "$(sc_open SC-IDLE-INFERRED)" = 1 ] && [ "$(sc_open SC-IDLE-MEASURED)" = 1 ]'
+ok "#2838 default (unset): no ttl_close ledger table is created" \
+  '[ "$(scq "SELECT COUNT(*) FROM sqlite_master WHERE name=\"ttl_close\"")" = 0 ]'
+ok "#2838 default (unset): the idle-session constraint is in the snapshot" \
+  'grep -qF "SC-IDLE-INFERRED" "$SCSNAP"'
+sc_bad_rc=0
+# shellcheck disable=SC2034  # sc_bad_rc is read via eval inside ok()
+for v in 0 -7 abc "" nan inf -inf 1e12; do
+  NUNCHI_SESSION_CONSTRAINT_TTL_DAYS="$v" sc python3 "$NP" snapshot --limit 5 >/dev/null 2>&1 || sc_bad_rc=1
+  NUNCHI_SESSION_CONSTRAINT_TTL_DAYS="$v" sc python3 "$NP" assemble --budget 4096 --hint "" >/dev/null 2>&1 || sc_bad_rc=1
+done
+ok "#2838 off/invalid values (0, negative, text, empty, nan, inf, out-of-range) never close and never fail" \
+  '[ "$sc_bad_rc" = 0 ] && [ "$(sc_open SC-IDLE-INFERRED)" = 1 ] && [ "$(sc_open SC-IDLE-MEASURED)" = 1 ]'
+# shellcheck disable=SC2034  # sc_parse is read via eval inside ok()
+sc_parse="$(NUNCHI_SESSION_CONSTRAINT_TTL_DAYS=abc python3 - "$NP" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nx", sys.argv[1])
+nx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nx)
+print(nx._SESSION_CONSTRAINT_TTL_DAYS, nx._session_constraint_ttl_days())
+PY
+)"
+ok "#2838 malformed env falls back to the knob's default (0 = off), no traceback" '[ "$sc_parse" = "0.0 0.0" ]'
+out="$(sc python3 "$NP" metrics)"
+ok "#2838 metrics (TTL off): session constraints open/idle reported, ttl off, nothing closed" \
+  'grep -qx "session_constraint_open=5" <<<"$out" && grep -qx "session_constraint_open_idle_over_7d=4" <<<"$out" && grep -qx "session_constraint_ttl_days=0" <<<"$out" && grep -qx "session_constraint_ttl_closed=0" <<<"$out"'
+# enabled: closes only rank-1/rank-2 unflagged constraints of the idle session
+NUNCHI_SESSION_CONSTRAINT_TTL_DAYS=7 sc python3 "$NP" snapshot --limit 5 >/dev/null 2>&1; rc=$?
+ok "#2838 enabled: idle-session rank-1/rank-2 constraints closed" \
+  '[ "$rc" = 0 ] && [ "$(sc_open SC-IDLE-INFERRED)" = 0 ] && [ "$(sc_open SC-IDLE-MEASURED)" = 0 ]'
+ok "#2838 enabled: user-stated (rank 3) constraint stays open (G2)" '[ "$(sc_open SC-IDLE-USER)" = 1 ]'
+ok "#2838 enabled: review-flagged constraint stays open" '[ "$(sc_open SC-IDLE-REVIEW)" = 1 ]'
+ok "#2838 enabled: an old constraint of a session that is still writing facts stays open" \
+  '[ "$(sc_open SC-ACTIVE-OLD)" = 1 ]'
+ok "#2838 enabled: a node/person constraint is never aged" '[ "$(sc_open SC-NODE-OLD)" = 1 ]'
+ok "#2838 enabled: other kinds of the idle session are not aged by this TTL" '[ "$(sc_open SC-IDLE-DECISION)" = 1 ]'
+ok "#2838 enabled: the closed constraint left the snapshot, the kept ones did not" \
+  '! grep -qF "SC-IDLE-INFERRED" "$SCSNAP" && grep -qF "SC-NODE-OLD" "$SCSNAP"'
+ok "#2838 nothing is deleted (close = valid_to only)" '[ "$(scq "SELECT COUNT(*) FROM peer_facts")" = 8 ]'
+ok "#2838 ledger records the closes body-free under kind=constraint" \
+  '[ "$(scq "SELECT COUNT(*) FROM ttl_close WHERE kind=\"constraint\" AND ttl_days=7")" = 2 ]'
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(NUNCHI_SESSION_CONSTRAINT_TTL_DAYS=7 sc python3 "$NP" metrics)"
+ok "#2838 metrics (TTL on): closed count and remaining exempt idle rows visible" \
+  'grep -qx "session_constraint_open=3" <<<"$out" && grep -qx "session_constraint_open_idle_over_7d=2" <<<"$out" && grep -qx "session_constraint_ttl_days=7" <<<"$out" && grep -qx "session_constraint_ttl_closed=2" <<<"$out"'
+ok "#2838 metrics keep the task-progress counters separate" \
+  'grep -qx "task_progress_ttl_closed=0" <<<"$out"'
+python3 -c "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute(\"UPDATE peer_facts SET valid_to=NULL WHERE fact='SC-IDLE-INFERRED'\");c.commit()" "$SCDB"
+NUNCHI_SESSION_CONSTRAINT_TTL_DAYS=7 sc python3 "$NP" snapshot --limit 5 >/dev/null 2>&1
+ok "#2838 a reopened constraint is not closed again by the next sweep" \
+  '[ "$(sc_open SC-IDLE-INFERRED)" = 1 ] && [ "$(sc_open SC-IDLE-MEASURED)" = 0 ]'
+sc_row SC-IDLE2-ASSEMBLE session:idle-2 constraint "$old" 1 0
+NUNCHI_SESSION_CONSTRAINT_TTL_DAYS=7 sc python3 "$NP" assemble --budget 4096 --hint "" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
+ok "#2838 assemble runs the session-constraint sweep too" '[ "$rc" = 0 ] && [ "$(sc_open SC-IDLE2-ASSEMBLE)" = 0 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
