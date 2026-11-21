@@ -9,7 +9,10 @@ Two subcommands:
 ``node`` lists every installed skill of this node with its origin
 (repo-managed / fleet-managed / autosave / external / user / unknown), usage
 counters and curator lifecycle state. Usage is the same ledger UNION the
-curator judges idleness on (owner decision #1739): the Skill-tool record in
+curator judges idleness on (owner decision #1739). An `unknown` skill carries
+its body-free reason family/code, and ``unknown_reasons`` counts them per
+family (#2843); a directory without SKILL.md is counted as ``not-a-skill``
+there and not listed. Usage sources: the Skill-tool record in
 ``state/skill-autosave-usage.json`` and the Read|Skill ledger
 ``state/skill-usage/usage.jsonl``. The ledger readers, record schema and
 evidence rules are imported from claude/hooks/skill-review/curator.py so the
@@ -37,6 +40,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import sys
@@ -107,6 +111,46 @@ ORIGINS = {
 }
 ORIGIN_ORDER = ("repo-managed", "fleet-managed", "autosave", "external", "user", "unknown")
 PROVIDERS = ("claude", "codex", "piri", "danso")
+# #2843: ownership.py folds every ContractError into `unknown/unreadable`, which
+# mixed three different causes in one origin bucket. The classification itself
+# stays fail-closed (the curator relies on it); the report only says *why*, as
+# a closed family vocabulary plus the body-free ContractError code.
+#   not-a-skill        — a directory without SKILL.md (e.g. the runtime-created
+#                        `skills/synced/` bucket). Not listed under `skills`.
+#   unsafe-permissions — owner/mode checks refused the skill (`unsafe_*`).
+#   metadata-invalid   — a provenance/control marker did not validate.
+#   other              — anything else (races, unreadable paths, ...).
+UNKNOWN_REASON_FAMILIES = ("not-a-skill", "unsafe-permissions", "metadata-invalid", "other")
+_REASON_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def _reason_code(value: Any) -> str:
+    """A ContractError code re-validated by shape; anything else is `other`."""
+    return value if isinstance(value, str) and _REASON_CODE_RE.fullmatch(value) else "other"
+
+
+def _unknown_reason_family(code: str) -> str:
+    if code == "target_missing":
+        return "not-a-skill"
+    if code.startswith("unsafe_"):
+        return "unsafe-permissions"
+    if code.endswith("metadata_invalid") or code in {
+        "conflicting_external_autosave_metadata",
+        "metadata_unreadable",
+    }:
+        return "metadata-invalid"
+    return "other"
+
+
+def _reason_counts(raw: Any) -> dict[str, int]:
+    """Node-report `unknown_reasons`, every family present, junk ignored."""
+    counts = {family: 0 for family in UNKNOWN_REASON_FAMILIES}
+    if isinstance(raw, dict):
+        for family in UNKNOWN_REASON_FAMILIES:
+            value = raw.get(family)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                counts[family] = value
+    return counts
 
 
 class ReportError(RuntimeError):
@@ -391,6 +435,8 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
     ledgers: dict[str, Any] = {}
     roots: dict[str, str] = {}
     state_dir: Path | None = None
+    unknown_reasons = {family: 0 for family in UNKNOWN_REASON_FAMILIES}
+    unknown_codes: dict[str, int] = {}
     for provider in providers:
         try:
             context = _provider_context(curator, provider)
@@ -418,8 +464,21 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
         controls = curator.ownership._preload_controls(context)
         for name in names:
             classification = curator.ownership._classification(context, name, controls=controls)
+            family: str | None = None
+            if classification.get("base_classification") == "unknown/unreadable":
+                code = _reason_code(classification.get("reason"))
+                family = _unknown_reason_family(code)
+                unknown_reasons[family] += 1
+                unknown_codes[code] = unknown_codes.get(code, 0) + 1
+                if family == "not-a-skill":
+                    # Counted, not listed: it is no skill, so it must not
+                    # inflate the unknown origin or read as a never-used skill.
+                    continue
             entry = _node_skill(curator, context, name, classification, usage, ledger, window_start)
             entry["usage_evidence"] = evidence
+            if family is not None:
+                entry["unknown_reason"] = family
+                entry["reason_code"] = _reason_code(classification.get("reason"))
             skills.append(entry)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -430,6 +489,8 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
         "skills_roots": roots,
         "usage_ledgers": ledgers,
         "skills": skills,
+        "unknown_reasons": unknown_reasons,
+        "unknown_reason_codes": dict(sorted(unknown_codes.items())),
         "lifecycle": _node_lifecycle(state_dir, now) if state_dir is not None else {"index": "no-context"},
     }
 
@@ -649,6 +710,23 @@ def _origin_totals(by_skill: dict[str, dict[str, dict[str, Any]]]) -> dict[str, 
     return totals
 
 
+def _unknown_reason_totals(latest: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Fleet sum of the per-node `unknown_reasons` (#2843).
+
+    A node report from before #2843 has no such field; it is not guessed at,
+    only left out of `unknown_reasons_nodes` so the sum's coverage is visible.
+    """
+    totals = {family: 0 for family in UNKNOWN_REASON_FAMILIES}
+    reported = 0
+    for report in latest.values():
+        if "unknown_reasons" not in report:
+            continue
+        reported += 1
+        for family, count in _reason_counts(report.get("unknown_reasons")).items():
+            totals[family] += count
+    return {"unknown_reasons": totals, "unknown_reasons_nodes": reported}
+
+
 def _percentile(values: list[int], pct: float) -> int | None:
     """Nearest-rank percentile of a sorted list."""
     if not values:
@@ -769,7 +847,12 @@ def build_aggregate(
         "graduation_candidates": graduation_candidates,
         "retire_candidates": retire_candidates,
         "unused": unused,
-        "totals": {"by_origin": _origin_totals(by_skill), "skills": len(by_skill), "nodes": len(latest)},
+        "totals": {
+            "by_origin": _origin_totals(by_skill),
+            "skills": len(by_skill),
+            "nodes": len(latest),
+            **_unknown_reason_totals(latest),
+        },
         "evidence_gaps": evidence_gaps,
         "lifecycle": _lifecycle_aggregate(latest),
     }
@@ -808,6 +891,8 @@ def render_node(report: dict[str, Any]) -> str:
             rows,
         )
     )
+    reasons = _reason_counts(report.get("unknown_reasons"))
+    out.append("unknown reasons: " + " ".join(f"{k}={v}" for k, v in reasons.items()))
     return "\n".join(out) + "\n"
 
 
@@ -821,6 +906,11 @@ def render_aggregate(agg: dict[str, Any]) -> str:
         _table(
             ["origin", "skills", "installs", "used_installs"],
             [[o, v["skills"], v["installs"], v["used_installs"]] for o, v in agg["totals"]["by_origin"].items()],
+        ),
+        "unknown reasons ({} of {} node(s) reporting): {}".format(
+            agg["totals"].get("unknown_reasons_nodes", 0),
+            agg["totals"]["nodes"],
+            " ".join(f"{k}={v}" for k, v in _reason_counts(agg["totals"].get("unknown_reasons")).items()),
         ),
         "",
         f"archive candidates (autosave, idle >= {t['stale_days']}d on every node holding them): {len(agg['archive_candidates'])}",

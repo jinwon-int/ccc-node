@@ -211,6 +211,59 @@ class NodeReportTests(unittest.TestCase):
         self.assertEqual(skills["user-one"]["use_count"], 1)
         self.assertIsNone(skills["repo-one"]["curator_state"])
 
+    def test_unknown_reasons_split_three_causes(self) -> None:
+        # #2843: the three causes seen fleet-wide, one fixture each.
+        n = self.node
+        (n.skills / "synced").mkdir(mode=0o700)  # runtime bucket, no SKILL.md
+        os.chmod(n.skill("group-writable") / "SKILL.md", 0o664)
+        n.autosave("auto-edited")
+        with (n.skills / "auto-edited" / "SKILL.md").open("a", encoding="utf-8") as handle:
+            handle.write("edited after the provenance marker\n")
+        report = self.node_json()
+        self.assertEqual(
+            report["unknown_reasons"],
+            {"not-a-skill": 1, "unsafe-permissions": 1, "metadata-invalid": 1, "other": 0},
+        )
+        skills = {s["name"]: s for s in report["skills"]}
+        self.assertNotIn("synced", skills, "a directory without SKILL.md is not listed as a skill")
+        self.assertEqual(
+            (skills["group-writable"]["origin"], skills["group-writable"]["unknown_reason"],
+             skills["group-writable"]["reason_code"]),
+            ("unknown", "unsafe-permissions", "unsafe_target_file"),
+        )
+        self.assertEqual(
+            (skills["auto-edited"]["origin"], skills["auto-edited"]["unknown_reason"]),
+            ("unknown", "metadata-invalid"),
+        )
+        self.assertTrue(skills["auto-edited"]["reason_code"].endswith("metadata_invalid"))
+        self.assertNotIn("unknown_reason", skills["user-one"])
+        self.assertEqual(
+            report["unknown_reason_codes"],
+            {"target_missing": 1, "unsafe_target_file": 1, skills["auto-edited"]["reason_code"]: 1},
+        )
+        text = n.run("node")
+        self.assertIn("unknown reasons: not-a-skill=1 unsafe-permissions=1 metadata-invalid=1 other=0", text.stdout)
+        agg = report_mod.build_aggregate(
+            [report, {**report, "node": "node-b"}, {k: v for k, v in report.items() if k != "unknown_reasons"} | {"node": "old"}],
+            stale_days=30, min_nodes=2, min_uses=3, dwell_days=14,
+        )
+        self.assertEqual(
+            agg["totals"]["unknown_reasons"],
+            {"not-a-skill": 2, "unsafe-permissions": 2, "metadata-invalid": 2, "other": 0},
+        )
+        self.assertEqual(agg["totals"]["unknown_reasons_nodes"], 2, "pre-#2843 reports are not guessed at")
+        self.assertIn("unknown reasons (2 of 3 node(s) reporting): not-a-skill=2", report_mod.render_aggregate(agg))
+
+    def test_reason_family_vocabulary(self) -> None:
+        family = report_mod._unknown_reason_family
+        self.assertEqual(family("unsafe_skill_dir"), "unsafe-permissions")
+        self.assertEqual(family("legacy_autosave_metadata_invalid"), "metadata-invalid")
+        self.assertEqual(family("skill_changed_during_classification"), "other")
+        self.assertEqual(report_mod._reason_code("Bad Code/../x"), "other")
+        self.assertEqual(report_mod._reason_code(None), "other")
+        self.assertEqual(report_mod._reason_counts({"not-a-skill": True, "other": 2, "x": 9}),
+                         {"not-a-skill": 0, "unsafe-permissions": 0, "metadata-invalid": 0, "other": 2})
+
     def test_node_report_is_body_free_and_read_only(self) -> None:
         before = self.node.snapshot()
         result = self.node.run("node", "--json")
