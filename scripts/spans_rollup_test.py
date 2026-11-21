@@ -237,6 +237,60 @@ def test_ledger_cross_check_buckets_turns_by_end_time_across_midnight(env, capsy
     assert summary["read"]["files_read"] == 2
 
 
+def test_ledger_cross_check_leaves_out_zero_cost_ledger_rows(env, capsys):
+    # Live case (one fleet node, 2026-11-18): a turn that ended in
+    # error_during_execution added no spend. The per-turn delta still listed
+    # the session's two models at cost 0, so the ledger wrote a
+    # total_cost_usd 0.0 row for it. Counting that row on the ledger side only
+    # read 3 turns vs 2 priced spans (33.33 %) with cost and tokens identical.
+    zero_models = [{"model": "m", "cost_usd": 0.0, "in": 0, "out": 0},
+                   {"model": "aux", "cost_usd": 0.0, "in": 0, "out": 0}]
+    env.write_spans("2026-11-06", [
+        turn(IN_DAY, inp=0, out=0, cache_read=0, cost=0.0, status="error",
+             outcome="error_during_execution", **{"error.type": "error_during_execution"}),
+        turn(IN_DAY + 90, inp=2, out=4026, cache_read=0, cost=0.131537),
+        turn(IN_DAY + 110, inp=2, out=361, cache_read=0, cost=0.088644),
+    ])
+    env.ledger_row(IN_DAY + 9, 0.0, zero_models)
+    env.ledger_row(IN_DAY + 99, 0.131537, [{"model": "m", "cost_usd": 0.131537, "in": 2,
+                                            "out": 4026}])
+    env.ledger_row(IN_DAY + 119, 0.088644, [{"model": "m", "cost_usd": 0.088644, "in": 2,
+                                             "out": 361}])
+
+    assert env.run("--dry-run", "--json") == 0
+    summary = json.loads(capsys.readouterr().out)
+    check = summary["cost_ledger_check"]
+    assert check["metrics"]["turns"] == {"spans": 2, "ledger": 2, "diff_pct": 0.0}
+    assert check["metrics"]["cost_usd"] == {"spans": 0.220181, "ledger": 0.220181, "diff_pct": 0.0}
+    assert check["max_diff_pct"] == 0.0 and check["within_target"] is True
+    assert check["ledger_zero_cost_rows"] == 1
+    # The error turn is still a turn of the day: only the cross-check skips it.
+    assert summary["totals"]["turns"] == 3
+    assert "⚠" not in rollup.build_digest_text(summary)
+    assert ("ledger zero-cost rows left out of the comparison: 1"
+            in "\n".join(rollup._check_table(check)))
+
+
+def test_zero_cost_ledger_rows_add_nothing_to_any_ledger_total(env):
+    # A zero-cost row that still carries tokens, and a row whose total is null
+    # while its models are priced: the span side keys on the turn total
+    # (``ccc.cost_usd``), so the ledger side keys on ``total_cost_usd`` alone.
+    start, end = rollup.kst_day_window(date.fromisoformat(DAY))
+    env.ledger_row(IN_DAY, 0.5, [{"model": "m", "cost_usd": 0.5, "in": 100, "out": 200}])
+    env.ledger_row(IN_DAY + 1, 0.0, [{"model": "m", "cost_usd": 0.0, "in": 70, "out": 30}])
+    env.ledger_row(IN_DAY + 2, None, [{"model": "m", "cost_usd": 0.4, "in": 7, "out": 3}])
+    assert rollup.read_cost_ledger(env.ledger, start, end) == {
+        "turns": 1, "input_tokens": 100, "output_tokens": 200, "cost_usd": 0.5,
+        "corrupt_lines": 0, "zero_cost_rows": 2}
+    # No zero-cost rows: nothing extra is rendered.
+    env.ledger.unlink()
+    env.ledger_row(IN_DAY, 0.5, [{"model": "m", "cost_usd": 0.5, "in": 100, "out": 200}])
+    env.write_spans("2026-11-06", [turn(IN_DAY, inp=100, out=200, cache_read=0, cost=0.5)])
+    check = summarize(env)["cost_ledger_check"]
+    assert check["ledger_zero_cost_rows"] == 0
+    assert not any("zero-cost" in line for line in rollup._check_table(check))
+
+
 def test_turn_end_ts_tolerates_missing_or_bad_duration():
     assert rollup.turn_end_ts({"start_ts": 100.0, "duration_ms": 2500}) == 102.5
     assert rollup.turn_end_ts({"start_ts": 100.0}) == 100.0
