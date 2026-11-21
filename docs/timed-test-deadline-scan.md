@@ -138,6 +138,15 @@ audit's two real findings stay high: a2a-nexus#2395 (`소크: 실제 T2 태스�
 수일분`) and family-messenger#404 (`- [ ] 관찰 기간: 공명에서 며칠 운영`, no
 verdict yet).
 
+Two issue-level rules run after the table, only on paragraphs it left high
+(#2817). Both look at fleet-authored sources only, ordered by posting time with
+the body earliest:
+
+| reason code | rule | measured on |
+|---|---|---|
+| `superseded-by-absolute` | a comment posted *after* the paragraph's own source has a deadline-keyword paragraph that expired mode accepts at high confidence (explicit datetime; not past at posting, claim ETA, cross-reference, date-only or a completion report). Expired mode judges that booking from then on. A booking posted before the paragraph supersedes nothing | iphone-agent-cast#87, #89 |
+| `not-started` | the same or a later source has both a `시작 일시: 미정` line (`시작 일`/`시각`, `Start date: TBD`) and a `시작 조건: …` line (labels may be bold or table cells). Low, not dropped, so a condition that never clears stays visible | a2a-nexus#2395 |
+
 `gh issue list` now also requests `author` (comments already carry theirs).
 Notices use `notify-relative.json` and point at `timed-relative-scan.cron.log`.
 
