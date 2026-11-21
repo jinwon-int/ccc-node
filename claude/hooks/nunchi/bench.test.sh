@@ -28,6 +28,9 @@ cat > "$hooks/nunchi.py" <<'PY'
 #!/usr/bin/env python3
 import sys
 
+if sys.argv[1:2] == ["synth-model"]:  # #2824 bench header probe
+    print("stub-model")
+    sys.exit(0)
 # Simulate a provider CLI that consumes inherited stdin.
 sys.stdin.read()
 print("BENCH_STDIN_ISOLATED")
@@ -57,6 +60,9 @@ ok "all five Q-set rows run even when the backend drains stdin" \
 ok "every child (5 queries + metrics) is stdin-isolated" \
   '[ "$(grep -c "BENCH_STDIN_ISOLATED" "$out")" = 6 ]'
 ok "bench records the #890 metrics section" 'grep -q "^## metrics " "$out"'
+# #2824 — the summary names the configured claude synthesis model and CLI.
+ok "bench summary records the synth backend/model line" \
+  'grep -Eq "^- synth backend/model: claude stub-model \(cli [A-Za-z0-9._-]+\)$" "$out"'
 ok "the final Q-set row is preserved" \
   'grep -q "^- Q: query five$" "$out" && grep -q "^- expect: expect five$" "$out"'
 

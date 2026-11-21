@@ -60,8 +60,8 @@ The sweep is opt-in per node. `install-nunchi.sh --apply --conflict-sweep` (or
 - The installer refuses (exit 2, crontab untouched) when the installed `nunchi.py` predates the
   subcommand.
 - The judge is `llm_synthesize` (claude → codex → pi, first that answers), not judge-batch's
-  provider switch. `NUNCHI_SYNTH_ORDER`, `NUNCHI_PIRI` and `NUNCHI_PIRI_ARGS` set at install time
-  are stamped on the line. With no usable backend the run fails closed: exit 1, nothing written,
+  provider switch. `NUNCHI_SYNTH_ORDER`, `NUNCHI_PIRI`, `NUNCHI_PIRI_ARGS` and `NUNCHI_SYNTH_CLAUDE_MODEL`
+  (#2824) set at install time are stamped on the line. With no usable backend the run fails closed: exit 1, nothing written,
   the same pairs are asked again next night. A danso-only node needs one of those backends.
 - `install-nunchi.sh` status prints `conflict_sweep_cron: <n> line(s)`.
 - Rollout: one-node canary for 7 days (review-queue growth, flags per night, false

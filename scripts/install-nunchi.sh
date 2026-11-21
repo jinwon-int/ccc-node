@@ -239,6 +239,7 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "$(id -un)" ]; then
     CCC_NUNCHI_CONFLICT_SWEEP="$CONFLICT_SWEEP" \
     NUNCHI_SYNTH_ORDER="${NUNCHI_SYNTH_ORDER:-}" NUNCHI_PIRI="${NUNCHI_PIRI:-}" \
     NUNCHI_PIRI_ARGS="${NUNCHI_PIRI_ARGS:-}" \
+    NUNCHI_SYNTH_CLAUDE_MODEL="${NUNCHI_SYNTH_CLAUDE_MODEL:-}" \
     NUNCHI_SWEEP_DIR="${NUNCHI_SWEEP_DIR:-}" \
     bash "$0" "${ORIGINAL_ARGS[@]}"
 fi
@@ -1117,7 +1118,7 @@ case "$ACTION" in
       # pi, first that answers), NOT through judge-batch's provider switch, so
       # there is no NUNCHI_JUDGE_PROVIDER equivalent to stamp. The only
       # per-node knobs that chain reads are NUNCHI_SYNTH_ORDER / NUNCHI_PIRI /
-      # NUNCHI_PIRI_ARGS; cron starts without the operator's env, so they are
+      # NUNCHI_PIRI_ARGS / NUNCHI_SYNTH_CLAUDE_MODEL (#2824); cron starts without the operator's env, so they are
       # stamped here when set at install time (and replayed by self-update
       # from the same env). With no usable backend the sweep fails closed:
       # exit 1, no flag, no ledger row, the pairs are asked again next run.
@@ -1125,6 +1126,8 @@ case "$ACTION" in
       if [ -n "${NUNCHI_SYNTH_ORDER:-}" ]; then sweep_synth_env+="NUNCHI_SYNTH_ORDER=$(cron_quote "$NUNCHI_SYNTH_ORDER") "; fi
       if [ -n "${NUNCHI_PIRI:-}" ]; then sweep_synth_env+="NUNCHI_PIRI=$(cron_quote "$NUNCHI_PIRI") "; fi
       if [ -n "${NUNCHI_PIRI_ARGS:-}" ]; then sweep_synth_env+="NUNCHI_PIRI_ARGS=$(cron_quote "$NUNCHI_PIRI_ARGS") "; fi
+      # #2824 — a pinned claude synthesis model, same stamping rule.
+      if [ -n "${NUNCHI_SYNTH_CLAUDE_MODEL:-}" ]; then sweep_synth_env+="NUNCHI_SYNTH_CLAUDE_MODEL=$(cron_quote "$NUNCHI_SYNTH_CLAUDE_MODEL") "; fi
       append_cron_line "53 4 * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${sweep_synth_env}${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") NUNCHI_DB=$(cron_quote "$NUNCHI_DB_PATH") NUNCHI_SNAPSHOT=$(cron_quote "$NUNCHI_SNAPSHOT_PATH") $(cron_quote "$python3_bin") $(cron_quote "$HOOKS/nunchi.py") conflict-sweep --apply --since-days 2 --max-pairs 100 >> $(cron_quote "$NUNCHI_DIR/conflict-sweep.cron.log") 2>&1 $MARK gen=$GEN"
       echo "daily conflict-sweep cron added (04:53, flag review=1 only, never closes)"
       if [ "$resolved_provider" = danso ]; then
