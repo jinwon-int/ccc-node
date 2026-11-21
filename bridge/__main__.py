@@ -215,22 +215,12 @@ def _build_global_local_sink_worker(
         "curated",
     }:
         return None
-    from telegram_bot.core import tool_policy
-    from telegram_bot.core.session_scope import (
-        SESSION_SCOPE_SHARED_ALL,
-        normalize_session_scope,
-    )
+    from telegram_bot.utils.memory_policy import owner_global_memory_gate
 
-    profile = tool_policy.resolve_execution_profile(
-        settings.execution_profile,
-        allowed_user_ids=settings.allowed_user_ids,
-        require_allowlist=settings.require_allowlist,
-    )
-    scope = normalize_session_scope(settings.telegram_session_scope)
-    if (
-        profile != tool_policy.EXECUTION_OWNER_OPERATOR
-        or scope == SESSION_SCOPE_SHARED_ALL
-    ):
+    # Same gate as the curated nunchi read hook (#2844), so write and read
+    # sides of the node-global lane cannot drift.
+    allowed, profile, scope = owner_global_memory_gate(settings)
+    if not allowed:
         logger.info(
             "Distill node-global local sink not composed: bridge_memory_mode=%s "
             "requires execution_profile=owner-operator and a session scope other "

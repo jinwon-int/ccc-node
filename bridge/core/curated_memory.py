@@ -18,9 +18,28 @@ from telegram_bot.utils.memory_policy import (
     MEMORY_MODE_CURATED,
     MEMORY_MODE_OFF,
     assert_memory_scope_safe,
+    owner_global_memory_gate,
 )
 
 
+def owner_nunchi_injection_allowed(settings: Any, audience: MemoryAudience | None) -> bool:
+    """May this curated session read the node-global nunchi snapshot? (#2844)
+
+    The node-global nunchi store is the owner's own memory, and the curated
+    layer is shared by non-owner profiles, so the hook is added only when the
+    write-side privacy gate (``owner_global_memory_gate``) passes, no route
+    audience is attached (audience-scoped memory has its own scoped
+    snapshot), and the node is not on the ``external`` isolation profile.
+    """
+
+    if audience is not None:
+        return False
+    if getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF) != MEMORY_MODE_CURATED:
+        return False
+    if str(getattr(settings, "node_isolation_profile", "fleet") or "fleet") != "fleet":
+        return False
+    allowed, _profile, _scope = owner_global_memory_gate(settings)
+    return allowed
 
 
 def _command(hook_dir: Path, relative: str, *args: str, background: bool = False) -> str:
@@ -53,29 +72,37 @@ def build_curated_memory_settings(
     policy_env = dict(settings.hook_policy_environment())
     if audience is not None:
         policy_env.update(audience.hook_environment(settings))
+    session_start: list[dict[str, Any]] = [
+        {
+            "type": "command",
+            "command": _command(hook_dir, "load-memory.sh", "SessionStart"),
+            "timeout": 15,
+        },
+        {
+            "type": "command",
+            "command": _command(
+                hook_dir,
+                "distill/pending-drain.sh",
+                background=True,
+            ),
+            "timeout": 5,
+        },
+    ]
+    if owner_nunchi_injection_allowed(settings, audience):
+        # The installer registers this hook in settings.local.json, which a
+        # setting_sources=[] session never reads (#2844). The hook exits 0
+        # when nunchi is not installed/enabled or the session is scoped.
+        session_start.append(
+            {
+                "type": "command",
+                "command": _command(hook_dir, "nunchi/sessionstart.sh"),
+                "timeout": 15,
+            }
+        )
     payload = {
         "env": policy_env,
         "hooks": {
-            "SessionStart": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": _command(hook_dir, "load-memory.sh", "SessionStart"),
-                            "timeout": 15,
-                        },
-                        {
-                            "type": "command",
-                            "command": _command(
-                                hook_dir,
-                                "distill/pending-drain.sh",
-                                background=True,
-                            ),
-                            "timeout": 5,
-                        },
-                    ]
-                }
-            ],
+            "SessionStart": [{"hooks": session_start}],
             "PreCompact": [
                 {
                     "hooks": [

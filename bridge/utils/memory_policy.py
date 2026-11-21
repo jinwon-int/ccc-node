@@ -66,3 +66,38 @@ def assert_memory_provider_safe(
         and str(codex_audience_auth_mode or "").strip().lower() != "keyring"
     ):
         raise ValueError(_CODEX_AUDIENCE_ERROR)
+
+
+def owner_global_memory_gate(settings: object) -> tuple[bool, str, str]:
+    """Is this bridge the owner's own, so the node-global memory is theirs?
+
+    The single privacy gate for the node-global (unpartitioned) memory lane,
+    shared by the write side (``__main__._build_global_local_sink_worker``,
+    #2296) and the read side (the curated ``nunchi/sessionstart.sh`` hook,
+    #2844) so the two cannot drift. True only for an ``off``/``curated``
+    bridge whose resolved execution profile is ``owner-operator`` (exactly
+    one allowlisted user) and whose session scope is not ``shared-all``.
+
+    Returns ``(allowed, profile, scope)``; the last two are for log lines.
+    Imports are local: ``core`` modules import this module.
+    """
+
+    from telegram_bot.core import tool_policy
+    from telegram_bot.core.session_scope import (
+        SESSION_SCOPE_SHARED_ALL,
+        normalize_session_scope,
+    )
+
+    profile = tool_policy.resolve_execution_profile(
+        getattr(settings, "execution_profile", None),
+        allowed_user_ids=getattr(settings, "allowed_user_ids", None),
+        require_allowlist=getattr(settings, "require_allowlist", True),
+    )
+    scope = normalize_session_scope(getattr(settings, "telegram_session_scope", None))
+    mode = getattr(settings, "bridge_memory_mode", MEMORY_MODE_OFF)
+    allowed = (
+        mode in {MEMORY_MODE_OFF, MEMORY_MODE_CURATED}
+        and profile == tool_policy.EXECUTION_OWNER_OPERATOR
+        and scope != SESSION_SCOPE_SHARED_ALL
+    )
+    return allowed, profile, scope
