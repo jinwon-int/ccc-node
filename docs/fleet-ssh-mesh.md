@@ -43,7 +43,7 @@ scripts/fleet-ssh-mesh.sh [--nodes FILE] [--dry-run] [--allow-partial] PHASE
 | `scan` | `ssh-keyscan -t ed25519` each node's host/port. |
 | `build` | Render `block_authorized_keys`, `block_known_hosts`, `block_config` in the work dir (`$CCC_FLEET_SSH_WORK`, default `~/.claude/state/fleet-mesh`). Refuses when fewer keys or host keys than nodes were collected (a push would drop the missing node everywhere) unless `--allow-partial`. |
 | `push` | Replace the managed block in `~/.ssh/authorized_keys` (append, 600), `~/.ssh/known_hosts` (append, 644) and `~/.ssh/config` (prepend, 600) on every node. `--dry-run` fetches each file read-only and prints the per-node/per-file change as a diff; nothing is written. |
-| `verify` | N×N: from every node, `ssh <alias> echo ok` to every other node. |
+| `verify` | N×N: from every node, `ssh <alias> echo ok` to every other node. Then, for each node that answered, a read-only check of its `~/.ssh/config` for fleet aliases defined outside the managed block (see below). |
 | `all` (default) | `collect`, `scan`, `build`, `push`, stopping at the first failing phase. `verify` is run separately. |
 
 `collect`, `push` and `verify` connect by alias (`ssh <name>`), as defined by
@@ -62,6 +62,38 @@ the managed `~/.ssh/config` block on the machine running the script.
 - Re-running `build` + `push` produces byte-identical files.
 - Exit codes: `0` ok, `1` a node or step failed, `2` usage/config/resolution
   error.
+
+## Alias redefined outside the managed block
+
+The managed block is meant to be the only definition of each fleet alias.
+`ssh` keeps the first value it reads for each option, so a second `Host` entry
+for the same name elsewhere in `~/.ssh/config` can change where the alias
+connects. `verify` reads each reachable node's config (one extra
+`ssh <node> cat ~/.ssh/config`, nothing is written) and prints one line per
+outside `Host` pattern that names an alias the block defines:
+
+```
+VERIFY-WARN node-c ~/.ssh/config:1: Host 'node-a' is also defined outside the managed block, before it: ssh keeps the first value of each option, so this outside entry wins over the managed entry at line 5
+VERIFY-WARN node-a ~/.ssh/config:28: Host 'node-b' is also defined outside the managed block, after it: shadowed by the managed entry at line 9 for the options that entry sets; IdentityFile lines and options only this outside entry sets still apply
+```
+
+- **before** the managed entry: the outside entry wins for every option it
+  sets (`HostName`, `Port`, `User`, ...).
+- **after** it: the managed entry wins for `HostName`, `Port`, `User` and
+  `StrictHostKeyChecking`. An option only the outside entry sets (for example
+  `ProxyJump`) still takes effect, and so does every `IdentityFile` line:
+  `ssh` offers the keys of both entries, in file order.
+- These are warnings. The exit status of `verify` is still the N×N result, and
+  no file is changed: remove or rename the outside entry by hand.
+- Read as `ssh_config(5)` reads it: keyword in any case, leading blanks,
+  `Host=name`, several patterns on one line, quoted patterns, trailing
+  `# comment`. Names compare case-sensitively, as in `ssh`.
+- Not reported: wildcard or negated patterns (`Host *`, `Host node-*`,
+  `Host !x`), `Match` blocks, and files pulled in with `Include`. Any of these
+  placed above the managed block can still override it.
+- A config whose markers are unbalanced, or that cannot be read, gets a single
+  `VERIFY-WARN ... alias check skipped` line. A node that did not answer the
+  N×N check is not contacted again.
 
 Tests: `scripts/fleet-ssh-mesh.test.sh` (stub `ssh`/`ssh-keyscan`/`tailscale`
 via `SSH_BIN`, `SSH_KEYSCAN_BIN`, `TAILSCALE_BIN`; fake nodes are temp HOMEs).

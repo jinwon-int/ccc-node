@@ -15,7 +15,10 @@
 #   build    render the three blocks into the work dir
 #   push     replace the managed block in each file on each node
 #            (--dry-run: report per node/file what would change, write nothing)
-#   verify   N x N check: every node ssh's to every other node by alias
+#   verify   N x N check: every node ssh's to every other node by alias;
+#            then, per reachable node, VERIFY-WARN for every fleet alias that
+#            a Host line outside the managed ~/.ssh/config block defines too
+#            (read-only, warning only: the exit status is the N x N result)
 #
 # Node table — kept OUT of this script and out of the repo. Default path:
 #   ${CCC_FLEET_SSH_NODES:-$HOME/.config/ccc/fleet-ssh-nodes}   (or --nodes FILE)
@@ -99,6 +102,40 @@ AWK_STRIP='$0==mb{skip=1} !skip{print} $0==me{skip=0}'
 # Fail (exit 1) on a begin inside a block, an end outside one, or an
 # unterminated block — stripping such a file could drop unrelated lines.
 AWK_BALANCED='$0==mb{if(inb)bad=1; inb=1; next} $0==me{if(!inb)bad=1; inb=0} END{exit (bad||inb)?1:0}'
+
+# Alias redefinition scan (#2687 proposal 5). Reads one ssh config and prints
+#   <line> <before|after> <managed line> <alias>
+# for every Host pattern OUTSIDE the managed block that names an alias the
+# block defines. ssh keeps the first value it reads for each option, so the
+# position relative to the managed entry decides which definition wins.
+# Read the way ssh_config(5) does: keyword in any case, leading blanks,
+# `Host=a`, several patterns per line, "quoted" patterns, a trailing
+# `# comment`; names compare case-sensitively. Only names the node table could
+# hold are considered, which leaves out wildcard (`*`, `?`) and negated (`!`)
+# patterns and keeps odd bytes from a remote file out of the report.
+AWK_ALIAS='
+$0==mb { inb=1; next }
+$0==me { inb=0; next }
+{
+  line=$0; sub(/\r$/, "", line); sub(/^[ \t]+/, "", line)
+  if (tolower(substr(line, 1, 4)) != "host") next
+  rest=substr(line, 5)   # "name ..." (HostName) and "KeyAlias ..." stop here
+  if (rest !~ /^[ \t]*=[ \t]*[^ \t]/ && rest !~ /^[ \t]+[^ \t]/) next
+  sub(/^[ \t]*=?[ \t]*/, "", rest)
+  n=split(rest, tok, /[ \t]+/)
+  for (i=1; i<=n; i++) {
+    p=tok[i]
+    if (p ~ /^#/) break
+    gsub(/"/, "", p)
+    if (p !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) continue
+    if (inb) { if (!(p in mline)) mline[p]=NR }
+    else { no++; oline[no]=NR; oname[no]=p }
+  }
+}
+END {
+  for (i=1; i<=no; i++) if (oname[i] in mline)
+    print oline[i], (oline[i] < mline[oname[i]] ? "before" : "after"), mline[oname[i]], oname[i]
+}'
 
 # ------------------------------------------------------------- node table
 declare -a NAMES=()
@@ -357,6 +394,36 @@ phase_push() {
   [ "$fails" = 0 ]
 }
 
+# Read-only: fetch <node>'s ~/.ssh/config and warn about every alias the
+# managed block defines that a Host line outside the block defines as well.
+# Nothing is written on the node, and a warning never changes verify's exit
+# status.
+verify_aliases() { # verify_aliases <node>
+  local n="$1" cfg hits ln pos mln alias where
+  if ! cfg=$(sshx "$n" 'f="$HOME/.ssh/config"; if [ -f "$f" ]; then cat "$f"; fi'); then
+    echo "VERIFY-WARN $n ~/.ssh/config: could not be read; alias check skipped"
+    return 0
+  fi
+  [ -n "$cfg" ] || return 0
+  if ! awk -v mb="$MB" -v me="$ME" "$AWK_BALANCED" <<< "$cfg"; then
+    echo "VERIFY-WARN $n ~/.ssh/config: unbalanced marker block; alias check skipped"
+    return 0
+  fi
+  if ! hits=$(awk -v mb="$MB" -v me="$ME" "$AWK_ALIAS" <<< "$cfg"); then
+    echo "VERIFY-WARN $n ~/.ssh/config: alias scan failed; alias check skipped"
+    return 0
+  fi
+  [ -n "$hits" ] || return 0
+  while read -r ln pos mln alias; do
+    if [ "$pos" = before ]; then
+      where="before it: ssh keeps the first value of each option, so this outside entry wins over the managed entry at line $mln"
+    else
+      where="after it: shadowed by the managed entry at line $mln for the options that entry sets; IdentityFile lines and options only this outside entry sets still apply"
+    fi
+    echo "VERIFY-WARN $n ~/.ssh/config:$ln: Host '$alias' is also defined outside the managed block, $where"
+  done <<< "$hits"
+}
+
 phase_verify() {
   local src t targets res fails=0
   for src in "${NAMES[@]}"; do
@@ -368,6 +435,8 @@ phase_verify() {
       done' </dev/null)
     echo "VERIFY $src -> ${res:-FAIL:unreachable}"
     case " ${res:-FAIL:} " in *" FAIL:"*) fails=$((fails + 1)) ;; esac
+    # No answer from the source: there is no config to read, do not probe again.
+    [ -z "$res" ] || verify_aliases "$src"
   done
   [ "$fails" = 0 ]
 }

@@ -330,11 +330,17 @@ run --nodes "$NODES_FILE" verify
 check "verify exits 0 when the mesh is complete" test "$RC" = 0
 check "verify node-a line" has "$OUT" "VERIFY node-a -> node-b node-c "
 check "verify has no failures" hasnt "$OUT" "FAIL:"
+# node-a still carries "Host legacy" outside the block: not a fleet alias.
+check "verify: no alias warning without an outside redefinition" hasnt "$OUT" "VERIFY-WARN"
 touch "$NODES/node-c.down"
+reset_calls
 run --nodes "$NODES_FILE" verify
 check "verify exits 1 with a down node" test "$RC" = 1
 check "verify marks the unreachable target" has "$OUT" "VERIFY node-a -> node-b FAIL:node-c "
 check "verify marks the unreachable source" has "$OUT" "VERIFY node-c -> FAIL:unreachable"
+check "verify: unreachable source gets no alias warning" hasnt "$OUT" "VERIFY-WARN"
+# One call from the operator and one each from node-a and node-b; no config fetch.
+check "verify: unreachable source is not probed a second time" test "$(grep -cx node-c "$FLEET/ssh.calls")" = 3
 
 # --------------------------------------- partial collect / bad pubkey reply
 WORK="$T/work-partial"; export WORK
@@ -367,6 +373,95 @@ check "env table used (one node)" test "$(grep -c '^COLLECT-OK ' <<< "$OUT")" = 
 OUT=$(env -u CCC_FLEET_SSH -u CCC_FLEET_SSH_MARKER HOME="$T/ops" CCC_FLEET_SSH_NODES="$T/cfg/env-nodes" CCC_FLEET_SSH_WORK="$T/work-env" \
   SSH_BIN="$STUB/ssh" FAKE_FLEET="$FLEET" STUB_DIR="$STUB" bash "$SCRIPT" --nodes "$NODES_FILE" collect 2>&1); RC=$?
 check "--nodes overrides the env table" test "$(grep -c '^COLLECT-OK ' <<< "$OUT")" = 3
+
+# ------------- verify: fleet alias redefined outside the managed block (#2687)
+# Every node's config is the pushed block (Host node-a/-b/-c at lines 2/9/16);
+# node-a also keeps its "Host legacy" entry below it.
+C="$NODES/node-c/home/.ssh"
+for n in a b c; do cp -p "$NODES/node-$n/home/.ssh/config" "$T/keep_config_$n"; done
+warns() { grep -c "^VERIFY-WARN $1" <<< "$OUT"; }
+OUTSIDE="is also defined outside the managed block"
+clean=$(snapshot)
+
+# After the block: the managed entry is read first and shadows this one.
+after_ln=$(( $(wc -l < "$A/config") + 2 ))
+printf '\nHost node-b\n    HostName 203.0.113.7\n' >> "$A/config"
+# Before the block: this entry is read first and wins.
+{ printf 'Host node-a\n    HostName 203.0.113.8\n\n'; cat "$T/keep_config_c"; } > "$C/config"
+before=$(snapshot)
+run --nodes "$NODES_FILE" verify
+check "alias warning does not change the exit status" test "$RC" = 0
+check "alias warning leaves the N x N result intact" has "$OUT" "VERIFY node-a -> node-b node-c "
+check "after the block: line number, alias, shadowed by the managed entry" has "$OUT" \
+  "VERIFY-WARN node-a ~/.ssh/config:$after_ln: Host 'node-b' $OUTSIDE, after it: shadowed by the managed entry at line 9"
+check "before the block: line number, alias, the outside entry wins" has "$OUT" \
+  "VERIFY-WARN node-c ~/.ssh/config:1: Host 'node-a' $OUTSIDE, before it: ssh keeps the first value of each option, so this outside entry wins over the managed entry at line 5"
+check "one warning per redefinition (node-a)" test "$(warns node-a)" = 1
+check "one warning per redefinition (node-c)" test "$(warns node-c)" = 1
+check "a node without a redefinition gets no warning" test "$(warns node-b)" = 0
+check "verify modifies or creates no file on any node" test "$(snapshot)" = "$before"
+
+# Several patterns on one line, keyword case, leading blanks, a tab, a quoted
+# pattern, Host=, and a trailing comment that only mentions an alias.
+multi_ln=$(( $(wc -l < "$B/config") + 1 ))
+printf '  hOsT\tlegacy node-c  "node-a" # node-b in a comment\n    HostName 203.0.113.9\nHost=node-b\n' >> "$B/config"
+run --nodes "$NODES_FILE" verify
+check "multi-pattern Host line: first fleet alias" has "$OUT" "VERIFY-WARN node-b ~/.ssh/config:$multi_ln: Host 'node-c' $OUTSIDE, after it"
+check "multi-pattern Host line: quoted fleet alias" has "$OUT" "VERIFY-WARN node-b ~/.ssh/config:$multi_ln: Host 'node-a' $OUTSIDE, after it"
+check "Host=<alias> form" has "$OUT" "VERIFY-WARN node-b ~/.ssh/config:$((multi_ln + 2)): Host 'node-b' $OUTSIDE, after it"
+check "non-fleet pattern and trailing comment are not reported" test "$(warns node-b)" = 3
+check "non-fleet pattern on the same line is not named" hasnt "$OUT" "Host 'legacy'"
+
+# Nothing here defines a fleet alias: wildcards, negation, other keywords that
+# start with "Host", a comment, a Match block, other names, another case.
+cp -p "$T/keep_config_b" "$B/config"
+cat >> "$B/config" <<'EOF'
+Host *
+    ServerAliveInterval 30
+Host node-* !node-a ?ode-b
+    User nobody
+# Host node-a
+    HostName node-a
+    HostKeyAlias node-b
+Match host node-c
+    User nobody
+Host NODE-A Node-B other node-a.example
+EOF
+run --nodes "$NODES_FILE" verify
+check "Host * and other non-definitions are ignored" test "$(warns node-b)" = 0
+check "ignored forms: exit status 0" test "$RC" = 0
+
+# An unbalanced marker block makes inside/outside undecidable: say so, skip.
+cp -p "$T/keep_config_b" "$B/config"
+printf '%s\nHost node-a\n' "$MB" >> "$B/config"
+b_sum=$(sha256sum < "$B/config")
+run --nodes "$NODES_FILE" verify
+check "unbalanced config block: check skipped with a warning" has "$OUT" "VERIFY-WARN node-b ~/.ssh/config: unbalanced marker block; alias check skipped"
+check "unbalanced config block: nothing else reported for that node" test "$(warns node-b)" = 1
+check "unbalanced config block: exit status 0" test "$RC" = 0
+check "unbalanced config block: file left as it was" test "$(sha256sum < "$B/config")" = "$b_sum"
+
+# No config at all: nothing to compare, and verify does not create one.
+rm -f "$B/config"
+run --nodes "$NODES_FILE" verify
+check "missing config: no warning" test "$(warns node-b)" = 0
+check "missing config: not created" test ! -e "$B/config"
+cp -p "$T/keep_config_b" "$B/config"
+
+# The config cannot be read on the node (stub cat on the fake node's PATH).
+real_cat=$(command -v cat)
+printf '#!/bin/sh\ncase "$*" in */.ssh/config) echo "cat: $*: Permission denied" >&2; exit 1 ;; esac\nexec %s "$@"\n' "$real_cat" > "$STUB/cat"
+chmod +x "$STUB/cat"
+run --nodes "$NODES_FILE" verify
+rm -f "$STUB/cat"
+check "unreadable config: check skipped with a warning" has "$OUT" "VERIFY-WARN node-b ~/.ssh/config: could not be read; alias check skipped"
+check "unreadable config: one warning per node, no alias report" test "$(grep -c '^VERIFY-WARN ' <<< "$OUT")" = 3
+check "unreadable config: exit status 0" test "$RC" = 0
+
+cp -p "$T/keep_config_a" "$A/config"; cp -p "$T/keep_config_c" "$C/config"
+run --nodes "$NODES_FILE" verify
+check "redefinitions removed: no warning left" hasnt "$OUT" "VERIFY-WARN"
+check "alias checks left every node as they found it" test "$(snapshot)" = "$clean"
 
 # ---------------------------------------------------- final key sweep
 check "no private key material anywhere off-node" test -z "$(grep -rl 'PRIVATE' "$T/work" "$T/work-partial" "$T/work-env" "$T/ops" "$T/tmp" "$ALL_OUT" 2>/dev/null)"
