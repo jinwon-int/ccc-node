@@ -24,8 +24,8 @@
 #   install-nunchi.sh --apply --conflict-sweep # + daily implicit-conflict sweep
 #                                            # (#2479); flags review=1 only, never closes
 #   install-nunchi.sh --apply --verbatim-backend both
-#                                            # + hourly gotgan refresh beside the
-#                                            # MemPalace sweep (#2331 P3-2);
+#                                            # + daily gotgan refresh beside the
+#                                            # MemPalace sweep (#2331 P3-2, #2850);
 #                                            # `gotgan` drops the MemPalace sweep,
 #                                            # `mempalace` (default) is unchanged
 #   install-nunchi.sh --apply --target-user gongmyoung
@@ -110,6 +110,18 @@ case "$CONFLICT_SWEEP" in
 esac
 WIKI_PROMOTE="${CCC_NUNCHI_WIKI_PROMOTE:-0}"
 WIKI_PROMOTE_APPLY="${CCC_NUNCHI_WIKI_PROMOTE_APPLY:-0}"
+# Verbatim-layer refresh schedules (#2850). The MemPalace/gotgan transcript
+# index feeds only `nunchi.py dialectic` (verbatim_excerpts) and its weekly
+# bench; recall, snapshot and assemble never read it. Measured 2026-11-21 over
+# 12 nodes: 4 dialectic calls in 28 days against an hourly refresh costing
+# ~32,300 s/day fleet-wide, so the owner chose a once-a-day early-morning run.
+# 02:17 / 02:47 KST keep clear of wiki-agent (03:4x), self-update (04:45/05:45),
+# the conflict sweep (04:53) and the Monday 11:07 bench, and leave 30 min
+# between the two transcript readers because a day's backlog runs longer than
+# an hour's. The doctor's sweep age gate (CCC_NUNCHI_SWEEP_STALE_MIN, 1560 min
+# = 26 h) already fits a daily tick.
+MEMPALACE_REFRESH_SCHEDULE="17 2 * * *"
+GOTGAN_REFRESH_SCHEDULE="47 2 * * *"
 AUDIENCE_SCOPED="${CCC_NUNCHI_AUDIENCE_SCOPED:-0}"
 AUDIENCE_ROOT="${CCC_NUNCHI_AUDIENCE_ROOT:-}"
 # #2331 P3-2 — which verbatim store the hourly refresh keeps current and the
@@ -1025,8 +1037,8 @@ case "$ACTION" in
     if [ "$VERBATIM_BACKEND" = gotgan ]; then
       echo "verbatim backend gotgan: MemPalace refresh cron not installed (store stays on disk, untouched)"
     elif [ "$refresh_ready" = 1 ]; then
-      append_cron_line "17 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK gen=$GEN"
-      echo "mempalace hourly refresh cron added ($resolved_provider: $sweep_dir)"
+      append_cron_line "$MEMPALACE_REFRESH_SCHEDULE CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") CCC_NUNCHI_MEMPALACE_STATUS=$(cron_quote "$MEMPALACE_STATUS") CCC_NUNCHI_MEMPALACE_REFRESH_TIMEOUT_SEC=$(cron_quote "$MEMPALACE_TIMEOUT") CCC_NUNCHI_MEMPALACE_CLI=$(cron_quote "$mp") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/mempalace-sweep.cron.log") 2>&1 $MARK gen=$GEN"
+      echo "mempalace daily refresh cron added ($MEMPALACE_REFRESH_SCHEDULE, $resolved_provider: $sweep_dir)"
     elif [ "$claude_scoped" = 1 ]; then
       echo "$resolved_provider audience-scoped: verbatim MemPalace refresh is not audience-routable — refresh cron skipped (peer facts use validated audience routes)"
     else
@@ -1041,8 +1053,8 @@ case "$ACTION" in
       if [ -n "$GOTGAN_RUN_BYTES_PIN" ]; then gotgan_budget_env="GOTGAN_RUN_BYTES=$(cron_quote "$GOTGAN_RUN_BYTES_PIN") "; fi
       gotgan_py_env=""
       if [ -n "$GOTGAN_PYTHON_PIN" ]; then gotgan_py_env="CCC_NUNCHI_GOTGAN_PYTHON=$(cron_quote "$GOTGAN_PYTHON_PIN") "; fi
-      append_cron_line "27 * * * * CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${gotgan_budget_env}${gotgan_py_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") GOTGAN_DB=$(cron_quote "$GOTGAN_DB_PATH") CCC_NUNCHI_GOTGAN_STATUS=$(cron_quote "$GOTGAN_STATUS") CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC=$(cron_quote "$GOTGAN_TIMEOUT") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$gotgan_refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/gotgan-refresh.cron.log") 2>&1 $MARK gen=$GEN"
-      echo "gotgan hourly refresh cron added (:27, $resolved_provider: $sweep_dir, backend=$VERBATIM_BACKEND)"
+      append_cron_line "$GOTGAN_REFRESH_SCHEDULE CCC_STATE_DIR=$(cron_quote "$STATE") ${scoped_env}${gotgan_budget_env}${gotgan_py_env}NUNCHI_HOME=$(cron_quote "$NUNCHI_DIR") GOTGAN_DB=$(cron_quote "$GOTGAN_DB_PATH") CCC_NUNCHI_GOTGAN_STATUS=$(cron_quote "$GOTGAN_STATUS") CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC=$(cron_quote "$GOTGAN_TIMEOUT") CCC_NUNCHI_TIMEOUT_CLI=$(cron_quote "$timeout_bin") CCC_NUNCHI_FLOCK_CLI=$(cron_quote "$flock_bin") $(cron_quote "$bash_bin") $(cron_quote "$gotgan_refresh") $resolved_provider $(cron_quote "$sweep_dir") >> $(cron_quote "$NUNCHI_DIR/gotgan-refresh.cron.log") 2>&1 $MARK gen=$GEN"
+      echo "gotgan daily refresh cron added ($GOTGAN_REFRESH_SCHEDULE, $resolved_provider: $sweep_dir, backend=$VERBATIM_BACKEND)"
     fi
     write_backend_file "$VERBATIM_BACKEND"
     # Bench must score the backend the node actually reads at SessionStart;
