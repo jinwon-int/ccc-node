@@ -1133,6 +1133,83 @@ class RelativeFalsePositive2544Tests(unittest.TestCase):
         self.assertEqual(scanner.notify_candidates(findings, "high"), [])
 
 
+# --- relative mode: later absolute booking / not-started marker (#2817) -------
+# Reduced from the 2026-11-15 relative list: iphone-agent-cast#87/#89 kept
+# their relative wording after a later comment booked an absolute end, and
+# a2a-nexus#2395's soak had not started yet.
+REL_BOOKING = "종료 일시: **2026-11-23 09:00 KST** (1~2주 운영 뒤 기준 조정)"
+
+
+class RelativeSupersede2817Tests(unittest.TestCase):
+    _judge = RelativeFalsePositive2544Tests._judge
+    assertDemoted = RelativeFalsePositive2544Tests.assertDemoted
+    assertFlagged = RelativeFalsePositive2544Tests.assertFlagged
+
+    def test_later_absolute_comment_supersedes_a_relative_comment(self) -> None:
+        # iphone-agent-cast#87: "1~2주 운영 뒤 기준 조정" (10-27), booked 11-15.
+        relative = _rel_comment("- 1~2주 운영 뒤 기준 조정", "2026-10-27T01:00:00Z", author="jinon86")
+        self.assertFlagged(_rel_issue(comments=[relative]))
+        booking = _rel_comment(REL_BOOKING, "2026-11-15T03:00:00Z")
+        issue = _rel_issue(comments=[relative, booking])
+        self.assertDemoted(issue, "superseded-by-absolute")
+        self.assertEqual(scanner.scan([issue], NOW, "relative", min_confidence="high"), [])
+
+    def test_later_absolute_comment_supersedes_the_body(self) -> None:
+        # iphone-agent-cast#89: the relative wording is in the body.
+        body = "1~2주 운영한 뒤 #87에서 다시 본다"
+        self.assertFlagged(_rel_issue(body=body, author="jinon86"))
+        booking = _rel_comment(REL_BOOKING, "2026-11-15T03:00:00Z")
+        self.assertDemoted(_rel_issue(body=body, comments=[booking], author="jinon86"),
+                           "superseded-by-absolute")
+
+    def test_earlier_absolute_comment_does_not_supersede(self) -> None:
+        booking = _rel_comment(REL_BOOKING, "2026-11-15T03:00:00Z")
+        relative = _rel_comment("- 배포 후 며칠 관찰한 뒤 판정", "2026-11-16T03:00:00Z")
+        self.assertFlagged(_rel_issue(comments=[booking, relative]))
+
+    def test_only_a_high_confidence_booking_supersedes(self) -> None:
+        relative = _rel_comment("- 배포 후 며칠 관찰한 뒤 판정", "2026-10-27T01:00:00Z")
+        for name, later in (
+            ("past-at-posting", _rel_comment("관측 종료 2026-11-01 09:00 KST", "2026-11-15T03:00:00Z")),
+            ("date-only", _rel_comment("관측 종료 2026-11-23", "2026-11-15T03:00:00Z")),
+            ("cross-reference", _rel_comment("#99 관측 종료 2026-11-23 09:00 KST", "2026-11-15T03:00:00Z")),
+            ("no keyword", _rel_comment("2026-11-23 09:00 KST 회의", "2026-11-15T03:00:00Z")),
+            ("external author", _rel_comment(REL_BOOKING, "2026-11-15T03:00:00Z", author="outsider")),
+        ):
+            with self.subTest(name=name):
+                self.assertFlagged(_rel_issue(comments=[relative, later]))
+
+    def test_existing_demotion_reason_is_kept(self) -> None:
+        relative = _rel_comment("페이지 넘김은 당분간 오너 수동.", "2026-10-27T01:00:00Z")
+        booking = _rel_comment(REL_BOOKING, "2026-11-15T03:00:00Z")
+        self.assertDemoted(_rel_issue(comments=[relative, booking]), "operational-wording")
+
+    def test_not_started_marker_demotes_to_low(self) -> None:
+        # a2a-nexus#2395: the soak has not started; its end will be booked at start.
+        body = "- 소크: 실제 T2 태스크 수일분. 프록시 로그의 호스트 집합을 수집한다."
+        marker = _rel_comment(
+            "소크 미시작 — 시작일에 종료일시 코멘트 예정\n\n"
+            "- **시작 일시**: 미정\n- **시작 조건**: T2 워커 2대 복구 후",
+            "2026-11-15T03:00:00Z",
+        )
+        self.assertDemoted(_rel_issue(body=body, comments=[marker], author="jinon86"), "not-started")
+        same_source = body + "\n| 시작 일시 | 미정 |\n| 시작 조건 | T2 워커 복구 |"
+        self.assertDemoted(_rel_issue(body=same_source, author="jinon86"), "not-started")
+
+    def test_incomplete_or_earlier_not_started_marker_keeps_high(self) -> None:
+        relative = _rel_comment("- 소크: 실제 T2 태스크 수일분", "2026-11-16T03:00:00Z")
+        for name, marker in (
+            ("date line only", "- 시작 일시: 미정"),
+            ("condition line only", "- 시작 조건: T2 워커 복구 후"),
+            ("start decided", "- 시작 일시: 2026-11-20 09:00 KST\n- 시작 조건: T2 워커 복구 후"),
+        ):
+            with self.subTest(name=name):
+                later = _rel_comment(marker, "2026-11-17T03:00:00Z")
+                self.assertFlagged(_rel_issue(comments=[relative, later]))
+        earlier = _rel_comment("- 시작 일시: 미정\n- 시작 조건: T2 워커 복구 후", "2026-11-15T03:00:00Z")
+        self.assertFlagged(_rel_issue(comments=[earlier, relative]))
+
+
 class ReposFileTests(unittest.TestCase):
     """An unconfigured scheduled scan must never look like a clean scan.
 

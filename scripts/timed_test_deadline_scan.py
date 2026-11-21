@@ -35,6 +35,8 @@ Three modes:
     "당분간" operations, effort estimates, external process durations, quoted
     rule text, judged checkboxes, outside authors — are demoted to low
     confidence with a reason code (#2544); see ``classify_relative_paragraph``.
+    So is a paragraph a later comment superseded with an absolute booking,
+    and a test marked as not started yet (#2817); see ``relative_offenders``.
 
 ``followup`` (opt-in, #2324)
     A verdict was posted, and the verdict comment or a later one promised a
@@ -258,6 +260,26 @@ REL_PROCESS = "process-duration"  # family-messenger#338 "수일 소요"
 REL_PAST_EVENT = "past-event-offset"  # family-messenger#616 "15시간 뒤에야 일어났고" (#2635)
 REL_CLOCK_GLOSS = "anchored-clock-gloss"  # family-messenger#616 "10-31 11:27:19(약 15시간 뒤)"
 REL_GENERIC = "generic-duration"  # ccc-node#2659 "며칠씩 … 이어질 수 있습니다"
+# Issue-level shapes (#2817), applied after the paragraph rules above:
+REL_SUPERSEDED = "superseded-by-absolute"  # iphone-agent-cast#87/#89
+REL_NOT_STARTED = "not-started"  # a2a-nexus#2395
+
+# A test that has not started yet cannot have an end datetime, so the owner
+# rule is met by saying so (#2817, a2a-nexus#2395): a "시작 일시: 미정" line
+# plus a "시작 조건: …" line, in the same source as the relative paragraph or
+# a later one. Demoted to low, not dropped — a condition that never clears
+# must stay visible.
+_LABEL_LEAD = r"^[\s>*_#|-]*"
+_LABEL_SEP = r"[\s*_]*[:：|][\s*_]*"
+NOT_STARTED_DATE = re.compile(
+    _LABEL_LEAD + r"(?:시작\s*(?:일시|일자|시각|일)|start\s+(?:date|time))" + _LABEL_SEP
+    + r"(?:미정|TBD|undecided)",
+    re.IGNORECASE | re.MULTILINE,
+)
+NOT_STARTED_CONDITION = re.compile(
+    _LABEL_LEAD + r"(?:시작\s*조건|start\s+condition)" + _LABEL_SEP + r"\S",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Accounts whose words are the fleet's own (skills/external-github-content:
 # jinon86, seoseo-ai and the fleet dependency bots). GitHub renders an app as
@@ -663,56 +685,72 @@ def collect_hits(issue: dict[str, Any]) -> tuple[list[Hit], list[str]]:
         # The issue body is not a completion report no matter what it says,
         # so only comments contribute a header signal.
         header = text[:SETTLED_HEADER_CHARS] if posted is not None else ""
-        is_claim = posted is not None and bool(CLAIM_MARKER.search(text))
-        explicit_hits = len(hits)
-        for paragraph in _iter_paragraphs(text):
-            if not DEADLINE_KEYWORD.search(INLINE_CODE.sub("", paragraph)):
-                continue
-            dates = _dates_in(paragraph)
-            if not dates:
-                continue
-            reason = classify_false_positive(paragraph, number, header)
-            if reason is None and (is_claim or CLAIM_ETA.search(paragraph)):
-                reason = "claim-eta"
-            # A paragraph may render the same instant twice (KST and UTC);
-            # _dates_in already normalised marked UTC, so both agree. Keep the
-            # latest, which is also the KST rendering of an unmarked UTC pair.
-            deadline, explicit = max(dates, key=lambda item: item[0])
-            # A booking always precedes its deadline. A comment stating a time
-            # that had already passed when it was posted is a record of what
-            # happened — "테스트 종료: 07:36:11 UTC" inside the result report
-            # posted eight minutes later (a2a-nexus#2256) — or a nag citing a
-            # missed deadline whose original booking is scored on its own.
-            # Demote, keep.
-            if reason is None and posted is not None and deadline <= posted:
-                reason = "past-at-posting"
-            # The owner rule asks for an absolute KST *datetime*. A bare date
-            # next to a deadline keyword is more often a citation than a
-            # booking — "오너 규칙(2026-09-11)은 … 종료 일시를 …" got the
-            # scanner's own tracking issue (ccc-node#1870) reported at high
-            # confidence on its first production run (#1873). Demote, keep.
-            if reason is None and not explicit:
-                reason = "date-only"
-            if reason:
-                dropped.append(f"{reason}: {paragraph[:90]}")
-            hits.append(
-                Hit(
-                    deadline=deadline,
-                    paragraph=paragraph,
-                    source_url=source_url,
-                    posted_at=posted,
-                    had_explicit_time=explicit,
-                    weak_reason=reason,
-                )
-            )
+        source_hits, source_dropped = _explicit_hits(text, source_url, posted, number)
+        hits.extend(source_hits)
+        dropped.extend(source_dropped)
         # An explicit end in this comment is the booking; an anchor + offset
         # beside it would only double-detect the same window (#2252).
-        if len(hits) == explicit_hits:
+        if not source_hits:
             inferred = _infer_anchor_offset(text)
             if inferred is not None:
                 hit = _inferred_hit(inferred, number, header, source_url, posted)
                 dropped.append(f"{hit.weak_reason}: {hit.paragraph[:90]}")
                 hits.append(hit)
+    return hits, dropped
+
+
+def _explicit_hits(
+    text: str, source_url: str, posted: dt.datetime | None, number: int
+) -> tuple[list[Hit], list[str]]:
+    """Deadline-keyword paragraphs with a date in one source (body or comment).
+
+    ``posted`` is None for the issue body. Shared by expired mode and by the
+    relative-mode supersede check (#2817), so both agree on what a booking is.
+    """
+    header = text[:SETTLED_HEADER_CHARS] if posted is not None else ""
+    is_claim = posted is not None and bool(CLAIM_MARKER.search(text))
+    hits: list[Hit] = []
+    dropped: list[str] = []
+    for paragraph in _iter_paragraphs(text):
+        if not DEADLINE_KEYWORD.search(INLINE_CODE.sub("", paragraph)):
+            continue
+        dates = _dates_in(paragraph)
+        if not dates:
+            continue
+        reason = classify_false_positive(paragraph, number, header)
+        if reason is None and (is_claim or CLAIM_ETA.search(paragraph)):
+            reason = "claim-eta"
+        # A paragraph may render the same instant twice (KST and UTC);
+        # _dates_in already normalised marked UTC, so both agree. Keep the
+        # latest, which is also the KST rendering of an unmarked UTC pair.
+        deadline, explicit = max(dates, key=lambda item: item[0])
+        # A booking always precedes its deadline. A comment stating a time
+        # that had already passed when it was posted is a record of what
+        # happened — "테스트 종료: 07:36:11 UTC" inside the result report
+        # posted eight minutes later (a2a-nexus#2256) — or a nag citing a
+        # missed deadline whose original booking is scored on its own.
+        # Demote, keep.
+        if reason is None and posted is not None and deadline <= posted:
+            reason = "past-at-posting"
+        # The owner rule asks for an absolute KST *datetime*. A bare date
+        # next to a deadline keyword is more often a citation than a
+        # booking — "오너 규칙(2026-09-11)은 … 종료 일시를 …" got the
+        # scanner's own tracking issue (ccc-node#1870) reported at high
+        # confidence on its first production run (#1873). Demote, keep.
+        if reason is None and not explicit:
+            reason = "date-only"
+        if reason:
+            dropped.append(f"{reason}: {paragraph[:90]}")
+        hits.append(
+            Hit(
+                deadline=deadline,
+                paragraph=paragraph,
+                source_url=source_url,
+                posted_at=posted,
+                had_explicit_time=explicit,
+                weak_reason=reason,
+            )
+        )
     return hits, dropped
 
 
@@ -901,8 +939,28 @@ def classify_relative_paragraph(
     return None
 
 
+def _is_not_started(text: str) -> bool:
+    return bool(NOT_STARTED_DATE.search(text) and NOT_STARTED_CONDITION.search(text))
+
+
 def relative_offenders(issue: dict[str, Any]) -> list[tuple[str, str | None]]:
-    """(paragraph, weak_reason) for every relative-only paragraph, in order."""
+    """(paragraph, weak_reason) for every relative-only paragraph, in order.
+
+    Two issue-level rules follow the paragraph rules (#2817). Neither applies
+    to a paragraph already demoted, and both look only at fleet-authored
+    sources posted *after* the paragraph's own (the body is earliest; the
+    not-started marker may also sit in the same source):
+
+    ``superseded-by-absolute``
+        A later comment books an absolute end that expired mode accepts at
+        high confidence (deadline keyword + explicit datetime, not past at
+        posting, not a claim ETA, cross-reference or report). Expired mode
+        owns the issue from then on. An earlier booking supersedes nothing.
+    ``not-started``
+        A "시작 일시: 미정" + "시작 조건: …" marker.
+    """
+    number = int(issue.get("number", 0))
+    url = issue.get("url", "")
     sources: list[tuple[str, str | None, dt.datetime | None]] = [
         (issue.get("body") or "", _author_login(issue), None)
     ]
@@ -915,9 +973,23 @@ def relative_offenders(issue: dict[str, Any]) -> list[tuple[str, str | None]]:
         posted for text, _, posted in sources
         if posted is not None and _verdict_strength(text) == "strict"
     ]
+    booking_times: list[dt.datetime] = []
+    not_started_times: list[dt.datetime | None] = []
+    for text, author, posted in sources:
+        if not is_fleet_author(author):
+            continue
+        if posted is not None:
+            hits, _ = _explicit_hits(text, url, posted, number)
+            if any(hit.weak_reason is None for hit in hits):
+                booking_times.append(posted)
+        if _is_not_started(text):
+            not_started_times.append(posted)
     offenders: list[tuple[str, str | None]] = []
     for text, author, posted in sources:
         verdict_after = any(posted is None or when > posted for when in verdict_times)
+        at = posted or dt.datetime.min  # the body predates every comment
+        superseded = any(when > at for when in booking_times)
+        not_started = any((when or dt.datetime.min) >= at for when in not_started_times)
         for paragraph, fenced in _iter_paragraphs_fenced(text):
             if not RELATIVE_DURATION.search(paragraph):
                 continue
@@ -926,6 +998,10 @@ def relative_offenders(issue: dict[str, Any]) -> list[tuple[str, str | None]]:
             reason = classify_relative_paragraph(
                 paragraph, author=author, in_code_block=fenced, verdict_after=verdict_after
             )
+            if reason is None and superseded:
+                reason = REL_SUPERSEDED
+            elif reason is None and not_started:
+                reason = REL_NOT_STARTED
             offenders.append((paragraph[:160], reason))
     return offenders
 
