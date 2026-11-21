@@ -96,7 +96,10 @@ def _bot_harness(
     return bot
 
 
-async def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+# 10 s, not 2 s (#2832): this is only the failure bound. A passing run returns
+# as soon as the predicate holds; on a loaded CI runner the retry/discard path
+# sometimes needed more than 2 s of wall time and failed spuriously.
+async def _wait_until(predicate, *, timeout: float = 10.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:

@@ -130,10 +130,16 @@ class SinkTests(unittest.IsolatedAsyncioTestCase):
             script.write_text("#!/bin/bash\nsleep 30\n")
             sink = SkillUsageSink({"HOME": raw, "PATH": os.environ["PATH"], "CCC_SKILL_USAGE_LOGGER": str(script)})
             with patch("telegram_bot.core.skill_usage._TIMEOUT_SECONDS", 0.05):
+                loop = asyncio.get_running_loop()
+                started = loop.time()
                 for _ in range(20):
                     sink.record("test-skill")
+                # The observer contract: record() never waits on the logger.
+                self.assertLess(loop.time() - started, 1.0)
                 self.assertEqual(len(sink._tasks), 4)
-                await asyncio.wait_for(sink.drain(), 2)
+                # Failure bound only (#2821): killing 4 bounded loggers took
+                # >2 s on a loaded merge_group runner; a pass returns early.
+                await asyncio.wait_for(sink.drain(), 10)
             self.assertFalse(sink._tasks)
 
     async def test_logger_descendants_are_killed_even_after_parent_success(self):
