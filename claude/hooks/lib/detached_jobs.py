@@ -72,6 +72,21 @@ hand-written units. A transient timer does not survive a reboot (#2827): use
 ``schedule`` only for waits that cannot cross one, and a persistent
 ``Persistent=true`` unit for waits spanning nights or days.
 
+Reboot export / restore (#2827)
+-------------------------------
+A reboot that does happen must not take the armed timers with it. ``schedule``
+therefore writes the exact ``systemd-run`` argv it launched into the registry
+row (``launch_argv``): run time, command, ``Environment=`` and ``--user`` in
+one piece, on disk, where a reboot cannot reach it. ``restore-timers`` replays
+that argv for every scheduled job that has not started and whose timer is
+gone, so nothing is rebuilt from the restoring shell's own HOME/PATH.
+``export-timers`` is the pre-reboot snapshot of the same jobs plus the values
+of each live unit (``systemctl cat``); ``restore-timers --from <snapshot>``
+compares those values with the re-created unit. Neither command guesses: a job
+whose one-shot time has passed is reported ``missed`` and never re-armed for a
+later time, and a row written before ``launch_argv`` existed is reported
+``unrestorable``.
+
 Usage::
 
     detached_jobs.py register --unit U --log P [--summary S] [--workdir W]
@@ -81,6 +96,8 @@ Usage::
                               [--result-file P] [--user] [--print] -- <cmd…>
     detached_jobs.py notify   --unit U --exit N [--summary S] [--log P]
                               [--tier T] [--fail-tier T] [--result-file P]
+    detached_jobs.py export-timers  [--out FILE]
+    detached_jobs.py restore-timers [--from FILE] [--dry-run]
 
 Tiers (#2710) are the fleet-alert tiers ``info|notice|action|critical``.
 ``notify`` defaults to ``info`` (held for the 09:00 KST digest);
@@ -151,6 +168,26 @@ RESULT_MAX_CHARS = 280
 RESULT_READ_BYTES = 8192
 SCOPE_USER = "user"
 SCOPE_SYSTEM = "system"
+
+# Reboot export/restore of scheduled timers (#2827). ``schedule`` stores the
+# exact argv it launched under LAUNCH_KEY; the TIMER_* values say where a
+# scheduled job that has not started stands.
+LAUNCH_KEY = "launch_argv"
+EXPORT_VERSION = 1
+TIMER_ARMED = "armed"                # its .timer is active: nothing to do
+TIMER_MISSING = "missing"            # timer gone, still due: restore re-creates it
+TIMER_MISSED = "missed"              # timer gone and the one-shot time has passed
+TIMER_UNRESTORABLE = "unrestorable"  # timer gone and no usable launch argv
+# Registry fields an export carries, so a snapshot row can be judged and
+# replayed exactly like the registry row it was copied from.
+_EXPORT_KEYS = (
+    "unit", "log", "log_offset", "started_at", "scheduled_at", "scheduled_epoch",
+    "scope", "summary", "workdir", "tier", LAUNCH_KEY,
+)
+# Unit-file settings compared by value between a snapshot and the live unit.
+_LIVE_KEYS = ("OnCalendar", "Environment", "WorkingDirectory", "ExecStart")
+# Operator-run commands: an unexpected error must be loud, unlike the sweep.
+_LOUD_COMMANDS = ("export-timers", "restore-timers")
 
 # Longest alternatives first: ``m`` must not swallow the start of ``min``.
 _DURATION_RE = re.compile(r"(\d+)\s*(hours|hour|hrs|hr|days|day|secs|sec|min|d|h|m|s)?", re.IGNORECASE)
@@ -414,14 +451,17 @@ def marker_baseline(log_path: str, unit: str, *, user: bool = False, scheduled: 
         return 0
 
 
+def _log_offset(rec: Dict[str, Any]) -> int:
+    try:
+        return int(rec.get("log_offset") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def classify_one(rec: Dict[str, Any], *, now: Optional[float] = None) -> Tuple[str, Optional[int]]:
     """Return (state, exit_code). exit_code is None unless state is done."""
     log_path = str(rec.get("log") or "")
-    try:
-        offset = int(rec.get("log_offset") or 0)
-    except (TypeError, ValueError):
-        offset = 0
-    code = read_exit_marker(log_path, offset)
+    code = read_exit_marker(log_path, _log_offset(rec))
     if code is not None:
         return STATE_DONE, code
     age = _log_age(log_path)
@@ -709,6 +749,10 @@ def _spool_dir() -> str:
     return os.path.join(state, "telegram-spool")
 
 
+def _node_name() -> str:
+    return os.environ.get("CCC_NODE", "").strip() or (os.uname().nodename.split(".")[0] if hasattr(os, "uname") else "node")
+
+
 def read_result_line(path: str) -> str:
     """The job's own result line from ``--result-file`` (#2710), or ''.
 
@@ -753,7 +797,7 @@ def write_notice(
     if log_path:
         text += f" · 로그 {log_path}"
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    node = os.environ.get("CCC_NODE", "").strip() or (os.uname().nodename.split(".")[0] if hasattr(os, "uname") else "node")
+    node = _node_name()
     record = {
         "ts": ts, "event": NOTIFY_EVENT, "node": node, "text": text,
         "dedup": f"{NOTIFY_EVENT}:{unit}:{exit_code}", "tier": tier,
@@ -826,7 +870,8 @@ _SCHEDULE_USAGE = (
     " [--summary S] [--workdir W] [--tier T (default notice)] [--fail-tier T]"
     " [--result-file P] [--user] [--print] -- <command…>\n"
     "note: the timer is transient and a reboot erases it (#2827) — for a wait that\n"
-    "spans nights or days use a persistent Persistent=true unit instead.\n"
+    "spans nights or days use a persistent Persistent=true unit instead. Around a\n"
+    "reboot: `export-timers --out FILE` before, `restore-timers --from FILE` after.\n"
 )
 
 
@@ -917,6 +962,10 @@ def cmd_schedule(argv: List[str]) -> int:
         "scheduled_at": at[:80],
         "notify_on_exit": True,
         "tier": tier,
+        # The argv just launched, whole: what `restore-timers` replays after a
+        # reboot erased the transient timer (#2827). Time, command,
+        # Environment= and --user all live in it.
+        LAUNCH_KEY: cmd,
     }
     due = calendar_instant(at)
     if due is not None:
@@ -992,6 +1041,321 @@ def _linger_enabled() -> Optional[bool]:
     if value == "Linger=no":
         return False
     return None
+
+
+# ---- #2827: export / restore of scheduled timers around a reboot -------------
+
+_ENV_VALUE_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\S+')
+
+
+def launch_argv_error(rec: Dict[str, Any]) -> str:
+    """Why a row's saved launch argv cannot be replayed, or '' when it can.
+
+    The argv is run as a command, so it must have the shape ``schedule`` wrote
+    and agree with the row it sits in — same unit, same scope, same time.
+    Anything else is reported, never run.
+    """
+    argv = rec.get(LAUNCH_KEY)
+    if argv is None:
+        return "no launch definition (scheduled before export/restore existed)"
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return "launch definition is not a list of strings"
+    user = rec.get("scope") == SCOPE_USER
+    head = ["systemd-run"] + (["--user"] if user else []) + [
+        "--unit", str(rec.get("unit") or ""), "--collect", "--on-calendar",
+    ]
+    if argv[:len(head)] != head or len(argv) < len(head) + 2:
+        return "launch definition does not match the row's unit or scope"
+    if argv[len(head)][:80] != str(rec.get("scheduled_at") or ""):
+        return "launch definition does not match the row's scheduled time"
+    return ""
+
+
+def timer_status(rec: Dict[str, Any], *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Where a scheduled job that has not started stands, else None (#2827).
+
+    None means there is nothing to restore: not a ``schedule`` row, acked,
+    already ran (an ``EXIT=`` marker after its offset), running right now, or
+    aged out of the registry. Otherwise ``{"state", "restorable", "detail"}``
+    with a ``TIMER_*`` state; ``restorable`` says whether the saved argv could
+    re-create the timer (asked of an armed timer too, so an export can warn
+    before the reboot rather than after it).
+    """
+    if not rec.get("scheduled_at") or rec.get("acked") is True:
+        return None
+    unit = str(rec.get("unit") or "")
+    user = rec.get("scope") == SCOPE_USER
+    if read_exit_marker(str(rec.get("log") or ""), _log_offset(rec)) is not None:
+        return None
+    if unit_is_active(unit, user=user):
+        return None
+    problem = launch_argv_error(rec)
+    if unit_is_active(unit, suffix=".timer", user=user):
+        return {"state": TIMER_ARMED, "restorable": not problem, "detail": problem}
+    now = time.time() if now is None else now
+    if _too_old(rec, now):
+        return None
+    due = scheduled_due(rec)
+    if due is not None and due <= now:
+        # Re-arming it would run the job at a time nobody asked for, or (a past
+        # calendar instant never elapses) not at all. Say so instead.
+        detail = (
+            f"due {rec.get('scheduled_at')} passed {_fmt_duration(int(now - due))} ago with no EXIT marker;"
+            " not re-armed — run it by hand if it is still wanted, then ack the unit"
+        )
+        return {"state": TIMER_MISSED, "restorable": False, "detail": detail}
+    if problem:
+        return {"state": TIMER_UNRESTORABLE, "restorable": False, "detail": problem}
+    return {"state": TIMER_MISSING, "restorable": True, "detail": ""}
+
+
+def live_definition(unit: str, *, user: bool = False) -> Optional[Dict[str, List[str]]]:
+    """The live timer and service settings that matter, as sorted values, else None.
+
+    Read from ``systemctl cat`` and only ever compared with another reading of
+    the same kind, so unit-file quoting is never parsed back into an argv.
+    ``Environment=`` is split into its assignments first: one line carrying
+    two and two lines carrying one each are the same environment, and a text
+    diff of the two called them different (#2827, 2026-11-17).
+    """
+    argv = ["systemctl"] + (["--user"] if user else []) + [
+        "cat", "--no-pager", f"{unit}.timer", f"{unit}.service",
+    ]
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found: Dict[str, List[str]] = {key: [] for key in _LIVE_KEYS}
+    for line in proc.stdout.decode("utf-8", "ignore").splitlines():
+        key, sep, value = line.strip().partition("=")
+        value = value.strip()
+        if not sep or key not in found or not value:
+            continue  # other settings, and the empty `ExecStart=` reset line
+        if key == "Environment":
+            found[key] += [
+                token[1:-1] if len(token) > 1 and token[0] == token[-1] == '"' else token
+                for token in _ENV_VALUE_RE.findall(value)
+            ]
+        else:
+            found[key].append(value)
+    if not any(found.values()):
+        return None
+    return {key: sorted(values) for key, values in found.items()}
+
+
+def export_timers(records: List[Dict[str, Any]], *, now: Optional[float] = None) -> Dict[str, Any]:
+    """The pre-reboot snapshot: every scheduled job that has not started.
+
+    ``timers`` are the ones ``restore-timers`` can re-create; ``skipped`` are
+    the ones it cannot, each with a ``reason``. An armed timer also carries
+    ``live``, the values of the unit as systemd holds it now — the reference
+    for the after-reboot comparison, and for a ``skipped`` row the definition
+    to re-create by hand.
+    """
+    now = time.time() if now is None else now
+    timers: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for rec in sorted(records, key=lambda r: str(r.get("unit") or "")):
+        status = timer_status(rec, now=now)
+        if status is None:
+            continue
+        user = rec.get("scope") == SCOPE_USER
+        entry = {key: rec[key] for key in _EXPORT_KEYS if key in rec}
+        entry["scope"] = SCOPE_USER if user else SCOPE_SYSTEM
+        entry["state"] = status["state"]
+        if status["state"] == TIMER_ARMED:
+            live = live_definition(str(rec.get("unit") or ""), user=user)
+            if live:
+                entry["live"] = live
+        if status["restorable"]:
+            timers.append(entry)
+        else:
+            entry["reason"] = status["detail"]
+            skipped.append(entry)
+    return {
+        "version": EXPORT_VERSION, "exported_at": int(now), "node": _node_name(),
+        "timers": timers, "skipped": skipped,
+    }
+
+
+def _write_private(path: str, text: str) -> bool:
+    """Write ``text`` to ``path`` owner-only and atomically; explain a failure."""
+    path = os.path.abspath(os.path.expanduser(path))
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except OSError as exc:
+        sys.stderr.write(f"detached_jobs: cannot write {path}: {exc}\n")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+_EXPORT_USAGE = (
+    "usage: detached_jobs.py export-timers [--out FILE]\n"
+    "  JSON snapshot of the scheduled jobs that have not started (stdout, or FILE\n"
+    "  owner-only). exit 0: all of them can be restored; exit 1: some are listed\n"
+    "  under `skipped` (missed, or no launch definition).\n"
+)
+
+
+def cmd_export_timers(argv: List[str]) -> int:
+    if "--help" in argv or "-h" in argv:
+        sys.stdout.write(_EXPORT_USAGE)
+        return 0
+    doc = export_timers(load_records(registry_path(_opt(argv, "registry"))))
+    text = json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    out = _opt(argv, "out").strip()
+    if not out:
+        sys.stdout.write(text)
+    elif not _write_private(out, text):
+        return 2
+    else:
+        sys.stdout.write(f"exported: timers={len(doc['timers'])} skipped={len(doc['skipped'])} -> {out}\n")
+    for entry in doc["skipped"]:
+        sys.stderr.write(
+            f"detached_jobs: not restorable: {entry.get('unit')} ({entry.get('state')}) — {entry.get('reason')}\n"
+        )
+    return 1 if doc["skipped"] else 0
+
+
+def _load_snapshot(path: str) -> Tuple[List[Dict[str, Any]], str]:
+    """``(rows, error)`` from an ``export-timers`` file; rows cover timers and skipped."""
+    try:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as handle:
+            # A snapshot row can stand in for a job the registry no longer has,
+            # and its argv is then run. Take it only from a file this user owns
+            # and nobody else can write (`export-timers --out` writes it 0600).
+            info = os.fstat(handle.fileno())
+            if info.st_uid != _geteuid() or info.st_mode & 0o022:
+                return [], f"snapshot {path} must be owned by this user and not group/world-writable"
+            doc = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return [], f"cannot read snapshot {path}: {exc}"
+    if not isinstance(doc, dict) or doc.get("version") != EXPORT_VERSION or not isinstance(doc.get("timers"), list):
+        return [], f"{path} is not an export-timers snapshot (version {EXPORT_VERSION})"
+    skipped = doc.get("skipped") if isinstance(doc.get("skipped"), list) else []
+    rows = [row for row in doc["timers"] + skipped if isinstance(row, dict) and str(row.get("unit") or "").strip()]
+    return rows, ""
+
+
+def restore_candidates(records: List[Dict[str, Any]], snapshot: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Registry rows, with what a snapshot adds to them.
+
+    The registry stays the source of truth: it is what ``schedule`` and ``ack``
+    wrote last, while a snapshot may be days old. A snapshot row contributes
+    its ``live`` values only to the registry row it was copied from (same
+    argv, same registration), and stands in as the job itself only when the
+    registry no longer knows the unit at all.
+    """
+    by_unit: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        by_unit[str(rec.get("unit") or "")] = {key: value for key, value in rec.items() if key != "live"}
+    for row in snapshot:
+        unit = str(row.get("unit") or "")
+        current = by_unit.get(unit)
+        if current is None:
+            by_unit[unit] = dict(row)
+        elif current.get(LAUNCH_KEY) == row.get(LAUNCH_KEY) and current.get("started_at") == row.get("started_at"):
+            current["live"] = row.get("live")
+    return [by_unit[unit] for unit in sorted(by_unit)]
+
+
+def _verify_live(rec: Dict[str, Any], outcome: str) -> Tuple[str, str]:
+    """Compare the live unit with the snapshot's values; ``differs`` when they are not equal."""
+    expected = rec.get("live")
+    if not isinstance(expected, dict):
+        return outcome, ""
+    current = live_definition(str(rec.get("unit") or ""), user=rec.get("scope") == SCOPE_USER)
+    if current is None:
+        return outcome, "not verified: the live unit could not be read"
+    changed = []
+    for key in _LIVE_KEYS:
+        want = expected.get(key)
+        values = sorted(str(item) for item in want) if isinstance(want, list) else []
+        if values != current.get(key):
+            changed.append(key)
+    if changed:
+        return "differs", "live unit differs from the snapshot in " + ", ".join(changed)
+    return outcome, "time, command and environment match the snapshot"
+
+
+def restore_timers(
+    records: List[Dict[str, Any]], *, dry_run: bool = False, now: Optional[float] = None,
+) -> List[Tuple[str, Dict[str, Any], str]]:
+    """Re-create every missing timer from its saved argv: ``[(outcome, row, detail)]``.
+
+    Outcomes: ``restored`` (``would-restore`` on a dry run), ``kept`` (still
+    armed — never launched twice), ``missed``, ``unrestorable``, ``failed``
+    (``systemd-run`` refused) and ``differs`` (armed, but not with the values
+    the snapshot recorded). Rows with nothing to restore are not listed.
+    """
+    results: List[Tuple[str, Dict[str, Any], str]] = []
+    for rec in records:
+        status = timer_status(rec, now=now)
+        if status is None:
+            continue
+        state = status["state"]
+        if state == TIMER_ARMED:
+            outcome, detail = _verify_live(rec, "kept")
+            if outcome == "kept" and not status["restorable"]:
+                detail = f"armed, but a reboot would lose it: {status['detail']}"
+        elif state in (TIMER_MISSED, TIMER_UNRESTORABLE):
+            outcome, detail = state, status["detail"]
+        elif dry_run:
+            outcome, detail = "would-restore", shlex.join(rec[LAUNCH_KEY])
+        elif _launch_schedule(rec[LAUNCH_KEY], user=rec.get("scope") == SCOPE_USER):
+            outcome, detail = _verify_live(rec, "restored")
+        else:
+            outcome, detail = "failed", "systemd-run did not start the timer (see stderr)"
+        results.append((outcome, rec, detail))
+    return results
+
+
+_RESTORE_USAGE = (
+    "usage: detached_jobs.py restore-timers [--from FILE] [--dry-run]\n"
+    "  re-create the transient timer of every scheduled job that has not started\n"
+    "  and whose timer is gone, from the argv `schedule` saved. --from FILE (an\n"
+    "  export-timers snapshot) also compares each unit with its pre-reboot values.\n"
+    "  --dry-run (or --print) launches nothing. exit 0: every such job is armed;\n"
+    "  exit 1: at least one is missed, unrestorable, failed or differs.\n"
+)
+_RESTORE_OUTCOMES = ("restored", "would-restore", "kept", "missed", "unrestorable", "failed", "differs")
+_RESTORE_ATTENTION = ("missed", "unrestorable", "failed", "differs")
+
+
+def cmd_restore_timers(argv: List[str]) -> int:
+    if "--help" in argv or "-h" in argv:
+        sys.stdout.write(_RESTORE_USAGE)
+        return 0
+    dry_run = "--dry-run" in argv or "--print" in argv
+    snapshot: List[Dict[str, Any]] = []
+    source = _opt(argv, "from").strip()
+    if source:
+        snapshot, err = _load_snapshot(source)
+        if err:
+            sys.stderr.write(f"detached_jobs: {err}\n{_RESTORE_USAGE}")
+            return 2
+    records = restore_candidates(load_records(registry_path(_opt(argv, "registry"))), snapshot)
+    results = restore_timers(records, dry_run=dry_run)
+    counts = {name: 0 for name in _RESTORE_OUTCOMES}
+    for outcome, rec, detail in results:
+        counts[outcome] += 1
+        scope = SCOPE_USER if rec.get("scope") == SCOPE_USER else SCOPE_SYSTEM
+        row = f"{outcome}\t{rec.get('unit')}\t{rec.get('scheduled_at')}\t{scope}"
+        sys.stdout.write(row + (f"\t{detail}" if detail else "") + "\n")
+    shown = [name for name in _RESTORE_OUTCOMES if counts[name] or name in ("restored", "kept")]
+    if dry_run:
+        shown = [name for name in shown if name != "restored"]
+    summary = " ".join(f"{name}={counts[name]}" for name in shown)
+    sys.stdout.write(f"restore-timers: {summary}" + (" (dry run: nothing launched)" if dry_run else "") + "\n")
+    return 1 if any(counts[name] for name in _RESTORE_ATTENTION) else 0
 
 
 def _bridge_python() -> str:
@@ -1106,6 +1470,10 @@ def main(argv: List[str]) -> int:
         return cmd_schedule(rest)
     if cmd == "notify":
         return cmd_notify(rest)
+    if cmd == "export-timers":
+        return cmd_export_timers(rest)
+    if cmd == "restore-timers":
+        return cmd_restore_timers(rest)
     if cmd == "ack":
         return cmd_ack(rest)
     if cmd == "list":
@@ -1122,5 +1490,10 @@ if __name__ == "__main__":
         raise SystemExit(main(sys.argv[1:]))
     except SystemExit:
         raise
-    except Exception:  # noqa: BLE001 - fail open, never break the loader
+    except Exception as exc:  # noqa: BLE001 - fail open, never break the loader
+        if sys.argv[1:2] and sys.argv[1] in _LOUD_COMMANDS:
+            # An operator runs these around a reboot: "exit 0, no output" would
+            # read as "every timer is back" (#2827).
+            sys.stderr.write(f"detached_jobs: {sys.argv[1]} failed: {exc!r}\n")
+            raise SystemExit(1)
         raise SystemExit(0)
