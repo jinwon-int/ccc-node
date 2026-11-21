@@ -32,6 +32,14 @@
   with no OS database and no `tzdata` package (Termux) is `경고` — agent-cron then accepts
   only UTC and rejects `--timezone <IANA name>`. Read-only; the action names the package to
   install. See *Nodes without a time zone database* in `docs/agent-cron.md`.
+- **Span rollup tick** (`#2684`): when the cost-ledger cron block carries the opt-in
+  `spans-rollup.py` line, the `spans-rollup tick` row reads the
+  `spans-rollup.status.json` receipt every non-dry-run rollup writes (in the
+  `CCC_STATE_DIR` baked into the line). No line is `정상` (not installed); a missing
+  receipt (`rollup-status-missing`), `ok: false` (`rollup-failed; result=<code>`), a tick
+  older than 36 h (`rollup-tick-stale`; `CCC_DOCTOR_SPANS_ROLLUP_MAX_AGE_HOURS`, `0`
+  disables) or a symlinked / oversized / malformed receipt is `경고`; an unreadable one is
+  `수동필요`. Only fixed tokens and numbers from the file are printed.
 
 The report is Markdown and classifies rows as:
 

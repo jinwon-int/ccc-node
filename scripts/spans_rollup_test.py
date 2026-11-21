@@ -358,3 +358,77 @@ def test_isolated_interpreter_uses_checkout_sanitizer(env):
     assert proc.returncode == 0, proc.stderr
     summary = json.loads(proc.stdout)
     assert summary["tools"]["Bash"]["calls"] == 1 and "SECRET" not in proc.stdout
+
+
+# --- tick receipt for doctor's `spans-rollup tick` row ---------------------------
+
+
+def read_status(env: Env) -> dict:
+    path = env.state / rollup.STATUS_FILE
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert set(data) == {"schema", "finished_at", "ok", "result_code", "date", "node"}
+    assert data["schema"] == rollup.STATUS_SCHEMA and data["date"] == DAY
+    assert data["node"] == "testnode"
+    datetime.strptime(data["finished_at"], "%Y-%m-%dT%H:%M:%SZ")
+    return data
+
+
+def test_status_file_written_for_queued_and_already_queued(env, capsys):
+    env.write_spans("2026-11-06", [tool("Bash", IN_DAY, 10, prompt=BODY), turn(IN_DAY + 1)])
+    assert env.run() == 0
+    status = read_status(env)
+    assert status["ok"] is True and status["result_code"] == "queued"
+    assert "SECRET" not in (env.state / rollup.STATUS_FILE).read_text(encoding="utf-8")
+    assert env.run() == 0
+    assert read_status(env)["result_code"] == "already-queued"
+    assert not list(env.state.glob(f".{rollup.STATUS_FILE}.*"))  # no temp leftovers
+
+
+def test_status_file_written_for_no_spans(env, capsys):
+    assert env.run() == 0
+    status = read_status(env)
+    assert status["ok"] is True and status["result_code"] == "no-spans"
+
+
+def test_status_file_never_written_on_dry_run(env, capsys):
+    env.write_spans("2026-11-06", [tool("Bash", IN_DAY, 10)])
+    assert env.run("--dry-run") == 0
+    assert env.run("--dry-run", "--json") == 0
+    assert not (env.state / rollup.STATUS_FILE).exists()
+
+
+def test_status_file_records_sanitizer_failure(env, capsys, monkeypatch):
+    def boom():
+        raise ImportError("gone")
+
+    monkeypatch.setattr(rollup, "load_span_ledger", boom)
+    assert env.run("--dry-run") == 4
+    assert not (env.state / rollup.STATUS_FILE).exists()
+    assert env.run() == 4
+    status = read_status(env)
+    assert status["ok"] is False and status["result_code"] == "sanitizer-unavailable"
+
+
+def test_status_file_records_crash_and_reraises(env, capsys, monkeypatch):
+    env.write_spans("2026-11-06", [tool("Bash", IN_DAY, 10)])
+
+    def broken_append(queue, entry):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rollup, "append_queue_entry", broken_append)
+    with pytest.raises(OSError):
+        env.run("--no-digest")
+    status = read_status(env)
+    assert status["ok"] is False and status["result_code"] == "crashed"
+
+
+def test_status_write_failure_keeps_exit_code(env, capsys, monkeypatch):
+    env.state.parent.mkdir(parents=True, exist_ok=True)
+    blocker = env.state.parent / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("CCC_STATE_DIR", str(blocker))
+    assert env.run() == 0  # no-spans day; the receipt cannot be written
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["skipped"] == "no-spans"
+    assert "status file not written" in captured.err

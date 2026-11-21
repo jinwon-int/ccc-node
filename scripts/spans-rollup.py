@@ -34,10 +34,14 @@ dropped before aggregation. The cost ledger contributes numbers only.
 Robustness: a missing spans directory, an empty day, unreadable files and
 corrupt/torn lines never fail the run. An empty day exits 0 with a "no spans"
 summary on stdout and delivers nothing (same as the weekly rollup's
-``no-ledger-rows``: an idle node should not fill the human-gated queue; node
-liveness is the doctor "last rollup tick" follow-up). Idempotence: the entry
-embeds ``<!-- spans-rollup:YYYY-MM-DD:NODE -->``; a run that finds it in the
-queue exits 0 without delivering again.
+``no-ledger-rows``: an idle node should not fill the human-gated queue).
+Idempotence: the entry embeds ``<!-- spans-rollup:YYYY-MM-DD:NODE -->``; a run
+that finds it in the queue exits 0 without delivering again.
+
+Tick receipt: every non ``--dry-run`` run that gets past argument parsing
+overwrites ``$CCC_STATE_DIR/spans-rollup.status.json`` (0600, atomic; fixed
+``result_code`` tokens, date and node only) so doctor's ``spans-rollup tick``
+row can tell a quiet day from a cron line that stopped firing.
 
 Usage:
   spans-rollup.py [--date YYYY-MM-DD(KST)] [--project-root DIR]
@@ -54,6 +58,7 @@ import math
 import os
 import secrets
 import sys
+import tempfile
 import types
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -701,6 +706,63 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+#: Last-tick receipt read by doctor's ``spans-rollup tick`` row (#2684).
+STATUS_FILE = "spans-rollup.status.json"
+STATUS_SCHEMA = "ccc.spans-rollup-status.v1"
+#: Fixed ``result_code`` tokens; the status file never carries free text.
+RESULT_QUEUED = "queued"
+RESULT_ALREADY_QUEUED = "already-queued"
+RESULT_NO_SPANS = "no-spans"
+RESULT_SANITIZER_UNAVAILABLE = "sanitizer-unavailable"
+RESULT_CRASHED = "crashed"
+
+
+def write_status(ok: bool, result_code: str, day: date, node: str,
+                 now: Optional[datetime] = None) -> Optional[Path]:
+    """Best-effort owner-only ``$CCC_STATE_DIR/spans-rollup.status.json``.
+
+    Overwritten on every delivering (non ``--dry-run``) run so doctor can tell
+    a nightly tick that ran — including an idle ``no-spans`` day, which
+    delivers nothing else — from a cron line that silently stopped firing.
+    Fixed tokens and the date only. Self-contained (mkstemp in the same
+    directory + ``os.replace``) so it still works when the checkout is too
+    broken for the sanitizer. A write failure warns on stderr and never
+    changes the rollup's exit code.
+    """
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    payload = {
+        "schema": STATUS_SCHEMA,
+        "finished_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ok": bool(ok),
+        "result_code": result_code,
+        "date": day.isoformat(),
+        "node": node,
+    }
+    tmp_name = None
+    try:
+        state = _state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        path = state / STATUS_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{STATUS_FILE}.", suffix=".tmp", dir=state)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = None
+        return path
+    except Exception as exc:  # never let the receipt change the run's verdict
+        print(f"spans-rollup: status file not written ({type(exc).__name__})", file=sys.stderr)
+        return None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     now = datetime.now(timezone.utc)
@@ -710,6 +772,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps({"ok": False, "error": "bad --date (want YYYY-MM-DD)"}))
         return 2
     node = args.node or resolve_node()
+    if args.dry_run:
+        return _run(args, day, node, now)
+    try:
+        return _run(args, day, node, now)
+    except Exception:
+        # An unexpected crash (e.g. a queue append failure) is exactly the
+        # tick doctor must see; record it, then fail exactly as before.
+        write_status(False, RESULT_CRASHED, day, node)
+        raise
+
+
+def _run(args: argparse.Namespace, day: date, node: str, now: datetime) -> int:
     data_dir = args.project_root.expanduser() / ".telegram_bot"
     spans_dir = (args.spans_dir or data_dir / "spans").expanduser()
     ledger_path = (args.cost_ledger or data_dir / "usage-cost-ledger.jsonl").expanduser()
@@ -719,12 +793,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.dry_run and marker in queue_text:
         print(json.dumps({"ok": True, "skipped": "already-queued", "date": day.isoformat(),
                           "node": node}))
+        write_status(True, RESULT_ALREADY_QUEUED, day, node)
         return 0
 
     try:
         sanitize = load_span_ledger().sanitize_span
     except Exception as exc:  # fail closed: never aggregate unsanitized spans
         print(json.dumps({"ok": False, "error": f"span sanitizer unavailable: {type(exc).__name__}"}))
+        if not args.dry_run:
+            write_status(False, RESULT_SANITIZER_UNAVAILABLE, day, node)
         return 4
 
     start, end = kst_day_window(day)
@@ -744,6 +821,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if summary["empty"]:
         print(json.dumps({"ok": True, "skipped": "no-spans", "date": day.isoformat(),
                           "node": node, "read": stats}))
+        write_status(True, RESULT_NO_SPANS, day, node)
         return 0
 
     digest_ref = None
@@ -756,6 +834,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cand_id = append_queue_entry(args.queue, build_entry(summary, digest_ref))
     print(json.dumps({"ok": True, "queued": day.isoformat(), "node": node, "cand": cand_id,
                       "spans": summary["totals"]["spans"], "digest_spool": digest_ref}))
+    write_status(True, RESULT_QUEUED, day, node)
     return 0
 
 
