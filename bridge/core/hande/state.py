@@ -25,6 +25,9 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "attachment_frames": false,
       "attachment_out_frames": false,
       "skill_frames": false,
+      "reply_split": true,
+      "bot_reply_max_bytes": 8192,
+      "bot_interim_max": 40,
       "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
     }
 
@@ -64,6 +67,15 @@ DEFAULT_WAIT_STATUS_INTERVAL_S = 120
 MIN_WAIT_STATUS_INTERVAL_S = 30
 MAX_WAIT_STATUS_INTERVAL_S = 240
 DEFAULT_SOCKET_MODE = 0o660
+# ``reply_split`` (#2856): a final answer above the bot's message bound is sent as
+# ``(k/N)`` parts. These two mirror the bot's own settings (``reply_max_bytes``,
+# ``interim_max`` in family-messenger ``responder.rs``); change them only together
+# with the bot's.
+DEFAULT_BOT_REPLY_MAX_BYTES = 8 * 1024
+MIN_BOT_REPLY_MAX_BYTES = 1024
+MAX_BOT_REPLY_MAX_BYTES = 64 * 1024
+DEFAULT_BOT_INTERIM_MAX = 40
+MAX_BOT_INTERIM_MAX = 1000
 
 
 class HandeConfigError(RuntimeError):
@@ -175,8 +187,10 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         "attachment_frames",
         "attachment_out_frames",
         "skill_frames",
+        "reply_split",
     ):
-        value = config.get(key, key == "steward_tools")  # steward tools default on
+        # Default on: steward tools, and reply_split (it needs no bot change).
+        value = config.get(key, key in ("steward_tools", "reply_split"))
         if type(value) is not bool:
             raise HandeConfigError(f"hande config {key!r} must be true or false")
         knobs[key] = value
@@ -203,6 +217,22 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
             f"{MIN_WAIT_STATUS_INTERVAL_S}..{MAX_WAIT_STATUS_INTERVAL_S}"
         )
     knobs["wait_status_interval_s"] = wait_raw
+    reply_max_raw = config.get("bot_reply_max_bytes", DEFAULT_BOT_REPLY_MAX_BYTES)
+    if (
+        type(reply_max_raw) is not int
+        or not MIN_BOT_REPLY_MAX_BYTES <= reply_max_raw <= MAX_BOT_REPLY_MAX_BYTES
+    ):
+        raise HandeConfigError(
+            "hande config 'bot_reply_max_bytes' must be "
+            f"{MIN_BOT_REPLY_MAX_BYTES}..{MAX_BOT_REPLY_MAX_BYTES}"
+        )
+    knobs["bot_reply_max_bytes"] = reply_max_raw
+    interim_max_raw = config.get("bot_interim_max", DEFAULT_BOT_INTERIM_MAX)
+    if type(interim_max_raw) is not int or not 0 <= interim_max_raw <= MAX_BOT_INTERIM_MAX:
+        raise HandeConfigError(
+            f"hande config 'bot_interim_max' must be 0..{MAX_BOT_INTERIM_MAX}"
+        )
+    knobs["bot_interim_max"] = interim_max_raw
     knobs["attachment_spool_dir"] = _validate_spool_dir(
         config, knobs["attachment_frames"] or knobs["attachment_out_frames"]
     )
