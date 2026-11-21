@@ -661,6 +661,9 @@ ok "ordinary paths remain idempotent after custom-path installation" \
 out="$(run_install --apply --claude 2>&1)"; rc=$?
 ok "provider change atomically rewires feed and sweep to Claude" \
   '[ "$rc" = 0 ] && grep -q "ingest-cron.sh" "$cron_store" && grep -q "mempalace-refresh.sh claude $home/.claude/projects" "$cron_store" && ! grep -q "codex-feed.sh" "$cron_store"'
+# #2850: the verbatim-layer refresh is daily at 02:17, never hourly again.
+ok "MemPalace refresh is installed once a day at 02:17 (#2850)" \
+  'grep -q "^17 2 \* \* \* .*mempalace-refresh.sh claude $home/.claude/projects" "$cron_store" && ! grep -qE "^[0-9]+ \* \* \* \* .*mempalace-refresh\.sh" "$cron_store"'
 ok "Claude apply owns exactly one standalone nunchi hook" \
   '[ "$(grep -c "$hooks/nunchi/sessionstart.sh" "$claude_dir/settings.local.json")" = 1 ] && grep -q "load-memory.sh" "$claude_dir/settings.local.json"'
 refresh_capture="$TMP/claude-refresh.args"
@@ -896,7 +899,7 @@ ok "default status reports verbatim_backend=mempalace and does not count the sha
 # shellcheck disable=SC2034
 out="$(run_install --apply --codex --verbatim-backend both 2>&1)"; rc=$?
 ok "--verbatim-backend both adds a managed :27 gotgan refresh beside the MemPalace sweep (4 managed lines)" \
-  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "^27 \* \* \* \* .*gotgan-refresh.sh codex $codex_home/sessions .*nunchi:#816 gen=$want_gen$" "$cron_store" && grep -q "mempalace-refresh.sh codex" "$cron_store"'
+  '[ "$rc" = 0 ] && [ "$(grep -c "nunchi:#816" "$cron_store")" = 4 ] && grep -q "^47 2 \* \* \* .*gotgan-refresh.sh codex $codex_home/sessions .*nunchi:#816 gen=$want_gen$" "$cron_store" && grep -q "mempalace-refresh.sh codex" "$cron_store"'
 ok "gotgan line carries db/status/timeout/flock pins" \
   'grep "gotgan-refresh.sh" "$cron_store" | grep -q "GOTGAN_DB=$nunchi_home/gotgan.db CCC_NUNCHI_GOTGAN_STATUS=$nunchi_home/gotgan-refresh.status.json CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC=1500 CCC_NUNCHI_TIMEOUT_CLI="'
 ok "both: hand-installed gotgan-shadow line is retired" \
