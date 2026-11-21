@@ -178,3 +178,107 @@ def test_main_installs_the_dotenv_layers(monkeypatch, tmp_path):
     assert ExternalWaitMonitor.env_int(
         "CCC_EXTERNAL_WAIT_RESUME_DAILY_CAP", default=DEFAULT_RESUME_DAILY_CAP
     ) == 33
+
+
+# --- #2841 follow-up: the remaining os.environ-only readers -----------------
+
+_NUDGE_KEYS = (
+    "CCC_MODEL_LABEL",
+    "ANTHROPIC_MODEL",
+    "CCC_CRUSH_MODEL",
+    "CCC_WEBHOOK_NUDGE_ENABLED",
+    "CCC_WEBHOOK_NUDGE_SECRET",
+    "CCC_WEBHOOK_NUDGE_HOST",
+    "CCC_WEBHOOK_NUDGE_PORT",
+    "CCC_WEBHOOK_NUDGE_MAX_BODY_BYTES",
+    "CCC_MATRIX_WEBHOOK_NUDGE_PORT",
+)
+
+
+@pytest.fixture
+def _clean_nudge_env(monkeypatch):
+    for name in _NUDGE_KEYS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_merged_environ_process_wins_even_blank_and_never_carries_secrets(monkeypatch):
+    dotenv_fallback.install(
+        {"CCC_WEBHOOK_NUDGE_PORT": "8799", "CCC_T2841_FLAG": "on", "CCC_WEBHOOK_NUDGE_SECRET": "s"}
+    )
+    merged = dotenv_fallback.merged_environ({"CCC_T2841_FLAG": "", "PATH": "/bin"})
+    assert merged["CCC_WEBHOOK_NUDGE_PORT"] == "8799"
+    assert merged["CCC_T2841_FLAG"] == ""
+    assert merged["PATH"] == "/bin"
+    assert "CCC_WEBHOOK_NUDGE_SECRET" not in merged
+
+
+def test_session_banner_model_label_comes_from_dotenv(_clean_nudge_env, monkeypatch):
+    from telegram_bot.core.turn_notices import session_start_notice_text
+
+    dotenv_fallback.install({"CCC_MODEL_LABEL": "Opus 5.5 (high)"})
+    text = session_start_notice_text(reason="automatic reset", model=None, provider="claude")
+    assert "◆ Model: Opus 5.5 (high)" in text
+
+    monkeypatch.setenv("CCC_MODEL_LABEL", "process label")
+    text = session_start_notice_text(reason="automatic reset", model=None, provider="claude")
+    assert "◆ Model: process label" in text
+
+
+def test_crush_model_label_comes_from_dotenv(_clean_nudge_env):
+    from telegram_bot.core.turn_notices import session_start_notice_text
+
+    dotenv_fallback.install({"CCC_CRUSH_MODEL": "glm-x"})
+    text = session_start_notice_text(reason="automatic reset", model=None, provider="crush")
+    assert "◆ Model: glm-x" in text
+
+
+def test_webhook_nudge_bind_settings_come_from_dotenv(_clean_nudge_env, monkeypatch, tmp_path):
+    from telegram_bot.core.external_wait import ExternalWaitRegistry
+    from telegram_bot.core.webhook_nudge import build_from_env
+
+    dotenv_fallback.install(
+        {
+            "CCC_WEBHOOK_NUDGE_ENABLED": "true",
+            "CCC_WEBHOOK_NUDGE_PORT": "8799",
+            "CCC_WEBHOOK_NUDGE_MAX_BODY_BYTES": "8192",
+        }
+    )
+    factory = lambda: ExternalWaitRegistry(tmp_path / "waits.json")  # noqa: E731
+
+    # The secret is never in the fallback: .env alone stays fail-closed.
+    assert build_from_env(factory) is None
+
+    monkeypatch.setenv("CCC_WEBHOOK_NUDGE_SECRET", "process-secret")
+    server = build_from_env(factory)
+    assert server is not None
+    assert server._port == 8799
+    assert server._max_body_bytes == 8192
+
+    # An explicit mapping is still read as given (no fallback mixed in).
+    assert build_from_env(factory, environ={"CCC_WEBHOOK_NUDGE_SECRET": "x"}) is None
+
+
+def test_matrix_nudge_reads_dotenv_ports(_clean_nudge_env, monkeypatch, tmp_path):
+    from telegram_bot.core.matrix import lifecycle
+
+    dotenv_fallback.install(
+        {
+            "CCC_WEBHOOK_NUDGE_ENABLED": "true",
+            "CCC_WEBHOOK_NUDGE_PORT": "8799",
+            "CCC_MATRIX_WEBHOOK_NUDGE_PORT": "8799",
+        }
+    )
+    monkeypatch.setenv("CCC_WEBHOOK_NUDGE_SECRET", "process-secret")
+    # Same port from .env is detected as a clash, so the .env layer is read.
+    assert lifecycle.build_webhook_nudge_server(tmp_path) is None
+
+    dotenv_fallback.install(
+        {
+            "CCC_WEBHOOK_NUDGE_ENABLED": "true",
+            "CCC_WEBHOOK_NUDGE_PORT": "8799",
+            "CCC_MATRIX_WEBHOOK_NUDGE_PORT": "8800",
+        }
+    )
+    server = lifecycle.build_webhook_nudge_server(tmp_path)
+    assert server is not None
+    assert server._port == 8800
