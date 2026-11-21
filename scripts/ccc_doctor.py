@@ -5724,7 +5724,7 @@ class Doctor:
 
         The settings a running bridge actually uses come from its process
         environment — including unit ``Environment=``/``EnvironmentFile=``
-        values the env files on disk do not show (nosuk 2026-11-21:
+        values the env files on disk do not show (one node, 2026-11-21:
         ``bridge/.env`` and the data-dir ``.env`` said audience-scoped while
         the unit's later EnvironmentFile made the live mode ``off``). Only
         ``BRIDGE_PROCESS_ENV_KEYS`` are kept; nothing is printed.

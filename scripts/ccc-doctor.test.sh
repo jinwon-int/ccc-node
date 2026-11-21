@@ -1118,7 +1118,7 @@ ok "no managed nunchi cron means nothing is mixed — no audience-scope row" \
   'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
 
 # #2845: the audience rows must judge the LIVE configuration. Two false
-# DEFECTs were measured on 2026-11-21 (nosuk, soonwook) whose recommended
+# DEFECTs were measured on 2026-11-21 (two nodes) whose recommended
 # `--audience-scoped` re-apply would have broken a healthy node-global lane:
 #   1. a commented-out `#unified-…# … CCC_NUNCHI_AUDIENCE_SCOPED=1 …` crontab
 #      line was matched as an active scoped lane (and its SCOPED=1 also made

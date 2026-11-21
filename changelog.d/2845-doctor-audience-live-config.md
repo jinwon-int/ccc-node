@@ -13,5 +13,5 @@
   `audience-scoped` value is reported as `확인 필요` without the
   `--audience-scoped` re-apply advice. That advice would break a healthy
   node-global lane. The DEFECT row now names its `source=`. Measured
-  2026-11-21: false DEFECTs on nosuk and soonwook, where the live mode was
+  2026-11-21: false DEFECTs on two nodes, where the live mode was
   `off`.
