@@ -838,6 +838,30 @@ out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$
 ok "a healthy claude is still preferred over codex" \
   'grep -q "CLAUDE-ANSWER" <<<"$out" && ! grep -q "CODEX-ANSWER" <<<"$out"'
 
+# #2824 — the claude synthesis model comes from NUNCHI_SYNTH_CLAUDE_MODEL
+# (default: the "haiku" alias); a value that is not a plain model token never
+# reaches argv.
+cat > "$synth_bin/claude" <<'EOF'
+#!/usr/bin/env bash
+prev=""
+for arg in "$@"; do
+  [ "$prev" = "--model" ] && echo "CLAUDE-MODEL:$arg"
+  prev="$arg"
+done
+EOF
+chmod +x "$synth_bin/claude"
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "#2824 claude synthesis defaults to the haiku alias" 'grep -q "CLAUDE-MODEL:haiku" <<<"$out"'
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 NUNCHI_SYNTH_CLAUDE_MODEL=claude-haiku-5-5 HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "#2824 NUNCHI_SYNTH_CLAUDE_MODEL pins the claude synthesis model" 'grep -q "CLAUDE-MODEL:claude-haiku-5-5" <<<"$out"'
+out="$(PATH="$synth_bin:/usr/bin:/bin" NUNCHI_PIRI=0 NUNCHI_SYNTH_CLAUDE_MODEL="--dangerously-skip-permissions" HOME="$TMP/home" python3 "$NP" dialectic "모델" 2>&1)"
+ok "#2824 a non-token model value falls back to the default" \
+  'grep -q "CLAUDE-MODEL:haiku" <<<"$out" && ! grep -q "dangerously" <<<"$out"'
+out="$(NUNCHI_SYNTH_CLAUDE_MODEL=claude-haiku-5-5 HOME="$TMP/home" python3 "$NP" synth-model 2>&1)"
+ok "#2824 synth-model prints the configured model" '[ "$out" = "claude-haiku-5-5" ]'
+out="$(NUNCHI_SYNTH_CLAUDE_MODEL="a b" HOME="$TMP/home" python3 "$NP" synth-model 2>&1)"
+ok "#2824 synth-model prints the default for an invalid value" '[ "$out" = "haiku" ]'
+
 # A non-zero exit is a distinct failure mode from a login notice.
 cat > "$synth_bin/claude" <<'EOF'
 #!/usr/bin/env bash

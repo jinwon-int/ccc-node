@@ -262,7 +262,7 @@ run_install --apply --codex --allow-drop-optins >/dev/null 2>&1
 # --- Conflict-sweep (#2479): opt-in daily line. Flag-only by construction
 # (review=1 + pair ledger, never closes), so the cron always runs --apply and
 # there is no separate APPLY flag. Same replay contract as --judge (#1264).
-unset NUNCHI_SYNTH_ORDER NUNCHI_PIRI NUNCHI_PIRI_ARGS CCC_NUNCHI_CONFLICT_SWEEP
+unset NUNCHI_SYNTH_ORDER NUNCHI_PIRI NUNCHI_PIRI_ARGS NUNCHI_SYNTH_CLAUDE_MODEL CCC_NUNCHI_CONFLICT_SWEEP
 ok "plain --apply installs no conflict-sweep line (opt-in)" \
   '! grep -q " conflict-sweep " "$cron_store"'
 out="$(run_install --apply --codex --conflict-sweep 2>&1)"; rc=$?
@@ -310,6 +310,9 @@ ok "per-node synthesis knobs set at install time are stamped on the sweep line" 
   '[ "$rc" = 0 ] && grep " conflict-sweep " "$cron_store" | grep -q "NUNCHI_SYNTH_ORDER=piri,claude NUNCHI_PIRI_ARGS='"'"'--provider openai-codex --model gpt-x'"'"' "'
 ok "synthesis knobs stay off the other managed lines" \
   '[ "$(grep -c "NUNCHI_SYNTH_ORDER" "$cron_store")" = 1 ]'
+out="$(NUNCHI_SYNTH_CLAUDE_MODEL=claude-haiku-5-5 run_install --apply --codex --conflict-sweep 2>&1)"; rc=$?
+ok "#2824 a pinned claude synthesis model is stamped on the sweep line" \
+  '[ "$rc" = 0 ] && grep " conflict-sweep " "$cron_store" | grep -q "NUNCHI_SYNTH_CLAUDE_MODEL=claude-haiku-5-5 "'
 # A hook tree older than #2474 has no subcommand: refuse BEFORE strip_cron so
 # the node keeps its previous managed lines instead of a half re-render.
 cp "$hooks/nunchi/nunchi.py" "$TMP/nunchi.py.keep"

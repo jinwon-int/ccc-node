@@ -396,6 +396,10 @@ fi
 # four of five healthy node-weeks while still failing the worst tail; ratchet
 # down as Wiki-layer coverage matures. Still overridable per node.
 UNANSWERED_MAX_PCT="${NUNCHI_BENCH_UNANSWERED_MAX_PCT:-40}"
+synth_model="$(python3 "$HERE/nunchi.py" synth-model </dev/null 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9._:[]-')"
+[ -n "$synth_model" ] || synth_model=unknown
+synth_cli="$(timeout 10 claude --version </dev/null 2>/dev/null | head -n1 | awk '{print $1}' | tr -cd 'A-Za-z0-9._-')"
+[ -n "$synth_cli" ] || synth_cli=unavailable
 unanswered_pct=0
 [ "$pos_valid" -gt 0 ] && unanswered_pct=$(( unanswered * 100 / pos_valid ))
 {
@@ -403,6 +407,10 @@ unanswered_pct=0
   echo "- queries: $total"
   echo "- valid: $valid"
   echo "- invalid: $invalid"
+  # #2824 — which model the claude synthesis lane was configured with, and
+  # the CLI that resolved it ("haiku" is an alias whose target moves with CLI
+  # updates), so a week-over-week shift can be told apart from a model swap.
+  echo "- synth backend/model: claude $synth_model (cli $synth_cli)"
   # #827 / TM-2339 — the Phase 2 gate counts "queries only Honcho answered".
   # TM-2029 gave durable cross-node knowledge to the Wiki, so the honest
   # denominator is "neither nunchi nor Wiki answered", not "nunchi alone".

@@ -105,6 +105,7 @@ Usage:
                                              # legacy observed=unknown facts -> node name (#2759)
   nunchi.py metrics                        # body-free counters for bench
   nunchi.py backend-status                   # synthesis backend health (#1263)
+  nunchi.py synth-model                      # configured claude synthesis model (#2824)
   nunchi.py stats
 
 Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
@@ -1740,10 +1741,29 @@ CLAUDE_SYNTH_ISOLATION = (
 )
 
 
+# #2824 — the claude synthesis model. "haiku" is a Claude Code CLI alias whose
+# target moves with CLI updates (2026-11-16 yukson: claude-haiku-5-5 on CLI
+# 2.1.322), so a node can pin a fixed id with NUNCHI_SYNTH_CLAUDE_MODEL and
+# bench.sh records the model and CLI version it ran with. The default stays
+# the alias: a pinned id breaks silently (falls through to codex) once that
+# model is retired, so pinning is a per-node choice. A value that is not a
+# plain model token (or starts with "-") is ignored rather than passed to argv.
+DEFAULT_SYNTH_CLAUDE_MODEL = "haiku"
+_SYNTH_MODEL_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$")
+
+
+def synth_claude_model():
+    raw = os.environ.get("NUNCHI_SYNTH_CLAUDE_MODEL", "").strip()
+    if raw and _SYNTH_MODEL_TOKEN.match(raw):
+        return raw
+    return DEFAULT_SYNTH_CLAUDE_MODEL
+
+
 def _synth_candidates():
     """Backends to try, in order. claude stays first for backward compatibility."""
     return (
-        ("claude", ["claude", "-p", "{prompt}", *CLAUDE_SYNTH_ISOLATION, "--model", "haiku"]),
+        ("claude", ["claude", "-p", "{prompt}", *CLAUDE_SYNTH_ISOLATION,
+                    "--model", synth_claude_model()]),
         ("codex", ["codex", "exec", "--skip-git-repo-check", "{prompt}"]),
     )
 
@@ -4093,6 +4113,9 @@ if __name__ == "__main__":
         metrics()
     elif cmd == "backend-status":
         backend_status()
+    elif cmd == "synth-model":
+        # #2824 — the configured claude synthesis model, for bench headers.
+        print(synth_claude_model())
     elif cmd == "stats":
         stats()
     else:
