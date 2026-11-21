@@ -522,7 +522,11 @@ def build_webhook_nudge_server(
     from telegram_bot.core.external_wait import ExternalWaitRegistry, default_registry_path
     from telegram_bot.core.webhook_nudge import DEFAULT_PORT, build_from_env
 
-    env = dict(os.environ if environ is None else environ)
+    from telegram_bot.utils import dotenv_fallback
+
+    # Process env over the bridge .env fallback (#2841); the secret is never
+    # in the fallback, so it still has to come from the process environment.
+    env = dotenv_fallback.merged_environ() if environ is None else dict(environ)
     if (env.get("CCC_WEBHOOK_NUDGE_ENABLED") or "").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
     raw_port = (env.get(MATRIX_NUDGE_PORT_ENV) or "").strip()

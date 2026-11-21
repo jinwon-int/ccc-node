@@ -14,6 +14,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from telegram_bot.core.heartbeat import format_duration
+from telegram_bot.utils import dotenv_fallback
 
 _PROVIDER_LABELS = {
     "claude": "Claude Code",
@@ -71,7 +72,9 @@ def session_start_notice_text(
     and ``Claude Fable 5.1 (high)`` on the other.
     """
     provider_label = _PROVIDER_LABELS.get(provider, provider.title())
-    operator_label = os.environ.get("CCC_MODEL_LABEL", "").strip()
+    # CCC_* display knobs honour the bridge .env too (#2841): the Hande and
+    # Matrix entry points never export it, so os.environ alone missed them.
+    operator_label = (dotenv_fallback.lookup("CCC_MODEL_LABEL") or "").strip()
     env_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
     if model and provider == "claude" and operator_label and model == env_model:
         model = operator_label
@@ -79,7 +82,7 @@ def session_start_notice_text(
     if not display_model and provider == "claude":
         display_model = os.environ.get("ANTHROPIC_MODEL", "").strip()
     if not display_model and provider == "crush":
-        display_model = os.environ.get("CCC_CRUSH_MODEL", "").strip()
+        display_model = (dotenv_fallback.lookup("CCC_CRUSH_MODEL") or "").strip()
     if not display_model:
         display_model = "default"
     lines = [

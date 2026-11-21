@@ -34,13 +34,13 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from telegram_bot.core.external_wait import STATE_MONITORING, ExternalWaitRegistry
+from telegram_bot.utils import dotenv_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -588,8 +588,15 @@ def build_from_env(
     *,
     environ: Optional[Dict[str, str]] = None,
 ) -> Optional[WebhookNudgeServer]:
-    """Env-gated constructor; None when disabled or misconfigured (fail-closed)."""
-    env = os.environ if environ is None else environ
+    """Env-gated constructor; None when disabled or misconfigured (fail-closed).
+
+    Without an explicit ``environ`` the process environment is read over the
+    bridge ``.env`` fallback (#2841), so ``CCC_WEBHOOK_NUDGE_ENABLED`` / host /
+    port / body cap written only to ``.env`` are honoured. The secret is a
+    credential name and never in that fallback: it must come from the process
+    environment, otherwise the listener refuses to start (logged).
+    """
+    env = dotenv_fallback.merged_environ() if environ is None else environ
     raw = (env.get("CCC_WEBHOOK_NUDGE_ENABLED") or "").strip().lower()
     if raw not in {"1", "true", "yes", "on"}:
         return None

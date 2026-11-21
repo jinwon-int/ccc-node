@@ -91,3 +91,19 @@ def lookup(name: str, environ: Optional[Mapping[str, str]] = None) -> Optional[s
     if name in env:
         return env[name]
     return _values.get(name)
+
+
+def merged_environ(environ: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """Return ``environ`` (default: the process env) over the installed fallback.
+
+    For readers that take a whole mapping rather than one name (the webhook
+    nudge builders). A key present in ``environ`` wins even when blank, as in
+    :func:`lookup`; credential-looking names are never in the fallback, so a
+    secret such as ``CCC_WEBHOOK_NUDGE_SECRET`` still comes from the process
+    environment only.
+    """
+
+    env = os.environ if environ is None else environ
+    merged = dict(_values)
+    merged.update(env)
+    return merged
