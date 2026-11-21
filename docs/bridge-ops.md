@@ -452,8 +452,12 @@ day it reads the two UTC files the KST day overlaps and keeps spans with
 - **Cost-ledger cross-check** against `.telegram_bot/usage-cost-ledger.jsonl`
   for the same window, on node totals: turns, input tokens, output tokens and
   cost, each with a discrepancy % (target < 5 %, `⚠` in the digest when
-  exceeded). The ledger writes rows only for priced turns, so the span side
-  counts turns with `ccc.cost_usd > 0`; the ledger's `in` excludes cache
+  exceeded). Both sides count priced turns only — spans with
+  `ccc.cost_usd > 0`, ledger rows with `total_cost_usd > 0`. The ledger also
+  holds zero-cost rows (a turn that added no spend, e.g. one that ended in
+  `error_during_execution`, still gets a row once the session has model
+  rows); they are left out of every ledger total and counted in
+  `ledger_zero_cost_rows` (#2858). The ledger's `in` excludes cache
   tokens, so `ccc.usage.cache_*_tokens` are subtracted first. It is not per
   model: a turn span names one model, a ledger row lists every model of the
   turn.

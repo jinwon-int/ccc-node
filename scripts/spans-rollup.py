@@ -262,11 +262,21 @@ def _ledger_row_totals(record: dict) -> tuple[float, float, float]:
 
 
 def read_cost_ledger(path: Path, start: float, end: float) -> Optional[dict]:
-    """Numeric totals of the bridge cost ledger inside the window (no names kept)."""
+    """Numeric totals of the bridge cost ledger inside the window (no names kept).
+
+    Only rows with ``total_cost_usd > 0`` are summed — the same definition the
+    span side uses (``ccc.cost_usd > 0`` in ``cross_check``; both values are the
+    turn's cost delta rounded to 6 places). The ledger skips a turn only when it
+    has no model rows *and* no total, and a per-turn delta keeps a zero-cost row
+    for every model the session already used, so a turn that added no spend (an
+    ``error_during_execution`` turn, live 2026-11-18: ledger 3 rows vs 2 priced
+    spans, 33 % on a 3-turn day) still gets a ``total_cost_usd: 0.0`` row.
+    Those rows are counted in ``zero_cost_rows`` and left out of every total.
+    """
     if path.is_symlink() or not path.is_file():
         return None
     totals = {"turns": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
-              "corrupt_lines": 0}
+              "corrupt_lines": 0, "zero_cost_rows": 0}
     try:
         with path.open("rb") as handle:
             for raw in handle:
@@ -283,6 +293,9 @@ def read_cost_ledger(path: Path, start: float, end: float) -> Optional[dict]:
                 if not start <= ts < end:
                     continue
                 tin, tout, cost = _ledger_row_totals(record)
+                if cost <= 0:
+                    totals["zero_cost_rows"] += 1
+                    continue
                 totals["turns"] += 1
                 totals["input_tokens"] += int(tin)
                 totals["output_tokens"] += int(tout)
@@ -396,8 +409,10 @@ def cross_check(turns: list[dict], ledger: Optional[dict], turn_basis: str = "st
     ``turns`` should be the turns that *finished* in the window
     (``read_ledger_turns``, ``turn_basis="end"``): the ledger stamps a row at
     turn end, so start-bucketed turns drift by one across midnight.
-    The ledger writes a row only for a turn that carries cost, so the span side
-    counts turns with ``ccc.cost_usd > 0``. Its ``in`` excludes cache tokens
+    Both sides count priced turns only: spans with ``ccc.cost_usd > 0`` here,
+    ledger rows with ``total_cost_usd > 0`` in ``read_cost_ledger`` (the ledger
+    also holds zero-cost rows, reported as ``ledger_zero_cost_rows``). The
+    ledger's ``in`` excludes cache tokens
     while ``gen_ai.usage.input_tokens`` includes them, so the cache share is
     subtracted before comparing. The ledger is per model and a turn span names
     one model, so the comparison is on node totals, not per model.
@@ -428,8 +443,9 @@ def cross_check(turns: list[dict], ledger: Optional[dict], turn_basis: str = "st
         "target_pct": DISCREPANCY_TARGET_PCT,
         "within_target": worst is not None and worst < DISCREPANCY_TARGET_PCT,
         "ledger_corrupt_lines": ledger.get("corrupt_lines", 0),
+        "ledger_zero_cost_rows": ledger.get("zero_cost_rows", 0),
         "turn_basis": turn_basis,
-        "note": "node totals; ledger counts priced turns only, input excludes cache",
+        "note": "node totals; both sides count priced turns only, input excludes cache",
     }
 
 
@@ -527,7 +543,11 @@ def _check_table(check: dict) -> list[str]:
             rows.append([name, f"${m['spans']:.2f}", f"${m['ledger']:.2f}", _fmt_pct(m["diff_pct"])])
         else:
             rows.append([name, f"{m['spans']:,}", f"{m['ledger']:,}", _fmt_pct(m["diff_pct"])])
-    return _table(["metric", "spans", "ledger", "diff"], rows)
+    lines = _table(["metric", "spans", "ledger", "diff"], rows)
+    zero_cost = check.get("ledger_zero_cost_rows", 0)
+    if zero_cost:
+        lines += ["", f"ledger zero-cost rows left out of the comparison: {zero_cost}"]
+    return lines
 
 
 def _counts_line(label: str, counts: Mapping[str, int]) -> str:
