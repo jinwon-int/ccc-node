@@ -126,7 +126,7 @@ fix — not as a silent `ingested: 0`. To actually collect facts, set
 `CCC_USAGE_BUDGET_TOKENS_DANSO` and `CCC_BRIDGE_MEMORY_MODE=audience-scoped`.
 Point `CCC_BRIDGE_DISTILL_JOURNAL` at the journal directory when the bridge's
 `PROJECT_ROOT` is not `$HOME`. MemPalace has no verified `danso` wing, so the
-hourly refresh takes the generic `sweep` and is skipped entirely unless
+daily refresh takes the generic `sweep` and is skipped entirely unless
 `CCC_DANSO_STATE_DIR` is set.
 
 ### Feed/provider drift
@@ -446,8 +446,9 @@ install-nunchi.sh --apply                              # mempalace (default) —
 ```
 
 `CCC_NUNCHI_VERBATIM_BACKEND` in the installer's environment is equivalent to
-the flag. `gotgan`/`both` add one managed cron line at `:27` (offset from the
-MemPalace `:17` sweep so the two transcript readers never overlap) running
+the flag. `gotgan`/`both` add one managed cron line at `02:47` daily (30 min
+after the MemPalace `02:17` daily sweep, so the two transcript readers do not
+overlap even on a day's backlog; both were hourly before #2850) running
 `hooks/nunchi/gotgan-refresh.sh <provider> <transcript-dir>` under the same
 discipline as the MemPalace refresh: `nunchi.mode` gate, single-flight
 `flock`, hard `timeout` (`CCC_NUNCHI_GOTGAN_REFRESH_TIMEOUT_SEC`, default
