@@ -197,12 +197,39 @@ runs and the owner's promised check silently does not happen (same property as
 cannot cross a reboot. For a wait that spans nights or days, write a persistent
 unit pair under `/etc/systemd/system/` (or `~/.config/systemd/user/`) with
 `Persistent=true` on the timer and the same `EXIT=`/`notify` tail, and remove it
-after it fires. Before rebooting a node, list its transient timers
-(`ls /run/systemd/transient/*.timer /run/user/*/systemd/transient/*.timer`),
-save each `systemctl cat`, and re-create them after boot. A row whose `--at`
-is a single instant records `scheduled_epoch`, so the SessionStart sweep keeps
-it for a week after it was due (not after it was registered) and a vanished
-timer shows up as `lost`; a recurring spec keeps the registration-time week.
+after it fires. A row whose `--at` is a single instant records
+`scheduled_epoch`, so the SessionStart sweep keeps it for a week after it was
+due (not after it was registered) and a vanished timer shows up as `lost`; a
+recurring spec keeps the registration-time week.
+
+**Around a reboot: export, then restore (#2827).** `schedule` saves the exact
+`systemd-run` argv it launched in the registry row (`launch_argv`: run time,
+command, `Environment=`, `--user`), so the timer can be re-created after the
+reboot from what is on disk:
+
+```bash
+DJ=~/.claude/hooks/lib/detached_jobs.py; SNAP=~/.claude/state/reboot-$(date +%Y%m%d)/timers.json
+python3 $DJ export-timers --out "$SNAP"      # before: snapshot of jobs still waiting; exit 1 = some are not restorable
+python3 $DJ restore-timers --from "$SNAP" --dry-run   # after: what would be launched, nothing changed
+python3 $DJ restore-timers --from "$SNAP"    # re-create the missing timers and compare with the snapshot
+```
+
+- `restore-timers` replays the saved argv, so the job keeps the HOME/PATH it
+  was scheduled with, not the restoring shell's. A timer that is still armed
+  is `kept`, never launched twice; running it again is a no-op. Without
+  `--from` it restores from the registry alone (an unplanned reboot).
+- With `--from`, each unit is compared with its pre-reboot `systemctl cat`
+  values (time, command, working directory, and `Environment=` by value, so
+  one line with two assignments equals two lines); a mismatch is `differs`.
+- Exit 1 means something needs a person: `missed` (the one-shot time passed
+  while the timer was gone — it is not re-armed for a later time; run it by
+  hand if still wanted, then `ack --unit`), `unrestorable` (a row scheduled
+  before `launch_argv` existed, or one whose argv does not match its row —
+  re-create it by hand from the `live` values in the snapshot), `failed`, or
+  `differs`. Run the user-scope restore as that user. Timers made by a bare
+  `systemd-run`, outside `schedule`, are not in the registry: list them with
+  `ls /run/systemd/transient/*.timer /run/user/*/systemd/transient/*.timer`
+  and save each `systemctl cat` yourself.
 
 Two traps, both silent (#2710):
 

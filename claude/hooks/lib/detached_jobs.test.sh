@@ -610,6 +610,224 @@ rows={r[\"unit\"]:r for r in (json.loads(l) for l in open(sys.argv[1]) if l.stri
 assert rows[\"due2827\"][\"scheduled_epoch\"]==int(datetime(2030,1,2,3,4,5,tzinfo=ZoneInfo(\"Asia/Seoul\")).timestamp())
 assert \"scheduled_epoch\" not in rows[\"rec2827\"]" "$R2827"'
 
+# ---- #2827 (B): export / restore of scheduled timers around a reboot ----------
+# A transient timer lives under /run and a reboot erases it. `schedule` now
+# saves the argv it launched in the registry row; `restore-timers` replays it
+# for every job whose timer is gone, and `export-timers` is the pre-reboot
+# snapshot the re-created units are compared with. The fake systemd below keeps
+# one file per armed timer, so "reboot" is `rm` and nothing touches the host.
+FAKE="$TMP/fake-systemd"; mkdir -p "$FAKE/system" "$FAKE/user" || exit 1
+RB="$TMP/reg-restore.jsonl"; RBLOG="$TMP/restore-sdr.log"; : > "$RB"; : > "$RBLOG"
+export FAKE_SYSTEMD="$FAKE" SDR_LOG="$RBLOG"
+write_exec_stub "$TMP/bin/systemd-run" <<'SH'
+[ -n "${SDR_FAIL:-}" ] && { echo "Failed to start transient timer unit: boom" >&2; exit 1; }
+{ printf '%q ' "$@"; echo; } >> "${SDR_LOG:?}"
+scope=system; [ "$1" = "--user" ] && { scope=user; shift; }
+unit=""; cal=""; wd=""; envs=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --unit) unit="$2"; shift 2 ;;
+    --on-calendar) cal="$2"; shift 2 ;;
+    --property=Environment=*) envs+=("${1#--property=Environment=}"); shift ;;
+    --property=WorkingDirectory=*) wd="${1#--property=WorkingDirectory=}"; shift ;;
+    --collect|--timer-property=*) shift ;;
+    *) break ;;
+  esac
+done
+{
+  echo "[Timer]"; echo "OnCalendar=$cal"; echo "[Service]"
+  for e in "${envs[@]}"; do echo "Environment=\"$e\""; done
+  [ -n "$wd" ] && echo "WorkingDirectory=$wd"
+  echo "ExecStart="; echo "ExecStart=$*"
+} > "${FAKE_SYSTEMD:?}/$scope/$unit.cat"
+SH
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+scope=system; [ "$1" = "--user" ] && { scope=user; shift; }
+case "$1" in
+  is-active)
+    case "$2" in
+      *.timer) [ -f "${FAKE_SYSTEMD:?}/$scope/${2%.timer}.cat" ] && { echo active; exit 0; } ;;
+      *.service) [ -f "${FAKE_SYSTEMD:?}/$scope/${2%.service}.running" ] && { echo active; exit 0; } ;;
+    esac
+    exit 3 ;;
+  cat)
+    shift; [ "$1" = "--no-pager" ] && shift
+    [ -f "${FAKE_SYSTEMD:?}/$scope/${1%.timer}.cat" ] || exit 1
+    cat "${FAKE_SYSTEMD:?}/$scope/${1%.timer}.cat"; exit 0 ;;
+esac
+exit 3
+SH
+write_exec_stub "$TMP/bin/loginctl" <<'SH'
+echo "Linger=yes"
+SH
+reboot_fake() { rm -f "$FAKE"/system/*.cat "$FAKE"/user/*.cat; }
+armed_count() { find "$FAKE/system" "$FAKE/user" -name '*.cat' | wc -l | tr -d ' '; }
+launches() { grep -c -- "--unit $1 " "$RBLOG" || true; }
+# jpy FILE EXPR — EXPR is python over the snapshot `d`: T / S map unit -> timers / skipped row.
+jpy() {
+  python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+T = {t["unit"]: t for t in d["timers"]}; S = {t["unit"]: t for t in d["skipped"]}
+assert eval(sys.argv[2]), sys.argv[2]' "$1" "$2" 2>/dev/null
+}
+FUTURE="2099-01-02 03:04:05 Asia/Seoul"
+
+# The environment at schedule time is deliberately not the one restore runs in.
+HOME=/home/sched PATH="$TMP/bin:/sched/bin:$PATH" python3 "$MOD" schedule --unit rb-a --at "$FUTURE" \
+  --log "$TMP/rb-a.log" --summary "check the rollout" --workdir "$TMP" --tier action --fail-tier critical \
+  --result-file "$TMP/rb-a.result" --registry "$RB" -- bash -c 'echo "hi there" "$HOME"' >/dev/null 2>&1
+HOME=/home/sched python3 "$MOD" schedule --unit rb-u --at "$FUTURE" --log "$TMP/rb-u.log" --user --registry "$RB" -- true >/dev/null 2>&1
+python3 "$MOD" schedule --unit rb-r --at "05:00" --log "$TMP/rb-r.log" --registry "$RB" -- true >/dev/null 2>&1
+ok "#2827B: schedule saves the exact systemd-run argv it launched in the registry row" \
+  'python3 -c "import json,sys,shlex
+rows={r[\"unit\"]:r for r in (json.loads(l) for l in open(sys.argv[1]) if l.strip())}
+logged=[shlex.split(l) for l in open(sys.argv[2]) if l.strip()]
+a=rows[\"rb-a\"][\"launch_argv\"]; u=rows[\"rb-u\"][\"launch_argv\"]
+assert a[:6]==[\"systemd-run\",\"--unit\",\"rb-a\",\"--collect\",\"--on-calendar\",sys.argv[3]], a[:6]
+assert \"--property=Environment=HOME=/home/sched\" in a and any(x.startswith(\"--property=Environment=PATH=\") and \"/sched/bin\" in x for x in a)
+assert u[:2]==[\"systemd-run\",\"--user\"] and a[1:]==logged[0] and u[1:]==logged[1]" "$RB" "$RBLOG" "$FUTURE"'
+
+# Scheduled jobs that are no longer waiting: finished, acknowledged, already started.
+for u in rb-done rb-acked rb-running; do
+  python3 "$MOD" schedule --unit "$u" --at "$FUTURE" --log "$TMP/$u.log" --registry "$RB" -- true >/dev/null 2>&1
+done
+printf 'ran\nEXIT=0\n' > "$TMP/rb-done.log"
+python3 "$MOD" ack --unit rb-acked --registry "$RB" >/dev/null
+: > "$FAKE/system/rb-running.running"
+python3 "$MOD" register --unit rb-plain --log "$TMP/rb-plain.log" --registry "$RB" >/dev/null
+n_before="$(wc -l < "$RBLOG")"
+python3 "$MOD" export-timers --registry "$RB" > "$TMP/snap0.json" 2>"$TMP/snap0.err"; rc=$?
+ok "#2827B: export-timers lists only the scheduled jobs still waiting (not done, acked, started, or plain register)" \
+  '[ "$rc" = 0 ] && [ ! -s "$TMP/snap0.err" ] && jpy "$TMP/snap0.json" "sorted(T)==[\"rb-a\",\"rb-r\",\"rb-u\"] and not S and d[\"version\"]==1"'
+ok "#2827B: an exported row carries time, scope, the launch argv and the live unit's values" \
+  'jpy "$TMP/snap0.json" "T[\"rb-a\"][\"state\"]==\"armed\" and T[\"rb-a\"][\"scheduled_at\"]==\"$FUTURE\" and T[\"rb-a\"][\"scope\"]==\"system\" and T[\"rb-u\"][\"scope\"]==\"user\" and T[\"rb-a\"][\"launch_argv\"][0]==\"systemd-run\" and T[\"rb-a\"][\"live\"][\"OnCalendar\"]==[\"$FUTURE\"] and \"HOME=/home/sched\" in T[\"rb-a\"][\"live\"][\"Environment\"] and T[\"rb-a\"][\"live\"][\"WorkingDirectory\"]==[\"$TMP\"] and len(T[\"rb-a\"][\"live\"][\"ExecStart\"])==1"'
+ok "#2827B: export-timers launches nothing" '[ "$(wc -l < "$RBLOG")" = "$n_before" ]'
+
+# A row written before launch_argv existed, its timer still armed: the export
+# must say before the reboot that this one cannot be brought back.
+printf '{"unit":"rb-legacy","log":"%s","started_at":%s,"scheduled_at":"%s","notify_on_exit":true,"tier":"notice"}\n' \
+  "$TMP/rb-legacy.log" "$NOW" "$FUTURE" >> "$RB"
+printf '[Timer]\nOnCalendar=%s\n[Service]\nEnvironment="HOME=/root"\nExecStart=\nExecStart="/bin/bash" "-c" "true"\n' "$FUTURE" > "$FAKE/system/rb-legacy.cat"
+out="$(python3 "$MOD" export-timers --registry "$RB" --out "$TMP/snap.json" 2>"$TMP/snap.err")"; rc=$?
+ok "#2827B: a row without a launch definition is exported under skipped, with its live values, and exit 1" \
+  '[ "$rc" = 1 ] && grep -q "not restorable: rb-legacy (armed)" "$TMP/snap.err" && jpy "$TMP/snap.json" "sorted(T)==[\"rb-a\",\"rb-r\",\"rb-u\"] and sorted(S)==[\"rb-legacy\"] and \"no launch definition\" in S[\"rb-legacy\"][\"reason\"] and S[\"rb-legacy\"][\"live\"][\"ExecStart\"]"'
+ok "#2827B: --out writes the snapshot owner-only and prints the counts" \
+  '[ "$(stat -c %a "$TMP/snap.json" 2>/dev/null || stat -f %Lp "$TMP/snap.json")" = 600 ] && grep -q "exported: timers=3 skipped=1 -> $TMP/snap.json" <<<"$out"'
+
+# Nothing is missing yet: restore must not launch a second copy of an armed timer.
+out="$(python3 "$MOD" restore-timers --registry "$RB" 2>&1)"; rc=$?
+ok "#2827B: restore-timers leaves armed timers alone (kept, nothing launched, exit 0)" \
+  '[ "$rc" = 0 ] && [ "$(wc -l < "$RBLOG")" = "$n_before" ] && grep -q "restore-timers: restored=0 kept=4$" <<<"$out" && grep -q "^kept	rb-legacy	.*a reboot would lose it" <<<"$out"'
+
+# ---- reboot: every transient timer is gone -----------------------------------
+PAST_AT="$(python3 -c "import time; print(time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(time.time() - 7200)))") UTC"
+python3 "$MOD" schedule --unit rb-past --at "$PAST_AT" --log "$TMP/rb-past.log" --registry "$RB" -- true >/dev/null 2>&1
+reboot_fake
+cp "$RB" "$TMP/reg-restore.before"; n_before="$(wc -l < "$RBLOG")"
+python3 "$MOD" export-timers --registry "$RB" > "$TMP/snap-after.json" 2>/dev/null
+ok "#2827B: after the reboot the export shows the timers missing, the past one missed, the legacy one unrestorable" \
+  'jpy "$TMP/snap-after.json" "sorted(T)==[\"rb-a\",\"rb-r\",\"rb-u\"] and all(t[\"state\"]==\"missing\" and \"live\" not in t for t in T.values()) and S[\"rb-past\"][\"state\"]==\"missed\" and S[\"rb-legacy\"][\"state\"]==\"unrestorable\""'
+
+for flag in --dry-run --print; do
+  out="$(HOME=/home/restorer python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/snap.json" "$flag" 2>&1)"; rc=$?
+  ok "#2827B: restore-timers $flag prints what it would launch and changes nothing" \
+    '[ "$rc" = 1 ] && [ "$(grep -c "^would-restore	" <<<"$out")" = 3 ] && grep -q "^would-restore	rb-a	$FUTURE	system	systemd-run --unit rb-a --collect --on-calendar" <<<"$out" && grep -q "would-restore=3 .*(dry run: nothing launched)" <<<"$out" && [ "$(wc -l < "$RBLOG")" = "$n_before" ] && [ "$(armed_count)" = 0 ] && cmp -s "$RB" "$TMP/reg-restore.before"'
+done
+
+# The real thing, from a shell whose HOME/PATH are not the ones the job was scheduled with.
+out="$(HOME=/home/restorer python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/snap.json" 2>&1)"; rc=$?
+ok "#2827B: restore-timers re-creates each missing timer by replaying the saved argv — same time, command, environment, scope" \
+  '[ "$(launches rb-a)" = 2 ] && [ "$(launches rb-u)" = 2 ] && [ "$(launches rb-r)" = 2 ] && [ "$(grep -- "--unit rb-a " "$RBLOG" | sort -u | wc -l)" = 1 ] && [ "$(grep -- "--unit rb-u " "$RBLOG" | sort -u | wc -l)" = 1 ] && grep -q "^--user --unit rb-u " "$RBLOG" && ! grep -q "/home/restorer" "$RBLOG" && [ -f "$FAKE/system/rb-a.cat" ] && [ -f "$FAKE/user/rb-u.cat" ] && [ -f "$FAKE/system/rb-r.cat" ]'
+ok "#2827B: the re-created unit is compared with the snapshot's values and reported as matching" \
+  'grep -q "^restored	rb-a	$FUTURE	system	time, command and environment match the snapshot$" <<<"$out" && grep -q "^restored	rb-u	$FUTURE	user	" <<<"$out"'
+ok "#2827B: a job whose time has passed is reported missed and not re-armed; exit 1" \
+  '[ "$rc" = 1 ] && grep -q "^missed	rb-past	.*passed 2h.*not re-armed" <<<"$out" && [ "$(launches rb-past)" = 1 ] && [ ! -f "$FAKE/system/rb-past.cat" ]'
+ok "#2827B: a row without the new fields is reported unrestorable, without a crash or a launch" \
+  'grep -q "^unrestorable	rb-legacy	.*no launch definition" <<<"$out" && [ "$(launches rb-legacy)" = 0 ] && grep -q "restore-timers: restored=3 kept=0 missed=1 unrestorable=1$" <<<"$out"'
+ok "#2827B: restore-timers does not write the registry (started_at and log_offset stay the original run's)" 'cmp -s "$RB" "$TMP/reg-restore.before"'
+
+n_before="$(wc -l < "$RBLOG")"
+out="$(python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/snap.json" 2>&1)"
+ok "#2827B: a second restore-timers is a no-op — the timers that exist are kept, not duplicated" \
+  '[ "$(wc -l < "$RBLOG")" = "$n_before" ] && grep -q "restored=0 kept=3 " <<<"$out" && grep -q "^kept	rb-a	.*match the snapshot" <<<"$out"'
+
+# By value, not by text: the same environment on one line is still the same unit...
+{
+  grep -v '^Environment=' "$FAKE/system/rb-a.cat"
+  printf 'Environment=%s\n' "$(sed -n 's/^Environment=//p' "$FAKE/system/rb-a.cat" | tr '\n' ' ')"
+} > "$TMP/rb-a.cat" && cp "$TMP/rb-a.cat" "$FAKE/system/rb-a.cat"
+out="$(python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/snap.json" 2>&1)"
+ok "#2827B: two Environment= assignments on one line compare equal to one per line" \
+  '[ "$(grep -c "^Environment=" "$FAKE/system/rb-a.cat")" = 1 ] && grep -q "^kept	rb-a	.*match the snapshot" <<<"$out"'
+# ...and a timer re-created by hand without its environment is not.
+grep -v '^Environment=' "$TMP/rb-a.cat" > "$FAKE/system/rb-a.cat"
+out="$(python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/snap.json" 2>&1)"; rc=$?
+ok "#2827B: an armed timer whose environment is not the snapshot's is reported as differs" \
+  '[ "$rc" = 1 ] && grep -q "^differs	rb-a	.*differs from the snapshot in Environment$" <<<"$out" && grep -q " differs=1$" <<<"$out"'
+
+# A snapshot is a reference, not an override: a job scheduled again since the
+# export is restored from the registry's newer row.
+NEWER="2099-06-07 08:09:10 Asia/Seoul"
+python3 "$MOD" schedule --unit rb-a --at "$NEWER" --log "$TMP/rb-a.log" --registry "$RB" -- true >/dev/null 2>&1
+reboot_fake
+out="$(python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/snap.json" 2>&1)"
+ok "#2827B: a job re-scheduled after the export is restored at its new time, without a false differs" \
+  'grep -q "^restored	rb-a	$NEWER	system$" <<<"$out" && grep -q "^OnCalendar=$NEWER$" "$FAKE/system/rb-a.cat"'
+# With the registry gone, the snapshot rows are the jobs.
+reboot_fake
+out="$(python3 "$MOD" restore-timers --registry "$TMP/no-such-registry.jsonl" --from "$TMP/snap.json" 2>&1)"
+ok "#2827B: when the registry no longer knows a unit, the snapshot row restores it" \
+  'grep -q "^restored	rb-a	$FUTURE	system	" <<<"$out" && grep -q "^restored	rb-u	$FUTURE	user	" <<<"$out" && grep -q "^OnCalendar=$FUTURE$" "$FAKE/system/rb-a.cat"'
+
+# A launch definition that does not belong to its row is never run.
+reboot_fake; RBAD="$TMP/reg-bad.jsonl"
+# shellcheck disable=SC2034  # read via eval inside ok()
+n_before="$(wc -l < "$RBLOG")"
+{
+  printf '{"unit":"rb-x1","log":"%s","started_at":%s,"scheduled_at":"05:00","launch_argv":["/bin/sh","-c","touch %s"]}\n' "$TMP/x1.log" "$NOW" "$TMP/pwned"
+  printf '{"unit":"rb-x2","log":"%s","started_at":%s,"scheduled_at":"05:00","launch_argv":["systemd-run","--unit","other","--collect","--on-calendar","05:00","true"]}\n' "$TMP/x2.log" "$NOW"
+  printf '{"unit":"rb-x3","log":"%s","started_at":%s,"scheduled_at":"05:00","launch_argv":["systemd-run","--user","--unit","rb-x3","--collect","--on-calendar","05:00","true"]}\n' "$TMP/x3.log" "$NOW"
+  printf '{"unit":"rb-x4","log":"%s","started_at":%s,"scheduled_at":"05:00","launch_argv":["systemd-run","--unit","rb-x4","--collect","--on-calendar","06:00","true"]}\n' "$TMP/x4.log" "$NOW"
+  printf '{"unit":"rb-x5","log":"%s","started_at":%s,"scheduled_at":"05:00","launch_argv":"systemd-run --unit rb-x5"}\n' "$TMP/x5.log" "$NOW"
+} > "$RBAD"
+out="$(python3 "$MOD" restore-timers --registry "$RBAD" 2>&1)"; rc=$?
+ok "#2827B: an argv that is not schedule's, or names another unit, scope or time, is unrestorable and never run" \
+  '[ "$rc" = 1 ] && [ "$(grep -c "^unrestorable	rb-x[1-5]	" <<<"$out")" = 5 ] && [ "$(wc -l < "$RBLOG")" = "$n_before" ] && [ ! -e "$TMP/pwned" ]'
+
+# Failures are said out loud.
+out="$(SDR_FAIL=1 python3 "$MOD" restore-timers --registry "$RB" 2>&1)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
+ok "#2827B: a systemd-run that refuses is reported failed with exit 1" \
+  '[ "$rc" = 1 ] && grep -q "^failed	rb-a	" <<<"$out" && grep -q "systemd-run rc=1" <<<"$out"'
+printf 'not json\n' > "$TMP/bad-snap.json"; printf '{"version":99,"timers":[]}\n' > "$TMP/old-snap.json"
+chmod 600 "$TMP/bad-snap.json" "$TMP/old-snap.json"
+out="$(for snap in bad-snap old-snap absent; do python3 "$MOD" restore-timers --registry "$RB" --from "$TMP/$snap.json" 2>&1; echo "rc=$?"; done)"
+ok "#2827B: an unreadable, foreign or missing --from snapshot is a usage error and launches nothing" \
+  '[ "$(grep -c "^rc=2$" <<<"$out")" = 3 ] && grep -q "not an export-timers snapshot" <<<"$out" && [ "$(armed_count)" = 0 ]'
+# A snapshot row's argv can be run, so the file must be this user's alone.
+cp "$TMP/snap.json" "$TMP/loose-snap.json"; chmod 664 "$TMP/loose-snap.json"
+out="$(python3 "$MOD" restore-timers --registry "$TMP/no-such-registry.jsonl" --from "$TMP/loose-snap.json" 2>&1)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
+ok "#2827B: a group-writable --from snapshot is refused and launches nothing" \
+  '[ "$rc" = 2 ] && grep -q "not group/world-writable" <<<"$out" && [ "$(armed_count)" = 0 ]'
+# The sweep fails open on an unexpected error; an operator-run restore must not.
+crash() {
+  python3 - "$MOD" "$@" <<'PY'
+import json, runpy, sys
+def boom(*_a, **_k):
+    raise RuntimeError("boom")
+json.loads = boom
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+PY
+}
+out="$(crash sweep "$RB" 2>&1; echo "rc=$?"; crash restore-timers --registry "$RB" 2>&1; echo "rc=$?"; crash export-timers --registry "$RB" 2>&1; echo "rc=$?")"
+ok "#2827B: an unexpected error stays silent for sweep (rc 0) and is loud for export/restore (rc 1)" \
+  '[ "$(sed -n 1p <<<"$out")" = "rc=0" ] && grep -q "restore-timers failed: RuntimeError" <<<"$out" && grep -q "export-timers failed: RuntimeError" <<<"$out" && [ "$(grep -c "^rc=1$" <<<"$out")" = 2 ]'
+unset FAKE_SYSTEMD SDR_LOG
+
 # The summary line format is load-bearing: validate-harness.sh's
 # suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
 # reads as a suite that asserted nothing.
