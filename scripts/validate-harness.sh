@@ -705,6 +705,12 @@ else
   err "doctor skill-promotion last-collect verdict tests failed (a skipped or failed nightly collect would stay invisible, #2232)"
   tail -10 "$TMP/doctor-last-collect-test.out" 2>/dev/null
 fi
+if python3 scripts/ccc_doctor_spans_rollup_tick_test.py >"$TMP/doctor-spans-rollup-tick-test.out" 2>&1; then
+  say "  ok doctor spans-rollup tick verdict tests"
+else
+  err "doctor spans-rollup tick verdict tests failed (a nightly span rollup that stopped firing would stay invisible, #2684)"
+  tail -10 "$TMP/doctor-spans-rollup-tick-test.out" 2>/dev/null
+fi
 if python3 scripts/ccc_skill_promotion_redispatch_test.py >"$TMP/skill-promotion-redispatch-test.out" 2>&1; then
   say "  ok skill-promotion dispatch-skip ledger + redispatch selection tests"
 else

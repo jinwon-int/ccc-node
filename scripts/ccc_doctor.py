@@ -1224,6 +1224,7 @@ class Doctor:
         self.check_skill_prescreen()
         self.check_skill_promotion_dispatch_gap()
         self.check_skill_promotion_last_collect()
+        self.check_spans_rollup_tick()
         self.check_fleet_skills_sync()
         self.check_skill_promotion_revise_stall()
         self.check_skill_promotion_unpromoted()
@@ -3154,6 +3155,110 @@ class Doctor:
             )
             return
         self.add("정상", item, f"ok; published={count}; {age}", "none")
+
+    _SPANS_ROLLUP_STATUS_FILE = "spans-rollup.status.json"
+    _SPANS_ROLLUP_MAX_BYTES = 64 * 1024
+    _SPANS_ROLLUP_MAX_AGE_HOURS_DEFAULT = 36
+    _SPANS_ROLLUP_CODE_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+    _SPANS_ROLLUP_STATE_DIR_RE = re.compile(r'CCC_STATE_DIR=\\?"(/[^"\\]+)\\?"')
+    _SPANS_ROLLUP_CRON_MARKER = "# ccc-node:cost-ledger"
+
+    def _spans_rollup_status_path(self) -> Path | None:
+        """Status file for the installed spans-rollup cron line, or None if absent.
+
+        The cost-ledger installer bakes `CCC_STATE_DIR="<dir>"` into the line
+        and the rollup writes its receipt there, so prefer that over the
+        doctor's own state dir.
+        """
+        crontab_cmd = os.environ.get("CCC_CRONTAB_CMD", "crontab")
+        try:
+            cron = subprocess.run(
+                [crontab_cmd, "-l"], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            cron = ""
+        lines = [
+            ln for ln in cron.splitlines()
+            if self._SPANS_ROLLUP_CRON_MARKER in ln and "spans-rollup" in ln
+            and not ln.lstrip().startswith("#") and not CRON_BLOCK_MARKER_RE.search(ln)
+        ]
+        if not lines:
+            return None
+        match = self._SPANS_ROLLUP_STATE_DIR_RE.search(lines[0])
+        state_dir = Path(
+            match.group(1) if match
+            else os.environ.get("CCC_STATE_DIR") or (self.claude_dir / "state")
+        ).expanduser()
+        return state_dir / self._SPANS_ROLLUP_STATUS_FILE
+
+    def _load_spans_rollup_status(self, path: Path) -> tuple[str, str] | dict:
+        """The parsed status object, or a `(klass, token)` verdict when unusable."""
+        if path.is_symlink():
+            return ("경고", "rollup-status-symlink")
+        if not path.exists():
+            return ("경고", "rollup-status-missing")
+        try:
+            if not path.is_file() or path.stat().st_size > self._SPANS_ROLLUP_MAX_BYTES:
+                return ("경고", "rollup-status-oversized")
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError:
+            return ("수동필요", "rollup-status-unreadable")
+        except ValueError:
+            return ("경고", "rollup-status-malformed")
+        if not isinstance(data, dict) or self._parse_ledger_ts(data.get("finished_at")) is None:
+            return ("경고", "rollup-status-malformed")
+        return data
+
+    def check_spans_rollup_tick(self) -> None:
+        """Did the nightly span rollup (#2684) actually run recently?
+
+        `spans-rollup.py` exits 0 and delivers nothing on an idle day, so the
+        wiki queue and the 09:00 digest cannot tell a quiet node from a cron
+        line that stopped firing. Every delivering run now overwrites
+        `$CCC_STATE_DIR/spans-rollup.status.json`; this row reads it when the
+        cost-ledger block carries a spans-rollup line. No line → opt-in, not
+        drift. Only fixed tokens and numbers from the file are printed.
+        `CCC_DOCTOR_SPANS_ROLLUP_MAX_AGE_HOURS` sets the staleness threshold
+        (default 36; `0` disables the age gate).
+        """
+        item = "spans-rollup tick"
+        path = self._spans_rollup_status_path()
+        if path is None:
+            self.add("정상", item, "not installed (opt-in)", "none")
+            return
+        rerun = ("rerun `python3 scripts/spans-rollup.py` (or wait for the 03:41 KST tick), "
+                 "then read the cost-ledger cron log")
+        data = self._load_spans_rollup_status(path)
+        if isinstance(data, tuple):
+            klass, token = data
+            action = {
+                "rollup-status-missing": "the cron line exists but no tick was recorded — "
+                                         f"check that cron runs; {rerun}",
+                "rollup-status-unreadable": f"inspect {path} permissions; "
+                                            "the last rollup tick cannot be verified",
+            }.get(token, f"inspect {path} (must be a small regular JSON file); {rerun}")
+            self.add(klass, item, token, action)
+            return
+        finished = self._parse_ledger_ts(data.get("finished_at")) or 0.0
+        raw_code = data.get("result_code")
+        code = (raw_code if isinstance(raw_code, str) and self._SPANS_ROLLUP_CODE_RE.match(raw_code)
+                else "unknown")
+        age_sec = max(0.0, time.time() - finished)
+        age_hours = int(age_sec // 3600)
+        status = f"result={code}; age={age_hours}h"
+        if data.get("ok") is not True:
+            self.add("경고", item, f"rollup-failed; {status}",
+                     "the last rollup ended ok=false; read the cost-ledger cron log, "
+                     f"fix the cause, then {rerun}")
+            return
+        raw = os.environ.get("CCC_DOCTOR_SPANS_ROLLUP_MAX_AGE_HOURS", "").strip()
+        max_age = int(raw) if raw.isdigit() else self._SPANS_ROLLUP_MAX_AGE_HOURS_DEFAULT
+        if max_age and age_sec > max_age * 3600:
+            self.add("경고", item, f"rollup-tick-stale; {status}; max={max_age}h",
+                     f"no rollup tick for {age_hours}h — check cron and the cost-ledger "
+                     f"cron log; {rerun}")
+            return
+        self.add("정상", item, f"ok; {status}", "none")
 
     @staticmethod
     def _parse_ledger_ts(value: object) -> float | None:
