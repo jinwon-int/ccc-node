@@ -369,12 +369,25 @@ run_skill_review_bg() {
     # away (Hermes-style — no human gate). The script is a strict no-op unless
     # CCC_SKILL_AUTOSAVE_MODE=auto (or the skill-autosave.mode state file says
     # auto), so approve-mode nodes are unchanged.
-    local AUTOINSTALL summary still_pending
+    local AUTOINSTALL summary still_pending counts_line
     AUTOINSTALL="${CCC_SKILL_AUTOINSTALL_CMD:-$HOOKDIR/skill-review/autoinstall.sh}"
     if [ -f "$AUTOINSTALL" ]; then
       summary="$(CCC_SKILL_AUTOSAVE_TRIGGER="hook-$TRIGGER" bash "$AUTOINSTALL" run 2>>"$LOG")" \
         && log "autoinstall $(printf '%s' "$summary" | head -c 500)" \
         || log "autoinstall failed (non-fatal)"
+      # #2843: the line above is cut at 500 bytes; this one is counts only
+      # (no skill names/ids), same filter as autoinstall_counts() in
+      # scripts/ccc-skill-autosave.sh — the autosave suite pins both.
+      counts_line="$(printf '%s' "$summary" | jq -r '
+        def n: if type == "array" then length else 0 end;
+        def num: if type == "number" and . >= 0 then floor else 0 end;
+        def code: if type == "string" and test("^[a-z0-9_-]{1,64}$") then . else "other" end;
+        def tally: [.[]? | (if type == "object" then (.reason // "" | tostring | split(" ")[0]) else "" end) | code]
+          | group_by(.) | map("\(.[0]):\(length)") | join(",") | if . == "" then "-" else . end;
+        select(type == "object" and (.installed | type) == "array")
+        | "installed=\(.installed | n) blocked=\(.blocked | n) blocked_reasons=\(.blocked | tally) newly_blocked=\(.newly_blocked | n) would_install=\(.would_install | n) deferred=\(.deferred | num) failed=\(.failed | num) pending=\(.pending | num) prescreen_archived=\(.prescreen_archived | n) dry_run=\(.dry_run == true)"
+      ' 2>/dev/null | head -n 1)"
+      [ -n "$counts_line" ] && log "autoinstall-counts $counts_line"
     fi
     # Approval marker only for drafts that still wait for a human — in auto
     # mode an installed draft needs review/rollback, not approval.

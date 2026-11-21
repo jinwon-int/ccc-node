@@ -87,6 +87,10 @@ if probe_touch:
 if sys.argv[1:2] == ["collect"] and "PROMOTION_COLLECT_RC" in os.environ:
     sys.stdout.write(os.environ.get("PROMOTION_COLLECT_OUT", ""))
     sys.exit(int(os.environ["PROMOTION_COLLECT_RC"]))
+# #2843: a run child can be handed a canned summary (file) and exit code.
+if sys.argv[1:2] == ["run"] and "PROMOTION_RUN_OUT" in os.environ:
+    sys.stdout.write(Path(os.environ["PROMOTION_RUN_OUT"]).read_text(encoding="utf-8"))
+    sys.exit(int(os.environ.get("PROMOTION_RUN_RC", "0")))
 print('{"ok":true}')
 PY
 chmod +x "$PROMOTER"
@@ -1224,6 +1228,72 @@ st52c="$(CCC_STATE_DIR="$STATE19" CCC_SKILL_AUTOSAVE_ENV_FILE="$AENV" bash "$AUT
 ok "#2650: a group/other-readable autosave env file is ignored and reported unsafe" \
   'jq -e ".max_per_run == \"unset\"" <<<"$out52c" >/dev/null && printf "%s" "$st52c" | grep -q "^autosave env file: unsafe .*applied=none"'
 
+# ---- #2843: untruncatable promotion-stage / autoinstall count lines ----------
+# The raw summary lines are cut at 500 bytes (unparseable on every node); the
+# count lines carry whole counts and shape-checked code tallies, never names.
+STATE53="$TMP/state53"; mkdir -p "$STATE53"; chmod 700 "$STATE53"
+PROMO53="$TMP/promotion53.json"
+python3 - "$PROMO53" <<'PY53'
+import json, sys
+blocked = [{"provider": "claude", "name": f"private-skill-name-{i:02d}", "code": "usage_unproven", "uses": 0} for i in range(20)]
+blocked += [{"provider": "claude", "name": f"private-skill-name-{i:02d}", "code": "description_trigger_missing"} for i in range(20, 29)]
+blocked += [{"provider": "claude", "name": "private-skill-name-29", "code": "Bad Code/../x"}]
+summary = {"ok": False, "mode": "run", "enabled": True, "autonomy": "active",
+           "staged": [{"outcome": "staged", "transport_id": "t1", "provider": "claude", "name": "private-skill-name-staged"}],
+           "blocked": blocked, "repaired": [{"provider": "claude", "name": "private-skill-name-r", "code": "frontmatter"}],
+           "errors": [{"provider": "claude", "name": "private-skill-name-e1", "code": "publish_failed"},
+                      {"provider": "claude", "name": "private-skill-name-e2", "code": "publish_failed"}],
+           "outbox": {"stale": False}}
+open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(summary))
+PY53
+AI53="$TMP/autoinstall-stub53.sh"
+cat > "$AI53" <<'SH53'
+#!/usr/bin/env bash
+# Canned autoinstall summary: 12 blocked drafts (long enough to be cut at 500).
+python3 - <<'PY'
+import json
+blocked = [{"id": f"draft-private-{i:02d}", "reason": r} for i, r in enumerate(
+    ["dedup private-skill-name-x"] * 5 + ["lint description-yaml-unsafe"] * 4 + ["proposal mixed-payload", "already-exists private-skill-name-y", "Weird/Reason x"])]
+print(json.dumps({"mode": "auto", "autonomy": "active", "providers": ["claude"], "provider": "claude",
+                  "installed": ["private-skill-name-installed"], "blocked": blocked,
+                  "newly_blocked": ["draft-private-00", "draft-private-11"], "would_install": [],
+                  "dry_run": False, "deferred": 3, "failed": 0, "pending": 14,
+                  "require_prescreen": True, "unscreened": 0, "prescreen_archived": [{"id": "draft-private-z", "verdict": "reject"}]}))
+PY
+SH53
+chmod +x "$AI53"
+run53() { # <promotion-rc>
+  CCC_STATE_DIR="$STATE53" CLAUDE_PROJECTS_DIR="$TMP/projects53" CCC_PUSH_SPOOL="$TMP/spool53" \
+    CCC_SKILL_REVIEW_CMD="$REVIEW" CCC_SKILL_SCAN_CMD="$SCAN" SCAN_TOUCH="$TMP/scan53.touched" \
+    CCC_SKILL_PROMOTION_CMD="$PROMOTER" PROMOTION_TOUCH="$TMP/promotion53.touched" \
+    PROMOTION_RUN_OUT="$PROMO53" PROMOTION_RUN_RC="$1" \
+    CCC_SKILL_AUTOINSTALL_CMD="$AI53" CCC_SKILL_AUTOSAVE_MODE=auto \
+    CLAUDE_SKILLS_DIR="$TMP/skills53" CCC_SKILL_AUTOSAVE_SETTLE_SECONDS=15 \
+    CCC_NODE=testnode bash "$AUTOSAVE" run >/dev/null 2>&1
+}
+run53 2
+LOG53="$STATE53/skill-autosave.log"
+ok "#2843: a failing promotion run (staging errors, rc=2) still logs whole counts and code tallies" \
+  'grep -q " promotion-stage-counts mode=run status=none staged=1 blocked=30 blocked_codes=description_trigger_missing:9,other:1,usage_unproven:20 errors=2 error_codes=publish_failed:2 repaired=1$" "$LOG53"'
+ok "#2843: the existing failed line is unchanged" 'grep -q " promotion-stage failed (non-fatal) code=unknown$" "$LOG53"'
+: > "$LOG53"
+run53 0
+ok "#2843: the raw promotion-stage line is kept (cut at 500) alongside the count line" \
+  'grep -q " promotion-stage {" "$LOG53" && grep -q " promotion-stage-counts mode=run .* blocked=30 " "$LOG53"'
+ok "#2843: autoinstall count line — counts plus first-word reason tallies" \
+  'grep -q " autoinstall-counts installed=1 blocked=12 blocked_reasons=already-exists:1,dedup:5,lint:4,other:1,proposal:1 newly_blocked=2 would_install=0 deferred=3 failed=0 pending=14 prescreen_archived=1 dry_run=false$" "$LOG53"'
+ok "#2843: count lines never carry skill names or draft ids" \
+  '! grep -E " (promotion-stage|autoinstall)-counts " "$LOG53" | grep -q "private"'
+ok "#2843: count lines fit one short line" \
+  '[ "$(grep -E " (promotion-stage|autoinstall)-counts " "$LOG53" | awk "length > 400" | wc -l)" = 0 ]'
+# The hook path (skill-review.sh) carries its own copy of the autoinstall filter;
+# both copies must stay identical so the two producers log the same format.
+# shellcheck disable=SC2034  # read via eval inside ok()
+filter_sweep="$(sed -n '/^autoinstall_counts()/,/^}/p' "$AUTOSAVE" | sed -n '/def n:/,/dry_run ==/p' | sed 's/^ *//')"
+# shellcheck disable=SC2034  # read via eval inside ok()
+filter_hook="$(sed -n '/counts_line="$(printf/,/head -n 1)"/p' "$REVIEW" | sed -n '/def n:/,/dry_run ==/p' | sed 's/^ *//')"
+ok "#2843: sweep and hook autoinstall count filters are identical" \
+  '[ -n "$filter_sweep" ] && [ "$filter_sweep" = "$filter_hook" ]'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

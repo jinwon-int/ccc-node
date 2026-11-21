@@ -217,6 +217,38 @@ mkdir -p "$STATE_DIR" "$PENDING_DIR" 2>/dev/null
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s %s\n' "$(ts)" "$*" 2>/dev/null >> "$LOG" || :; }
 
+# #2843: the `autoinstall` / `promotion-stage` lines log the summary JSON cut
+# at 500 bytes, which on every node ended mid-`blocked[]` (537-char lines,
+# unparseable). These fixed-format count lines are derived from the same JSON
+# and cannot be cut mid-meaning: counts plus code tallies only. Codes are
+# re-validated by shape (anything else tallies as `other`) and skill names,
+# ids and paths never appear — the log is shipped off-node. Prints nothing
+# when the input is not the expected summary object.
+# The autoinstall filter is duplicated in claude/hooks/skill-review.sh (hook
+# path); scripts/ccc-skill-autosave.test.sh pins both to the same output.
+autoinstall_counts() { # <summary-json>
+  printf '%s' "$1" | jq -r '
+    def n: if type == "array" then length else 0 end;
+    def num: if type == "number" and . >= 0 then floor else 0 end;
+    def code: if type == "string" and test("^[a-z0-9_-]{1,64}$") then . else "other" end;
+    def tally: [.[]? | (if type == "object" then (.reason // "" | tostring | split(" ")[0]) else "" end) | code]
+      | group_by(.) | map("\(.[0]):\(length)") | join(",") | if . == "" then "-" else . end;
+    select(type == "object" and (.installed | type) == "array")
+    | "installed=\(.installed | n) blocked=\(.blocked | n) blocked_reasons=\(.blocked | tally) newly_blocked=\(.newly_blocked | n) would_install=\(.would_install | n) deferred=\(.deferred | num) failed=\(.failed | num) pending=\(.pending | num) prescreen_archived=\(.prescreen_archived | n) dry_run=\(.dry_run == true)"
+  ' 2>/dev/null | head -n 1
+}
+
+promotion_stage_counts() { # <summary-json>
+  printf '%s' "$1" | jq -r '
+    def n: if type == "array" then length else 0 end;
+    def code: if type == "string" and test("^[a-z0-9_-]{1,64}$") then . else "other" end;
+    def tally: [.[]? | (if type == "object" then .code else null end) | code]
+      | group_by(.) | map("\(.[0]):\(length)") | join(",") | if . == "" then "-" else . end;
+    select(type == "object" and (.staged | type) == "array")
+    | "mode=\(.mode // "none" | code) status=\(.status // "none" | code) staged=\(.staged | n) blocked=\(.blocked | n) blocked_codes=\(.blocked | tally) errors=\(.errors | n) error_codes=\(.errors | tally) repaired=\(.repaired | n)"
+  ' 2>/dev/null | head -n 1
+}
+
 pending_count() {
   find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
     | grep -Ev '\.(approved|rejected|installed)-[0-9]+$' | wc -l | tr -d '[:space:]'
@@ -1038,6 +1070,8 @@ if [ "$EFFECTIVE_MODE" = "auto" ]; then
     summary="$(CCC_SKILL_REVIEW_STATE_DIR="$STATE_DIR" CCC_SKILL_AUTOSAVE_TRIGGER=sweep bash "$AUTOINSTALL" run 2>>"$LOG")" \
       && log "autoinstall $(printf '%s' "$summary" | head -c 500)" \
       || log "autoinstall failed (non-fatal)"
+    counts_line="$(autoinstall_counts "$summary")"
+    [ -n "$counts_line" ] && log "autoinstall-counts $counts_line"
   else
     # Fall back to the approve-mode reminder below rather than going silent.
     EFFECTIVE_MODE="approve"
@@ -1114,6 +1148,10 @@ if [ -f "$PROMOTER" ] && command -v python3 >/dev/null 2>&1; then
   summary="$(python3 "$PROMOTER" $promotion_args 2>>"$LOG")" \
     && log "promotion-stage $(printf '%s' "$summary" | head -c 500)" \
     || log "promotion-stage failed (non-fatal) code=$(printf '%s' "$summary" | jq -r '(.code // "unknown") | if test("^[a-z0-9_]+$") then . else "unknown" end' 2>/dev/null)"
+  # #2843: whole counts and code tallies, also on the failed path — a run with
+  # staging errors exits 2 and the line above keeps only `.code` (absent there).
+  counts_line="$(promotion_stage_counts "$summary")"
+  [ -n "$counts_line" ] && log "promotion-stage-counts $counts_line"
   # #2153: the promotion-stage line above is cut at 500 chars, so a stranded
   # outbox (collector dialling the wrong account, node dropped from the collect
   # list, dead publisher) gets its own line. Values are re-validated by shape
