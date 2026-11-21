@@ -1742,7 +1742,7 @@ CLAUDE_SYNTH_ISOLATION = (
 
 
 # #2824 — the claude synthesis model. "haiku" is a Claude Code CLI alias whose
-# target moves with CLI updates (2026-11-16 yukson: claude-haiku-5-5 on CLI
+# target moves with CLI updates (2026-11-16 on one node: claude-haiku-5-5 on CLI
 # 2.1.322), so a node can pin a fixed id with NUNCHI_SYNTH_CLAUDE_MODEL and
 # bench.sh records the model and CLI version it ran with. The default stays
 # the alias: a pinned id breaks silently (falls through to codex) once that
