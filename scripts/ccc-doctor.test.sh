@@ -899,6 +899,7 @@ r = d.rows[0] if d.rows else None
 print(json.dumps({"klass": r.klass, "status": r.status} if r else {"klass": "none", "status": "none"}, ensure_ascii=False))
 PY_EOF
 run_nc() {  # <provider> <cron-text> <status-json> <mp-path|empty> [path] [ingest-json]
+  CCC_DOCTOR_BRIDGE_ENVIRON_FILE="" \
   ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="$3" ND_MP="$4" \
   ND_HOME="$TMP/nc-home" ND_PATH="${5:-$nbin:/usr/bin:/bin}" \
   ND_INGEST_JSON="${6:-}" \
@@ -1020,6 +1021,7 @@ rm -f "$nc_aud/private-x/nunchi/ingest.status.json"
 sed 's/r = d.rows\[0\] if d.rows else None/r = next((x for x in d.rows if x.item == "nunchi claude audience map"), None)/' \
   "$TMP/nunchi-collection.py" > "$TMP/nunchi-audience-map.py"
 run_map() {  # <provider> <cron-text> [bridge-audience-root]
+  CCC_DOCTOR_BRIDGE_ENVIRON_FILE="" \
   CCC_BRIDGE_MEMORY_AUDIENCE_ROOT="${3:-$map_aud}" CCC_DOCTOR_BRIDGE_PROJECT_ROOT="$TMP/nc-home" \
   ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="" ND_MP="$nbin/mempalace" \
   ND_HOME="$TMP/nc-home" ND_PATH="$nbin:/usr/bin:/bin" ND_INGEST_JSON="$fresh_ingest" \
@@ -1082,7 +1084,8 @@ rm -f "$map_aud/shared/nunchi/mempalace-refresh.status.json" "$map_aud/shared/nu
 # healthy. The doctor must call that a defect and name the re-scope procedure.
 sed 's/r = d.rows\[0\] if d.rows else None/r = next((x for x in d.rows if x.item == "nunchi audience scope"), None)/' \
   "$TMP/nunchi-collection.py" > "$TMP/nunchi-audience-scope.py"
-run_scope() {  # <provider> <cron-text> <bridge-memory-mode|empty>
+run_scope() {  # <provider> <cron-text> <bridge-memory-mode|empty> [bridge-environ-file|empty]
+  CCC_DOCTOR_BRIDGE_ENVIRON_FILE="${4:-}" \
   CCC_BRIDGE_MEMORY_MODE="$3" CCC_BRIDGE_MEMORY_AUDIENCE_ROOT="$map_aud" \
   CCC_DOCTOR_BRIDGE_PROJECT_ROOT="$TMP/nc-home" BOT_DATA_DIR="" \
   ND_PROVIDER="$1" ND_CRON="$2" ND_STATUS_JSON="$ok_json" ND_MP="$nbin/mempalace" \
@@ -1113,6 +1116,42 @@ rm -f "$TMP/nc-home/.telegram_bot/.env"
 nc="$(run_scope claude "" audience-scoped)"
 ok "no managed nunchi cron means nothing is mixed — no audience-scope row" \
   'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+
+# #2845: the audience rows must judge the LIVE configuration. Two false
+# DEFECTs were measured on 2026-11-21 (two nodes) whose recommended
+# `--audience-scoped` re-apply would have broken a healthy node-global lane:
+#   1. a commented-out `#unified-…# … CCC_NUNCHI_AUDIENCE_SCOPED=1 …` crontab
+#      line was matched as an active scoped lane (and its SCOPED=1 also made
+#      the scope-mismatch check return early, hiding a real mismatch);
+#   2. env files said audience-scoped while the running bridge's unit
+#      EnvironmentFile made the live mode `off` (and moved BOT_DATA_DIR).
+commented_scoped="#unified-20261014# */10 * * * * CCC_NUNCHI_AUDIENCE_SCOPED=1 CCC_NUNCHI_AUDIENCE_ROOT=$TMP/elsewhere-aud bash /h/.claude/hooks/nunchi/ingest-cron.sh >> /log 2>&1 # nunchi:#816
+$claude_cron"
+nc="$(run_map claude "$commented_scoped" "$map_aud")"
+ok "a commented-out scoped cron line is not an active audience lane — no audience-map row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+nc="$(run_scope claude "$commented_scoped" audience-scoped)"
+ok "a commented-out SCOPED=1 line no longer hides a real audience-scope mismatch" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\"))" <<<"$nc" >/dev/null'
+mkdir -p "$TMP/nc-home/.telegram_bot"
+printf 'CCC_BRIDGE_MEMORY_MODE="audience-scoped"\n' > "$TMP/nc-home/.telegram_bot/.env"
+printf 'CCC_BRIDGE_MEMORY_MODE=off\0BOT_DATA_DIR=%s\0TELEGRAM_BOT_TOKEN=never-read\0' "$TMP/nc-home/.telegram_bot" > "$TMP/bridge-environ-off"
+nc="$(run_scope claude "$claude_cron" "" "$TMP/bridge-environ-off")"
+ok "a live bridge env of off beats an env file that says audience-scoped — no audience-scope row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+printf 'BOT_DATA_DIR=%s\n' "$TMP/hande-data" > "$TMP/bridge-environ-datadir"
+nc="$(run_scope claude "$claude_cron" "" "$TMP/bridge-environ-datadir")"
+ok "a live BOT_DATA_DIR elsewhere means the project .telegram_bot/.env is not the bridge's — no row" \
+  'jq -e ".klass == \"none\"" <<<"$nc" >/dev/null'
+nc="$(run_scope claude "$claude_cron" "" "$TMP/no-such-environ")"
+ok "env-file-only audience-scoped with an unreadable live bridge env is 확인 필요, not a DEFECT" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"확인 필요\") and (contains(\"DEFECT\") | not))" <<<"$nc" >/dev/null'
+rm -f "$TMP/nc-home/.telegram_bot/.env"
+printf 'CCC_BRIDGE_MEMORY_MODE=audience-scoped\n' > "$TMP/bridge-environ-scoped"
+# shellcheck disable=SC2034  # nc is read via eval inside ok()
+nc="$(run_scope claude "$claude_cron" "" "$TMP/bridge-environ-scoped")"
+ok "a live audience-scoped bridge with a non-scoped lane is still a DEFECT (source=process)" \
+  'jq -e ".klass == \"경고\" and (.status | contains(\"DEFECT\") and contains(\"source=process\"))" <<<"$nc" >/dev/null'
 
 # #1081: doctor surfaces installer-managed cron entries frozen at older code.
 # One row per known marker (absent = opt-in 정상; gen match = 정상; unstamped

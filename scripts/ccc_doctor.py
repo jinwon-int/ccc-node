@@ -413,6 +413,40 @@ def _resolved(path: str) -> Path:
     return Path(path)
 
 
+def _active_cron_text(text: str) -> str:
+    """crontab text without its comment-only lines (#2845).
+
+    A line an operator disabled with a leading ``#`` (for example an old
+    ``#unified-20261014# … CCC_NUNCHI_AUDIENCE_SCOPED=1 …`` entry) is not
+    configuration. Matching the raw ``crontab -l`` text made such a line read
+    as an active audience-scoped lane: a false DEFECT on nodes whose live lane
+    was healthy, and an early return that could hide a real scope mismatch.
+    Trailing markers on active lines (``… # nunchi:#816``) are kept.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+# The only keys the doctor ever reads out of a running bridge's environment
+# (#2845). Neighbouring values can be credentials, so nothing else is kept.
+BRIDGE_PROCESS_ENV_KEYS: tuple[str, ...] = (
+    "CCC_BRIDGE_MEMORY_MODE",
+    "CCC_BRIDGE_MEMORY_AUDIENCE_ROOT",
+    "BOT_DATA_DIR",
+)
+
+
+def _environ_subset(entries: list[str]) -> dict[str, str]:
+    """``KEY=value`` entries reduced to ``BRIDGE_PROCESS_ENV_KEYS`` (#2845)."""
+    keep: dict[str, str] = {}
+    for entry in entries:
+        key, sep, value = entry.partition("=")
+        if sep and key in BRIDGE_PROCESS_ENV_KEYS:
+            keep[key] = value
+    return keep
+
+
 def _dotenv_value(path: Path, key: str) -> str | None:
     """Last ``KEY=value`` for one key in a dotenv file (never sourced), or None."""
     try:
@@ -5394,6 +5428,8 @@ class Doctor:
             ).stdout
         except Exception:
             cron = ""
+        # Commented-out lines are not configuration (#2845).
+        cron = _active_cron_text(cron)
 
         configured = _configured_nunchi_lane(cron)
 
@@ -5603,8 +5639,25 @@ class Doctor:
         """
         if configured == "none" or re.search(r"\bCCC_NUNCHI_AUDIENCE_SCOPED=1\b", cron):
             return
-        mode = (self._bridge_env_value("CCC_BRIDGE_MEMORY_MODE") or "off").strip().lower()
+        raw_mode, source = self._bridge_env_lookup("CCC_BRIDGE_MEMORY_MODE")
+        mode = (raw_mode or "off").strip().lower()
         if mode != "audience-scoped":
+            return
+        bridge_seen, environs = self._running_bridge_environ()
+        if source == "file" and bridge_seen and not environs:
+            # #2845: a bridge is running but its environment is unreadable, so
+            # the env-file value may be overridden by the unit (Environment= /
+            # EnvironmentFile=). Re-scoping a healthy node-global lane on that
+            # guess breaks it — report it as unverified, never as a defect.
+            self.add(
+                "경고",
+                "nunchi audience scope",
+                "확인 필요: an env file sets bridge memory mode audience-scoped, but the "
+                "running bridge's environment could not be read — the live mode may "
+                "differ (unit Environment=/EnvironmentFile= overrides); unverified, not a defect",
+                "read CCC_BRIDGE_MEMORY_MODE from the running bridge (/proc/<MainPID>/environ) "
+                "before any re-scope; do not re-apply --audience-scoped on the env file alone",
+            )
             return
         root = self._bridge_memory_audience_root()
         if configured in {"claude", "piri"}:
@@ -5622,8 +5675,9 @@ class Doctor:
         self.add(
             "경고",
             "nunchi audience scope",
-            f"DEFECT: bridge memory mode is audience-scoped but the nunchi '{configured}' "
-            "lane is not — private and shared route work is ingested into one node-wide store",
+            f"DEFECT: bridge memory mode is audience-scoped (source={source}) but the "
+            f"nunchi '{configured}' lane is not — private and shared route work is "
+            "ingested into one node-wide store",
             fix,
         )
 
@@ -5634,31 +5688,130 @@ class Doctor:
             or self.running_bridge_home()
             or os.path.expanduser("~")
         ).expanduser()
-        data_dir = os.environ.get("BOT_DATA_DIR") or str(project / ".telegram_bot")
+        # The running bridge's BOT_DATA_DIR decides which data-dir .env it reads
+        # (bridge/utils/config.py ENV_FILE_PATH); a unit that sets it makes the
+        # project's default ``.telegram_bot/.env`` irrelevant (#2845).
+        _seen, environs = self._running_bridge_environ()
+        live_data_dir = next(
+            (env["BOT_DATA_DIR"] for env in environs if env.get("BOT_DATA_DIR")), None
+        )
+        data_dir = (
+            live_data_dir
+            or os.environ.get("BOT_DATA_DIR")
+            or str(project / ".telegram_bot")
+        )
         return data_dir, [Path(data_dir) / ".env", self.repo / "bridge/.env"]
 
-    def _bridge_env_value(self, key: str) -> str | None:
-        """One bridge setting: process env, then the env files (never sourced)."""
+    def bridge_process_ids(self) -> list[int]:
+        """PIDs of live bridge processes (same match as ``bridge_command_lines``)."""
+        try:
+            out = subprocess.run(
+                ["ps", "-eo", "pid=,command="], text=True, capture_output=True, timeout=10
+            ).stdout
+        except Exception:
+            return []
+        pids: list[int] = []
+        for line in out.splitlines():
+            if "telegram_bot" not in line or "--path" not in line or "grep" in line:
+                continue
+            head = line.strip().split(None, 1)[0]
+            if head.isdigit():
+                pids.append(int(head))
+        return pids
+
+    def _running_bridge_environ(self) -> tuple[bool, list[dict[str, str]]]:
+        """``(bridge seen, [per-process env subsets])`` for live bridges (#2845).
+
+        The settings a running bridge actually uses come from its process
+        environment — including unit ``Environment=``/``EnvironmentFile=``
+        values the env files on disk do not show (one node, 2026-11-21:
+        ``bridge/.env`` and the data-dir ``.env`` said audience-scoped while
+        the unit's later EnvironmentFile made the live mode ``off``). Only
+        ``BRIDGE_PROCESS_ENV_KEYS`` are kept; nothing is printed.
+
+        ``CCC_DOCTOR_BRIDGE_ENVIRON_FILE`` replaces the live probe (tests, or
+        an operator pinning one bridge): empty = no bridge running; a missing
+        path = a bridge whose environment is unreadable; otherwise a
+        NUL- or newline-separated ``KEY=value`` file.
+        """
+        cached = getattr(self, "_bridge_environ_cache", None)
+        if cached is not None:
+            return cached
+        override = os.environ.get("CCC_DOCTOR_BRIDGE_ENVIRON_FILE")
+        result: tuple[bool, list[dict[str, str]]]
+        if override is not None:
+            if not override:
+                result = (False, [])
+            else:
+                try:
+                    text = Path(override).read_text(errors="replace")
+                except OSError:
+                    result = (True, [])
+                else:
+                    entries = text.replace("\0", "\n").splitlines()
+                    result = (True, [_environ_subset(entries)])
+        else:
+            pids = self.bridge_process_ids()
+            environs: list[dict[str, str]] = []
+            for pid in pids:
+                try:
+                    raw = Path(f"/proc/{pid}/environ").read_bytes()
+                except OSError:
+                    continue
+                entries = raw.decode("utf-8", errors="replace").split("\0")
+                environs.append(_environ_subset(entries))
+            result = (bool(pids), environs)
+        self._bridge_environ_cache = result
+        return result
+
+    def _bridge_env_lookup(self, key: str) -> tuple[str | None, str | None]:
+        """``(value, source)`` for one bridge setting, in the bridge's own order.
+
+        Running bridge process env first (``source=process``), then this
+        doctor's env (``doctor-env``), then the env files the bridge reads —
+        data-dir ``.env`` then ``bridge/.env`` (``file``; never sourced). With
+        several bridges, any ``audience-scoped`` memory mode wins: one scoped
+        bridge is enough for the scope check to apply.
+        """
+        _seen, environs = self._running_bridge_environ()
+        live = [env[key] for env in environs if env.get(key)]
+        if live:
+            if key == "CCC_BRIDGE_MEMORY_MODE":
+                for value in live:
+                    if value.strip().lower() == "audience-scoped":
+                        return value, "process"
+            return live[0], "process"
+        value = os.environ.get(key)
+        if value:
+            return value, "doctor-env"
         _data_dir, files = self._bridge_env_files()
-        return os.environ.get(key) or next(
-            (v for v in (_dotenv_value(f, key) for f in files) if v), None
-        )
+        value = next((v for v in (_dotenv_value(f, key) for f in files) if v), None)
+        return (value, "file") if value else (None, None)
+
+    def _bridge_env_value(self, key: str) -> str | None:
+        """One bridge setting (see ``_bridge_env_lookup`` for the order)."""
+        return self._bridge_env_lookup(key)[0]
 
     def _bridge_memory_audience_root(self) -> str | None:
         """The bridge's audience root, mirroring settings precedence (#1921).
 
-        Process env, then the bot data dir ``.env``, then ``bridge/.env`` for
-        ``CCC_BRIDGE_MEMORY_AUDIENCE_ROOT``; otherwise the settings default
-        ``<bot-data-dir>/memory-audiences``. Only that one key (and
-        ``BOT_DATA_DIR``) is read from an env file — never sourced, never shown.
+        Running bridge process env, then this doctor's env, then the bot data
+        dir ``.env``, then ``bridge/.env`` for ``CCC_BRIDGE_MEMORY_AUDIENCE_ROOT``
+        (#2845); otherwise the settings default ``<bot-data-dir>/memory-audiences``.
+        A live ``BOT_DATA_DIR`` wins over one written in an env file. Only that
+        one key (and ``BOT_DATA_DIR``) is read from an env file — never sourced,
+        never shown.
         """
         data_dir, files = self._bridge_env_files()
         value = self._bridge_env_value("CCC_BRIDGE_MEMORY_AUDIENCE_ROOT")
         if value:
             return value
-        data_dir = next(
-            (v for v in (_dotenv_value(f, "BOT_DATA_DIR") for f in files) if v), data_dir
-        )
+        _live_dd, dd_source = self._bridge_env_lookup("BOT_DATA_DIR")
+        if dd_source == "file":
+            data_dir = next(
+                (v for v in (_dotenv_value(f, "BOT_DATA_DIR") for f in files) if v),
+                data_dir,
+            )
         return str(Path(data_dir).expanduser() / "memory-audiences")
 
     @staticmethod
