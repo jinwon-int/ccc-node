@@ -41,7 +41,7 @@ everything above. Nodes without a bridge keep the Rust responder.
 | `TurnSink.typing` | no-op (the port has no typing indicator) |
 | `TurnSink.status` (the `⏳ Working — 10s \| Bash: …` heartbeat Matrix edits in place) | no-op by default (no editable bubble). **`status_frames: true`** (status-v1, family-messenger#560 / `archive/native-mls/STATUS-V1.md`) forwards every heartbeat as an `interim` frame tagged `kind:"status"` at the Matrix cadence: a status-v1 bot posts it under a `status-<uuid>` client_id, the relay sends no push for it, and the apps show the newest one per sender as one transient bubble (dropped when the reply lands) — turn it on only after the node's bot is status-v1 (an older bot posts it as a plain interim). Otherwise `status_interims: true` forwards it as `interim` frames — a new room message each — throttled: the first line as soon as the heartbeat starts, then one line per `status_interim_interval_s` (default 60, 10..3600) — a changing tool label does not reopen the window (on Matrix it carries the Bash command and changes with every quick call); `None` has no frame, answer previews are never forwarded; needs `interim_frames` (off → counted in `notices_dropped`). A real in-place status bubble needs an app-layer `status` message kind (family-messenger, tracked with the live-preview gap) |
 | `TurnSink.interim` | dropped and counted unless `interim_frames: true` (then an `interim` frame the bot must know) |
-| `TurnResult` | `result{status complete\|uncertain, text, session_id[, reason][, skills]}` (`skills`: #2833, only with `skill_frames: true`); a cancelled, timed-out or failed turn is `uncertain` and never re-run automatically. `reason` is a machine code for a cancel/hang-up (`cancelled`, `worker_gone`, `error` for a runner exception) and, for a returned failure, one human line from `TurnResult.error_detail` (#2813, `core/hande/failure_reason.py`): `사용 한도 초과 — <original>`, `Claude API 일시 차단(Cloudflare 403)`, `인증 실패 — …`, `요청 과다·일시 과부하 — …`, else `오류 — <first line>` — control characters removed, credentials masked, ≤ 160 chars; no cause known → the bare status. A failed self-job's notice uses the same line |
+| `TurnResult` | `result{status complete\|uncertain, text, session_id[, reason][, skills][, part, parts]}` (`skills`: #2833, only with `skill_frames: true`; `part`/`parts`: #2856, only on the last page of a split answer — see `reply_split`); a cancelled, timed-out or failed turn is `uncertain` and never re-run automatically. `reason` is a machine code for a cancel/hang-up (`cancelled`, `worker_gone`, `error` for a runner exception) and, for a returned failure, one human line from `TurnResult.error_detail` (#2813, `core/hande/failure_reason.py`): `사용 한도 초과 — <original>`, `Claude API 일시 차단(Cloudflare 403)`, `인증 실패 — …`, `요청 과다·일시 과부하 — …`, else `오류 — <first line>` — control characters removed, credentials masked, ≤ 160 chars; no cause known → the bare status. A failed self-job's notice uses the same line |
 | `enqueue_notice` (restart receipt, waits status, CI-wait results, async/background completions) | a `notice{room, text}` frame when `notice_frames: true` (the bot speaks it since #474; turn it on once the node's bot is replaced). With no bot connected (it reconnects ~10 s after a bridge restart, so the startup banner always lands in that gap) the notice is **held and flushed in order on connect**, before waiting self-jobs (#2563; at most 16, oldest dropped first, aged out after 10 min; `notices_pending`). Off → **counted and dropped** — `health_signals().notices_dropped` — never claimed delivered. The push spool stays with the node's Matrix bridge (one consumer); alerts stay on the Telegram fallback (owner decision ②) |
 | `enqueue_self_job` (CI-wait resume, yield-and-continue bundle, Danso auto-resume) | #2561, as on Matrix: a `$self-…` turn the bridge runs itself — only while the bot is connected and between bot turns, everything it says (reply, interim, a refused approval) as `notice` frames. Refused while `notice_frames` is off. A bot turn arriving meanwhile is **held** (not `rejected`, which would end the owner's message `uncertain`) and starts next; a held `/stop` or `/cancel` cancels the self-job. Approvals cannot be asked inside one (the bot accepts `approval` only for its own turn) → denied with a notice. Pending jobs persist in `bot_data_dir/hande-self-jobs.json` (0600) and are dropped from it when they start (at-most-once) |
 | steward room tools (`room_create/join/invite/remove/close/members/mode/status`) | served (PR-4): `HandeBot` exposes the bot's tool table as an in-process Claude Agent SDK MCP server (`mcp__steward__*`, `core/hande/steward.py`); each call is a `tool` frame → the bot validates, enforces owner-only, executes → `tool-result`. Read-only `room_status`/`room_members` run unasked (as #378); every tool with a side effect first asks the owner through the hande `approval` frame **inside the bridge** (PR-5) — same redacted snapshot and audit ledger as a provider approval, independent of the node's `CCC_BRIDGE_BASH_POLICY` (all eight are pre-allowed at the SDK level so `approve-each` nodes never double-prompt and `auto-approve` nodes never skip it). Claude provider only; `steward_tools: false` turns it off, `steward_tools_approve_all: true` makes read-only calls ask too. One call at a time (`busy`), `tool_timeout_s` (default 90) → `steward_timeout`, cancel → `cancelled` |
@@ -90,6 +90,9 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   "attachment_frames": false,
   "attachment_out_frames": false,
   "skill_frames": false,
+  "reply_split": true,
+  "bot_reply_max_bytes": 8192,
+  "bot_interim_max": 40,
   "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
 }
 ```
@@ -129,6 +132,38 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   `health_signals()` reports `attachment_out_frames`, `attachments_out_sent`,
   `attachments_out_acked` and `attachments_out_failed`.
 
+- `reply_split` (default **on**, #2856) sends a final answer that is too long for one bot
+  message as page-numbered bubbles instead of letting the bot cut it with `…(길어서 줄임)`.
+  The bot bounds every message it posts (`reply_max_bytes`, 8 KiB — about 2,700 Korean
+  characters); above that the bridge splits the answer (`core/hande/reply_split.py`) and sends
+  the first N-1 parts as `interim` frames and the last as the `result`, in order. Each part
+  starts with `(k/N)`; an answer that fits one message is sent exactly as before, unmarked.
+  - Cuts prefer a heading, then a blank line, then a list item, then any line. A cut inside a
+    code fence closes the fence and reopens it (same language) in the next part; a cut inside
+    a table repeats the header rows. The last `[답변 필요]` block stays whole in the last part
+    (the choice card is one per message), in a part of its own when the last one is full.
+  - It needs `interim_frames: true` — the bot posts an interim as a message of its own. With
+    interims off the answer goes out as one `result`, as before.
+  - Part frames carry `kind: "part"`, `part` and `parts` (the `result` too) for a bot that
+    knows them. Today's bot posts any non-status interim as an ordinary message, so no bot
+    change is needed; it also means every page is a normal message (push included).
+  - `bot_reply_max_bytes` (default 8192) and `bot_interim_max` (default 40) mirror the bot's
+    `reply_max_bytes` and `interim_max`; change them only together with the bot's. The
+    skills line the bot appends (`skill_frames`) is taken off the last part's room.
+  - The bot drops interims past its per-turn cap without a word. The bridge counts the
+    interims the turn already used; when the pages would not fit under `bot_interim_max` the
+    answer is **not** split (`reply_split_skipped`, one warning in the log) and the bot cuts
+    it as before — a marked cut rather than pages that silently go missing.
+  - Pages stop at the first one the bot does not take (`reply_split_failed`); with
+    `notice_frames` on, the room is told `Only part of a long answer was delivered (k/N
+    bubbles)` once a bot is connected again.
+  - The conversation record and the distill journal keep the whole answer as one entry; the
+    split is transport-only. Self-job replies and other `notice` frames are not split.
+  - Known limit: if the bot's watchdog has already ended the turn, it ignores that turn's
+    interims and posts only the late `result` — the last page, marked `(N/N)`.
+  - `health_signals()` reports `reply_split` (the knob and `interim_frames` both on),
+    `replies_split`, `reply_split_skipped` and `reply_split_failed`. Turn it off with
+    `"reply_split": false` (config edit + `ccc-hande-bridge` restart).
 - `skill_frames` (default off, #2833) adds `skills: ["gh-pr-flow", …]` to a `complete`
   `result`: the skills the turn loaded (a `Skill` call or a `Read` of `…/skills/<name>/SKILL.md`),
   names only, identifier-shaped, first-seen order, at most 8; the key is absent when there are

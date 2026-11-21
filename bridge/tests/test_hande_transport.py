@@ -1609,3 +1609,195 @@ async def test_result_skills_empty_or_invalid(tmp_path: Path) -> None:
         tmp_path, ("ok-skill", "/etc/passwd", "ok-skill"), skill_frames=True
     )
     assert frame["skills"] == ["ok-skill"]
+
+
+# -- long answers as numbered parts (#2856) ------------------------------------
+
+BOT_REPLY_MAX = 8 * 1024
+PART_MARKER = re.compile(r"^\((\d+)/(\d+)\)\n\n")
+ANSWER_BLOCK = "**[답변 필요]** 하나만 선택\n1. (권장) 진행\n2. 보류"
+
+
+def _long_answer(paragraphs: int) -> str:
+    """About 1 KiB of Korean prose per paragraph, ending in an answer block."""
+
+    body = "\n\n".join("문단 %02d %s" % (n, "가나다 " * 100) for n in range(paragraphs))
+    return f"{body}\n\n{ANSWER_BLOCK}"
+
+
+async def _answer_frames(
+    tmp_path: Path, text: str, *, before: Any = None, skills: tuple[str, ...] = (), **config: Any
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Every frame the bot gets for one turn that answers ``text``, and the health after."""
+
+    served = await _serve(tmp_path, **config)
+    try:
+
+        async def behaviour(job: Any, sink: Any) -> TurnResult:
+            if before is not None:
+                await before(sink)
+            return TurnResult(text=text, session_id="s", skills=skills)
+
+        served.runner.behaviour = behaviour
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-1", "hi"))
+        frames: list[dict[str, Any]] = []
+        while not frames or frames[-1]["type"] != "result":
+            frames.append(await bot.recv())
+        health = served.transport.health_signals()
+        await bot.close()
+        return frames, health
+    finally:
+        await _stop(served)
+
+
+async def test_long_answer_goes_out_as_numbered_parts_in_order(tmp_path: Path) -> None:
+    text = _long_answer(21)
+    assert len(text.encode()) > 20 * 1024
+    frames, health = await _answer_frames(tmp_path, text, interim_frames=True)
+    assert [frame["type"] for frame in frames[:1]] == ["session"]
+    pages = frames[1:]
+    total = len(pages)
+    assert total >= 3
+    assert [frame["type"] for frame in pages] == ["interim"] * (total - 1) + ["result"]
+    for index, frame in enumerate(pages, 1):
+        assert frame["turn_id"] == "t-1"
+        assert (frame["part"], frame["parts"]) == (total if index == total else index, total)
+        match = PART_MARKER.match(frame["text"])
+        assert match and (int(match.group(1)), int(match.group(2))) == (index, total)
+        # Each part is one bot message: the bot never cuts it.
+        assert len(frame["text"].encode()) <= BOT_REPLY_MAX
+    assert all(frame["kind"] == "part" for frame in pages[:-1])
+    assert pages[-1]["status"] == "complete" and pages[-1]["session_id"] == "s"
+    assert pages[-1]["text"].endswith(ANSWER_BLOCK)
+    assert all("[답변 필요]" not in frame["text"] for frame in pages[:-1])
+    # Nothing is lost: the paragraphs come back whole and in order.
+    joined = "\n\n".join(PART_MARKER.sub("", frame["text"]) for frame in pages)
+    assert re.findall(r"문단 \d\d", joined) == ["문단 %02d" % n for n in range(21)]
+    assert joined.count("가나다 ") == text.count("가나다 ")
+    assert health["reply_split"] is True
+    assert health["replies_split"] == 1
+    assert health["reply_split_skipped"] == 0 and health["reply_split_failed"] == 0
+
+
+async def test_answer_within_the_bots_bound_is_one_unmarked_result(tmp_path: Path) -> None:
+    for text in ("가" * (BOT_REPLY_MAX // 3), "a" * BOT_REPLY_MAX):
+        frames, health = await _answer_frames(tmp_path, text, interim_frames=True)
+        assert [frame["type"] for frame in frames] == ["session", "result"]
+        assert frames[-1] == {
+            "type": "result",
+            "turn_id": "t-1",
+            "status": "complete",
+            "text": text,
+            "session_id": "s",
+        }
+        assert health["replies_split"] == 0
+
+
+async def test_long_answer_is_one_result_when_parts_cannot_be_posted(tmp_path: Path) -> None:
+    text = _long_answer(20)
+    # No interim frames: the bot would not post the first pages.
+    frames, health = await _answer_frames(tmp_path, text)
+    assert [frame["type"] for frame in frames] == ["session", "result"]
+    assert frames[-1]["text"] == text and "part" not in frames[-1]
+    assert health["reply_split"] is False
+    # The knob off.
+    frames, health = await _answer_frames(tmp_path, text, interim_frames=True, reply_split=False)
+    assert [frame["type"] for frame in frames] == ["session", "result"]
+    assert frames[-1]["text"] == text and "part" not in frames[-1]
+    assert health["reply_split"] is False and health["replies_split"] == 0
+
+
+async def test_split_leaves_room_for_the_skills_line_the_bot_appends(tmp_path: Path) -> None:
+    skills = ("gh-pr-flow", "wiki-record", "bridge-safe-detached-run")
+    footer = len(("📘 " + " · ".join(skills)).encode()) + 2
+    # Fits one message without the skills line, not with it.
+    text = "\n\n".join(["가" * 300] * 9 + ["b" * 50])
+    assert BOT_REPLY_MAX - footer < len(text.encode()) <= BOT_REPLY_MAX
+    frames, _ = await _answer_frames(
+        tmp_path, text, skills=skills, interim_frames=True, skill_frames=True
+    )
+    pages = [frame for frame in frames if frame["type"] != "session"]
+    assert [frame["type"] for frame in pages] == ["interim", "result"]
+    assert pages[-1]["skills"] == list(skills) and "skills" not in pages[0]
+    assert len(pages[-1]["text"].encode()) + footer <= BOT_REPLY_MAX
+    # Without skills the same answer is one message.
+    frames, _ = await _answer_frames(tmp_path, text, interim_frames=True, skill_frames=True)
+    assert [frame["type"] for frame in frames] == ["session", "result"]
+
+
+async def test_long_answer_is_not_split_past_the_bots_interim_cap(tmp_path: Path) -> None:
+    async def two_progress_lines(sink: Any) -> None:
+        await sink.interim("step one")
+        await sink.interim("   ")  # blank: the bot does not count it
+        await sink.interim("step two")
+
+    # 20 KiB needs two interim pages; the bot has one left of its three.
+    frames, health = await _answer_frames(
+        tmp_path, _long_answer(20), before=two_progress_lines, interim_frames=True, bot_interim_max=3
+    )
+    assert [frame["type"] for frame in frames if frame["type"] != "session"][-1] == "result"
+    assert all("part" not in frame for frame in frames)
+    assert frames[-1]["text"] == _long_answer(20)
+    assert health["reply_split_skipped"] == 1 and health["replies_split"] == 0
+    # 12 KiB needs one: it is split.
+    frames, health = await _answer_frames(
+        tmp_path, _long_answer(11), before=two_progress_lines, interim_frames=True, bot_interim_max=3
+    )
+    assert [frame.get("part") for frame in frames if "part" in frame] == [1, 2]
+    assert health["reply_split_skipped"] == 0 and health["replies_split"] == 1
+    # A bot that posts no interims at all (0) never gets pages.
+    frames, health = await _answer_frames(
+        tmp_path, _long_answer(11), interim_frames=True, bot_interim_max=0
+    )
+    assert all("part" not in frame for frame in frames)
+    assert health["reply_split_skipped"] == 1
+
+
+async def test_split_stops_at_the_first_part_the_bot_does_not_take(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_send = hande_transport._Client.send
+
+    async def flaky_send(self: Any, frame: Any) -> bool:
+        if frame.get("type") == "interim" and frame.get("part") == 2:
+            self.closed = True
+            self._drop()
+            return False
+        return await real_send(self, frame)
+
+    monkeypatch.setattr(hande_transport._Client, "send", flaky_send)
+    served = await _serve(tmp_path, interim_frames=True, notice_frames=True)
+    try:
+
+        async def behaviour(job: Any, sink: Any) -> TurnResult:
+            return TurnResult(text=_long_answer(20), session_id="s")
+
+        served.runner.behaviour = behaviour
+        bot = await FakeBot.connect(served.path)
+        await bot.send(bot.turn("t-1", "hi"))
+        seen: list[dict[str, Any]] = []
+        while True:
+            line = await asyncio.wait_for(bot.reader.readline(), 5)
+            if not line:
+                break
+            seen.append(json.loads(line))
+        # Page 1 arrived; page 2 failed, so page 3 and the result were never sent.
+        assert [frame.get("part") for frame in seen if frame["type"] == "interim"] == [1]
+        assert not [frame for frame in seen if frame["type"] == "result"]
+        for _ in range(100):
+            if served.transport.health_signals()["reply_split_failed"]:
+                break
+            await asyncio.sleep(0.01)
+        health = served.transport.health_signals()
+        assert health["reply_split_failed"] == 1 and health["replies_split"] == 0
+        assert health["notices_pending"] == 1
+        await bot.close()
+        # The next bot posts what happened.
+        bot = await FakeBot.connect(served.path)
+        notice = await bot.recv_kind("notice")
+        assert notice["room"] == "agent"
+        assert "(1/3 bubbles)" in notice["text"]
+        await bot.close()
+    finally:
+        await _stop(served)

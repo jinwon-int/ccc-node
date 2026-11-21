@@ -87,7 +87,10 @@ from telegram_bot.core.skill_display import bounded_skills
 from . import outbound
 from .attachments import AttachmentFrameError, parse_frame_attachment
 from .failure_reason import failure_reason
+from .reply_split import split_reply
 from .state import (
+    DEFAULT_BOT_INTERIM_MAX,
+    DEFAULT_BOT_REPLY_MAX_BYTES,
     DEFAULT_SOCKET_MODE,
     DEFAULT_STATUS_INTERIM_INTERVAL_S,
     DEFAULT_WAIT_STATUS_INTERVAL_S,
@@ -100,9 +103,16 @@ logger = logging.getLogger(__name__)
 MAX_IN_FRAME_BYTES = 64 * 1024
 MAX_OUT_FRAME_BYTES = 512 * 1024
 TURN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
-# The bot bounds replies itself (reply_max_bytes, 8 KiB by default); this is the
-# port ceiling so a huge reply never ends the connection.
+# The bot bounds every message it posts (reply_max_bytes, 8 KiB by default) and
+# cuts the rest. A longer answer is split into page-numbered parts first
+# (``reply_split``, #2856); this is the port ceiling so a huge reply never ends
+# the connection.
 MAX_RESULT_TEXT_BYTES = 256 * 1024
+# Kept free in every part of a split answer, on top of the page marker.
+REPLY_PART_MARGIN_BYTES = 128
+# The line the bot appends to an answer that used skills (family-messenger#834).
+SKILLS_FOOTER_PREFIX = "📘 "
+SKILLS_FOOTER_SEPARATOR = " · "
 # How long one outbound frame may wait for the bot to take it. A bot that has
 # stopped reading for this long is treated as gone and its connection is
 # dropped, so it sees ``worker_gone`` and reconnects (#2740).
@@ -129,6 +139,10 @@ NOTICE_SELF_JOB_APPROVAL = (
     "⚠️ Denied: an automatic follow-up turn cannot ask for approval here.\n{text}"
 )
 NOTICE_SELF_JOB_STOPPED = "⏹ Stopped the running automatic follow-up turn."
+NOTICE_REPLY_PARTIAL = (
+    "⚠️ Only part of a long answer was delivered ({sent}/{total} bubbles). "
+    "Ask again for the rest."
+)
 
 # Screen delegation (family-messenger #493 「에이전트에게 보내기」 shortcut): the owner's
 # Back Tap sends the on-screen text (screenshot OCR) and the clipboard, starting with
@@ -247,6 +261,10 @@ class _ActiveTurn:
         # an interim reply would hide the line until the next heartbeat (#2602);
         # the sink re-posts this text right after each interim.
         self.status_text: str | None = None
+        # Plain ``interim`` frames the bot took this turn. It posts at most
+        # ``interim_max`` of them per turn and drops the rest without a word, so
+        # a split answer (#2856) checks what is left before it uses them as pages.
+        self.interims_sent = 0
         # Outbound attachments (#2764, attachment_out_frames): the deliverables
         # the answer named, staged by HandeBot while the turn runs and sent as
         # ``attachment`` frames before ``result``; notes are appended to the
@@ -331,9 +349,10 @@ class _HandeSink:
             self._transport._dropped("status", "interim-frames-off")
             return
         turn.status_sent += 1
-        await self._client.send(
+        if await self._client.send(
             {"type": "interim", "turn_id": turn.turn_id, "text": _bounded_text(text, 8192)}
-        )
+        ):
+            turn.interims_sent += 1
 
     async def interim(self, text: str) -> None:
         if not self._live():
@@ -341,9 +360,11 @@ class _HandeSink:
         if not self._transport.interim_frames:
             self._transport._dropped("interim")
             return
-        await self._client.send(
+        sent = await self._client.send(
             {"type": "interim", "turn_id": self._turn.turn_id, "text": _bounded_text(text, 8192)}
         )
+        if sent and text.strip():  # the bot ignores a blank one
+            self._turn.interims_sent += 1
         # status-v1 apps drop this sender's ``⏳`` bubble on the interim just
         # posted; without a re-post the line stays hidden until the next
         # heartbeat (5 s at best, often longer), which on chatty turns hid it for
@@ -583,6 +604,22 @@ class HandeTransport:
         # draws them as chips). Off by default: turn it on after the bot and apps.
         self.skill_frames = bool(self.c.get("skill_frames"))
         self._skill_results = 0
+        # #2856: a final answer above the bot's message bound goes out as
+        # ``(k/N)`` parts — the first N-1 as ``interim`` frames, the last as the
+        # ``result``. On by default; needs ``interim_frames`` (the bot posts an
+        # interim as a message of its own). The two bounds mirror the bot's
+        # ``reply_max_bytes`` and ``interim_max``.
+        self.reply_split = bool(self.c.get("reply_split", True))
+        self.bot_reply_max_bytes = int(
+            self.c.get("bot_reply_max_bytes") or DEFAULT_BOT_REPLY_MAX_BYTES
+        )
+        bot_interim_max = self.c.get("bot_interim_max")
+        self.bot_interim_max = (
+            DEFAULT_BOT_INTERIM_MAX if bot_interim_max is None else int(bot_interim_max)
+        )
+        self._replies_split = 0
+        self._reply_split_skipped = 0
+        self._reply_split_failed = 0
         # #2602: ``⏳`` lines re-posted right after an interim (status_frames).
         self._status_resent = 0
         self.socket_path = Path(socket_path or self.c.get("socket_path") or "").expanduser()
@@ -1085,6 +1122,10 @@ class HandeTransport:
             "wait_status_sent": self._wait_status_sent,
             "skill_frames": self.skill_frames,
             "skill_results": self._skill_results,
+            "reply_split": self.reply_split and self.interim_frames,
+            "replies_split": self._replies_split,
+            "reply_split_skipped": self._reply_split_skipped,
+            "reply_split_failed": self._reply_split_failed,
             "status_resent": self._status_resent,
             "attachment_frames": self.attachment_frames,
             "attachments_ignored": self._attachments_ignored,
@@ -1286,18 +1327,7 @@ class HandeTransport:
                 await client.send(
                     {"type": "session", "turn_id": turn.turn_id, "session_id": session_id}
                 )
-            frame: dict[str, Any] = {
-                "type": "result",
-                "turn_id": turn.turn_id,
-                "status": "complete",
-                "text": text,
-                "session_id": session_id,
-            }
-            skills = bounded_skills(getattr(result, "skills", ()) or ()) if self.skill_frames else ()
-            if skills:
-                frame["skills"] = list(skills)
-                self._skill_results += 1
-            await client.send(frame)
+            await self._send_answer(client, turn, result, text, session_id)
         else:
             self._turns_uncertain += 1
             # Machine codes set above (``cancelled``/``worker_gone``/``error``
@@ -1321,6 +1351,95 @@ class HandeTransport:
         self._hook("turn_closed", turn.job)
         self._hook("delivered", turn.job)
         self._kick_self_jobs()
+
+    async def _send_answer(
+        self, client: _Client, turn: _ActiveTurn, result: Any, text: str, session_id: Any
+    ) -> None:
+        """The ``complete`` answer: one ``result``, or ``(k/N)`` parts ending in it (#2856)."""
+
+        skills = bounded_skills(getattr(result, "skills", ()) or ()) if self.skill_frames else ()
+        parts = self._reply_parts(turn, text, skills)
+        pages = len(parts)
+        sent = 0
+        for part in parts[:-1]:
+            # ``kind``/``part``/``parts`` are for a bot that knows them; today's
+            # bot posts any non-status interim as a message of its own.
+            if not await client.send(
+                {
+                    "type": "interim",
+                    "turn_id": turn.turn_id,
+                    "kind": "part",
+                    "part": sent + 1,
+                    "parts": pages,
+                    "text": part,
+                }
+            ):
+                break
+            sent += 1
+        if sent == pages - 1:
+            frame: dict[str, Any] = {
+                "type": "result",
+                "turn_id": turn.turn_id,
+                "status": "complete",
+                "text": parts[-1],
+                "session_id": session_id,
+            }
+            if pages > 1:
+                frame["part"] = pages
+                frame["parts"] = pages
+            if skills:
+                frame["skills"] = list(skills)
+                self._skill_results += 1
+            if await client.send(frame):
+                sent += 1
+        if pages > 1:
+            if sent == pages:
+                self._replies_split += 1
+            else:
+                # Pages go out in order and stop at the first one the bot did
+                # not take: later pages without the earlier ones would read as
+                # the whole answer.
+                self._reply_split_failed += 1
+                logger.warning(
+                    "hande: long answer partly delivered (%d/%d parts)", sent, pages
+                )
+                self._note_partial_reply(str(turn.job["room_id"]), sent, pages)
+
+    def _reply_parts(self, turn: _ActiveTurn, text: str, skills: tuple[str, ...]) -> list[str]:
+        """The answer as the bot messages it takes (#2856); one part = sent as before."""
+
+        if not (self.reply_split and self.interim_frames):
+            return [text]
+        limit = self.bot_reply_max_bytes
+        if skills:
+            # The bot bounds the body first, then appends ``\n\n📘 a · b``.
+            footer = SKILLS_FOOTER_PREFIX + SKILLS_FOOTER_SEPARATOR.join(skills)
+            limit -= len(footer.encode("utf-8")) + 2
+        parts = split_reply(
+            text, single_bytes=limit, part_bytes=limit - REPLY_PART_MARGIN_BYTES
+        )
+        if len(parts) < 2:
+            return [text]
+        if len(parts) - 1 > self.bot_interim_max - turn.interims_sent:
+            # The bot drops interims past its per-turn cap without a word. An
+            # answer it cuts and marks as cut beats pages that silently go missing.
+            self._reply_split_skipped += 1
+            logger.warning(
+                "hande: long answer not split (parts=%d interims_sent=%d bot_interim_max=%d)",
+                len(parts),
+                turn.interims_sent,
+                self.bot_interim_max,
+            )
+            return [text]
+        return parts
+
+    def _note_partial_reply(self, room_id: str, sent: int, total: int) -> None:
+        """Tell the room a split answer stopped short, once a bot is back to post it."""
+
+        if not self.notice_frames:
+            self._dropped("notice")
+            return
+        self._hold_notice(room_id, NOTICE_REPLY_PARTIAL.format(sent=sent, total=total))
 
     # -- outbound attachments (#2764) -----------------------------------------
 
