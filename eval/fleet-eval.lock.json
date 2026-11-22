@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "fleet-eval-lock-v1",
+  "agentOlympics": "bc326bb252fc821b0428253974847d7bb94df46f",
+  "repo": "jinwon-int/ccc-node",
+  "lane": "claude-code-overlay",
+  "overlay": ["claude/output-styles/ccc-report.md", "claude/CLAUDE.md.template"],
+  "runsDir": "eval/fleet-eval/runs"
+}
