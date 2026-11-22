@@ -140,8 +140,15 @@ DEADLINE_KEYWORD = re.compile(
 # "테스트 종료: 2026-09-28 07:36:11 UTC (16:36 KST)" was read as 07:36 *KST*,
 # nine hours early (a2a-nexus#2256). "UTC+09:00" is an offset annotation, not
 # a UTC clock reading, so a following sign excludes it.
+#
+# A weekday between the date and the clock — "2026-11-23 (월) 09:00 KST", the
+# fleet's usual way to write a booking — is skipped. It used to end the match
+# at the date, so the booking was read as date-only (23:59, low confidence):
+# never a superseding booking in relative mode and never a high-confidence
+# expiry (#2863; iphone-agent-cast#87/#89, the very cases #2817 was for).
 DEADLINE_DATE = re.compile(
     r"(20\d{2})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})일?"
+    r"(?:\s*\((?:[월화수목금토일](?:요일)?|(?i:mon|tue|wed|thu|fri|sat|sun)[A-Za-z]*\.?)\))?"
     r"(?:\s*(?:T|\s)\s*(\d{1,2}):(\d{2})(?::\d{2})?"
     r"(?:\s*(UTC|GMT)(?![+-]\d)\b|(Z)\b)?)?"
 )
@@ -210,8 +217,17 @@ def _first_line(body: str) -> str:
 
 
 # The deadline paragraph itself already reports a finished test.
+#
+# "판정" counts only when it can be a judgement that was made. A booking that
+# says no verdict exists yet, or who will give one, is not a completion
+# report: "2주를 넘겼는데 판정이 없어 새 종료 일시를 정합니다", "판정 없이 지남",
+# "판정 주체 오너" each demoted a real booking to already-settled, which is
+# never a booking (NOT_A_BOOKING), so the deadline it set was not tracked
+# (#2863; iphone-agent-cast#87/#89, 2026-11-15). Excluded: 미판정, 판정(이/은/도)
+# 없…, 판정 주체/예정/대기. VERDICT is deliberately left as it is.
 SETTLED = re.compile(
-    r"(완료|✅|통과|합격|불합격|종료\s*보고|결과\s*갱신|실제\s*종료|판정)",
+    r"(완료|✅|통과|합격|불합격|종료\s*보고|결과\s*갱신|실제\s*종료"
+    r"|(?<!미)판정(?!\s*(?:이|은|도)?\s*없|\s*(?:주체|예정|대기)))",
 )
 
 # How much of a comment counts as its "header" when deciding whether the whole

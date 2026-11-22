@@ -1210,6 +1210,107 @@ class RelativeSupersede2817Tests(unittest.TestCase):
         self.assertFlagged(_rel_issue(comments=[earlier, relative]))
 
 
+# Verbatim shape of the two bookings #2817 was written for and did not fix
+# (iphone-agent-cast#87 and #89, both posted 2026-11-15): a weekday between the
+# date and the clock, and a "판정" that says no verdict exists / who gives it.
+BOOKING_2863_AT = "2026-11-15T10:48:00Z"
+BOOKING_2863_COMMENT = (
+    "## 기준 조정 일정 — 절대 종료 일시 지정 (2026-11-15 KST)\n\n"
+    "위 「남은 일: 1~2주 운영 뒤 기준 조정」에 절대 시각이 없어 시한부 테스트 스캔에 잡혔습니다. "
+    "2주를 넘겼는데 판정이 없어 새 종료 일시를 정합니다.\n\n"
+    "- **시작 일시**: 2026-10-27 20:29 KST (첫 실행)\n"
+    "- **원래 종료(「1~2주」의 끝)**: 2026-11-10 20:29 KST — 판정 없이 지남\n"
+    "- **새 종료 일시: 2026-11-23 (월) 09:00 KST**\n"
+)
+BOOKING_2863_ONE_LINE = (
+    "본문의 「기준 조정: 1~2주 운영한 뒤 #7에서 다시 본다」의 절대 일시를 #7에 정했습니다: "
+    "**시작 2026-10-27 20:29 KST · 종료 일시 2026-11-23 (월) 09:00 KST** · 판정 주체 오너"
+)
+BOOKING_2863_END = dt.datetime(2026, 11, 23, 9, 0)
+
+
+class BookingRecognition2863Tests(unittest.TestCase):
+    _judge = RelativeFalsePositive2544Tests._judge
+    assertDemoted = RelativeFalsePositive2544Tests.assertDemoted
+    assertFlagged = RelativeFalsePositive2544Tests.assertFlagged
+
+    def _hits(self, text: str) -> list[tuple[dt.datetime, str | None]]:
+        posted = scanner.parse_github_timestamp(BOOKING_2863_AT)
+        hits, _ = scanner._explicit_hits(text, "https://example/c/1", posted, 7)
+        return [(hit.deadline, hit.weak_reason) for hit in hits]
+
+    def test_weekday_between_date_and_clock_keeps_the_time(self) -> None:
+        for line in (
+            "종료 일시: 2026-11-23 (월) 09:00 KST",
+            "종료 일시: 2026-11-23(월) 09:00 KST",
+            "종료 일시: 2026년 11월 23일(월요일) 09:00",
+            "deadline: 2026-11-23 (Mon) 09:00 KST",
+            "deadline: 2026-11-23 (Monday) 09:00 KST",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self._hits(line), [(BOOKING_2863_END, None)])
+
+    def test_weekday_without_a_clock_is_still_date_only(self) -> None:
+        self.assertEqual(
+            self._hits("관측 종료 2026-11-23 (월)"),
+            [(dt.datetime(2026, 11, 23, 23, 59), "date-only")],
+        )
+        # Not a weekday: the parenthesis is left alone and ends the match.
+        self.assertEqual(
+            self._hits("관측 종료 2026-11-23 (잠정) 09:00 KST"),
+            [(dt.datetime(2026, 11, 23, 23, 59), "date-only")],
+        )
+
+    def test_negated_or_role_verdict_wording_is_not_a_completion_report(self) -> None:
+        for tail in ("· 판정 주체 오너", "— 판정 없이 지남", "(판정이 없어 다시 정함)",
+                     "· 판정 예정", "· 판정 대기", "· 기한 경과 미판정 재예약"):
+            with self.subTest(tail=tail):
+                self.assertEqual(
+                    self._hits(f"종료 일시: 2026-11-23 09:00 KST {tail}"),
+                    [(BOOKING_2863_END, None)],
+                )
+
+    def test_a_real_verdict_still_demotes_the_booking(self) -> None:
+        for text, reason in (
+            ("종료 일시: 2026-11-23 09:00 KST 판정: 보류", "already-settled"),
+            ("종료 일시: 2026-11-23 09:00 KST — 판정은 합격", "already-settled"),
+            ("## 관측 종료 판정 — 합격\n종료 일시: 2026-11-23 09:00 KST", "already-settled-comment"),
+            ("## 테스트 종료 보고\n종료 일시: 2026-11-23 09:00 KST", "already-settled-comment"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._hits(text), [(BOOKING_2863_END, reason)])
+
+    def test_the_live_booking_comments_are_bookings(self) -> None:
+        self.assertIn((BOOKING_2863_END, None), self._hits(BOOKING_2863_COMMENT))
+        self.assertEqual(self._hits(BOOKING_2863_ONE_LINE), [(BOOKING_2863_END, None)])
+
+    def test_the_live_booking_supersedes_the_relative_wording(self) -> None:
+        relative = _rel_comment(
+            "- **남은 일**: 1~2주 운영 뒤 기준 조정.", "2026-10-27T11:29:00Z", author="seoseo-ai")
+        self.assertFlagged(_rel_issue(comments=[relative]))
+        booking = _rel_comment(BOOKING_2863_COMMENT, BOOKING_2863_AT, author="jinon86")
+        issue = _rel_issue(comments=[relative, booking])
+        self.assertDemoted(issue, "superseded-by-absolute")
+        self.assertEqual(scanner.scan([issue], NOW, "relative", min_confidence="high"), [])
+        # The body form (the daily-report issue): one-line booking comment.
+        body = "- 기준 조정: 1~2주 운영한 뒤 #7에서 다시 본다."
+        one_line = _rel_comment(BOOKING_2863_ONE_LINE, BOOKING_2863_AT, author="jinon86")
+        self.assertDemoted(_rel_issue(body=body, comments=[one_line]), "superseded-by-absolute")
+
+    def test_the_live_booking_expires_at_high_confidence(self) -> None:
+        for booking in (BOOKING_2863_COMMENT, BOOKING_2863_ONE_LINE):
+            with self.subTest(booking=booking[:20]):
+                issue = _rel_issue(comments=[_rel_comment(booking, BOOKING_2863_AT, author="jinon86")])
+                before = dt.datetime(2026, 11, 22, 9, 30)
+                self.assertIsNone(scanner.judge_issue(issue, before, "expired"))
+                finding = scanner.judge_issue(issue, dt.datetime(2026, 11, 23, 9, 30), "expired")
+                assert finding is not None
+                self.assertEqual(
+                    (finding.deadline, finding.confidence, finding.weak_reason),
+                    (BOOKING_2863_END, "high", None),
+                )
+
+
 class ReposFileTests(unittest.TestCase):
     """An unconfigured scheduled scan must never look like a clean scan.
 

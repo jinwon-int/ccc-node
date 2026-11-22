@@ -44,7 +44,9 @@ later comment promised a follow-up at an absolute datetime that has passed with
 - Keywords: `후속`, `다음 확인`, `재측정`, `재확인`, `재점검`, `재카나리`,
   `next action`/`next check`, `follow-up`. The line must also carry a date.
   Dates are parsed as in the deadline scan: KST by default, and a time marked
-  `UTC`/`Z` is converted to KST.
+  `UTC`/`Z` is converted to KST. A weekday between the date and the clock
+  (`2026-11-23 (월) 09:00 KST`, `(Mon)`) is skipped, so the time is kept
+  (#2863).
 - Verdict: the first comment whose first line states a conclusion (as in the
   early-verdict check) or that has a `판정:`/`Verdict:` label line. The issue
   body and comments before the verdict are not read; those are bookings, which
@@ -56,7 +58,9 @@ later comment promised a follow-up at an absolute datetime that has passed with
   mentioned in passing instead of written as a label such as `다음 확인: …` or
   `| Next action | …`), `verdict-heading-only` (only the looser heading-window
   verdict so far), `cross-reference`, `already-settled`, `claim-eta`,
-  `date-only`. A time already past when the comment was posted is a record,
+  `date-only`. "판정" marks a completion report only as a verdict that was
+  given: `미판정`, `판정이 없어` / `판정 없이` and `판정 주체/예정/대기` do not
+  demote a booking (#2863). A time already past when the comment was posted is a record,
   not a promise (`past-at-posting`), and is never reported.
 - `--include-closed-days N` (followup mode only, default 0 = open issues only)
   also fetches issues closed on or after `now - N days` with a second
