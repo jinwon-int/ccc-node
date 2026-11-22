@@ -1,0 +1,74 @@
+name: fleet-eval
+
+# Fleet evaluation gate, observation phase (agent-olympics#325 slice 4c).
+#
+# Compares an operator-recorded, body-free Q-set run of this PR's overlay
+# (eval/fleet-eval.lock.json: claude/output-styles/ccc-report.md +
+# claude/CLAUDE.md.template) with the newest main run for the previous overlay.
+# CI never calls a model and uses no secret: it checks out agent-olympics at the
+# pinned commit and runs scripts/fleet-eval-ci.js, which only reads git objects
+# of this checkout. See eval/README.md.
+#
+# continue-on-error while observed; the job becomes a required context (and
+# loses continue-on-error) only in slice 4f, together with
+# .github/required-checks.json. No workflow-level `paths:` filter on purpose: a
+# required check that is skipped never reports. The job decides
+# `not_applicable` itself.
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fleet-eval-gate:
+    name: fleet-eval-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # fleet-eval-ci.js diffs base...HEAD and reads base run files.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the agent-olympics pin
+        id: lock
+        run: |
+          set -euo pipefail
+          sha="$(jq -r .agentOlympics eval/fleet-eval.lock.json)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "lock agentOlympics is not a 40-hex sha" >&2; exit 2; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: jinwon-int/agent-olympics
+          ref: ${{ steps.lock.outputs.sha }}
+          path: .fleet-eval-agent-olympics
+          persist-credentials: false
+      - name: Install agent-olympics dependencies (no scripts)
+        working-directory: .fleet-eval-agent-olympics
+        run: |
+          node --version
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Fleet eval gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -uo pipefail
+          head="$(git rev-parse HEAD)"
+          node .fleet-eval-agent-olympics/scripts/fleet-eval-ci.js \
+            --repo-dir . --base "$BASE_SHA" --head "$head" | tee fleet-eval.txt
+          rc=${PIPESTATUS[0]}
+          {
+            echo '### fleet-eval-gate (observation)'
+            echo '```'
+            cat fleet-eval.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
