@@ -161,5 +161,5 @@ MAXB=1024 run_watch
 ok "rotated" '[[ -s "$OUT.1" ]]'
 ok "fresh log after rotation" '[[ $(wc -c < "$OUT") -lt 1024 ]] && grep -q "PIN DRIFT" "$OUT"'
 
-echo "a2a-task-watch: $pass passed, $fail failed"
+echo "PASS=$pass FAIL=$fail"
 [[ $fail -eq 0 ]]
