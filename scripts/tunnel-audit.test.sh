@@ -55,8 +55,11 @@ printf '# comment tunnel\n17 * * * * root /usr/bin/autossh -M 0 -N -L 9000:127.0
 write_exec_stub "$TMP/bin/crontab" <<EOF
 [ "\${1:-}" = "-l" ] && cat "$TMP/crontab.txt"
 EOF
+# Real `ss -tlnp` output: the collector requires the State header (an answer
+# without it is a broken ss, not "no listeners").
 write_exec_stub "$TMP/bin/ss" <<EOF
 cat <<'SS'
+State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
 LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))
 LISTEN 0 128 127.0.0.1:8787 0.0.0.0:* users:(("node",pid=2,fd=4))
 LISTEN 0 128 100.127.171.124:8000 0.0.0.0:* users:(("python3",pid=3,fd=5))
@@ -107,6 +110,37 @@ ok "crontab tunnel line found, unrelated line skipped, cron token masked" '[ "$(
 ok "cron.d autossh -L line found, comment skipped" 'jq -e ".cron[] | select(.source == \"cron.d/hub\") | .line | test(\"autossh\")" <<<"$out" >/dev/null && [ "$(jq ".cron | length" <<<"$out")" = 2 ]'
 ok "loopback listener excluded; public/tailnet (v4 + fd7a ULA v6) classified" '[ "$(jq ".listeners | length" <<<"$out")" = 4 ] && jq -e "[.listeners[] | select(.bind == \"public\")] | length == 2" <<<"$out" >/dev/null && jq -e "[.listeners[] | select(.bind == \"tailnet\")] | length == 2" <<<"$out" >/dev/null'
 ok "listener process names captured" 'jq -e ".listeners[] | select(.local == \"[::]:443\") | .process == \"caddy\"" <<<"$out" >/dev/null'
+ok "healthy ss reports ss_status rc=0" 'jq -e ".tools.ss_status == \"rc=0\"" <<<"$out" >/dev/null'
+# A 0-byte ss (seen on a fleet node 2026-09-02..11-22): exec fails (ENOEXEC) -> error status.
+cp "$TMP/bin/ss" "$TMP/ss.good"
+: > "$TMP/bin/ss"
+# shellcheck disable=SC2034  # zero_* are read via eval inside ok()
+zero_json="$(bash "$AUDIT" 2>/dev/null)"
+# shellcheck disable=SC2034
+zero_rc=$?
+ok "0-byte ss: collector still exits 0 with JSON" '[ "$zero_rc" = 0 ] && jq -e ".schema" <<<"$zero_json" >/dev/null'
+ok "0-byte ss: ss_status is an error, listeners empty" 'jq -e "(.tools.ss_status | startswith(\"error:\")) and (.listeners | length == 0)" <<<"$zero_json" >/dev/null'
+# An ss that answers rc=0 with no output at all (no header): broken, not "no listeners".
+write_exec_stub "$TMP/bin/ss" <<EOF
+exit 0
+EOF
+# shellcheck disable=SC2034  # broken_* are read via eval inside ok()
+broken_json="$(bash "$AUDIT" 2>/dev/null)"
+# shellcheck disable=SC2034
+broken_md="$(bash "$AUDIT" --markdown 2>/dev/null)"
+ok "silent ss: ss_status is error:ss-no-header, listeners empty" 'jq -e ".tools.ss_status == \"error:ss-no-header\" and (.listeners | length == 0)" <<<"$broken_json" >/dev/null'
+ok "silent ss: markdown warns the listener count is untrustworthy" 'grep -q "WARNING listeners unavailable (ss_status=error:ss-no-header)" <<<"$broken_md"'
+# Header only = genuinely nothing listening: trusted, rc=0, no warning.
+write_exec_stub "$TMP/bin/ss" <<EOF
+echo 'State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process'
+EOF
+# shellcheck disable=SC2034
+empty_json="$(bash "$AUDIT" 2>/dev/null)"
+# shellcheck disable=SC2034
+empty_md="$(bash "$AUDIT" --markdown 2>/dev/null)"
+ok "header-only ss: trusted empty scan (rc=0, no listeners)" 'jq -e ".tools.ss_status == \"rc=0\" and (.listeners | length == 0) and .exposure.public_listeners == 0" <<<"$empty_json" >/dev/null'
+ok "header-only ss: no warning in markdown" '! grep -q "WARNING listeners unavailable" <<<"$empty_md"'
+cp "$TMP/ss.good" "$TMP/bin/ss"
 ok "tailscale serve configured; funnel status echoing a tailnet-only serve is NOT funnel" 'jq -e ".tailscale.serve.configured == true and .tailscale.funnel.configured == false" <<<"$out" >/dev/null'
 ok "multi-line ExecStart (backslash continuation) is joined and classified as reverse" 'jq -e ".units[] | select(.unit == \"gwakga-broker-public-tunnel.service\") | .kind == \"ssh-reverse\" and (.exec_start | test(\"-R 127.0.0.1:8799\"))" <<<"$out" >/dev/null'
 # Real funnel: an entry tagged "(Funnel on)" flips the flag.
