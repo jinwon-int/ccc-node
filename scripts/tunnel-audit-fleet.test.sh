@@ -143,6 +143,35 @@ out="$(bash "$FLEET" 2>&1)"; rc=$?
 ok "explicit ss_status rc=0 compares normally (OK)" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
 doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
 
+# 6c) a tailnet listener's interface zone is not part of its identity. When
+#     tailscaled began binding to tailscale0 (2026-11-15), ss started printing
+#     "100.x%tailscale0:PORT" and every node flipped NEW+GONE on unchanged
+#     ports. The port itself stays in the identity, and a public bind keeps its
+#     zone (dropping "%docker0" widens reachability).
+ts() { # <zone-or-empty> <serve-port> <docker0-zone-or-empty>
+  printf ',{"local":"100.101.102.103%s:51770","bind":"tailnet","process":"tailscaled"}' "$1"
+  printf ',{"local":"[fd7a:115c:a1e0::1:2]%s:37449","bind":"tailnet","process":"tailscaled"}' "$1"
+  printf ',{"local":"100.101.102.103%s:%s","bind":"tailnet","process":"tailscaled"}' "$1" "$2"
+  printf ',{"local":"0.0.0.0%s:5000","bind":"public","process":"docker-proxy"}' "$3"
+}
+doc active "$(ts "" 18443 %docker0)" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
+doc active "$(ts %tailscale0 18443 %docker0)" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "tailnet listeners gaining a %tailscale0 zone on the same ports are OK, not NEW/GONE" '[ "$rc" = 0 ] && grep -qx "OK alpha" <<<"$out"'
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
+doc active "$(ts "" 18443 %docker0)" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "a zoned baseline compared with an unzoned collection is OK too" '[ "$rc" = 0 ] && grep -qx "OK alpha" <<<"$out"'
+doc active "$(ts %tailscale0 18444 %docker0)" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "a tailnet port that moves is still NEW + GONE (port kept, zone dropped in the verdict)" '[ "$rc" = 1 ] && grep -qx "NEW alpha: 100.101.102.103:18444 tailscaled \[tailnet\] | GONE: 100.101.102.103:18443 tailscaled \[tailnet\]" <<<"$out"'
+doc active "$(ts %tailscale0 18443 "")" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "a public bind losing its %docker0 zone is NEW (zone kept for non-tailnet binds)" '[ "$rc" = 1 ] && grep -qx "NEW alpha: 0.0.0.0:5000 docker-proxy \[public\] | GONE: 0.0.0.0%docker0:5000 docker-proxy \[public\]" <<<"$out"'
+doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
+
 # 7) unreachable node → UNREACHABLE, exit 1; other node still evaluated
 rm -f "$TMP/reply/beta"
 out="$(bash "$FLEET" 2>&1)"; rc=$?

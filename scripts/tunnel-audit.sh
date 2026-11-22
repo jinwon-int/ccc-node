@@ -197,7 +197,11 @@ def scan_cron():
 
 
 def classify_bind(addr: str) -> str:
-    host = addr.rsplit(":", 1)[0].strip("[]")
+    # ss appends the interface of a device-bound socket as a zone:
+    # "100.x%tailscale0:36355", "[fd7a::1]%tailscale0:45436",
+    # "0.0.0.0%docker0:5000". Classify the address without it, or a
+    # device-bound wildcard bind would read as "other" instead of "public".
+    host = addr.rsplit(":", 1)[0].split("%", 1)[0].strip("[]")
     if host in ("0.0.0.0", "*", "::", ""):
         return "public"
     if host.startswith("127.") or host == "::1":

@@ -65,6 +65,9 @@ LISTEN 0 128 127.0.0.1:8787 0.0.0.0:* users:(("node",pid=2,fd=4))
 LISTEN 0 128 100.127.171.124:8000 0.0.0.0:* users:(("python3",pid=3,fd=5))
 LISTEN 0 128 [::]:443 [::]:* users:(("caddy",pid=4,fd=6))
 LISTEN 0 128 [fd7a:115c:a1e0::2f35:ab7d]:38602 [::]:* users:(("tailscaled",pid=5,fd=7))
+LISTEN 0 4096 100.127.171.124%tailscale0:44618 0.0.0.0:* users:(("tailscaled",pid=5,fd=8))
+LISTEN 0 4096 0.0.0.0%docker0:5000 0.0.0.0:* users:(("docker-proxy",pid=6,fd=4))
+LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=7,fd=15))
 SS
 EOF
 write_exec_stub "$TMP/bin/systemctl" <<EOF
@@ -108,7 +111,9 @@ ok "token-file path masked too" 'jq -r ".units[] | select(.kind == \"cloudflared
 ok "removed-unit residue listed" 'jq -e "(.residue | length) == 1 and (.residue[0].file | test(\"removed-20260626\"))" <<<"$out" >/dev/null'
 ok "crontab tunnel line found, unrelated line skipped, cron token masked" '[ "$(jq "[.cron[] | select(.source == \"crontab\")] | length" <<<"$out")" = 1 ] && ! grep -q "abc123" <<<"$out"'
 ok "cron.d autossh -L line found, comment skipped" 'jq -e ".cron[] | select(.source == \"cron.d/hub\") | .line | test(\"autossh\")" <<<"$out" >/dev/null && [ "$(jq ".cron | length" <<<"$out")" = 2 ]'
-ok "loopback listener excluded; public/tailnet (v4 + fd7a ULA v6) classified" '[ "$(jq ".listeners | length" <<<"$out")" = 4 ] && jq -e "[.listeners[] | select(.bind == \"public\")] | length == 2" <<<"$out" >/dev/null && jq -e "[.listeners[] | select(.bind == \"tailnet\")] | length == 2" <<<"$out" >/dev/null'
+ok "loopback listeners excluded; public/tailnet (v4 + fd7a ULA v6) classified" '[ "$(jq ".listeners | length" <<<"$out")" = 6 ] && jq -e "[.listeners[] | select(.bind == \"public\")] | length == 3" <<<"$out" >/dev/null && jq -e "[.listeners[] | select(.bind == \"tailnet\")] | length == 3" <<<"$out" >/dev/null'
+# ss prints a device-bound socket with an interface zone ("addr%iface:port").
+ok "zone-suffixed listeners classified by address: %tailscale0 tailnet, %docker0 wildcard public, %lo loopback excluded" 'jq -e ".listeners[] | select(.local == \"100.127.171.124%tailscale0:44618\") | .bind == \"tailnet\"" <<<"$out" >/dev/null && jq -e ".listeners[] | select(.local == \"0.0.0.0%docker0:5000\") | .bind == \"public\"" <<<"$out" >/dev/null && ! jq -e ".listeners[] | select(.local | startswith(\"127.0.0.53\"))" <<<"$out" >/dev/null'
 ok "listener process names captured" 'jq -e ".listeners[] | select(.local == \"[::]:443\") | .process == \"caddy\"" <<<"$out" >/dev/null'
 ok "healthy ss reports ss_status rc=0" 'jq -e ".tools.ss_status == \"rc=0\"" <<<"$out" >/dev/null'
 # A 0-byte ss (seen on a fleet node 2026-09-02..11-22): exec fails (ENOEXEC) -> error status.
@@ -160,7 +165,7 @@ case "\$1" in
 esac
 EOF
 out="$(bash "$AUDIT" 2>/dev/null)"
-ok "exposure summary counts" 'jq -e ".exposure == {cloudflared_units:1, reverse_ssh_units:1, public_tunnel_units:1, public_listeners:2, funnel_configured:false, residue_files:1, firewall_default_deny:true}" <<<"$out" >/dev/null'
+ok "exposure summary counts" 'jq -e ".exposure == {cloudflared_units:1, reverse_ssh_units:1, public_tunnel_units:1, public_listeners:3, funnel_configured:false, residue_files:1, firewall_default_deny:true}" <<<"$out" >/dev/null'
 ok "ufw active: default incoming + 3 normalised rules (comments stripped, whitespace collapsed)" 'jq -e ".firewall.ufw | .status == \"active\" and .default_incoming == \"deny\" and (.rules | length == 3) and (.rules | index([\"8123/tcp ALLOW IN 192.168.55.0/24\"]) != null) and (.rules_hash | length == 64)" <<<"$out" >/dev/null && ! jq -r ".firewall.ufw.rules[]" <<<"$out" | grep -q "home-assistant-lan"'
 # Pinned pre-#1536 output for the static-only fixture: the ufw block must stay
 # byte-identical (no dynamic_rules key, same sha256 of the sorted rules) so the
@@ -272,7 +277,7 @@ ok "stderr is empty" '[ ! -s "$TMP/err" ]'
 # shellcheck disable=SC2034  # md is read via eval inside ok()
 md="$(bash "$AUDIT" --markdown 2>/dev/null)"; rc=$?
 ok "markdown mode exits 0" '[ "$rc" = 0 ]'
-ok "markdown headline carries counts" 'grep -q "cloudflared units: 1 · reverse ssh: 1 · public tunnel units: 1 · public listeners: 2 · funnel: no · residue: 1" <<<"$md"'
+ok "markdown headline carries counts" 'grep -q "cloudflared units: 1 · reverse ssh: 1 · public tunnel units: 1 · public listeners: 3 · funnel: no · residue: 1" <<<"$md"'
 ok "markdown carries the ufw line and rules" 'grep -q "^- ufw: active · default incoming deny · 3 rules · hash" <<<"$md" && grep -q "8123/tcp ALLOW IN 192.168.55.0/24" <<<"$md"'
 ok "markdown ufw line is unchanged without bans (no dynamic suffix, pinned)" 'grep -q "^- ufw: active · default incoming deny · 3 rules · hash a9e09f43$" <<<"$md" && ! grep -q "dynamic" <<<"$md"'
 ok "markdown lists units and residue" 'grep -q "gwakga-broker-public-tunnel.service" <<<"$md" && grep -q "removed-20260626" <<<"$md"'
