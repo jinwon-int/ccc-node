@@ -16,7 +16,10 @@
 #      tunnel|ngrok|cloudflared|frp|bore|autossh|`ssh -R`|`ssh -L`
 #   2. crontab / cron.d lines of the same shape (Termux keeps tunnels here)
 #   3. non-loopback TCP listeners (`ss -tlnp`), tagged public (0.0.0.0/::)
-#      vs tailnet (100.64.0.0/10 bind) vs other
+#      vs tailnet (100.64.0.0/10 bind) vs other. An answer without the
+#      `State` header is a broken ss, not "no listeners":
+#      tools.ss_status=error:ss-no-header and the fleet wrapper reports the
+#      node DEGRADED instead of comparing an empty list.
 #   4. tailscale serve / funnel status (funnel = public exposure)
 #   5. removed-unit residue (`*.removed-*`, `*.disabled`) so orphans stay
 #      visible until an operator deletes them
@@ -207,13 +210,19 @@ def classify_bind(addr: str) -> str:
 
 
 def scan_listeners():
-    out, status = run([SS, "-tlnpH"])
-    if out is None:
-        out, status = run([SS, "-tlnp"])
+    # Read WITH the header and require it. `ss -tlnp` prints its "State ..."
+    # header even when nothing listens, so a missing header means ss itself is
+    # broken — never "no listeners". A 0-byte /usr/bin/ss exits 0 with no
+    # output and was audited as listeners=[] for months (one fleet node, 2026-09-02 to
+    # 2026-11-22); an ss without -H support used to fail the same silent way.
+    out, status = run([SS, "-tlnp"])
     if out is None:
         return [], status
+    lines = out.splitlines()
+    if not any(line.split()[:1] == ["State"] for line in lines):
+        return [], "error:ss-no-header"
     rows = []
-    for line in out.splitlines():
+    for line in lines:
         parts = line.split()
         if len(parts) < 5 or parts[0] == "State":
             continue
@@ -372,6 +381,8 @@ print("")
 print(f"- cloudflared units: {exposure['cloudflared_units']} · reverse ssh: {exposure['reverse_ssh_units']}"
       f" · public tunnel units: {exposure['public_tunnel_units']} · public listeners: {exposure['public_listeners']}"
       f" · funnel: {'YES' if exposure['funnel_configured'] else 'no'} · residue: {exposure['residue_files']}")
+if ss_status != "rc=0":
+    print(f"- WARNING listeners unavailable (ss_status={ss_status}) — public listener count above is not trustworthy")
 ufw = firewall["ufw"]
 if ufw["status"] == "active":
     dyn = ufw.get("dynamic_rules") or []

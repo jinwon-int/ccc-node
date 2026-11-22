@@ -6,8 +6,10 @@
 # with the node's ACCEPTED BASELINE. Anything that appeared since the baseline
 # was accepted — a tunnel-class unit, a cron tunnel line, a non-loopback
 # listener, funnel turning on — is reported as NEW; anything that vanished as
-# GONE. Exit 1 on NEW or UNREACHABLE so an agent-cron `telegram-owner-on-failure`
-# payload notifies the owner; GONE and unchanged nodes exit 0.
+# GONE. A node whose listener scan failed (tools.ss_status != rc=0) is DEGRADED:
+# never compared, never accepted as a baseline. Exit 1 on NEW, UNREACHABLE or
+# DEGRADED so an agent-cron `telegram-owner-on-failure` payload notifies the
+# owner; GONE and unchanged nodes exit 0.
 #
 # The baseline is the machine-checkable twin of the Family Wiki tunnel
 # registry ([DOC-3283]): an operator reviews the registry, then runs
@@ -53,10 +55,11 @@ for arg in "$@"; do
 Usage: tunnel-audit-fleet.sh [--accept-baseline[=node1,node2]] [--quiet]
 Collect tunnel-audit JSON from every fleet node and compare it with each node's
 accepted baseline. Verdicts per node: OK | NEW <items> | GONE <items> |
-UNBASELINED | UNREACHABLE | NOSCRIPT. Exit 1 when any node is NEW or
-UNREACHABLE (owner notification via agent-cron on-failure), else 0.
+UNBASELINED | UNREACHABLE | NOSCRIPT | DEGRADED (listener scan failed). Exit 1
+when any node is NEW, UNREACHABLE or DEGRADED (owner notification via
+agent-cron on-failure), else 0.
 --accept-baseline freezes the current collection as the baseline (all nodes,
-or the comma-separated list). Env: CCC_FLEET_NODES, CCC_FLEET_SSH,
+or the comma-separated list); a DEGRADED collection is never accepted. Env: CCC_FLEET_NODES, CCC_FLEET_SSH,
 CCC_FLEET_SELF, CCC_STATE_DIR / CCC_TUNNEL_AUDIT_DIR, CCC_FLEET_SSH_TIMEOUT.
 EOF
       exit 0
@@ -128,6 +131,14 @@ signature() { # <json> -> sorted "kind\tid" lines
 dynamic_count() { # <json> -> number of fail2ban-style dynamic ufw rules (0 when absent / old collector)
   jq -r '(.firewall.ufw.dynamic_rules // []) | length' "$1" 2>/dev/null || echo 0
 }
+# The listener scan is only evidence when ss answered normally. A broken ss
+# (0-byte binary, missing, timeout, no header) yields listeners=[]: compared,
+# that reads as OK or a GONE listener; accepted, it freezes a blind baseline
+# (one fleet node ran that way 2026-09-02..11-22). Old collectors without tools.ss_status
+# count as rc=0 so their baselines keep comparing as before.
+ss_status() { # <json> -> tools.ss_status, "rc=0" when absent
+  jq -r '.tools.ss_status // "rc=0"' "$1" 2>/dev/null || echo "unknown"
+}
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 run_file="$AUDIT_DIR/runs/$run_id.txt"
@@ -140,6 +151,10 @@ for node in $NODES; do
     verdict="UNREACHABLE $node"; fail=1
   elif [ "$rc" = 2 ]; then
     verdict="NOSCRIPT $node (checkout lacks scripts/tunnel-audit.sh — harness too old)"
+  elif sst="$(ss_status "$cur")"; [ "$sst" != "rc=0" ]; then
+    # Never compare or accept a collection whose listener scan failed.
+    verdict="DEGRADED $node: listener scan unavailable (ss_status=$sst) — not compared; fix ss on the node, then re-run"
+    fail=1
   else
     accept_this=0
     if [ "$ACCEPT" = 1 ]; then

@@ -127,6 +127,22 @@ ok "bans expiring after a baseline accepted while banned is OK, not GONE" '[ "$r
 doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
 bash "$FLEET" --accept-baseline=alpha >/dev/null 2>&1
 
+# 6b) a failed listener scan (tools.ss_status != rc=0) is DEGRADED: exit 1, never
+#     compared (an empty list would read as OK/GONE), never accepted as a baseline.
+#     A fleet node's 0-byte /usr/bin/ss reported error:OSError for months unnoticed.
+cp "$TMP/state/tunnel-audit/baseline/alpha.json" "$TMP/alpha-baseline.before"
+doc active "" false "[]" | fw active deny aaaaaaaa1111 | jq '.listeners = [] | .tools = {"ss_status":"error:OSError"}' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "failed listener scan exits 1" '[ "$rc" = 1 ]'
+ok "DEGRADED verdict names the ss status; other node still evaluated" 'grep -q "^DEGRADED alpha: listener scan unavailable (ss_status=error:OSError)" <<<"$out" && grep -q "^\(OK\|UNBASELINED\|GONE\|NEW\) beta" <<<"$out"'
+ok "DEGRADED is not compared (no GONE for the vanished listener)" '! grep -q "GONE alpha" <<<"$out"'
+out="$(bash "$FLEET" --accept-baseline=alpha 2>&1)"; rc=$?
+ok "accept-baseline refuses a DEGRADED collection" '[ "$rc" = 1 ] && grep -q "^DEGRADED alpha" <<<"$out" && ! grep -q "BASELINE-ACCEPTED alpha" <<<"$out" && cmp -s "$TMP/alpha-baseline.before" "$TMP/state/tunnel-audit/baseline/alpha.json"'
+doc active "" false "[]" | fw active deny aaaaaaaa1111 | jq '.tools = {"ss_status":"rc=0"}' > "$TMP/reply/alpha"
+out="$(bash "$FLEET" 2>&1)"; rc=$?
+ok "explicit ss_status rc=0 compares normally (OK)" '[ "$rc" = 0 ] && grep -q "^OK alpha" <<<"$out"'
+doc active "" false "[]" | fw active deny aaaaaaaa1111 > "$TMP/reply/alpha"
+
 # 7) unreachable node → UNREACHABLE, exit 1; other node still evaluated
 rm -f "$TMP/reply/beta"
 out="$(bash "$FLEET" 2>&1)"; rc=$?
