@@ -113,11 +113,22 @@ collect() { # <node> -> writes current/<node>.json ; returns 0 ok, 1 unreachable
 # them under firewall.ufw.dynamic_rules (#1536); dynamic_count() surfaces the
 # count on the verdict as an observation so a ban coming or going never
 # flips a node NEW/GONE.
+# A tailnet listener's interface zone is dropped from its identity: ss prints a
+# device-bound socket as "100.x.y.z%tailscale0:36355", and when tailscaled
+# started binding its listeners to tailscale0 every node flipped NEW+GONE on the
+# same unchanged ports (2026-11-15). A tailnet address only exists on
+# tailscale0, so the zone says nothing about reachability; the port stays in the
+# identity (tailscaled's peerapi port is derived from the node's IP and is
+# stable, and a serve port appearing or moving must still surface). Public and
+# other binds keep their zone: "0.0.0.0%docker0" becoming "0.0.0.0" widens
+# reachability and must surface as NEW.
 signature() { # <json> -> sorted "kind\tid" lines
   jq -r '
     ([.units[]? | "unit\t\(.unit) [\(.kind)]"]
      + [.cron[]? | "cron\t\(.source): \(.line | .[0:120])"]
-     + [.listeners[]? | select(.bind != "loopback") | "listener\t\(.local) \(.process // "-") [\(.bind)]"]
+     + [.listeners[]? | select(.bind != "loopback")
+        | (if .bind == "tailnet" then .local | sub("%[^%:\\]\\[]+:(?<p>[0-9]+)$"; ":\(.p)") else .local end) as $local
+        | "listener\t\($local) \(.process // "-") [\(.bind)]"]
      + (if (.exposure.funnel_configured // false) then ["funnel\tenabled"] else [] end)
      + [.residue[]? | "residue\t\(.file)"]
      + (if .firewall.ufw? then
