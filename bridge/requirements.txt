@@ -11,10 +11,10 @@ telegramify-markdown==1.4.2
 python-dotenv==1.2.4
 pydantic==2.13.5
 pydantic-settings==2.16.3
-claude-agent-sdk==0.2.182
+claude-agent-sdk==0.2.187
 opentelemetry-api==1.45.2
 opentelemetry-sdk==1.45.2
-openai==3.51.0
+openai==3.57.0
 # Optional: the Volcengine TOS voice-upload provider needs the `tos` package,
 # which builds a native `crcmod` wheel and can fail on minimal toolchains. It is
 # intentionally NOT a core dependency so a missing/unbuildable `tos` cannot abort
