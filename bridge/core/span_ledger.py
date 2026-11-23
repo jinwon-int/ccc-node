@@ -93,6 +93,14 @@ ALLOWED_TYPES: Mapping[str, str] = {
     "ccc.cost_usd": _FLOAT,
     "ccc.usage.cache_read_tokens": _INT,
     "ccc.usage.cache_creation_tokens": _INT,
+    # A2A worker spans (``kind=a2a``, #2858): written by the a2a-nexus worker
+    # (``a2a-span-writer.ts``) into the same day file. Body sizes and short
+    # sha256 prefixes only — never the task payload, result or error message.
+    "ccc.a2a.task_ref": _STR,
+    "ccc.a2a.payload_bytes": _INT,
+    "ccc.a2a.payload_sha256": _STR,
+    "ccc.a2a.result_bytes": _INT,
+    "ccc.a2a.result_sha256": _STR,
 }
 ALLOWED_KEYS = frozenset(ALLOWED_TYPES)
 
