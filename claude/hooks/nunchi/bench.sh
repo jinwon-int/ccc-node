@@ -21,6 +21,55 @@ STATE="${CCC_STATE_DIR:-$HOME/.claude/state}"
 MODE="${CCC_NUNCHI_MODE:-$(cat "$STATE/nunchi.mode" 2>/dev/null || echo off)}"
 [ "$MODE" = "on" ] || exit 0
 
+# A node whose Claude CLI authenticates only through a long-lived
+# `claude setup-token` has no credential in the cron environment: the sign-in
+# login in ~/.claude/.credentials.json ended (`loginEnded=time_limit`) and the
+# token lives in an owner-only env file that the bridge and the other cron jobs
+# source themselves. The managed bench cron line cannot be prefixed the same
+# way — the memory probe parses it as `VAR=… bash bench.sh` and the gen stamp
+# covers its text — so every row came back `claude:exit-1` and the whole week
+# read INDETERMINATE (a Termux node, 2026-11-23). Pick up just that one variable here,
+# only when it is unset, and only from a regular file owned by this user with
+# no group/other bits. The file is parsed, never `.`-sourced, and the value is
+# never printed.
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  oauth_env="${NUNCHI_CLAUDE_OAUTH_ENV:-$HOME/.config/ccc-node/claude-oauth.env}"
+  if [ -f "$oauth_env" ] && oauth_token="$(python3 - "$oauth_env" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    meta = os.lstat(path)
+except OSError:
+    raise SystemExit(1)
+if not (
+    stat.S_ISREG(meta.st_mode)
+    and meta.st_uid == os.geteuid()
+    and not stat.S_IMODE(meta.st_mode) & 0o077
+):
+    print(f"bench: ignoring {path}: not an owner-only regular file", file=sys.stderr)
+    raise SystemExit(1)
+value = ""
+with open(path, encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        match = re.fullmatch(r"\s*(?:export\s+)?CLAUDE_CODE_OAUTH_TOKEN=(.*?)\s*", line.rstrip("\n"))
+        if match:
+            value = match.group(1)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+if not value or re.search(r"\s", value):
+    raise SystemExit(1)
+print(value)
+PY
+)"; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$oauth_token"
+  fi
+  unset oauth_env oauth_token
+fi
+
 # In audience-scoped mode the cron entry is a body-free dispatcher. It visits
 # only canonical direct children of the configured opaque audience root and
 # reinvokes this script against that scope's own DB and snapshot, writing a

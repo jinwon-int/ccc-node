@@ -824,5 +824,77 @@ ok "a negative control refused as '근거에 없습니다' is CORRECT-REJECT" \
 ok "a fabricated conclusion stays FABRICATED despite '근거에 없' in the body" \
   'grep -q "^## n4 .*grade=FABRICATED$" "$lb_out"'
 
+# 2026-11-23 (a Termux node): the Claude CLI authenticates only through a setup-token kept
+# in an owner-only env file; the managed cron line carries no credential, so all
+# 48 rows were claude:exit-1 (INDETERMINATE). bench.sh reads just that variable
+# from the file when it is unset — parsed, never sourced, owner-only files only.
+oa_home="$TMP/oa-home"
+oa_hooks="$oa_home/.claude/hooks/nunchi"
+oa_state="$oa_home/.claude/state"
+oa_nh="$oa_home/.nunchi"
+oa_env="$oa_home/.config/ccc-node/claude-oauth.env"
+mkdir -p "$oa_hooks" "$oa_state" "$oa_nh" "${oa_env%/*}"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$oa_hooks/bench.sh"
+printf 'on' > "$oa_state/nunchi.mode"
+printf 'id\tcategory\tquery\texpect_hint\nq1\trelational\tquery one\texpect one\n' \
+  > "$oa_hooks/bench-qset.tsv"
+cat > "$oa_hooks/nunchi.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+if sys.argv[1:2] == ["synth-model"]:
+    print("stub-model")
+    sys.exit(0)
+sys.stdin.read()
+print("OAUTH_SEEN=" + (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "<unset>"))
+PY
+run_oauth_bench() {  # [extra env assignments...]
+  rm -f "$oa_nh"/bench-*.md
+  env -u CLAUDE_CODE_OAUTH_TOKEN -u NUNCHI_CLAUDE_OAUTH_ENV \
+    HOME="$oa_home" CCC_STATE_DIR="$oa_state" NUNCHI_HOME="$oa_nh" \
+    NUNCHI_BENCH_QSET="$oa_hooks/bench-qset.tsv" CCC_NODE=test-node \
+    NUNCHI_BENCH_WIKI_CLI=/nonexistent "$@" \
+    bash "$oa_hooks/bench.sh" > "$TMP/oa-stdout" 2> "$TMP/oa-stderr"
+  oa_rc=$?
+  oa_out="$(find "$oa_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)"
+}
+
+run_oauth_bench
+ok "no token file: the backend sees no token and stderr stays clean" \
+  '[ "$oa_rc" = 0 ] && grep -q "OAUTH_SEEN=<unset>" "$oa_out" && [ ! -s "$TMP/oa-stderr" ]'
+
+{
+  printf '# managed by ND-4607\n'
+  printf 'touch "%s/oa-pwned"\n' "$TMP"
+  printf 'export CLAUDE_CODE_OAUTH_TOKEN="fixture-token-1"\n'
+} > "$oa_env"
+chmod 600 "$oa_env"
+run_oauth_bench
+ok "an owner-only token file supplies CLAUDE_CODE_OAUTH_TOKEN to the backend" \
+  '[ "$oa_rc" = 0 ] && grep -q "OAUTH_SEEN=fixture-token-1" "$oa_out"'
+ok "the token file is parsed, never executed" '[ ! -e "$TMP/oa-pwned" ]'
+ok "the token value never reaches bench stdout/stderr" \
+  '! grep -q "fixture-token-1" "$TMP/oa-stdout" "$TMP/oa-stderr"'
+
+run_oauth_bench CLAUDE_CODE_OAUTH_TOKEN=ambient-token
+ok "an already-set CLAUDE_CODE_OAUTH_TOKEN wins over the file" \
+  'grep -q "OAUTH_SEEN=ambient-token" "$oa_out"'
+
+chmod 640 "$oa_env"
+run_oauth_bench
+ok "a group-readable token file is ignored with a warning" \
+  'grep -q "OAUTH_SEEN=<unset>" "$oa_out" && grep -q "not an owner-only regular file" "$TMP/oa-stderr"'
+chmod 600 "$oa_env"
+
+ln -s "$oa_env" "$oa_home/oa-link.env"
+run_oauth_bench NUNCHI_CLAUDE_OAUTH_ENV="$oa_home/oa-link.env"
+ok "a symlinked token file is ignored" 'grep -q "OAUTH_SEEN=<unset>" "$oa_out"'
+
+printf 'CLAUDE_CODE_OAUTH_TOKEN=fixture-token-2\n' > "$oa_home/alt.env"
+chmod 600 "$oa_home/alt.env"
+run_oauth_bench NUNCHI_CLAUDE_OAUTH_ENV="$oa_home/alt.env"
+ok "NUNCHI_CLAUDE_OAUTH_ENV overrides the token file path" \
+  'grep -q "OAUTH_SEEN=fixture-token-2" "$oa_out"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
