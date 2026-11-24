@@ -5,7 +5,9 @@ Turns a small JSON spec into ONE self-contained HTML file (inline CSS, no
 JavaScript, no external requests) and writes it under an ``artifacts``
 directory so the bridge delivers it as an attachment (core/deliverables.py
 admits html/htm only under ``…/artifacts/…``). Every value is HTML-escaped;
-status words (ok/warn/fail/n/a/info/pending) get a colour chip.
+status words (ok/warn/fail/n/a/info/pending) get a colour chip. A cell may be
+``{"text": "…", "href": "other.html"}`` to link another page in the same
+folder; any other href (scheme, slash, query, leading dot) is a spec error.
 
 Spec (UTF-8 JSON):
   {"title": "플릿 self-update 매트릭스", "subtitle": "2026-10-02 15:00 KST (node-b)",
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -43,6 +46,8 @@ STATUS_COLORS = {
 MAX_SECTIONS = 40
 MAX_ROWS = 500
 MAX_CELL = 400
+# A link cell may only name another page in the same folder (see _link_cell).
+_SAME_DIR_HTML = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,80}(\.[A-Za-z0-9_-]{1,40}){0,3}\.html\Z")
 CSS = """
 :root{color-scheme:light dark}
 body{font-family:"Noto Sans CJK KR","Noto Sans KR","NanumGothic","Apple SD Gothic Neo","DejaVu Sans",sans-serif;
@@ -58,6 +63,7 @@ th{background:#f4f6f8;font-weight:600}
 .kv dt{color:#5b6b7a;margin:0}.kv dd{margin:0}
 ul{padding-left:20px;font-size:14px}p{font-size:14px;white-space:pre-wrap}
 footer{margin-top:32px;color:#8a97a5;font-size:12px}
+a{color:#2563c9}@media (prefers-color-scheme:dark){a{color:#7fb0ff}}
 """
 
 
@@ -74,7 +80,23 @@ def _esc(value) -> str:
     return html.escape(_s(value), quote=True)
 
 
+def _link_cell(value: dict) -> str:
+    """``{"text": …, "href": "name.html"}`` → a link to a page in the SAME folder.
+
+    The href must be a bare ``*.html`` file name: no scheme, no slash, no query,
+    no leading dot. Anything else is a spec error — never rendered as a link —
+    so a value copied from collected data cannot point a reader elsewhere.
+    """
+    href = value.get("href")
+    if set(value) - {"text", "href"} or not isinstance(href, str) or not _SAME_DIR_HTML.match(href):
+        raise SpecError("link cell needs text and a same-folder *.html href")
+    text = _s(value.get("text")) or href
+    return f'<a href="{html.escape(href, quote=True)}">{html.escape(text)}</a>'
+
+
 def _cell(value) -> str:
+    if isinstance(value, dict):
+        return _link_cell(value)
     text = _s(value)
     key = text.strip().lower()
     if key in STATUS_COLORS:

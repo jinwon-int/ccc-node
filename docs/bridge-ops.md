@@ -492,6 +492,60 @@ day it reads the two UTC files the KST day overlaps and keeps spans with
   `CCC_SPANS_ROLLUP_CRON`); it reads the bridge project at the cron user's
   `$HOME`. Install it on bridge nodes only, after owner approval.
 
+### Read-only span view on the hub (#2858 item 4)
+
+One node (the hub) turns the nodes' daily summary files into static pages.
+Nothing is installed on the other nodes and no raw span leaves a node.
+
+- **Collect (`scripts/spans-view-collect.sh`):** for one KST day (default:
+  yesterday) and the nodes named in `CCC_FLEET_NODES` (required — there is no
+  built-in list) it runs `ssh <node> python3 - <day> < scripts/spans_view_probe.py`
+  per node — the same stdin-probe shape as `fleet-matrix-watch.sh`, with
+  `scripts/lib/fleet-ssh-reuse.sh` when a sweep already holds a connection.
+  The probe finds the state folder from the node's rollup cron line (also a
+  service account's crontab when run as root), opens that day's
+  `spans-rollup/YYYY-MM-DD.json` and prints it on one line. It writes nothing.
+  A crontab's directory is used only when its `spans-rollup` folder belongs
+  to that crontab's owner. One retry when an attempt fails or answers
+  nothing; the last attempt's exit decides: `255` → `UNREACHABLE`, `124` →
+  `UNVERIFIED`, with or without partial output. The hub's own node
+  (`CCC_FLEET_SELF`) is read without ssh.
+- **Check and render (`scripts/spans-view.py build`):** each answer is capped
+  (2 MiB staged; the node caps its file at 256 KiB), must carry schema
+  `ccc.spans-rollup.v1` and the requested day, and is copied field by field
+  into a bounded record — unknown keys dropped, a known key of the wrong type
+  rejects the answer. Records live in `$CCC_STATE_DIR/spans-view/data/<day>/`
+  (0700/0600). Pages go to `--out-dir`: `YYYY-MM-DD.html` (a summary table and
+  one section per node) and `index.html` (node × day for the last 30 days).
+  They are built by the fleet-html-report builder: no script, every value
+  escaped, links only to same-folder `*.html` names.
+- **A node that did not answer is shown as 「미수집」** with the reason (no
+  file, schema mismatch, size cap, `UNREACHABLE`, `UNVERIFIED`); an idle day
+  is shown as 「활동 없음」. Missing nodes do not fail the run, and a failed
+  re-run never replaces a record an earlier run collected.
+- **Files:** pages 0644 in a 0755 folder. The folder is opened once and used
+  only through that descriptor (temp name with `O_EXCL`, then rename), so a
+  different local account that owns the web root cannot redirect a write or
+  a delete by swapping the folder. It must be a real directory owned by the
+  running user or by its parent's owner, not group/other-writable, and its
+  parent path may hold no symlink; the parent is never created. The 90 most
+  recent days of pages and records are kept (`--keep-days`), counted back
+  from yesterday (KST); other names in the folder are left alone.
+- **Rebuild / backfill:** `spans-view.py build --out-dir DIR --date DAY`
+  without `--staging` rebuilds from kept records; `spans-view-collect.sh
+  --out-dir DIR --date DAY` collects a past day (nodes keep 90 days). `DAY`
+  may not be later than yesterday or outside the retention window, and
+  rebuilding an old day never prunes newer pages or shifts the index.
+- **Schedule:** `scripts/install-spans-view-timer.sh --out-dir DIR --nodes
+  "…" [--self NODE]` prints the systemd service + timer (04:30 Asia/Seoul,
+  `Persistent=true`, 900 s cap, `ProtectSystem=strict` with write access to
+  the state folder and the out-dir's parent only); `--apply` installs,
+  `--uninstall --apply` removes the units and keeps the pages. Hub only, after owner approval. A
+  node whose checkout predates the summary file shows 「미수집 — 집계 폴더
+  없음」 until its first rollup after updating.
+- **Who can read the pages** is decided by where `--out-dir` is served, not
+  by these scripts: check that folder's access policy before installing.
+
 ## Group rows still holding a DM session (#2075)
 
 Before #2092, a group/room row in `sessions.json` could end up holding the

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hermetic tests for skills/fleet-html-report/scripts/build_html_report.py (#2109 C).
-# Single-file output, escaping, status chips, the artifacts/ gate, limits, bad specs.
+# Single-file output, escaping, status chips, the artifacts/ gate, limits, bad specs,
+# same-folder link cells.
 # shellcheck disable=SC2034  # test variables are read inside the eval'd ok() conditions
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -64,6 +65,28 @@ python3 "$B" --spec "$TMP/long.json" --out "$HOME/.claude/state/artifacts" --nam
 ok "a 900-char cell is truncated with an ellipsis" 'grep -q "vvv…" "$HOME/.claude/state/artifacts/long.html" && ! grep -q "$(printf "v%.0s" $(seq 1 500))" "$HOME/.claude/state/artifacts/long.html"'
 python3 "$B" --spec "$TMP/big.json" --out "$HOME/.claude/state/artifacts" --name big >/dev/null; rc=$?
 ok "a 600-row table is refused (exit 2)" '[ "$rc" = 2 ]'
+
+# 6. link cells: only a bare same-folder *.html name becomes a link
+cat > "$TMP/link.json" <<'EOF'
+{"title":"t","sections":[{"kind":"table","columns":["day","n"],"rows":[[{"text":"2026-11-24 <b>","href":"2026-11-24.html"},"1"]]}]}
+EOF
+python3 "$B" --spec "$TMP/link.json" --out "$HOME/.claude/state/artifacts" --name link >/dev/null; rc=$?
+ok "a same-folder html name renders as a link with escaped text" \
+  '[ "$rc" = 0 ] && grep -q "<a href=\"2026-11-24.html\">2026-11-24 &lt;b&gt;</a>" "$HOME/.claude/state/artifacts/link.html"'
+link_rc() {
+  jq -n --arg h "$1" '{title:"t",sections:[{kind:"list",items:[{text:"x",href:$h}]}]}' > "$TMP/badlink.json"
+  python3 "$B" --spec "$TMP/badlink.json" --out "$HOME/.claude/state/artifacts" --name badlink >/dev/null 2>&1
+  echo $?
+}
+bad=0
+for h in "https://example.invalid/a.html" "//example.invalid/a.html" "javascript:alert(1)" "../a.html" \
+         "a/b.html" ".hidden.html" "a.html?x=1" "a.html#x" "a.htm" 'a".html' "a b.html" $'a.html\n' ""; do
+  [ "$(link_rc "$h")" = 2 ] || { bad=$((bad+1)); echo "  accepted bad href: $h"; }
+done
+ok "every href that is not a bare same-folder *.html name is refused (exit 2)" '[ "$bad" = 0 ]'
+echo '{"title":"t","sections":[{"kind":"list","items":[{"text":"x","href":"a.html","onclick":"y"}]}]}' > "$TMP/extra.json"
+python3 "$B" --spec "$TMP/extra.json" --out "$HOME/.claude/state/artifacts" --name extra >/dev/null 2>&1; rc=$?
+ok "a link cell with any extra key is refused" '[ "$rc" = 2 ]'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

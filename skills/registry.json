@@ -252,7 +252,7 @@
       "name": "fleet-html-report",
       "source": "skills/fleet-html-report",
       "status": "active",
-      "tree_sha256": "19b6e60ba9a507e4d0e38d20d6805c9ab7d25cfbb3d00cb9f0394ee8e22fc029"
+      "tree_sha256": "e69d158a83fdefeb86e7422bba578ba770dc290cecaed562e2f1e7a34fcb600a"
     },
     {
       "audience": "shared",
