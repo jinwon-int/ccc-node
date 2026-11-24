@@ -43,6 +43,13 @@ overwrites ``$CCC_STATE_DIR/spans-rollup.status.json`` (0600, atomic; fixed
 ``result_code`` tokens, date and node only) so doctor's ``spans-rollup tick``
 row can tell a quiet day from a cron line that stopped firing.
 
+View input (#2858 item 4): every non ``--dry-run`` run that computes a summary
+(not ``already-queued``, not a sanitizer failure) also saves it — exactly the
+``--dry-run --json`` output, body-free — to
+``$CCC_STATE_DIR/spans-rollup/YYYY-MM-DD.json`` (0600 in a 0700 dir, atomic,
+symlinked dir refused, best-effort), empty days included, and prune day files
+older than ``SUMMARY_KEEP_DAYS``. Raw spans never leave the node.
+
 Usage:
   spans-rollup.py [--date YYYY-MM-DD(KST)] [--project-root DIR]
                   [--spans-dir DIR] [--cost-ledger PATH] [--queue PATH]
@@ -783,6 +790,83 @@ def write_status(ok: bool, result_code: str, day: date, node: str,
                 pass
 
 
+#: Per-day summary files for the read-only view (#2858 item 4, piece 1).
+SUMMARY_DIR = "spans-rollup"
+#: Day files older than this many days before the rolled-up day are pruned.
+SUMMARY_KEEP_DAYS = 90
+_SUMMARY_NAME_LEN = len("YYYY-MM-DD.json")
+
+
+def _prune_summary_files(folder: Path, day: date) -> None:
+    """Drop ``YYYY-MM-DD.json`` regular files older than the retention window.
+
+    Anything else in the folder — other names, symlinks, directories — is left
+    untouched; a symlink is never followed.
+    """
+    cutoff = day - timedelta(days=SUMMARY_KEEP_DAYS)
+    for entry in folder.iterdir():
+        name = entry.name
+        if len(name) != _SUMMARY_NAME_LEN or not name.endswith(".json"):
+            continue
+        try:
+            file_day = datetime.strptime(name[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_day >= cutoff or entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            entry.unlink()
+        except OSError:
+            pass
+
+
+def write_summary_file(summary: dict, day: date) -> Optional[Path]:
+    """Best-effort owner-only ``$CCC_STATE_DIR/spans-rollup/YYYY-MM-DD.json``.
+
+    The file holds exactly the ``--dry-run --json`` summary — already
+    body-free, since every span went through ``sanitize_span`` and the cost
+    ledger contributes numbers only — so a later step can render a read-only
+    view without touching raw spans. Written whenever a non ``--dry-run`` run
+    computes a summary, including an idle ``no-spans`` day (``"empty": true``),
+    so the view can
+    tell a quiet day from a missing one. 0600 file in a 0700 directory, atomic
+    (mkstemp + ``os.replace``); a symlinked directory is refused. Files past
+    ``SUMMARY_KEEP_DAYS`` are pruned. A failure warns on stderr and never
+    changes the rollup's exit code.
+    """
+    tmp_name = None
+    try:
+        state = _state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        folder = state / SUMMARY_DIR
+        if folder.is_symlink():
+            raise PermissionError("summary dir is a symlink")
+        folder.mkdir(mode=0o700, exist_ok=True)
+        if folder.is_symlink() or not folder.is_dir():
+            raise PermissionError("summary dir is not a directory")
+        os.chmod(folder, 0o700)
+        path = folder / f"{day.isoformat()}.json"
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=folder)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = None
+        _prune_summary_files(folder, day)
+        return path
+    except Exception as exc:  # the view file must never change the run's verdict
+        print(f"spans-rollup: summary file not written ({type(exc).__name__})", file=sys.stderr)
+        return None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     now = datetime.now(timezone.utc)
@@ -837,6 +921,8 @@ def _run(args: argparse.Namespace, day: date, node: str, now: datetime) -> int:
             print("--- digest (not sent) ---")
             print(build_digest_text(summary))
         return 0
+
+    write_summary_file(summary, day)
 
     if summary["empty"]:
         print(json.dumps({"ok": True, "skipped": "no-spans", "date": day.isoformat(),
