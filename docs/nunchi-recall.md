@@ -88,3 +88,20 @@ All LLM-free except the one dialectic call that already existed.
 `bench.sh` rows carry `cited_ids=` (sorted, deduplicated `[#id]`s in the answer, or `none`), placed
 before `rc=` so existing `rc=… status=… source=…` parsers are unaffected. A usable answer with
 `cited_ids=none` is a hallucination suspect.
+
+**Sample noise (#2823).** One synthesis per row let the same Wiki context answer on one run and
+refuse on the next, so a node near the threshold could flip PASS/FAIL with no real change. Two
+guards, both on by default:
+
+- *One re-synthesis.* A **positive** row whose Wiki synthesis is refused (or empty/invalid) is
+  synthesized once more from the same `wiki-agent find` context; either accepted answer counts.
+  Negative controls (`source=none`, q44–q48) are never retried — a second draw there could only
+  add a fabrication. A timed-out first draw is not retried. Rows that tried it carry
+  `resynth=ok|no` before `wiki=`, the ledger gains a 7th column, and the summary adds
+  `- wiki re-synthesis (#2823): tried N, recovered M`. `NUNCHI_BENCH_WIKI_RESYNTH=0` turns it off.
+- *BORDERLINE band.* An unanswered rate within `NUNCHI_BENCH_BORDERLINE_PCT` points of
+  `NUNCHI_BENCH_UNANSWERED_MAX_PCT` (either side; default ±2, so 38–42% at the 40% default) is
+  `gate verdict: BORDERLINE — …`, not PASS or FAIL. Width is an integer 0–10 (0 = off; anything
+  else falls back to 2). No band when the threshold is 100% or more. Fabrication, contamination
+  and backend-degraded verdicts still outrank it. Roll-ups that count PASS/FAIL should count
+  BORDERLINE separately.

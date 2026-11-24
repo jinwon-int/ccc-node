@@ -896,5 +896,116 @@ run_oauth_bench NUNCHI_CLAUDE_OAUTH_ENV="$oa_home/alt.env"
 ok "NUNCHI_CLAUDE_OAUTH_ENV overrides the token file path" \
   'grep -q "OAUTH_SEEN=fixture-token-2" "$oa_out"'
 
+# ---- #2823: one re-synthesis on a refused positive Wiki row + BORDERLINE band --
+# One synthesis per row let the same Wiki context answer on one run and refuse
+# on the next, so near-threshold nodes flipped PASS/FAIL on sample noise. A
+# positive row whose Wiki synthesis is refused gets exactly one more draw from
+# the same context; negative controls never do (a second draw could only add a
+# fabrication). The stub refuses the first synthesize per query and answers the
+# second, and logs every synthesize call so the retry count is checked directly.
+rs_home="$TMP/home-rs"
+rs_hooks="$rs_home/.claude/hooks/nunchi"
+rs_state="$rs_home/.claude/state"
+rs_nh="$rs_home/.nunchi"
+mkdir -p "$rs_hooks" "$rs_state" "$rs_nh"
+cp "$ROOT/claude/hooks/nunchi/bench.sh" "$rs_hooks/bench.sh"
+chmod 700 "$rs_hooks/bench.sh"
+printf 'on' > "$rs_state/nunchi.mode"
+cp "$p1a_hooks/bench-qset.tsv" "$rs_hooks/bench-qset.tsv"
+cat > "$rs_hooks/nunchi.py" <<'STUB'
+#!/usr/bin/env python3
+import hashlib, os, sys
+cmd = sys.argv[1]
+sys.stdin.read()
+if cmd == "metrics":
+    print("stub metrics")
+elif cmd == "synthesize":
+    q = sys.argv[2]
+    calls = os.path.join(os.environ["RS_CALLS"], hashlib.sha1(q.encode()).hexdigest())
+    n = 0
+    if os.path.exists(calls):
+        n = int(open(calls).read() or 0)
+    open(calls, "w").write(str(n + 1))
+    with open(os.path.join(os.environ["RS_CALLS"], "log"), "a") as f:
+        f.write(q + "\n")
+    if os.environ.get("RS_MODE", "second") == "second" and n >= 1:
+        print("위키 근거로 확인한 답변입니다")
+    else:
+        print("해당 내용은 기록 없음")
+else:
+    print("해당 내용은 기록 없음")
+STUB
+cat > "$rs_hooks/wiki-stub.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "위키 검색 결과 조각"
+STUB
+chmod 700 "$rs_hooks/wiki-stub.sh"
+run_rs() {  # run_rs <name> [ENV=VAL ...]
+  local name="$1"; shift
+  rm -f "$rs_nh"/bench-*.md; rm -rf "$TMP/rs-calls-$name"; mkdir -p "$TMP/rs-calls-$name"
+  env HOME="$rs_home" CCC_STATE_DIR="$rs_state" NUNCHI_HOME="$rs_nh" \
+    NUNCHI_BENCH_QSET="$rs_hooks/bench-qset.tsv" CCC_NODE=test-node \
+    NUNCHI_BENCH_WIKI_CLI="$rs_hooks/wiki-stub.sh" RS_CALLS="$TMP/rs-calls-$name" "$@" \
+    bash "$rs_hooks/bench.sh" > "$TMP/rs-$name.out" 2>&1
+  cp "$(find "$rs_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)" "$TMP/rs-$name.md" 2>/dev/null
+}
+
+run_rs on
+ok "a refused positive Wiki row is re-synthesized once and recovers (#2823)" \
+  '[ "$(grep -c "^## p[1-3] .*resynth=ok wiki=ok source=wiki$" "$TMP/rs-on.md")" = 3 ]'
+ok "negative controls are never re-synthesized (#2823)" \
+  '[ "$(grep -c "^## n[12] .*wiki=no-record source=none grade=CORRECT-REJECT$" "$TMP/rs-on.md")" = 2 ] \
+   && ! grep -q "^## n[12] .*resynth=" "$TMP/rs-on.md" \
+   && [ "$(grep -c negative "$TMP/rs-calls-on/log")" = 2 ]'
+ok "each positive row gets exactly one extra synthesis (#2823)" \
+  '[ "$(grep -vc negative "$TMP/rs-calls-on/log")" = 6 ]'
+ok "the summary reports re-synthesis outcomes (#2823)" \
+  'grep -q "^- wiki re-synthesis (#2823): tried 3, recovered 3$" "$TMP/rs-on.md"'
+
+run_rs off NUNCHI_BENCH_WIKI_RESYNTH=0
+ok "NUNCHI_BENCH_WIKI_RESYNTH=0 turns the re-synthesis off (#2823)" \
+  '[ "$(grep -c "^## p[1-3] .*status=OK wiki=no-record source=none$" "$TMP/rs-off.md")" = 3 ] \
+   && ! grep -q "resynth" "$TMP/rs-off.md" \
+   && [ "$(wc -l < "$TMP/rs-calls-off/log")" = 5 ]'
+
+run_rs stuck RS_MODE=always-refuse
+ok "a row that refuses twice stays no-record and is tagged resynth=no (#2823)" \
+  '[ "$(grep -c "^## p[1-3] .*resynth=no wiki=no-record source=none$" "$TMP/rs-stuck.md")" = 3 ] \
+   && grep -q "^- wiki re-synthesis (#2823): tried 3, recovered 0$" "$TMP/rs-stuck.md"'
+
+# BORDERLINE: an all-unanswered positive set (100%) with the Wiki layer off.
+cat > "$rs_hooks/nunchi.py" <<'STUB'
+#!/usr/bin/env python3
+import sys
+cmd = sys.argv[1]
+sys.stdin.read()
+print("stub metrics" if cmd == "metrics" else "해당 내용은 기록 없음")
+STUB
+run_band() {  # run_band <name> [ENV=VAL ...]
+  local name="$1"; shift
+  rm -f "$rs_nh"/bench-*.md
+  env HOME="$rs_home" CCC_STATE_DIR="$rs_state" NUNCHI_HOME="$rs_nh" \
+    NUNCHI_BENCH_QSET="$rs_hooks/bench-qset.tsv" CCC_NODE=test-node \
+    NUNCHI_BENCH_WIKI_CLI=/nonexistent "$@" \
+    bash "$rs_hooks/bench.sh" > "$TMP/band-$name.out" 2>&1
+  cp "$(find "$rs_nh" -maxdepth 1 -name 'bench-*.md' -type f -print -quit)" "$TMP/band-$name.md" 2>/dev/null
+}
+run_band in NUNCHI_BENCH_UNANSWERED_MAX_PCT=99
+ok "a rate within ±2 of the threshold is BORDERLINE, not FAIL (#2823)" \
+  'grep -q "^- gate verdict: BORDERLINE — unanswered 100% within ±2 of 99% (sample-noise band; not a FAIL)$" "$TMP/band-in.md" \
+   && grep -q "gate=BORDERLINE" "$TMP/band-in.out"'
+run_band out NUNCHI_BENCH_UNANSWERED_MAX_PCT=97
+ok "a rate past the band still FAILs (#2823)" \
+  'grep -q "^- gate verdict: FAIL — unanswered 100% > 97%$" "$TMP/band-out.md"'
+run_band off NUNCHI_BENCH_UNANSWERED_MAX_PCT=99 NUNCHI_BENCH_BORDERLINE_PCT=0
+ok "NUNCHI_BENCH_BORDERLINE_PCT=0 turns the band off (#2823)" \
+  'grep -q "^- gate verdict: FAIL — unanswered 100% > 99%$" "$TMP/band-off.md"'
+run_band bad NUNCHI_BENCH_UNANSWERED_MAX_PCT=99 NUNCHI_BENCH_BORDERLINE_PCT=wide
+ok "an invalid band width falls back to 2 (#2823)" \
+  'grep -q "^- gate verdict: BORDERLINE — unanswered 100% within ±2 of 99%" "$TMP/band-bad.md"'
+run_band wide NUNCHI_BENCH_UNANSWERED_MAX_PCT=95 NUNCHI_BENCH_BORDERLINE_PCT=11
+ok "a band wider than 10 falls back to 2 (#2823)" \
+  'grep -q "^- gate verdict: FAIL — unanswered 100% > 95%$" "$TMP/band-wide.md"'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
