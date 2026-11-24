@@ -27,6 +27,27 @@ count is at least 1. It is a lower bound. A usage.jsonl row older than the
 skill's curator record belongs to an earlier skill with the same name and is
 not counted, matching the curator.
 
+`use_count_ledger_by_tool` splits the counted usage.jsonl rows by how they
+were recorded (`{"Read": n, "Skill": m, ...}`; a row without `tool` is
+`unknown`, an unexpected value is `other`) (#2881). Reading a `SKILL.md` to
+audit, review or compare skills writes the same row as a `Skill` call, so this
+shows how much of a skill's evidence is reads. It is reported only:
+`use_count`, `window_use_count` and every list below still count all rows.
+
+The consumers of `usage.jsonl` do not count it the same way (#2881):
+
+| Consumer | Rows it counts |
+|---|---|
+| this report (`scripts/ccc-skill-usage-report.py`) | all rows (`use_count`, `window_use_count`) |
+| curator (`claude/hooks/skill-review/curator.py` `_read_usage_ledger`) | all rows — stale/archive decisions |
+| listing policy, recent-use tier (`scripts/ccc-skill-listing-policy.py` `recent_usage`) | all rows in the window |
+| listing policy, keep-used tier and fill rank (`skill_tool_used`, `keep_used_candidates`) | `Skill` rows only |
+| promotion usage gate (`scripts/ccc-skill-promotion.py` `_skill_tool_uses`) | `Skill` rows only (plus the Skill-tool record) |
+| skill router (`claude/hooks/lib/skill_router.py`) | `Skill` rows only |
+
+Which of the all-rows consumers should stop counting reads is an open
+decision on #2881; this table describes the code, not a policy.
+
 Missing telemetry is never treated as zero use (#1739, #1675). Each node
 reports `usage_ledgers.<provider>.evidence`:
 

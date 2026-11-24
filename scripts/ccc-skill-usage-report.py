@@ -216,8 +216,23 @@ def _node_name() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _ledger_rows(curator: ModuleType, context: Any) -> tuple[str, list[tuple[str, str, datetime]]]:
-    """(status, [(skill, runtime, ts)]) from usage.jsonl via the curator reader.
+# usage.jsonl ``tool`` values are written by our own loggers (Read/Skill/Bash
+# from skill-usage-log.sh; codex/piri/danso loggers write theirs). Anything
+# outside this shape is reported as ``other`` so a report never echoes
+# arbitrary ledger text; a row without the field is ``unknown``.
+_LEDGER_TOOL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")
+
+
+def _ledger_tool(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    if isinstance(value, str) and _LEDGER_TOOL_RE.fullmatch(value):
+        return value
+    return "other"
+
+
+def _ledger_rows(curator: ModuleType, context: Any) -> tuple[str, list[tuple[str, str, str, datetime]]]:
+    """(status, [(skill, runtime, tool, ts)]) from usage.jsonl via the curator reader.
 
     Same safety bar and row filter as curator._read_usage_ledger: owner-only
     regular file, newest bytes only, malformed rows skipped. ``missing`` when
@@ -227,7 +242,7 @@ def _ledger_rows(curator: ModuleType, context: Any) -> tuple[str, list[tuple[str
     status, data = curator._read_ledger_tail(path, context.uid)
     if status != "read":
         return status, []
-    rows: list[tuple[str, str, datetime]] = []
+    rows: list[tuple[str, str, str, datetime]] = []
     for line in data.splitlines():
         try:
             row = json.loads(line)
@@ -240,7 +255,7 @@ def _ledger_rows(curator: ModuleType, context: Any) -> tuple[str, list[tuple[str
         if not isinstance(name, str) or not curator.ownership._NAME_RE.fullmatch(name) or when is None:
             continue
         runtime = row.get("runtime")
-        rows.append((name, runtime if isinstance(runtime, str) else "claude", when))
+        rows.append((name, runtime if isinstance(runtime, str) else "claude", _ledger_tool(row.get("tool")), when))
     return ("present" if rows else "missing"), rows
 
 
@@ -288,7 +303,7 @@ def _node_skill(
     name: str,
     classification: dict[str, Any],
     usage: dict[str, Any],
-    ledger: list[tuple[str, str, datetime]],
+    ledger: list[tuple[str, str, str, datetime]],
     window_start: datetime,
 ) -> dict[str, Any]:
     base = classification["base_classification"]
@@ -296,11 +311,16 @@ def _node_skill(
     created = _parse_ts(record.get("created_at")) if record else None
     # Mirror curator._decide_union: a usage.jsonl row older than this skill's
     # record belongs to an earlier same-name skill and is not its use.
-    rows = [when for skill, _rt, when in ledger if skill == name and (created is None or when >= created)]
+    rows = [when for skill, _rt, _tool, when in ledger if skill == name and (created is None or when >= created)]
     runtimes: dict[str, int] = {}
-    for skill, runtime, when in ledger:
+    # How the counted rows were recorded (#2881): a Read of SKILL.md (audit,
+    # review, comparison) lands in the same ledger as a Skill call. Facts
+    # only — use_count and every verdict below still count all rows.
+    by_tool: dict[str, int] = {}
+    for skill, runtime, tool, when in ledger:
         if skill == name and (created is None or when >= created):
             runtimes[runtime] = runtimes.get(runtime, 0) + 1
+            by_tool[tool] = by_tool.get(tool, 0) + 1
     tool_count = record["use_count"] if record else 0
     tool_last = _parse_ts(record.get("last_used_at")) if record else None
     ledger_last = max(rows) if rows else None
@@ -320,6 +340,7 @@ def _node_skill(
         "use_count": max(tool_count, len(rows)),
         "use_count_skill_tool": tool_count,
         "use_count_ledger": len(rows),
+        "use_count_ledger_by_tool": dict(sorted(by_tool.items())),
         "window_use_count": window_count,
         "runtimes": dict(sorted(runtimes.items())),
         "last_used_at": _ts(last_used),
@@ -548,6 +569,18 @@ def _read_inputs(paths: list[str], stdin: TextIO) -> list[dict[str, Any]]:
     return reports
 
 
+def _max_by_key(maps: Any) -> dict[str, int]:
+    """Per-key maximum of count maps (one node-wide ledger seen per provider)."""
+    merged: dict[str, int] = {}
+    for counts in maps:
+        if not isinstance(counts, dict):
+            continue
+        for key, value in counts.items():
+            if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool):
+                merged[key] = max(merged.get(key, 0), value)
+    return dict(sorted(merged.items()))
+
+
 def _merge_node_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """One node's view of a skill name across its provider roots.
 
@@ -561,6 +594,7 @@ def _merge_node_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "origin": first.get("origin", "unknown"),
         "providers": [e.get("provider") for e in entries],
         "use_count": max(int(e.get("use_count") or 0) for e in entries),
+        "use_count_ledger_by_tool": _max_by_key(e.get("use_count_ledger_by_tool") for e in entries),
         "window_use_count": max(int(e.get("window_use_count") or 0) for e in entries),
         "last_used_at": _latest(_parse_ts(e.get("last_used_at")) for e in entries),
         "created_at": _earliest(_parse_ts(e.get("created_at")) for e in entries),
