@@ -10,6 +10,7 @@ sys.modules.setdefault("telegram_bot", telegram_bot_pkg)
 
 from telegram_bot.core.heartbeat import (
     compose_heartbeat_text,
+    delegated_tasks_label,
     format_duration,
     has_recent_visible_progress,
     should_update_heartbeat,
@@ -18,6 +19,30 @@ from telegram_bot.core.heartbeat import (
 
 
 class HeartbeatFormatTests(unittest.TestCase):
+    def test_delegated_tasks_label_names_count_tool_and_age(self):
+        # #2895: a run waiting on a sub-agent says so, with when it last moved.
+        self.assertEqual(
+            delegated_tasks_label(active_count=1, last_tool="Bash", idle_seconds=20),
+            "Waiting for 1 background task (last: Bash 20s ago) · /stop to cancel",
+        )
+        self.assertEqual(
+            delegated_tasks_label(active_count=2),
+            "Waiting for 2 background tasks · /stop to cancel",
+        )
+
+    def test_delegated_tasks_label_is_absent_without_delegated_work(self):
+        self.assertIsNone(delegated_tasks_label(active_count=0, last_tool="Bash", idle_seconds=3))
+
+    def test_delegated_tasks_label_fits_the_heartbeat_line(self):
+        text = compose_heartbeat_text(
+            elapsed_seconds=1860,
+            current_tool=delegated_tasks_label(active_count=1, last_tool="Read", idle_seconds=65),
+        )
+        self.assertEqual(
+            text,
+            "⏳ Working — 31m 00s | Waiting for 1 background task (last: Read 1m 05s ago) · /stop to cancel",
+        )
+
     def test_format_duration_is_compact(self):
         self.assertEqual(format_duration(9.8), "9s")
         self.assertEqual(format_duration(65), "1m 05s")

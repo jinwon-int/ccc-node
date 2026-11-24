@@ -402,6 +402,89 @@ class HeartbeatLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Last: bash", text)
             self.assertNotIn("ETA", text)
 
+    async def test_waiting_on_delegated_work_shows_it_instead_of_silence(self):
+        # #2895: the run's own work is done and a sub-agent keeps reporting
+        # progress — the line names the wait and never flips to "no update".
+        project_chat.config.heartbeat_stall_seconds = 300.0
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        req = self._make_request()
+        req.current_tool_label = None
+        now = 10_000.0
+        req.started_at = now - 1800.0
+        req.last_event_at = now - 20.0
+        req.delegated_tasks_active = 1
+        req.delegated_last_activity_at = now - 20.0
+        req.delegated_last_tool = "Bash"
+        await self.handler._maybe_update_heartbeat(req, now)
+        text = self.status_calls[-1][0]
+        self.assertIn("⏳ Working — 30m 00s", text)
+        self.assertIn("Waiting for 1 background task (last: Bash 20s ago)", text)
+        self.assertIn("/stop to cancel", text)
+        self.assertNotIn("Waiting for progress", text)
+
+    async def test_own_running_tool_wins_over_delegated_label(self):
+        req = self._make_request()
+        req.current_tool_label = "Bash: pytest"
+        now = 10_000.0
+        req.started_at = now - 60.0
+        req.last_event_at = now - 1.0
+        req.delegated_tasks_active = 1
+        req.delegated_last_activity_at = now - 1.0
+        await self.handler._maybe_update_heartbeat(req, now)
+        text = self.status_calls[-1][0]
+        self.assertIn("Bash: pytest", text)
+        self.assertNotIn("background task", text)
+
+    async def test_delegated_work_that_truly_stalls_still_warns(self):
+        project_chat.config.heartbeat_stall_seconds = 300.0
+        self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)
+        req = self._make_request()
+        req.current_tool_label = None
+        now = 10_000.0
+        req.started_at = now - 1800.0
+        req.last_event_at = now - 600.0
+        req.delegated_tasks_active = 1
+        req.delegated_last_activity_at = now - 600.0
+        req.delegated_last_tool = "Bash"
+        await self.handler._maybe_update_heartbeat(req, now)
+        text = self.status_calls[-1][0]
+        self.assertIn("Waiting for progress", text)
+        self.assertIn("No update for 10m 00s", text)
+        self.assertIn("Last: Waiting for 1 background task (last: Bash 10m 00s ago)", text)
+
+    async def test_delegated_lifecycle_transition_updates_the_request(self):
+        from telegram_bot.core.agent_runtime import DelegatedTaskLifecycleEvent
+        from telegram_bot.core.project_chat_turn_state import DelegatedTaskLifecycleTransition
+
+        req = self._make_request()
+
+        async def _noop():
+            return None
+
+        async def apply(event, now):
+            await self.handler._apply_turn_event_transition(
+                DelegatedTaskLifecycleTransition(event),
+                now=now,
+                request=req,
+                output=None,
+                streaming_handler=None,
+                deliver_pending_interim=_noop,
+                usage_mode="interactive",
+            )
+
+        await apply(DelegatedTaskLifecycleEvent(1, 0.0, "started"), 100.0)
+        self.assertEqual((req.delegated_tasks_active, req.delegated_last_activity_at), (1, 100.0))
+        self.assertIsNone(req.delegated_last_tool)
+        await apply(DelegatedTaskLifecycleEvent(1, 5.0, "updated", "Bash"), 105.0)
+        self.assertEqual((req.delegated_last_activity_at, req.delegated_last_tool), (105.0, "Bash"))
+        await apply(DelegatedTaskLifecycleEvent(1, 9.0, "updated"), 109.0)
+        self.assertEqual((req.delegated_last_activity_at, req.delegated_last_tool), (109.0, "Bash"))
+        await apply(DelegatedTaskLifecycleEvent(0, None, "terminal"), 120.0)
+        self.assertEqual(
+            (req.delegated_tasks_active, req.delegated_last_activity_at, req.delegated_last_tool),
+            (0, 0.0, None),
+        )
+
     async def test_silent_update_failure_retries_without_deleting(self):
         project_chat.config.heartbeat_stall_seconds = 0.05
         self.addCleanup(setattr, project_chat.config, "heartbeat_stall_seconds", 0.0)

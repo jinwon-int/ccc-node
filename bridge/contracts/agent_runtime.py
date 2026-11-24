@@ -46,6 +46,15 @@ class ApprovalDecision(str, Enum):
     DENY = "deny"
 
 
+_TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,160}")
+
+
+def _is_tool_name(value: object) -> bool:
+    """A bare tool name (``Bash``, ``mcp__server__tool``), never free text."""
+
+    return isinstance(value, str) and _TOOL_NAME_RE.fullmatch(value) is not None
+
+
 @dataclass(frozen=True, slots=True)
 class TextDeltaEvent:
     """A non-empty increment of user-visible assistant text."""
@@ -263,11 +272,16 @@ class DelegatedTaskLifecycleEvent:
     state to distinguish a healthy delegated run from a vanished terminal
     frame.  ``oldest_age_seconds`` is measured by the adapter's monotonic clock
     and is absent exactly when no delegated task remains active.
+    ``last_tool_name`` is the tool the delegated work used most recently, as
+    reported by an ``updated`` progress frame (#2895): a bare tool name such as
+    ``Bash``, never its arguments.  It lets the heartbeat say what the
+    delegated work is doing without carrying any task body.
     """
 
     active_count: int
     oldest_age_seconds: float | None
     activity: Literal["started", "updated", "terminal"]
+    last_tool_name: str | None = None
     kind: Literal["delegated_task_lifecycle"] = "delegated_task_lifecycle"
 
     def __post_init__(self) -> None:
@@ -290,6 +304,8 @@ class DelegatedTaskLifecycleEvent:
             or age < 0
         ):
             raise ValueError("active delegated task state requires a non-negative age")
+        if self.last_tool_name is not None and not _is_tool_name(self.last_tool_name):
+            raise ValueError("delegated task last tool name must be a bare tool name")
 
 
 @dataclass(frozen=True, slots=True)

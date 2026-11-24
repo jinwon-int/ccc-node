@@ -109,6 +109,13 @@ class _PendingRequest:
     last_text_at: float = 0.0
     last_tool_at: float = 0.0
     current_tool_label: Optional[str] = None
+    # Delegated (sub-agent) work still running for this request (#2895): the
+    # body-free count, when it last reported progress, and its latest tool.
+    # The heartbeat shows it once no tool of the request's own is running, so
+    # a run waiting on a sub-agent reads as waiting, not silent.
+    delegated_tasks_active: int = 0
+    delegated_last_activity_at: float = 0.0
+    delegated_last_tool: Optional[str] = None
     last_visible_progress_at: float = 0.0
     heartbeat_forecast_loaded: bool = False
     # Duration samples the per-tick remaining-time ETA conditions on (loaded

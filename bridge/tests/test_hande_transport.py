@@ -973,6 +973,126 @@ async def test_bot_turn_during_a_self_job_is_held_not_refused(tmp_path: Path) ->
         await _stop(served)
 
 
+async def _status_notice(bot: FakeBot) -> dict[str, Any]:
+    while True:
+        frame = await bot.recv_kind("notice")
+        if frame.get("kind") == "status":
+            return frame
+
+
+async def test_self_job_heartbeat_is_the_rooms_status_line(tmp_path: Path) -> None:
+    # #2895: a self-job used to drop every heartbeat, so a long CI resume or
+    # continuation showed nothing at all.
+    runner = FakeRunner()
+    release = asyncio.Event()
+    sinks: list[Any] = []
+
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        sinks.append(sink)
+        await sink.status("⏳ Working — 11m 00s | Waiting for 1 background task · /stop to cancel")
+        await sink.status("⏳ Working — 11m 05s | Waiting for 1 background task · /stop to cancel")
+        await release.wait()
+        return TurnResult(text="CI green", session_id="s")
+
+    runner.behaviour = behaviour
+    transport = _self_job_transport(tmp_path, runner, wait_status_frames=True)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:status")
+        status = await _status_notice(bot)
+        assert status["room"] == "agent"
+        assert status["text"] == (
+            "⏳ Background job — 11m 00s | Waiting for 1 background task · /stop to cancel"
+        )
+        await asyncio.sleep(0.05)
+        # The second heartbeat inside the interval is not re-posted.
+        assert transport.health_signals()["self_job_status_sent"] == 1
+        await sinks[0].status(None)  # a clear has no frame
+        await sinks[0].status("🔧 answer preview")  # not a heartbeat line
+        assert transport.health_signals()["self_job_status_sent"] == 1
+        release.set()
+        assert (await bot.recv_kind("notice"))["text"] == "CI green"
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_owner_turn_held_behind_a_self_job_is_told_it_is_queued(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    release = asyncio.Event()
+
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        if str(job["event_id"]).startswith("$self-"):
+            await sink.status("⏳ Working — 3m 00s | Bash: gh pr checks")
+            await release.wait()
+            return TurnResult(text="CI green", session_id="s")
+        return TurnResult(text=f"echo:{job['body']}", session_id="s")
+
+    runner.behaviour = behaviour
+    transport = _self_job_transport(tmp_path, runner, wait_status_frames=True)
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:held")
+        first = await _status_notice(bot)
+        assert first["text"] == "⏳ Background job — 3m 00s | Bash: gh pr checks · /stop to interrupt"
+
+        await bot.send(bot.turn("t-40", "hello"))
+        held = await _status_notice(bot)
+        assert held["text"] == (
+            "⏳ Background job — 3m 00s | Bash: gh pr checks"
+            " · your message is queued and runs next · /stop to interrupt"
+        )
+        assert transport.health_signals()["held_turn"] == "t-40"
+
+        await bot.send(bot.turn("t-41", "are you there?"))
+        rejected = await bot.recv_kind("rejected")
+        assert rejected == {"type": "rejected", "turn_id": "t-41", "reason": "busy"}
+        refused = await _status_notice(bot)
+        assert "a message is already queued — send again after it runs" in refused["text"]
+        assert transport.health_signals()["self_job_status_sent"] == 3
+
+        release.set()
+        result = await bot.recv_kind("result")
+        assert result["turn_id"] == "t-40" and result["text"] == "echo:hello"
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
+async def test_self_job_status_needs_the_status_knobs(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    release = asyncio.Event()
+
+    async def behaviour(job: Any, sink: Any) -> TurnResult:
+        await sink.status("⏳ Working — 1m 00s")
+        await release.wait()
+        return TurnResult(text="done", session_id="s")
+
+    runner.behaviour = behaviour
+    transport = _self_job_transport(tmp_path, runner)  # wait_status_frames off
+    served = await _serve_transport(transport, tmp_path / "responder.sock")
+    try:
+        bot = await FakeBot.connect(served.path)
+        await _connected(served)
+        transport.enqueue_self_job("agent", "resume", key="wait:off")
+        await asyncio.wait_for(runner.started.wait(), 5)
+        await bot.send(bot.turn("t-42", "hello"))
+        await asyncio.sleep(0.05)
+        assert transport.health_signals()["self_job_status_sent"] == 0
+        release.set()
+        notice = await bot.recv_kind("notice")
+        assert notice.get("kind") is None and notice["text"] == "done"
+        await bot.close()
+    finally:
+        await _stop(served)
+
+
 async def test_stop_during_a_self_job_cancels_it(tmp_path: Path) -> None:
     runner = FakeRunner()
 
