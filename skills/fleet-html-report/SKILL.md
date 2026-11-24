@@ -25,7 +25,9 @@ never put secrets in a spec (values are rendered verbatim, escaped).
 1. Write the spec (UTF-8 JSON). Section kinds: `table` (`columns`, `rows`),
    `kv` (`items: [[key, value], …]`), `list` (`items`), `text` (`text`).
    Cells whose whole value is `ok|warn|fail|n/a|info|pending` render as a
-   colour chip.
+   colour chip. A cell may be `{"text": "…", "href": "other.html"}` to link
+   another page **in the same folder** (a bare `*.html` name); any other href
+   is a spec error, so a set of pages can link to each other and nowhere else.
 
    ```json
    {"title": "플릿 self-update 매트릭스", "subtitle": "2026-10-02 15:00 KST · node-b",
