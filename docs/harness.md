@@ -85,6 +85,24 @@ It is wired through `settings.json` `statusLine`.
 
 Switch interactively through Claude Code `/config` → Output style when needed.
 
+## Fleet notes in the tool cheatsheet
+
+`hooks/tools-cheatsheet.md` is node-owned: `setup.sh` seeds it once and never
+overwrites it, so a line added to the template reaches no installed node.
+Guidance every node should have lives in `hooks/lib/tools-fleet-notes.txt`
+instead — a repo-managed file the hook-tree walk deploys on each update — and
+`load-tools.sh` appends it after the node's cheatsheet (#2858).
+
+- Keep it short: every node pays for it in every session. `ccc-doctor.sh`
+  counts it in the `tools-cheatsheet.md` row.
+- `CCC_TOOLS_FLEET_NOTES=0` (`false`/`off`/`no`) turns the block off on a node.
+- The block is left out when cheatsheet + notes would pass 9,500 bytes: Claude
+  Code replaces a hook output over 10,000 characters with a file path and a
+  short preview, and a long node cheatsheet must not be pushed over that.
+- First entry: where a node's own daily span summary is
+  (`<state>/spans-rollup/YYYY-MM-DD.json`), so an agent can read its tool
+  error rates and durations without being told.
+
 ## Always-on text budget
 
 `CLAUDE.md`, `hooks/tools-cheatsheet.md`, the active output style, the

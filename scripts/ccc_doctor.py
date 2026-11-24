@@ -794,6 +794,27 @@ def _always_on_source(name: str, data: bytes | None, hint: str, state: str = "me
     return AlwaysOnSource(name, len(data.decode("utf-8", "replace")), len(data), state, hint)
 
 
+# load-tools.sh appends the repo-managed fleet notes to the node's cheatsheet
+# unless they are switched off or the two together would pass this many bytes
+# (#2858) — mirror that here so the row measures what the hook injects.
+TOOLS_FLEET_NOTES_MAX_BYTES = 9500
+
+
+def _tools_cheatsheet_bytes(hooks_dir: Path) -> bytes | None:
+    """What load-tools.sh injects: the cheatsheet, plus the fleet notes when it appends them."""
+    cheat = _always_on_bytes(hooks_dir / "tools-cheatsheet.md")
+    if cheat is None or _env_disabled("CCC_TOOLS_FLEET_NOTES", "1"):
+        return cheat
+    notes = _always_on_bytes(hooks_dir / "lib" / "tools-fleet-notes.txt")
+    if not notes:
+        return cheat
+    # The hook reads both through `$(cat …)`, which drops trailing newlines.
+    body, extra = cheat.rstrip(b"\n"), notes.rstrip(b"\n")
+    if not extra or len(body) + len(extra) + 2 > TOOLS_FLEET_NOTES_MAX_BYTES:
+        return cheat
+    return body + b"\n\n" + extra
+
+
 def _env_byte_cap(name: str, default: int) -> int:
     """load-memory.sh byte cap from the environment; 0 means uncapped there."""
     raw = os.environ.get(name, "").strip()
@@ -4948,7 +4969,7 @@ class Doctor:
         ]
         if commands is None or "load-tools.sh" in joined:
             sources.append(_always_on_source(
-                "tools-cheatsheet.md", _always_on_bytes(hooks_dir / "tools-cheatsheet.md"),
+                "tools-cheatsheet.md", _tools_cheatsheet_bytes(hooks_dir),
                 "trim hooks/tools-cheatsheet.md (load-tools.sh)",
             ))
         else:
