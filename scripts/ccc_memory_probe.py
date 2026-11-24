@@ -405,6 +405,28 @@ def parse_repair_status(text: str) -> dict[str, object]:
     return {**result, "status": "malformed"}
 
 
+_INDEX_PROBE_TIMEOUT_DEFAULT_SEC = 15
+_INDEX_PROBE_TIMEOUT_MAX_SEC = 60
+
+
+def index_probe_timeout() -> int:
+    """Seconds the live ``repair-status`` read may take (#2870).
+
+    ``CCC_NUNCHI_MEMPALACE_INDEX_PROBE_TIMEOUT_SEC``, 1..60, default 15. A
+    fixed 5 s turned a healthy 3.4 GB palace (5-6.4 s reads) into
+    ``index-timeout`` and a doctor DRIFT. Unset, non-integer or out-of-range
+    values use the default, like the refresh-side
+    ``CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TIMEOUT_SEC`` (1..120, default 30).
+    """
+    raw = (os.environ.get("CCC_NUNCHI_MEMPALACE_INDEX_PROBE_TIMEOUT_SEC") or "").strip()
+    if not raw.isdigit():
+        return _INDEX_PROBE_TIMEOUT_DEFAULT_SEC
+    value = int(raw)
+    if 1 <= value <= _INDEX_PROBE_TIMEOUT_MAX_SEC:
+        return value
+    return _INDEX_PROBE_TIMEOUT_DEFAULT_SEC
+
+
 def mempalace_index_probe(mp_cli: Path, home: Path) -> dict[str, object]:
     override = os.environ.get("CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT")
     if override is not None:
@@ -421,7 +443,7 @@ def mempalace_index_probe(mp_cli: Path, home: Path) -> dict[str, object]:
             cwd=home,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=index_probe_timeout(),
             check=False,
         )
     except subprocess.TimeoutExpired:

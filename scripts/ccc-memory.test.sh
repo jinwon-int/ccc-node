@@ -511,6 +511,19 @@ repair("[drawers]\nsqlite count: 302,895\nhnsw count: 303,009\ndivergence: 114\n
 repair("[drawers]\nsqlite count: 303,009\nhnsw count: 302,895\ndivergence: 114\nstatus: DIVERGED\n[closets]", "diverged")
 with mock.patch.object(probe.subprocess, "run", side_effect=subprocess.TimeoutExpired("mp", 5)):
     assert probe.mempalace_index_probe(Path("/mp"), Path("/"))["status"] == "timeout"
+# #2870: the live read's bound comes from the env (1..60, default 15), not a
+# fixed 5 s that a healthy large palace exceeds.
+for raw, expected in [(None, 15), ("", 15), ("30", 30), ("1", 1), ("60", 60),
+                      ("0", 15), ("61", 15), ("-5", 15), ("abc", 15), ("2.5", 15), (" 20 ", 20)]:
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CCC_NUNCHI_MEMPALACE_INDEX_PROBE_TIMEOUT_SEC", "CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT")}
+    if raw is not None:
+        env["CCC_NUNCHI_MEMPALACE_INDEX_PROBE_TIMEOUT_SEC"] = raw
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert probe.index_probe_timeout() == expected, (raw, expected)
+        with mock.patch.object(probe.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            probe.mempalace_index_probe(Path("/mp"), Path("/"))
+            assert run.call_args.kwargs["timeout"] == expected, (raw, run.call_args.kwargs)
 with mock.patch.object(probe.subprocess, "run", return_value=subprocess.CompletedProcess([], 9, "secret", "secret")):
     assert probe.mempalace_index_probe(Path("/mp"), Path("/"))["status"] == "error"
 

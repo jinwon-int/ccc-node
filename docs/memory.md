@@ -390,7 +390,11 @@ refresh. The readiness probe projects the field as `mempalace.refresh.index_stat
 (`absent` for older records or non-ok runs) and reports a recorded `diverged`
 as `index-diverged` when the live read is inconclusive (for example an
 `index-timeout` on a large palace) — once, and never over a live `ok`, which is
-fresher. Audience-scoped Piri lanes have no live per-scope read, so a scope's
+fresher. The live read itself is bounded by
+`CCC_NUNCHI_MEMPALACE_INDEX_PROBE_TIMEOUT_SEC` (1-60 s, default 15; an unset,
+non-integer or out-of-range value uses the default) — a fixed 5 s turned a
+healthy 3.4 GB palace whose reads take 5-6.4 s into `index-timeout` and a
+doctor `DRIFT` (#2870). Audience-scoped Piri lanes have no live per-scope read, so a scope's
 recorded `diverged` counts as `refresh_index_diverged` and degrades the lane
 with `index-diverged`.
 
