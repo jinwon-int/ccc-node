@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -1674,6 +1675,20 @@ async def _run_receipt_once(bot: MatrixBot, transport: FakeTransport | None) -> 
 
 @pytest.mark.anyio
 async def test_restart_receipt_loop_delivers_then_archives_terminal_receipt(
+    tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MatrixBot.run pins umask 0o077 before any state is written; this test
+    # drives run_turn directly, so pin it here instead of inheriting whatever
+    # an earlier test on the same xdist worker left behind (the private data
+    # directory check refuses a 0o755 directory under the runner's 022).
+    previous_umask = os.umask(0o077)
+    try:
+        await _restart_receipt_loop_body(tmp_path, matrix_config, monkeypatch)
+    finally:
+        os.umask(previous_umask)
+
+
+async def _restart_receipt_loop_body(
     tmp_path: Path, matrix_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
