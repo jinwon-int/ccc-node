@@ -364,6 +364,10 @@ fallback, PERSONA, the resume pointer, the Family Wiki cache), each under the
 hook's own byte cap (`CCC_BUILTIN_MEMORY_MAX_BYTES`, `CCC_RESUME_MAX_BYTES`,
 `CCC_WIKI_MAX_BYTES`), then the `CCC_MEMORY_MAX_BYTES` total. Query-time local
 hot memory and section headers are not counted.
+Both hooks also bound their output in characters (`CCC_MEMORY_MAX_CHARS`,
+`CCC_NUNCHI_INJECT_MAX_CHARS`, default 9500 — #2884, see
+[nunchi-normalization.md](nunchi-normalization.md#character-ceiling-2884));
+the estimates in these rows are byte ceilings and are not clipped to it.
 
 The nunchi row is not executed either, and nothing writes the hook's output to
 disk. It reports the byte ceiling of `nunchi.py assemble` —

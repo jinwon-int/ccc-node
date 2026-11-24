@@ -29,6 +29,72 @@ ok "limit-bytes truncation keeps valid UTF-8" '[ "$n_bad" = 0 ]'
 out="$(printf 'anything' | python3 "$MOD" limit-bytes 0)"
 ok "limit-bytes 0 disables the cap" '[ "$out" = "anything" ]'
 
+# limit-bytes <max-bytes> <max-chars> (#2884): a second bound in UTF-16 code
+# units, the unit of the Claude Code hook output cap.
+units() { python3 -c 'import sys; s = sys.stdin.buffer.read().decode("utf-8"); print(len(s) + sum(1 for c in s if ord(c) > 0xFFFF))'; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 0 120 | units)"
+ok "limit-bytes char bound cuts ASCII to the limit, marker included" '[ "$n" = 120 ]'
+out="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 0 120)"
+ok "limit-bytes char bound appends the truncation marker once" \
+  '[ "$(grep -c "truncated by CCC memory budget" <<<"$out")" = 1 ]'
+out="$(printf '한%.0s' $(seq 1 200) | python3 "$MOD" limit-bytes 0 300)"
+ok "limit-bytes char bound counts characters, not bytes (200 Hangul = 600 bytes pass a 300 bound)" \
+  '[ "$out" = "$(printf "한%.0s" $(seq 1 200))" ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf '한%.0s' $(seq 1 200) | python3 "$MOD" limit-bytes 0 100 | units)"
+ok "limit-bytes char bound cuts Hangul by characters" '[ "$n" = 100 ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf '🧱%.0s' $(seq 1 200) | python3 "$MOD" limit-bytes 0 101 | units)"
+ok "limit-bytes char bound counts an astral character as two units and never splits one" \
+  '[ "$n" -le 101 ] && [ "$n" -ge 99 ]'
+out="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 300 120)"
+ok "limit-bytes with both bounds honours the tighter one and marks the cut once" \
+  '[ "$(printf "%s" "$out" | units)" -le 120 ] && [ "$(grep -c "truncated by CCC memory budget" <<<"$out")" = 1 ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf '한%.0s' $(seq 1 200) | python3 "$MOD" limit-bytes 100 500 | wc -c)"
+ok "limit-bytes with both bounds still honours the byte cap" '[ "$n" -le 100 ]'
+ok "limit-bytes ignores an empty, zero or non-numeric char bound" \
+  '[ "$(printf "anything" | python3 "$MOD" limit-bytes 0 "")" = "anything" ] && [ "$(printf "anything" | python3 "$MOD" limit-bytes 0 0)" = "anything" ] && [ "$(printf "anything" | python3 "$MOD" limit-bytes 0 x)" = "anything" ]'
+printf 'ab\377\376cd' > "$TMP/raw.bin"
+ok "limit-bytes passes an under-cap payload through byte for byte, undecodable bytes included" \
+  'python3 "$MOD" limit-bytes 100 100 < "$TMP/raw.bin" | cmp -s - "$TMP/raw.bin"'
+
+# Boundaries of the character bound (#2884 review).
+out="$(printf 'A%.0s' $(seq 1 120) | python3 "$MOD" limit-bytes 0 120)"
+ok "limit-bytes char bound leaves an input of exactly the limit alone" '[ "$out" = "$(printf "A%.0s" $(seq 1 120))" ]'
+# Exactly the limit in characters but over it in bytes: counted, then left alone.
+out="$(printf '한%.0s' $(seq 1 120) | python3 "$MOD" limit-bytes 0 120)"
+ok "limit-bytes char bound leaves Hangul of exactly the limit alone" '[ "$out" = "$(printf "한%.0s" $(seq 1 120))" ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf 'A%.0s' $(seq 1 121) | python3 "$MOD" limit-bytes 0 120 | units)"
+ok "limit-bytes char bound cuts an input one over the limit to exactly the limit" '[ "$n" = 120 ]'
+# 60 astral characters are 60 code points but 120 units: over a 101 bound.
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf '🧱%.0s' $(seq 1 60) | python3 "$MOD" limit-bytes 0 101 | units)"
+ok "limit-bytes char bound counts units, not code points (60 emoji do not pass a 101 bound)" '[ "$n" = 100 ]'
+# Byte-cut text is 262 A + marker = 298 units: inside 300 bytes, over 280 units.
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 300 280 | units)"
+out="$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 300 280)"
+ok "limit-bytes counts the byte cut's own marker against the char bound, and keeps the marker whole" \
+  '[ "$n" = 280 ] && [[ "$out" == *"[truncated by CCC memory budget]" ]]'
+# The marker is 36 units but 38 bytes: a char cut must not land over the byte cap.
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(printf 'a%.0s' $(seq 1 39) | python3 "$MOD" limit-bytes 39 38 | wc -c)"
+ok "limit-bytes char cut stays within the byte cap as well" '[ "$n" -le 39 ]'
+tiny=0
+for lim in 1 10 35 36 37; do
+  [ "$(printf 'A%.0s' $(seq 1 500) | python3 "$MOD" limit-bytes 0 "$lim" | units)" -le "$lim" ] || tiny=$((tiny+1))
+done
+ok "limit-bytes holds a char bound smaller than the marker" '[ "$tiny" = 0 ]'
+# Undecodable bytes each become one U+FFFD downstream: they count.
+# shellcheck disable=SC2034  # read via eval inside ok()
+n="$(python3 -c 'import sys; sys.stdout.buffer.write(b"A" * 90 + bytes([255]) * 30)' | python3 "$MOD" limit-bytes 0 100 | python3 -c 'import sys; print(len(sys.stdin.buffer.read().decode("utf-8", "replace")))')"
+ok "limit-bytes char bound counts undecodable bytes (90 + 30 of them do not pass a 100 bound)" '[ "$n" = 100 ]'
+ok "limit-bytes ignores a char bound written in non-ASCII digits" \
+  '[ "$(printf "anything" | python3 "$MOD" limit-bytes 0 "$(python3 -c "print(chr(0xFF11) + chr(0xFF12), end=str())")")" = "anything" ] && [ "$(printf "anything" | python3 "$MOD" limit-bytes 0 "$(python3 -c "print(chr(0xB2), end=str())")")" = "anything" ]'
+
 # ---- dedup-local-hot --------------------------------------------------------
 dj='{"results":[{"source":"memory","snippet":"alpha bravo charlie delta echo"},{"source":"structured","snippet":"alpha bravo charlie delta echo"},{"source":"cache","snippet":"unique zulu yankee xray whiskey"}]}'
 out="$(INJECTED='context alpha bravo charlie delta echo tail' SEARCH_JSON="$dj" python3 "$MOD" dedup-local-hot)"

@@ -14,10 +14,18 @@ label="${1:-memory-injection}"
 # Empty/non-numeric means "no cap" — existing scan-only callers are unchanged.
 max_bytes="${2:-}"
 case "$max_bytes" in *[!0-9]*) max_bytes="" ;; esac
+# Optional character cap (#2884), applied after the byte cap in the same
+# process. Claude Code caps a hook output string at 10,000 characters and
+# replaces a longer one with a file path and a short preview, and a redaction
+# marker can be longer than the text it replaces — so a caller whose block was
+# sized to that ceiling before the scan needs the bound re-applied after it.
+# Counted in UTF-16 code units. Empty/non-numeric/0 means "no cap".
+max_chars="${3:-}"
+case "$max_chars" in *[!0-9]*) max_chars="" ;; esac
 input_tmp="$(mktemp)"
 trap 'rm -f "$input_tmp"' EXIT
 cat > "$input_tmp"
-python3 - "$label" "$input_tmp" "$max_bytes" <<'PY'
+python3 - "$label" "$input_tmp" "$max_bytes" "$max_chars" <<'PY'
 import json
 import os
 import re
@@ -97,6 +105,31 @@ if max_bytes.isdigit() and int(max_bytes) > 0 and len(out) > int(max_bytes):
     suffix = "\n… [truncated by CCC memory budget]\n".encode("utf-8")
     keep = max(0, limit - len(suffix))
     out = out[:keep].decode("utf-8", errors="ignore").encode("utf-8") + suffix
+# Character cap (#2884): same marker, reserved inside the limit (a limit
+# smaller than the marker gets as much of the marker as fits). Bytes are never
+# fewer than UTF-16 units, so a block within the limit in bytes is skipped
+# without decoding. This runs after redaction, so cutting inside a line here
+# cannot split a credential the patterns above would have matched.
+max_chars = sys.argv[4] if len(sys.argv) > 4 else ""
+if max_chars.isascii() and max_chars.isdigit() and 0 < int(max_chars) < len(out):
+    def units(value):
+        return len(value) + sum(1 for ch in value if ord(ch) > 0xFFFF)
+
+    def fit(value, room):
+        used = 0
+        for index, ch in enumerate(value):
+            used += 2 if ord(ch) > 0xFFFF else 1
+            if used > room:
+                return value[:index]
+        return value
+
+    limit = int(max_chars)
+    body = out.decode("utf-8", errors="ignore")
+    if units(body) > limit:
+        marker = "\n… [truncated by CCC memory budget]\n"
+        if body.endswith(marker):
+            body = body[:-len(marker)]
+        out = fit(fit(body, max(0, limit - units(marker))) + marker, limit).encode("utf-8")
 sys.stdout.buffer.write(out)
 
 if categories:
