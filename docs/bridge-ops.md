@@ -475,6 +475,15 @@ day it reads the two UTC files the KST day overlaps and keeps spans with
   `digest-spool:`. `--no-digest` queues only; `--dry-run` prints the entry
   and digest text and writes nothing (`--json` for the raw summary).
   Idempotent per `(date, node)` via `<!-- spans-rollup:DATE:NODE -->`.
+- **Summary file (view input, #2858 item 4):** every non-dry-run run that
+  computes a summary also saves it — exactly the `--dry-run --json` output —
+  to `$CCC_STATE_DIR/spans-rollup/YYYY-MM-DD.json` (0600 in a 0700 dir,
+  atomic, symlinked dir refused). Idle days are saved too (`"empty": true`)
+  so a view can tell a quiet day from a missing one. Day files older than
+  90 days (`SUMMARY_KEEP_DAYS`) are pruned; other names and symlinks are
+  left alone. Best-effort: a write failure prints `summary file not written`
+  on stderr and does not change the exit code. Delivery to the view host and
+  rendering are separate steps.
 - **Never fails on data:** missing spans dir, empty day, unreadable or
   corrupt lines → exit 0; an empty day prints `skipped: no-spans` and
   delivers nothing (read counters are in the summary).

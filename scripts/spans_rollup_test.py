@@ -539,3 +539,63 @@ def test_status_write_failure_keeps_exit_code(env, capsys, monkeypatch):
     captured = capsys.readouterr()
     assert json.loads(captured.out)["skipped"] == "no-spans"
     assert "status file not written" in captured.err
+
+
+# --- per-day summary file for the read-only view (#2858 item 4, piece 1) ----------
+
+
+def summary_path(env: Env, day: str = DAY) -> Path:
+    return env.state / rollup.SUMMARY_DIR / f"{day}.json"
+
+
+def test_summary_file_matches_dry_run_json_and_is_owner_only(env, capsys):
+    env.write_spans("2026-11-06", [tool("Bash", IN_DAY, 10, prompt=BODY), turn(IN_DAY + 1)])
+    assert env.run("--dry-run", "--json") == 0
+    expected = json.loads(capsys.readouterr().out)
+    assert not summary_path(env).exists()  # dry-run writes nothing
+    assert env.run() == 0
+    capsys.readouterr()
+    path = summary_path(env)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    text = path.read_text(encoding="utf-8")
+    assert "SECRET" not in text
+    assert json.loads(text) == expected
+    assert not list(path.parent.glob(".*.tmp"))  # no temp leftovers
+
+
+def test_summary_file_written_for_no_spans_day(env, capsys):
+    assert env.run() == 0
+    data = json.loads(summary_path(env).read_text(encoding="utf-8"))
+    assert data["empty"] is True and data["date"] == DAY and data["node"] == "testnode"
+
+
+def test_summary_file_prunes_only_expired_day_files(env, capsys):
+    folder = env.state / rollup.SUMMARY_DIR
+    folder.mkdir(parents=True)
+    expired = folder / "2026-08-07.json"  # 91 days before 2026-11-06
+    kept = folder / "2026-08-08.json"  # exactly SUMMARY_KEEP_DAYS old
+    other = folder / "notes.txt"
+    outside = env.state / "outside.json"
+    for p in (expired, kept, other, outside):
+        p.write_text("{}", encoding="utf-8")
+    link = folder / "2026-01-01.json"
+    link.symlink_to(outside)
+    assert rollup.SUMMARY_KEEP_DAYS == 90
+    assert env.run() == 0
+    assert not expired.exists()
+    assert kept.exists() and other.exists() and outside.exists()
+    assert link.is_symlink()  # never followed or removed
+
+
+def test_summary_file_refuses_symlinked_dir_and_keeps_exit_code(env, capsys):
+    target = env.state.parent / "elsewhere"
+    target.mkdir(parents=True)
+    env.state.mkdir(parents=True)
+    (env.state / rollup.SUMMARY_DIR).symlink_to(target)
+    env.write_spans("2026-11-06", [tool("Bash", IN_DAY, 10)])
+    assert env.run("--no-digest") == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["ok"] is True
+    assert "summary file not written" in captured.err
+    assert list(target.iterdir()) == []
