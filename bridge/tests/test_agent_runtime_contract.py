@@ -171,6 +171,8 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             lambda: DelegatedTaskLifecycleEvent(-1, None, "terminal"),
             lambda: DelegatedTaskLifecycleEvent(1, float("inf"), "updated"),
             lambda: DelegatedTaskLifecycleEvent(1, float("nan"), "updated"),
+            lambda: DelegatedTaskLifecycleEvent(1, 0.0, "updated", "Bash ls -la /etc"),
+            lambda: DelegatedTaskLifecycleEvent(1, 0.0, "updated", ""),
             lambda: ErrorEvent(code="", message="failed"),
             lambda: ErrorEvent(code="failed", message=""),
             lambda: SessionRequest(working_directory=""),
@@ -195,6 +197,9 @@ class AgentRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.oldest_age_seconds, 301.5)
         self.assertNotIn("task_id", repr(event))
         self.assertNotIn("session", repr(event))
+        self.assertIsNone(event.last_tool_name)
+        named = DelegatedTaskLifecycleEvent(1, 2.0, "updated", "mcp__family-ops__node_status")
+        self.assertEqual(named.last_tool_name, "mcp__family-ops__node_status")
 
     async def test_async_completion_capability_fails_closed(self) -> None:
         degraded = AsyncCompletionCapability(

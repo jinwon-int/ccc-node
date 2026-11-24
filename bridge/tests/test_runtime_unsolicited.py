@@ -59,6 +59,7 @@ from claude_agent_sdk import (  # noqa: E402 -- must follow the stub purge above
     StreamEvent,
     SystemMessage,
     TaskNotificationMessage,
+    TaskProgressMessage,
     TaskStartedMessage,
     TaskUpdatedMessage,
     TextBlock,
@@ -212,6 +213,40 @@ class ManualClaudeSdkClient:
                 patch=patch,
                 status=status if expose_status else None,  # type: ignore[arg-type]
                 session_id=self.session_id,
+            )
+        )
+
+    def emit_task_progress(
+        self,
+        task_id: str,
+        *,
+        last_tool_name: str | None = None,
+        typed: bool = True,
+    ) -> None:
+        data = {
+            "type": "system",
+            "subtype": "task_progress",
+            "task_id": task_id,
+            "description": task_id,
+            "usage": {"total_tokens": 10, "tool_uses": 1, "duration_ms": 1000},
+            "uuid": str(uuid.uuid4()),
+            "session_id": self.session_id,
+        }
+        if last_tool_name is not None:
+            data["last_tool_name"] = last_tool_name
+        if not typed:
+            self.emit(SystemMessage(subtype="task_progress", data=data))
+            return
+        self.emit(
+            TaskProgressMessage(
+                subtype="task_progress",
+                data=data,
+                task_id=task_id,
+                description=task_id,
+                usage=data["usage"],
+                uuid=data["uuid"],
+                session_id=self.session_id,
+                last_tool_name=last_tool_name,
             )
         )
 
@@ -1325,6 +1360,53 @@ class ClaudeRuntimeUnsolicitedTests(unittest.IsolatedAsyncioTestCase):
         texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
         self.assertEqual(texts, ["final answer"])
         self.assertEqual(self.delivered, [])
+
+    async def test_delegated_task_progress_refreshes_a_deferred_turn(self) -> None:
+        """#2895: a sub-agent working after the run's result must count as activity.
+
+        Without ``task_progress`` frames the deferred turn emits nothing for
+        minutes, so the heartbeat reads "no update" while the sub-agent works.
+        """
+        session, client = await self._start_session()
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+        client.emit_task_started("agent-1", "local_agent")
+        await _wait_until(
+            lambda: session._active_turn is not None
+            and "agent-1" in session._active_turn.result_deferring_tasks
+        )
+        client.emit_assistant("answer while the review runs")
+        client.emit_result(result="answer while the review runs")
+        client.emit_task_progress("agent-1", last_tool_name="Bash")
+        client.emit_task_progress("agent-1", last_tool_name="Read", typed=False)
+        client.emit_task_progress("agent-1")
+        client.emit_task_notification("agent-1")
+        client.emit_assistant("final answer")
+        client.emit_result(result="final answer")
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+
+        delegated = [event for event in events if isinstance(event, DelegatedTaskLifecycleEvent)]
+        self.assertEqual(
+            [event.activity for event in delegated],
+            ["started", "updated", "updated", "updated", "terminal"],
+        )
+        self.assertEqual(
+            [event.last_tool_name for event in delegated if event.activity == "updated"],
+            ["Bash", "Read", None],
+        )
+        self.assertEqual([event.active_count for event in delegated], [1, 1, 1, 1, 0])
+
+    async def test_progress_for_an_untracked_task_is_ignored(self) -> None:
+        session, client = await self._start_session()
+        client.turn_scripts.append("hang")
+        turn_task = asyncio.create_task(_collect(session.send_turn("owner question")))
+        await _wait_until(lambda: client.queries == ["owner question"])
+        client.emit_task_progress("never-started", last_tool_name="Bash")
+        client.emit_assistant("done")
+        client.emit_result(result="done")
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+        self.assertFalse(any(isinstance(event, DelegatedTaskLifecycleEvent) for event in events))
 
     async def test_parked_result_is_delivered_when_the_reader_dies(self) -> None:
         session, client = await self._start_session()

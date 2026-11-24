@@ -960,8 +960,18 @@ class ProjectChatProcessMixin:
             )
             return
         if isinstance(transition, DelegatedTaskLifecycleTransition):
-            # Aggregate lifecycle state is consumed by the timeout selector and
-            # health projection only. It is never rendered as assistant text.
+            # Aggregate lifecycle state is consumed by the timeout selector,
+            # health projection, and the heartbeat line (#2895). It is never
+            # rendered as assistant text.
+            event = transition.event
+            request.delegated_tasks_active = event.active_count
+            if event.active_count > 0:
+                request.delegated_last_activity_at = now
+                if event.last_tool_name:
+                    request.delegated_last_tool = event.last_tool_name
+            else:
+                request.delegated_last_activity_at = 0.0
+                request.delegated_last_tool = None
             return
         if isinstance(transition, IgnoredTransition) and isinstance(
             transition.event, TaskProgressEvent

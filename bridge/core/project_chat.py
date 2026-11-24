@@ -27,6 +27,7 @@ from telegram_bot.core.request_lifecycle import RequestPhase
 from telegram_bot.core.heartbeat import (
     await_heartbeat_update,
     compose_heartbeat_text,
+    delegated_tasks_label,
     has_recent_visible_progress,
     should_update_heartbeat,
 )
@@ -1504,9 +1505,20 @@ class ProjectChatHandler(
             if req.heartbeat_forecast_samples
             else None
         )
+        current_tool = req.current_tool_label
+        if current_tool is None and req.delegated_tasks_active > 0:
+            # Nothing of the request's own is running: it is waiting on
+            # delegated work, so say so instead of a bare elapsed time (#2895).
+            current_tool = delegated_tasks_label(
+                active_count=req.delegated_tasks_active,
+                last_tool=req.delegated_last_tool,
+                idle_seconds=(now - req.delegated_last_activity_at)
+                if req.delegated_last_activity_at > 0
+                else None,
+            )
         text = compose_heartbeat_text(
             elapsed_seconds=elapsed,
-            current_tool=req.current_tool_label,
+            current_tool=current_tool,
             forecast_seconds=(forecast_remaining_ms / 1000.0)
             if forecast_remaining_ms is not None
             else None,

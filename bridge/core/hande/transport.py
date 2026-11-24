@@ -134,6 +134,9 @@ SELF_JOB_PREFIX = "$self-"
 SELF_JOB_QUEUE_MAX = 32
 SELF_JOB_KEYS_MAX = 512
 SELF_JOB_STOP_COMMANDS = ("/stop", "/cancel")
+# A self-job's heartbeat goes out as the room's status line (#2895) at most
+# this often; holding or refusing an owner turn re-posts it at once.
+SELF_JOB_STATUS_MIN_INTERVAL_S = 10.0
 NOTICE_SELF_JOB_UNCERTAIN = "⚠️ Automatic follow-up turn did not finish ({reason})."
 NOTICE_SELF_JOB_APPROVAL = (
     "⚠️ Denied: an automatic follow-up turn cannot ask for approval here.\n{text}"
@@ -511,8 +514,16 @@ class _SelfJobSink:
         return None
 
     async def status(self, text: str | None) -> None:
-        del text
-        return None
+        """The heartbeat as the room's status line (#2895), never silence.
+
+        Without it a self-job ran for many minutes with nothing on screen and
+        the owner's messages queued behind it looked lost.
+        """
+
+        if text is None or not self._live() or not text.startswith("⏳"):
+            return
+        self._turn.status_text = text
+        await self._transport._send_self_job_status(text)
 
     async def interim(self, text: str) -> None:
         if not self._live() or not self._transport.interim_frames:
@@ -600,6 +611,7 @@ class HandeTransport:
             self.c.get("wait_status_interval_s") or DEFAULT_WAIT_STATUS_INTERVAL_S
         )
         self._wait_status_sent = 0
+        self._self_job_status_sent = 0
         # #2833: the turn's skill names as ``result.skills`` (family-messenger#834
         # draws them as chips). Off by default: turn it on after the bot and apps.
         self.skill_frames = bool(self.c.get("skill_frames"))
@@ -776,6 +788,14 @@ class HandeTransport:
         re-send carries the current one) and never sent while the knobs are off.
         """
 
+        if not await self._send_room_status(room_id, text):
+            return False
+        self._wait_status_sent += 1
+        return True
+
+    async def _send_room_status(self, room_id: str, text: str) -> bool:
+        """One ``kind:"status"`` notice (status-v1 line) when the knobs allow it."""
+
         if not self.wait_status_ready or room_id not in self.rooms or not text.strip():
             return False
         client = self._client
@@ -787,9 +807,49 @@ class HandeTransport:
             "text": _bounded_text(text, 2048),
             "kind": "status",
         }
-        if not await client.send(frame):
+        return bool(await client.send(frame))
+
+    def _self_job_status_line(self, text: str | None, *, refused: bool = False) -> str:
+        """The room's status line while a self-job runs (#2895).
+
+        A self-job (CI-wait resume, yield-and-continue bundle, Danso resume)
+        is not the owner's turn, so its heartbeat says whose work it is, whether
+        the owner's message waits behind it, and how to interrupt it.
+        """
+
+        base = text or "⏳ Working"
+        if base.startswith("⏳ Working"):
+            base = "⏳ Background job" + base[len("⏳ Working"):]
+        parts = [base]
+        if refused:
+            parts.append("a message is already queued — send again after it runs")
+        elif self._held is not None:
+            parts.append("your message is queued and runs next")
+        if "/stop" not in base:
+            parts.append("/stop to interrupt")
+        return " · ".join(parts)
+
+    async def _send_self_job_status(
+        self, text: str | None, *, force: bool = False, refused: bool = False
+    ) -> bool:
+        turn = self._active
+        if turn is None or not turn.self_job:
             return False
-        self._wait_status_sent += 1
+        now = time.monotonic()
+        if (
+            not force
+            and turn.status_sent_at is not None
+            and now - turn.status_sent_at < SELF_JOB_STATUS_MIN_INTERVAL_S
+        ):
+            return False
+        room = str(turn.job["room_id"])
+        if not await self._send_room_status(
+            room, self._self_job_status_line(text, refused=refused)
+        ):
+            return False
+        turn.status_sent_at = now
+        turn.status_sent += 1
+        self._self_job_status_sent += 1
         return True
 
     def enqueue_notice(
@@ -1120,6 +1180,7 @@ class HandeTransport:
             "status_frames": self.status_frames,
             "wait_status_frames": self.wait_status_frames,
             "wait_status_sent": self._wait_status_sent,
+            "self_job_status_sent": self._self_job_status_sent,
             "skill_frames": self.skill_frames,
             "skill_results": self._skill_results,
             "reply_split": self.reply_split and self.interim_frames,
@@ -1269,6 +1330,9 @@ class HandeTransport:
         active = self._active
         if active is not None and not (active.self_job and self._held is None):
             await client.send({"type": "rejected", "turn_id": turn_id, "reason": "busy"})
+            if active.self_job:
+                # Say why (#2895): one message already waits behind the self-job.
+                await self._send_self_job_status(active.status_text, force=True, refused=True)
             return True
         job, reason = self._job_for(frame)
         if job is None:
@@ -1283,6 +1347,10 @@ class HandeTransport:
             self._held = (client, turn)
             if _is_stop_command(str(job["body"])):
                 await self._stop_self_job()
+            else:
+                # The held turn gets no frame of its own until it starts; the
+                # room's status line says it is queued (#2895).
+                await self._send_self_job_status(active.status_text, force=True)
             return True
         self._active = turn
         turn.task = asyncio.get_running_loop().create_task(self._run_turn(client, turn))

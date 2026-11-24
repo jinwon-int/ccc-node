@@ -11,6 +11,7 @@ from claude_agent_sdk import (
     Message,
     SystemMessage,
     TaskNotificationMessage,
+    TaskProgressMessage,
     TaskStartedMessage,
     TaskUpdatedMessage,
 )
@@ -32,6 +33,17 @@ if TYPE_CHECKING:
 _RESULT_DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 
 
+def _bare_tool_name(value: object) -> str | None:
+    """The progress frame's tool name when it is a bare name, else nothing."""
+
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name) > 160 or not all(c.isalnum() or c in "_.:-" for c in name):
+        return None
+    return name if name.isascii() else None
+
+
 class ClaudeSessionDelegatedTasksMixin:
     """Mirror the Agent SDK run-boundary task ledger without task bodies."""
 
@@ -41,6 +53,7 @@ class ClaudeSessionDelegatedTasksMixin:
         *,
         activity: Literal["started", "updated", "terminal"],
         now: float,
+        last_tool_name: object = None,
     ) -> DelegatedTaskLifecycleEvent:
         oldest_age = None
         if active.result_deferring_tasks:
@@ -49,13 +62,22 @@ class ClaudeSessionDelegatedTasksMixin:
             active_count=len(active.result_deferring_tasks),
             oldest_age_seconds=oldest_age,
             activity=activity,
+            last_tool_name=_bare_tool_name(last_tool_name),
         )
 
     @staticmethod
     def _delegated_task_change(
         message: Message,
-    ) -> tuple[Literal["started", "updated", "terminal"], str, object | None] | None:
-        """Normalize one SDK task frame without retaining any task body."""
+    ) -> tuple[Literal["started", "updated", "progress", "terminal"], str, object | None] | None:
+        """Normalize one SDK task frame without retaining any task body.
+
+        The third element is the task type for ``started`` and the most recent
+        tool name for ``progress`` (#2895: ``task_progress`` frames arrive while
+        a sub-agent works, long after the run's own result).
+        """
+        if isinstance(message, TaskProgressMessage):
+            task_id = _normalize_task_id(message.task_id)
+            return ("progress", task_id, message.last_tool_name) if task_id is not None else None
         if isinstance(message, TaskStartedMessage):
             task_id = _normalize_task_id(message.task_id)
             return ("started", task_id, message.task_type) if task_id is not None else None
@@ -81,6 +103,8 @@ class ClaudeSessionDelegatedTasksMixin:
             return ("started", task_id, data.get("task_type"))
         if message.subtype == "task_notification":
             return ("terminal", task_id, None)
+        if message.subtype == "task_progress":
+            return ("progress", task_id, data.get("last_tool_name"))
         if message.subtype == "task_updated":
             patch = data.get("patch")
             status = patch.get("status") if isinstance(patch, Mapping) else None
@@ -123,5 +147,8 @@ class ClaudeSessionDelegatedTasksMixin:
         if task_id not in active.result_deferring_tasks:
             return None
         return ClaudeSessionDelegatedTasksMixin._delegated_task_event(
-            active, activity="updated", now=now
+            active,
+            activity="updated",
+            now=now,
+            last_tool_name=task_type if action == "progress" else None,
         )

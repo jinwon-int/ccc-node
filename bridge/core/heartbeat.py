@@ -89,6 +89,31 @@ def _tool_summary_label(name: Optional[str], tool_input: Any) -> Optional[str]:
     return str(name)
 
 
+def delegated_tasks_label(
+    *,
+    active_count: int,
+    last_tool: Optional[str] = None,
+    idle_seconds: Optional[float] = None,
+) -> Optional[str]:
+    """Heartbeat label while a request waits on delegated work (#2895).
+
+    Body-free: the count, the latest tool name, and how long ago the delegated
+    work last reported progress. ``None`` when nothing is delegated.
+    """
+    if active_count <= 0:
+        return None
+    noun = "background task" if active_count == 1 else "background tasks"
+    label = f"Waiting for {active_count} {noun}"
+    details = []
+    if last_tool:
+        details.append(f"last: {_truncate(last_tool, 40)}")
+    if idle_seconds is not None and idle_seconds >= 0:
+        details.append(f"{format_duration(idle_seconds)} ago")
+    if details:
+        label += f" ({' '.join(details)})"
+    return label + " · /stop to cancel"
+
+
 def compose_heartbeat_text(
     *,
     elapsed_seconds: float,

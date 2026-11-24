@@ -32,7 +32,9 @@ Mapping (one line each; the long form is ``docs/hande-frontend.md``):
   claimed delivered.
 * Self-jobs (``enqueue_self_job``, #2561) — the CI-wait resume, a
   yield-and-continue bundle, a Danso auto-resume — run between bot turns and
-  speak through ``notice`` frames, as Matrix runs its ``$self-`` jobs.
+  speak through ``notice`` frames, as Matrix runs its ``$self-`` jobs. Their
+  heartbeat is the room's ``kind:"status"`` line, which also tells the owner
+  when a message of theirs waits behind the job (#2895).
 """
 
 from __future__ import annotations
