@@ -1366,6 +1366,134 @@ def _vector_rank(c, model, query, where, args, limit):
         return []
 
 
+# #2885 — Korean words reach the index inflected. `facts_fts` uses FTS5's default
+# tokenizer, which splits on spaces and punctuation only, so "배포를" in a
+# question and "배포" (or "배포가", "배포했다") in a fact are different tokens
+# and a whole-word query misses. Measured on one node (59 questions written
+# from stored facts, plain search, 10 rows): the target was returned for 92%
+# of keyword questions; with the rules below, 100%, and MRR 0.74 -> 0.82. A
+# separate character-bigram index was measured too and did no better, so
+# nothing is added to the index — only the query changes:
+#   1. the trailing particle is taken off each Hangul word (gotgan's rule), and
+#   2. the stem is sent as a PREFIX query (`"배포"*`), which matches every
+#      inflection of it. A stem shorter than two syllables is not used — the
+#      word itself is the prefix then ("결과" stays "결과", not "결").
+#   3. A Hangul ending glued to a non-Hangul word ("PR에서") is one index token
+#      ("pr에서") that no Hangul prefix can reach, so the ending is ignored
+#      and the head ("PR") is sent as a phrase.
+# Everything the query sent before is still sent first (whole words, alias
+# slugs, hallway expansions), so the set of matching facts only grows. Which
+# of them are returned under a row limit is still bm25's call, so a row can be
+# displaced by a newly matching one. NUNCHI_QUERY_PREFIX=0 turns the addition
+# off.
+_QUERY_PREFIX_MAX = 12
+
+
+def _query_prefix_enabled():
+    return os.environ.get("NUNCHI_QUERY_PREFIX", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _gotgan_rules():
+    """(token, Hangul-run, particle regexes, stoplist) from gotgan.py, or None.
+
+    The verbatim layer answers the same questions, so its tokenisation and
+    particle list are reused rather than copied. The module sits beside this
+    file; anything wrong with it (missing, a different `gotgan` on the path,
+    an import-time error) means no stems, i.e. the query as it was.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import gotgan
+        return gotgan._TOKEN, gotgan._HANGUL_RUN, gotgan._PARTICLE, gotgan._STOP
+    except Exception:  # noqa: BLE001 — optional sibling module; recall must not depend on it
+        return None
+
+
+def _query_terms(query):
+    """`(stems, heads)` a query adds to its FTS expression (#2885).
+
+    stems: Hangul words with the trailing particle removed, for prefix
+    matching — in order, de-duplicated, at most _QUERY_PREFIX_MAX. heads: the
+    non-Hangul word a Hangul ending is glued to ("PR" in "PR에서"), for phrase
+    matching. Both empty without Hangul in the query or without gotgan.py.
+    """
+    text = str(query or "")
+    if not _HANGUL_RUN.search(text):
+        return [], []  # nothing to stem: skip the import (branch names, paths, English)
+    rules = _gotgan_rules()
+    if rules is None:
+        return [], []
+    token, hangul, particle, stop = rules
+    stems, heads = [], []
+    prev_end, prev_tok = -1, ""
+    for match in token.finditer(text):
+        tok, start = match.group(0), match.start()
+        glued_to, prev_end, prev_tok = (prev_tok if prev_end == start else ""), match.end(), tok
+        if not hangul.fullmatch(tok):
+            continue
+        if start > 0 and text[start - 1].isalnum():
+            # One index token with what precedes it; the Hangul part is an ending.
+            if (len(glued_to) >= 2 and any(ch.isalnum() for ch in glued_to)
+                    and glued_to not in heads and len(heads) < _QUERY_PREFIX_MAX):
+                heads.append(glued_to)
+            continue
+        stem = particle.sub("", tok)
+        if not stem:
+            continue  # the word is itself a particle or ending
+        if len(stem) < 2:
+            stem = tok
+        if len(stem) < 2 or stem in stop or stem in stems:
+            continue
+        stems.append(stem)
+        if len(stems) >= _QUERY_PREFIX_MAX:
+            break  # the cap bounds the work as well as the query
+    return stems, heads
+
+
+def _query_stems(query):
+    return _query_terms(query)[0]
+
+
+def _fts_query_parts(query):
+    """FTS5 MATCH operands for a recall query, to be joined with OR.
+
+    The first group is the pre-#2885 query unchanged: whitespace words, their
+    alias slugs (B3) and hallway expansions (P2-6), each as a phrase. With
+    NUNCHI_QUERY_PREFIX on (default) the query's heads are added as phrases
+    and its Hangul stems as prefix queries (_query_terms), plus the alias slug
+    — and that slug's hallway expansions — of a head or stem that only
+    resolves once its ending is off ("<별칭>는" -> the node slug).
+    """
+    words = _expand_query(query) + _hallway_expansions(query)
+    parts = [_fts_phrase(w) for w in words]
+    if not _query_prefix_enabled():
+        return parts
+    stems, heads = _query_terms(query)
+    new_slugs = []
+
+    def add_phrase(word):
+        if word and word not in words:
+            words.append(word)
+            parts.append(_fts_phrase(word))
+            return True
+        return False
+
+    for head in heads:
+        add_phrase(head)
+        if add_phrase(canon_node(head)):
+            new_slugs.append(canon_node(head))
+    for stem in stems:
+        if add_phrase(canon_node(stem)):
+            new_slugs.append(canon_node(stem))
+        parts.append(_fts_phrase(stem) + "*")
+    if new_slugs:
+        for term in _hallway_expansions(" ".join(new_slugs)):
+            add_phrase(term)
+    return parts
+
+
 def _state_rerank(c, rows, query, where, args, limit):
     """(a)+(c): bm25 position + recency position (+ vector RRF when vectors exist)."""
     if not rows:
@@ -1426,8 +1554,7 @@ def search(c, query, target=None, limit=10, include_history=False, state_aware=F
         # #2464 제안 3 — point-in-time view: only facts that were valid at `as_of`.
         where += " AND f.valid_from <= ? AND (f.valid_to IS NULL OR f.valid_to > ?)"
         args.extend([as_of, as_of])
-    words = _expand_query(query) + _hallway_expansions(query)
-    q = " OR ".join(_fts_phrase(w) for w in words) or _fts_phrase(query)
+    q = " OR ".join(_fts_query_parts(query)) or _fts_phrase(query)
     pool = max(limit * 4, 40) if state_aware else limit
     try:
         rows = c.execute(
