@@ -166,6 +166,89 @@ described skills and roughly 5K more tokens per session; 80% is about 11K
 more. Start low, and compare first uses of non-core skills with the mode on
 and off before raising it.
 
+### Keep-used tier (#2883, default off)
+
+A skill that was really used loses its description as soon as its last use
+leaves the recent window (30 days). Its name then competes with every other
+name-only skill, and a similarly named one can win. Measured on one node's
+catalog of 374 skills (2026-11-24, routing items answered from the listing
+alone): with the right skill name-only, 3 of 18 items picked another skill on
+every attempt; with its description listed, all 3 were answered correctly,
+and none of the 22 core, no-skill and overlap control items got worse. All
+three skills had earlier Skill-tool use on the fleet.
+
+With a keep-used window the policy also describes skills that have a recorded
+**Skill-tool** use in the last `N` days, or at any time (`all`):
+
+- **Evidence.** The same as the promotion usage gate: `Skill` rows in
+  `state/skill-usage/usage.jsonl`, and a Claude-lane record with
+  `use_count` > 0 in `state/skill-autosave-usage.json` (its `last_used_at`).
+  The two overlap, so the count is the larger of the two. A `Read` or shell
+  read of the SKILL.md is a view, not a use, and never qualifies — an audit
+  that reads many skills must not earn them a description (#2881).
+- **Order.** After the recent tier and before fill. Candidates are the skills
+  that would otherwise be plain `name-only`, ranked by most recent Skill-tool
+  use, then use count, then name.
+- **Budget.** They are described while the estimate stays within the **full**
+  budget. From the first one that does not fit, the rest are name-only with
+  the reason `skill-used, over budget`; a smaller, less recent one is not
+  taken instead.
+- **Never ahead of recent skills.** When any recently used skill is
+  `recent, over budget`, the tier places nothing. When the tier itself runs
+  out of budget, fill places nothing either.
+- **Window.** With `N` days only a use with a timestamp at or after
+  `now - N days` counts. With `all`, an undated use counts too and sorts last.
+- Core, operator-pinned and `disable-model-invocation` skills are not
+  candidates and are never modified.
+
+Like fill, the tier writes nothing new: a kept skill gets no `skillOverrides`
+entry and a policy-owned `"name-only"` entry for it is removed. No state is
+stored, a second `apply` is a no-op, and `release` does not read the switch.
+
+**Turning it on.** The first source that is present decides:
+
+1. `--keep-used-days N|all` (`plan` / `apply`);
+2. env `CCC_SKILL_LISTING_KEEP_USED_DAYS=N|all`;
+3. the node-local file `~/.claude/skill-listing-policy.keep-used`, whose first
+   non-empty, non-comment (`#`) line is `N` or `all`. `setup.sh` and the daily
+   cron entry run `apply --quiet` unchanged and pick it up.
+
+```bash
+python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --summary --keep-used-days all   # preview, read-only
+echo all > ~/.claude/skill-listing-policy.keep-used                                       # enable on this node
+python3 ~/.claude/hooks/ccc-skill-listing-policy.py apply
+rm ~/.claude/skill-listing-policy.keep-used && python3 ~/.claude/hooks/ccc-skill-listing-policy.py apply   # back to the default
+```
+
+`N` is 1..3650. `0` / `off` / `false` / `no` in the env or the file means off.
+Any other unusable value there is ignored with a warning on stderr
+(`keep-used tier off — <source>: invalid value ignored …`) and does not fall
+through to the next source; an invalid `--keep-used-days` is a usage error
+(exit 2, nothing written). With no switch present the decisions, the written
+`settings.json` and the text output are the same as before the tier existed,
+and removing the switch brings the same entries back.
+
+When the tier is on, `plan` / `apply` add `skill-used=<n>` to the `keep=`
+breakdown and print one more line:
+
+```
+  keep-used: window=all (file ~/.claude/skill-listing-policy.keep-used); described by Skill-tool use=7 over budget=0
+```
+
+Per-skill lines read `keep <name> [skill-used: last <timestamp>]`.
+`plan --json` carries the same under `keep_used` (`enabled`, `window`,
+`source`, `note`, and when enabled `described`, `over_budget`).
+
+**Cost.** Measured on twelve nodes on 2026-11-24 with `all`: 0 to 9 more
+described skills per node, 0 to about 3,150 more listing chars, against an
+80,000-char budget of which 19,000 to 40,000 were in use.
+
+**Limits.** The measurement used an appended system prompt, not the real
+skill-listing path, with tools off; the failing items were written from pairs
+picked because their names are close; one model, one node's catalog. A node
+where skills are mostly loaded by reading the file has few `Skill` rows, so
+the tier reaches little there until #2881 settles what counts as a use.
+
 A `name-only` skill is still listed and still invocable by name
 (`/<name>` or the Skill tool); it just costs no description budget. The policy
 **never writes `"off"`** and never deletes or moves a skill — retirement stays
@@ -205,6 +288,7 @@ python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan            # read-only,
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --json
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py apply           # idempotent
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --summary --fill-budget-fraction 0.5   # preview fill mode (#2748)
+python3 ~/.claude/hooks/ccc-skill-listing-policy.py plan --summary --keep-used-days all         # preview the keep-used tier (#2883)
 python3 ~/.claude/hooks/ccc-skill-listing-policy.py release         # remove every policy-owned entry
 ```
 
@@ -238,7 +322,8 @@ closed (exit 2, nothing written).
 
 Kill switch: `CCC_SKILL_LISTING_POLICY=0` or the file
 `~/.claude/skill-listing-policy.disabled` makes `apply` a no-op; follow with
-`release` to undo what it wrote. The kill switch wins over the fill switch.
+`release` to undo what it wrote. The kill switch wins over the fill and
+keep-used switches.
 
 ## Core list
 

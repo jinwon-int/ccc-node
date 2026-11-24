@@ -1450,7 +1450,9 @@ fi
 # Opt out per node with CCC_SKILL_LISTING_POLICY=0 or
 # $CLAUDE_DIR/skill-listing-policy.disabled. Fill mode (#2748, default off) is
 # a per-node opt-in read by the policy itself: $CLAUDE_DIR/skill-listing-policy.fill
-# or CCC_SKILL_LISTING_FILL_FRACTION (docs/skill-listing-budget.md).
+# or CCC_SKILL_LISTING_FILL_FRACTION (docs/skill-listing-budget.md). The
+# keep-used tier (#2883, default off) is the same kind of per-node opt-in:
+# $CLAUDE_DIR/skill-listing-policy.keep-used or CCC_SKILL_LISTING_KEEP_USED_DAYS.
 if [ "$DRY" = 1 ]; then
   CCC_CLAUDE_DIR="$CLAUDE_DIR" python3 "$SRC/scripts/ccc-skill-listing-policy.py" plan --summary \
     --core "$SRC/claude/skill-listing-core.txt" 2>&1 | sed 's/^/[dry-run] /' || true

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Hermetic tests for ccc-skill-listing-policy.py (ccc-node#2011 A, fill mode #2748).
+"""Hermetic tests for ccc-skill-listing-policy.py (ccc-node#2011 A, fill mode #2748,
+keep-used tier #2883).
 
 Every case builds a private CCC_CLAUDE_DIR under a temp dir and drives the
 real CLI through a subprocess, so the live ~/.claude is never read or written.
@@ -759,6 +760,284 @@ class FillModeTests(PolicyCase):
         self.assertEqual(self.backups(), [])
         proc = self.apply("--context-tokens", str(2 * limit), "--fill-budget-fraction", "0.5")
         self.assertIn("described by fill=4", proc.stdout)
+
+
+class KeepUsedTests(PolicyCase):
+    """Keep-used tier (#2883): Skill-tool use beyond the recent window; default off."""
+
+    KEEP_FILE = "skill-listing-policy.keep-used"
+    KEEP_ENV = "CCC_SKILL_LISTING_KEEP_USED_DAYS"
+    BASE_DESCRIBED = ("core-flow", "pad-core", "recent-autosave", "recent-jsonl")
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Budget = 0.25 x ctx x 4 = ctx chars exactly, so a test can pick it.
+        self.write_settings({"skillListingBudgetFraction": 0.25, "theme": "dark"})
+        # A large core skill keeps every picked budget above the CLI minimum
+        # (--context-tokens >= 1000) without taking part in any tier.
+        self.skill("pad-core", "p" * 1200)
+        with self.core.open("a", encoding="utf-8") as fh:
+            fh.write("pad-core\n")
+
+    # -- helpers ----------------------------------------------------------
+    def used_skill(self, name: str, ts: str, desc_len: int = 1000, uses: int = 1) -> None:
+        self.skill(name, "d" * desc_len)
+        self.usage(*({"ts": ts, "skill": name, "tool": "Skill"} for _ in range(uses)))
+
+    def chars(self, described: tuple[str, ...]) -> int:
+        return sum(described_cost(n, d) if n in described else name_only_cost(n)
+                   for n, d in self.descs.items())
+
+    def plan(self, *args: str, env: dict | None = None) -> dict:
+        proc = self.run_cli("plan", "--json", *args, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def reasons(self, plan: dict) -> dict[str, str]:
+        return {d["skill"]: d["reason"] for d in plan["decisions"]}
+
+    def decisions(self, plan: dict) -> dict[str, str]:
+        return {d["skill"]: d["decision"] for d in plan["decisions"]}
+
+    # -- default off ------------------------------------------------------
+    def test_default_off_is_the_previous_result(self) -> None:
+        proc = self.apply()
+        self.assertNotIn("keep-used", proc.stdout)
+        self.assertNotIn("skill-used", proc.stdout)
+        ov = self.settings()["skillOverrides"]
+        self.assertEqual(ov, {n: "name-only" for n in ("codex-lane-only", "stale-one", "stale-two")})
+        plan = self.plan()
+        self.assertEqual(plan["keep_used"],
+                         {"enabled": False, "window": None, "source": None, "note": None})
+        self.assertEqual(self.reasons(plan)["stale-one"], "not core, not recently used")
+        text = self.run_cli("plan").stdout
+        self.assertNotIn("keep-used", text)
+        self.assertNotIn("skill-used", text)
+
+    # -- evidence ---------------------------------------------------------
+    def test_skill_tool_use_outside_the_recent_window_keeps_the_description(self) -> None:
+        # A view is not a use: Read and Bash rows, and an autosave record
+        # without use_count, never qualify.
+        self.skill("read-only-view", "Only ever read, never invoked through the Skill tool.")
+        self.skill("bash-only-view", "Only ever printed with a shell reader.")
+        self.usage({"ts": STALE, "skill": "read-only-view", "tool": "Read"},
+                   {"ts": STALE, "skill": "bash-only-view", "tool": "Bash"})
+        plan = self.plan("--keep-used-days", "all")
+        reasons, decisions = self.reasons(plan), self.decisions(plan)
+        self.assertEqual(decisions["stale-one"], "keep")
+        self.assertEqual(reasons["stale-one"], f"skill-used: last {STALE}")
+        for name in ("stale-two", "read-only-view", "bash-only-view", "codex-lane-only"):
+            self.assertEqual((decisions[name], reasons[name]),
+                             ("name-only", "not core, not recently used"), name)
+        self.apply("--keep-used-days", "all")
+        self.assertNotIn("stale-one", self.settings()["skillOverrides"])
+        self.assertIn("read-only-view", self.settings()["skillOverrides"])
+
+    def test_autosave_use_count_counts_and_the_two_ledgers_are_not_summed(self) -> None:
+        self.skill("auto-used", "Autosave skill invoked through the Skill tool earlier.")
+        self.usage({"ts": "2026-06-01T00:00:00Z", "skill": "auto-used", "tool": "Skill"},
+                   {"ts": "2026-06-02T00:00:00Z", "skill": "auto-used", "tool": "Skill"})
+        self.autosave({"claude:auto-used": {"use_count": 5, "last_used_at": "2026-06-20T00:00:00Z"},
+                       "claude:stale-two": {"last_used_at": STALE, "last_viewed_at": STALE},
+                       "codex:codex-lane-only": {"use_count": 3, "last_used_at": STALE}})
+        module = load_module(SCRIPT, "listing_policy_keep_used")
+        last = module.skill_tool_last_use(self.claude / "state")
+        self.assertEqual(last["auto-used"]["count"], 5)
+        self.assertEqual(last["auto-used"]["when"].strftime("%Y-%m-%d"), "2026-06-20")
+        self.assertNotIn("stale-two", last)
+        self.assertNotIn("codex-lane-only", last)  # another runtime's lane
+        self.assertEqual(self.reasons(self.plan("--keep-used-days", "all"))["auto-used"],
+                         "skill-used: last 2026-06-20T00:00:00Z")
+
+    def test_window_in_days_and_an_undated_use(self) -> None:
+        self.skill("undated-use", "Autosave record with a use count but no timestamp.")
+        self.autosave({"claude:undated-use": {"use_count": 2}})
+        # STALE is 88 days before NOW.
+        near = self.reasons(self.plan("--keep-used-days", "30"))
+        self.assertEqual(near["stale-one"], "not core, not recently used")
+        self.assertEqual(near["undated-use"], "not core, not recently used")
+        wide = self.reasons(self.plan("--keep-used-days", "100"))
+        self.assertEqual(wide["stale-one"], f"skill-used: last {STALE}")
+        self.assertEqual(wide["undated-use"], "not core, not recently used")
+        everything = self.reasons(self.plan("--keep-used-days", "all"))
+        self.assertEqual(everything["undated-use"], "skill-used: last unknown")
+
+    # -- budget -----------------------------------------------------------
+    def test_most_recent_use_first_and_the_first_miss_ends_the_tier(self) -> None:
+        self.used_skill("u-new", "2026-08-20T00:00:00Z")
+        self.used_skill("u-mid", "2026-08-10T00:00:00Z")
+        self.used_skill("u-old", "2026-08-01T00:00:00Z", desc_len=20)  # small: would fit alone
+        fits_two = self.chars(self.BASE_DESCRIBED + ("u-new", "u-mid"))
+        plan = self.plan("--keep-used-days", "all", "--context-tokens", str(fits_two))
+        reasons, decisions = self.reasons(plan), self.decisions(plan)
+        self.assertEqual([decisions[n] for n in ("u-new", "u-mid")], ["keep", "keep"])
+        self.assertTrue(reasons["u-old"].startswith("skill-used, over budget"), reasons["u-old"])
+        self.assertTrue(reasons["stale-one"].startswith("skill-used, over budget"))
+        self.assertEqual(plan["keep_used"]["described"], 2)
+        self.assertEqual(plan["keep_used"]["over_budget"], 2)
+        self.assertFalse(plan["after"]["over_budget"])
+        # One char less: u-mid misses, and the smaller u-old is NOT taken instead.
+        plan = self.plan("--keep-used-days", "all", "--context-tokens", str(fits_two - 1))
+        decisions = self.decisions(plan)
+        self.assertEqual(decisions["u-new"], "keep")
+        self.assertEqual([decisions[n] for n in ("u-mid", "u-old", "stale-one")], ["name-only"] * 3)
+        self.assertEqual(plan["keep_used"], dict(plan["keep_used"], described=1, over_budget=3))
+
+    def test_ties_break_on_use_count_then_name(self) -> None:
+        same = "2026-08-15T00:00:00Z"
+        self.used_skill("t-b", same)
+        self.used_skill("t-a", same)
+        self.used_skill("t-many", same, uses=3)
+        budget = self.chars(self.BASE_DESCRIBED + ("t-many", "t-a"))
+        decisions = self.decisions(self.plan("--keep-used-days", "all", "--context-tokens", str(budget)))
+        self.assertEqual([decisions[n] for n in ("t-many", "t-a", "t-b")],
+                         ["keep", "keep", "name-only"])
+
+    def test_not_while_a_recent_skill_is_over_budget(self) -> None:
+        self.skill("r-big", "d" * 1000)
+        self.usage({"ts": RECENT, "skill": "r-big", "tool": "Skill"})
+        budget = self.chars(self.BASE_DESCRIBED)  # r-big does not fit
+        plan = self.plan("--keep-used-days", "all", "--context-tokens", str(budget))
+        reasons = self.reasons(plan)
+        self.assertTrue(reasons["r-big"].startswith("recent, over budget"))
+        self.assertEqual(reasons["stale-one"], "not core, not recently used")
+        self.assertEqual((plan["keep_used"]["described"], plan["keep_used"]["over_budget"]), (0, 0))
+
+    # -- with fill --------------------------------------------------------
+    def test_runs_before_fill_and_fill_waits_for_it(self) -> None:
+        # First in fill order (tier "other", by name) and small enough to fit
+        # wherever the used skill does not.
+        self.skill("a-tiny", "Tiny.")
+        both = ("--keep-used-days", "all", "--fill-budget-fraction", "1")
+        roomy = self.chars(tuple(self.descs))
+        plan = self.plan(*both, "--context-tokens", str(roomy))
+        reasons = self.reasons(plan)
+        self.assertEqual(reasons["stale-one"], f"skill-used: last {STALE}")
+        for name in ("a-tiny", "stale-two", "codex-lane-only"):
+            self.assertTrue(reasons[name].startswith("fill: "), name)
+        self.assertEqual(sum(plan["fill"]["candidates"].values()), 3)  # stale-one is not a fill candidate
+        # The used skill misses by one char: it is name-only and fill does not
+        # run, although a-tiny alone would still fit.
+        tight = self.chars(self.BASE_DESCRIBED + ("stale-one",)) - 1
+        self.assertLess(extra_cost("a-tiny", self.descs["a-tiny"]),
+                        extra_cost("stale-one", self.descs["stale-one"]) - 1)
+        plan = self.plan(*both, "--context-tokens", str(tight))
+        reasons = self.reasons(plan)
+        self.assertTrue(reasons["stale-one"].startswith("skill-used, over budget"))
+        self.assertEqual(reasons["a-tiny"], "not core, not recently used")
+        self.assertFalse([r for r in reasons.values() if r.startswith("fill: ")])
+        self.assertEqual(plan["fill"]["promoted_total"], 0)
+        # Without the keep-used tier the same budget lets fill take a-tiny.
+        only_fill = self.reasons(self.plan("--fill-budget-fraction", "1", "--context-tokens", str(tight)))
+        self.assertTrue(only_fill["a-tiny"].startswith("fill: "))
+
+    # -- fixed decisions --------------------------------------------------
+    def test_core_operator_and_unlisted_skills_are_untouched(self) -> None:
+        self.skill("hidden-used", "Hidden from the model.", extra="disable-model-invocation: true\n")
+        self.usage({"ts": STALE, "skill": "hidden-used", "tool": "Skill"},
+                   {"ts": STALE, "skill": "core-flow", "tool": "Skill"})
+        self.write_settings({"skillListingBudgetFraction": 0.25,
+                             "skillOverrides": {"stale-one": "off"}})
+        plan = self.plan("--keep-used-days", "all")
+        decisions, reasons = self.decisions(plan), self.reasons(plan)
+        self.assertEqual(decisions["stale-one"], "operator")
+        self.assertEqual(decisions["hidden-used"], "unlisted")
+        self.assertEqual(reasons["core-flow"], "core")
+        self.apply("--keep-used-days", "all")
+        self.assertEqual(self.settings()["skillOverrides"]["stale-one"], "off")
+        self.assertNotIn("stale-one", self.state()["owned_overrides"])
+        self.assertEqual(set(self.settings()["skillOverrides"].values()) - {"off"}, {"name-only"})
+
+    # -- safety -----------------------------------------------------------
+    def test_idempotent_switch_removal_restores_baseline_and_release_ignores_it(self) -> None:
+        self.apply()
+        baseline, owned = self.settings(), self.state()
+        (self.claude / self.KEEP_FILE).write_text("# pilot\nall\n", encoding="utf-8")
+        first = self.apply("--quiet")
+        self.assertIn("settings.json updated", first.stdout)
+        self.assertNotIn("stale-one", self.settings()["skillOverrides"])
+        self.assertNotIn("stale-one", self.state()["owned_overrides"])
+        before = self.settings_path.read_bytes()
+        again = self.apply("--quiet")
+        self.assertIn("no change", again.stdout)
+        self.assertEqual(self.settings_path.read_bytes(), before)
+        # Kill switch wins over the tier.
+        stopped = self.apply(env={"CCC_SKILL_LISTING_POLICY": "0"})
+        self.assertIn("disabled", stopped.stdout)
+        self.assertEqual(self.settings_path.read_bytes(), before)
+        # Removing the switch brings the baseline entries back.
+        (self.claude / self.KEEP_FILE).unlink()
+        self.apply()
+        self.assertEqual(self.settings(), baseline)
+        self.assertEqual(self.state(), owned)
+        # release removes everything owned and never consults the switch.
+        (self.claude / self.KEEP_FILE).write_text("all\n", encoding="utf-8")
+        proc = self.run_cli("release", core=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("keep-used", proc.stdout)
+        self.assertNotIn("skillOverrides", self.settings())
+        self.assertEqual(self.state()["owned_overrides"], {})
+        self.assertEqual(self.run_cli("release", "--keep-used-days", "all", core=False).returncode, 2)
+
+    def test_switch_precedence_flag_then_env_then_file(self) -> None:
+        (self.claude / self.KEEP_FILE).write_text("all\n", encoding="utf-8")
+        from_file = self.plan()
+        self.assertEqual(from_file["keep_used"]["window"], "all")
+        self.assertTrue(from_file["keep_used"]["source"].startswith("file "))
+        self.assertEqual(self.reasons(from_file)["stale-one"], f"skill-used: last {STALE}")
+        # The env beats the file, including to turn the tier off for one run.
+        off = self.plan(env={self.KEEP_ENV: "0"})
+        self.assertEqual((off["keep_used"]["enabled"], off["keep_used"]["note"]), (False, "off"))
+        self.assertEqual(self.reasons(off)["stale-one"], "not core, not recently used")
+        narrow = self.plan(env={self.KEEP_ENV: "30"})
+        self.assertEqual(narrow["keep_used"]["window"], 30)
+        self.assertEqual(self.reasons(narrow)["stale-one"], "not core, not recently used")
+        # The flag beats both.
+        flagged = self.plan("--keep-used-days", "100", env={self.KEEP_ENV: "30"})
+        self.assertEqual((flagged["keep_used"]["window"], flagged["keep_used"]["source"]),
+                         (100, "--keep-used-days"))
+        self.assertEqual(self.reasons(flagged)["stale-one"], f"skill-used: last {STALE}")
+
+    def test_invalid_values(self) -> None:
+        self.apply()
+        before = self.settings_path.read_bytes()
+        for bad in ("0", "-3", "3651", "soon", "1.5"):
+            proc = self.run_cli("apply", "--keep-used-days", bad)
+            self.assertEqual(proc.returncode, 2, bad)
+            self.assertEqual(self.settings_path.read_bytes(), before, bad)
+        # An unusable env or file value turns the tier off and says so; it never
+        # falls through to the next source and never fails the scheduled apply.
+        (self.claude / self.KEEP_FILE).write_text("all\n", encoding="utf-8")
+        proc = self.run_cli("plan", "--json", env={self.KEEP_ENV: "soon"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("keep-used tier off", proc.stderr)
+        self.assertFalse(json.loads(proc.stdout)["keep_used"]["enabled"])
+        for text in ("soon\n", "# only a comment\n", "9999\n"):
+            (self.claude / self.KEEP_FILE).write_text(text, encoding="utf-8")
+            proc = self.run_cli("apply", "--quiet")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("keep-used tier off", proc.stderr, text)
+            self.assertEqual(self.settings_path.read_bytes(), before, text)
+        (self.claude / self.KEEP_FILE).write_text("off\n", encoding="utf-8")
+        proc = self.run_cli("apply")
+        self.assertEqual(proc.stderr, "")
+        self.assertIn("keep-used: off", proc.stdout)
+
+    def test_plan_reports_the_tier_and_stays_read_only(self) -> None:
+        self.apply()
+        before = self.settings_path.read_bytes()
+        plan = self.plan("--keep-used-days", "all")
+        self.assertEqual(plan["keep_used"], {"enabled": True, "window": "all",
+                                             "source": "--keep-used-days", "note": None,
+                                             "described": 1, "over_budget": 0})
+        self.assertEqual(plan["removed"], ["stale-one"])
+        self.assertTrue(plan["changed"])
+        text = self.run_cli("plan", "--keep-used-days", "90").stdout
+        self.assertIn("skill-used=1", text)
+        self.assertIn("keep-used: window=90d (--keep-used-days); described by Skill-tool use=1 over budget=0",
+                      text)
+        self.assertIn("keep      stale-one  [skill-used: last", text)
+        self.assertEqual(self.settings_path.read_bytes(), before)
 
 
 class OverBudgetReportTests(PolicyCase):
