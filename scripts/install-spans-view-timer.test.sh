@@ -7,18 +7,19 @@ set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 I="$DIR/install-spans-view-timer.sh"
 ROOT="$(cd "$DIR/.." && pwd)"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
+ccc_test_reset_hook_env
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
 UNITS="$TMP/units"; LOG="$TMP/systemctl.log"; OUT="$TMP/uploads/spans"
 mkdir -p "$TMP/uploads" "$TMP/bin" "$TMP/home/.claude/state"
-cat > "$TMP/bin/systemctl" <<'EOF'
-#!/usr/bin/env bash
+write_exec_stub "$TMP/bin/systemctl" <<'EOF'
 printf '%s\n' "$*" >> "$LOG"
 EOF
-chmod +x "$TMP/bin/systemctl"
 export LOG
 inst() { HOME="$TMP/home" CCC_STATE_DIR="$TMP/home/.claude/state" CCC_SYSTEMD_DIR="$UNITS" \
            CCC_SYSTEMCTL="$TMP/bin/systemctl" CCC_FLEET_NODES='' CCC_FLEET_SELF='' bash "$I" "$@"; }

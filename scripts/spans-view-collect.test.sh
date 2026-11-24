@@ -6,9 +6,13 @@
 # shellcheck disable=SC2034  # test variables are read inside the eval'd ok() conditions
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$DIR/.." && pwd)"
 C="$DIR/spans-view-collect.sh"
+# shellcheck source=claude/hooks/lib/test-stub.sh
+. "$ROOT/claude/hooks/lib/test-stub.sh"
+ccc_test_reset_hook_env
 pass=0; fail=0
-TMP="$(mktemp -d)"
+TMP="$(ccc_test_tmpdir)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 ok() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
 
@@ -25,8 +29,7 @@ EOF
 
 # Fake ssh: logs its arguments, then behaves per node name. The probe arrives
 # on stdin exactly as it would on a node.
-cat > "$TMP/bin/ssh" <<'EOF'
-#!/usr/bin/env bash
+write_exec_stub "$TMP/bin/ssh" <<'EOF'
 printf '%s\n' "$*" >> "$CALLS"
 node=''; day="${*: -1}"
 prev=''
@@ -48,7 +51,6 @@ case "$node" in
 esac
 CCC_SPANS_VIEW_STATE_DIR="$NODE_STATE" python3 - "$day"
 EOF
-chmod +x "$TMP/bin/ssh"
 export CALLS TMP NODE_STATE
 run() { # <nodes> [extra args...]
   local nodes="$1"; shift
