@@ -366,7 +366,7 @@ for refresh_case in missing error stale provider; do
     CCC_NUNCHI_MEMPALACE_STATUS="$optional_refresh_status" \
     CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
     CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" \
-    CCC_MEMORY_CACHE_TTL_SEC="$case_ttl" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
+    CCC_MEMORY_MEMPALACE_REFRESH_TTL_SEC="$case_ttl" CCC_MEMORY_CHECK_NOW_EPOCH=200 \
     CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1)"; rc=$?
   ok "Termux configured refresh fails closed for $refresh_case state without its CLI" \
     '[ "$rc" = 0 ] && jq -e --arg reason "$expected_reason" '\'' .mempalace.status == "degraded" and (.mempalace.reasons | index($reason)) != null '\'' >/dev/null <<<"$out"'
@@ -645,6 +645,26 @@ out="$(HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_s
 ok "memory probe honors the custom refresh status path" \
   '[ "$rc" = 0 ] && jq -e '\'' .mempalace.status == "ok" and .mempalace.refresh.age_seconds == 10 '\'' >/dev/null <<<"$out"'
 
+# #2876: the managed refresh runs once a day (02:17, #2857), so a 09:00 check
+# (~6.7 h later) must not read as refresh-stale under the 6 h cache TTL.
+run_refresh_age_probe() {  # <now-epoch> [extra env assignment...]
+  local now="$1"; shift
+  env "$@" HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CHECK_NOW_EPOCH="$now" \
+    CCC_NUNCHI_MEMPALACE_STATUS="$custom_refresh_status" \
+    CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
+    CCC_NUNCHI_CRONTAB_TEXT="$probe_cron" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
+}
+out="$(run_refresh_age_probe 24310 CCC_MEMORY_CACHE_TTL_SEC=21600)"; rc=$?
+ok "a daily refresh checked ~6.7 h later is not refresh-stale under the 6 h cache TTL (#2876)" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.refresh.age_seconds == 24120 and (.mempalace.reasons | index("refresh-stale")) == null '\'' >/dev/null <<<"$out"'
+out="$(run_refresh_age_probe 93791)"; rc=$?
+ok "a refresh older than the 26 h default window is still refresh-stale (#2876)" \
+  '[ "$rc" = 0 ] && jq -e '\'' .mempalace.refresh.age_seconds == 93601 and (.mempalace.reasons | index("refresh-stale")) != null '\'' >/dev/null <<<"$out"'
+out="$(run_refresh_age_probe 24310 CCC_MEMORY_MEMPALACE_REFRESH_TTL_SEC=3600)"; rc=$?
+ok "CCC_MEMORY_MEMPALACE_REFRESH_TTL_SEC overrides the refresh freshness window (#2876)" \
+  '[ "$rc" = 0 ] && jq -e '\'' (.mempalace.reasons | index("refresh-stale")) != null '\'' >/dev/null <<<"$out"'
+
 cron_refresh_status="$TMP/cron-config-refresh.status.json"
 printf '%s\n' '{"schema":"ccc.nunchi.mempalace-refresh.v1","provider":"codex","state":"ok","exit_code":0,"started_at":180,"finished_at":190}' > "$cron_refresh_status"
 cron_configured_refresh=$'*/10 * * * * bash /tmp/codex-feed.sh # nunchi:#816\n17 * * * * CCC_NUNCHI_MEMPALACE_STATUS='"$cron_refresh_status"' CCC_NUNCHI_MEMPALACE_CLI='"$probe_home/.local/bin/mempalace"' bash /tmp/mempalace-refresh.sh codex /tmp/sessions # nunchi:#816\n7 8 * * 1 bash /tmp/bench.sh # nunchi:#816'
@@ -714,7 +734,7 @@ cs_feed="*/10 * * * * $cs_env bash /tmp/ingest-cron.sh # nunchi:#816 gen=h_01234
 cs_bench="7 11 * * 1 $cs_env bash /tmp/bench.sh # nunchi:#816 gen=h_0123456789ab"
 run_cs_probe() {  # <crontab-text>
   HOME="$probe_home" CCC_CLAUDE_DIR="$probe_claude" CCC_STATE_DIR="$probe_state" \
-    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CACHE_TTL_SEC=10 \
+    CCC_MEMORY_CACHE_DIR="$cache" CCC_MEMORY_DIR="$mem" CCC_MEMORY_CACHE_TTL_SEC=10 CCC_MEMORY_MEMPALACE_REFRESH_TTL_SEC=10 \
     CCC_MEMORY_CHECK_NOW_EPOCH=200 CCC_NUNCHI_MEMPALACE_REPAIR_STATUS_TEXT="$repair_ok" \
     CCC_NUNCHI_CRONTAB_TEXT="$1" bash "$ROOT/scripts/ccc-memory-check.sh" --json 2>&1
 }
