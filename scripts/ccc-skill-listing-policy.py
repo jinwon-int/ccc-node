@@ -49,6 +49,25 @@ cron change. ``0``/``off`` in the env or file means off; an invalid value there
 is ignored with a warning on stderr (fill off). Without a switch the decisions
 and the written ``settings.json`` are exactly the pre-fill ones.
 
+Keep-used tier (ccc-node#2883, default OFF). A skill that was really used
+loses its description once its last use leaves the recent window, and a
+name-only skill can then lose to a similarly named one (measured: three of
+eighteen routing items failed with the right skill name-only and passed with
+its description listed). With a keep-used window the policy also describes
+skills that have a recorded **Skill-tool** use within the last ``N`` days, or
+at any time (``all``). A ``Read`` of the SKILL.md is a view, not a use, and
+does not count here. The tier comes after the recent one and before fill:
+candidates are ranked by their most recent Skill-tool use (then use count,
+then name) and described while the estimate stays within the full budget; the
+first one that does not fit ends the tier (``skill-used, over budget``), and
+neither this tier nor fill runs while a recently used skill is over budget.
+The switch is, first present wins, ``--keep-used-days N|all`` > env
+``CCC_SKILL_LISTING_KEEP_USED_DAYS`` > the node-local file
+``<claude-dir>/skill-listing-policy.keep-used`` (first non-comment line).
+``0``/``off`` means off; an invalid env or file value is ignored with a
+warning on stderr (tier off). Without a switch the decisions, the report and
+the written ``settings.json`` are exactly the previous ones.
+
 Safety contract:
 
 * it only ever writes ``"name-only"``; never ``"off"``, never deletes or moves
@@ -69,10 +88,11 @@ Safety contract:
   before the 200k default;
 * ``settings.json`` is backed up and replaced atomically, only when the
   rendered result differs (a second ``apply`` is a no-op, with or without
-  fill: the decision depends only on the inputs and no fill state is stored).
+  fill or the keep-used tier: the decision depends only on the inputs and no
+  fill or keep-used state is stored).
 
 Subcommands: ``plan`` (read-only), ``apply``, ``release`` (remove every entry
-this tool owns; it ignores the fill switch). Kill switch: ``CCC_SKILL_LISTING_POLICY=0`` or the file
+this tool owns; it ignores the fill and keep-used switches). Kill switch: ``CCC_SKILL_LISTING_POLICY=0`` or the file
 ``<claude-dir>/skill-listing-policy.disabled`` makes ``apply`` a no-op.
 Stdlib only.
 """
@@ -157,6 +177,14 @@ FILL_OFF_WORDS = frozenset({"0", "off", "false", "no"})
 FILL_TIERS = ("autosave-unused", "fleet", "other")
 REASON_FILL_PREFIX = "fill: "
 MAX_FILL_FILE_BYTES = 4 * 1024
+# Keep-used tier (#2883, default off): Skill-tool use beyond the recent window.
+KEEP_USED_FILE = "skill-listing-policy.keep-used"
+KEEP_USED_ENV = "CCC_SKILL_LISTING_KEEP_USED_DAYS"
+KEEP_USED_FLAG = "--keep-used-days"
+KEEP_USED_ALL = "all"
+MAX_KEEP_USED_DAYS = 3650
+REASON_USED_PREFIX = "skill-used: "
+REASON_USED_OVER_BUDGET = "skill-used, over budget"
 # Provenance markers written by the autosave layer (skill-review/ownership.py)
 # and the fleet-skills sync (ccc-fleet-skills-sync.py). Read-only here, and
 # only to order fill candidates — never used for authority.
@@ -416,6 +444,108 @@ def skill_tool_used(state_dir: Path) -> set[str]:
         if isinstance(uses, int) and not isinstance(uses, bool) and uses > 0:
             used.add(skill)
     return used
+
+
+def skill_tool_last_use(state_dir: Path) -> dict[str, dict[str, Any]]:
+    """skill -> {"when": latest Skill-tool use or None, "count": n} (#2883).
+
+    The same evidence as ``skill_tool_used``: ``Skill`` rows in ``usage.jsonl``
+    and an autosave record with ``use_count`` > 0 (its ``last_used_at``). The
+    two ledgers overlap, so ``count`` is the larger of the two, never the sum.
+    ``when`` is None when no usable timestamp was recorded.
+    """
+    latest: dict[str, datetime | None] = {}
+    counts: dict[str, int] = {}
+
+    def note(skill: str, when: datetime | None) -> None:
+        current = latest.get(skill)
+        if skill not in latest or (when is not None and (current is None or when > current)):
+            latest[skill] = when
+
+    raw = _read_bounded(state_dir / "skill-usage" / "usage.jsonl", MAX_LEDGER_BYTES)
+    for line in (raw or b"").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("tool") != "Skill":
+            continue
+        skill = row.get("skill")
+        if isinstance(skill, str) and NAME_RE.match(skill):
+            counts[skill] = counts.get(skill, 0) + 1
+            note(skill, parse_ts(row.get("ts")))
+    for skill, rec in claude_autosave_records(state_dir):
+        uses = rec.get("use_count")
+        if (isinstance(skill, str) and NAME_RE.match(skill)
+                and isinstance(uses, int) and not isinstance(uses, bool) and uses > 0):
+            counts[skill] = max(counts.get(skill, 0), uses)
+            note(skill, parse_ts(rec.get("last_used_at")))
+    return {k: {"when": v, "count": counts[k]} for k, v in latest.items()}
+
+
+def keep_used_candidates(state_dir: Path, cutoff: datetime | None) -> dict[str, dict[str, Any]]:
+    """skill -> {"ts": ISO timestamp or "", "count": n} for the keep-used tier.
+
+    With a ``cutoff`` only a Skill-tool use at or after it counts, so a use
+    without a usable timestamp is left out. ``cutoff=None`` (window ``all``)
+    takes every recorded use; an undated one sorts last (``ts`` is ``""``).
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for skill, rec in skill_tool_last_use(state_dir).items():
+        when = rec["when"]
+        if cutoff is not None and (when is None or when < cutoff):
+            continue
+        out[skill] = {"ts": when.strftime("%Y-%m-%dT%H:%M:%SZ") if when else "", "count": rec["count"]}
+    return out
+
+
+def parse_keep_used(raw: str) -> int | str | None:
+    """A keep-used window: days (1..3650), ``"all"``, or None when unusable."""
+    text = raw.strip().lower()
+    if text == KEEP_USED_ALL:
+        return KEEP_USED_ALL
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if 1 <= value <= MAX_KEEP_USED_DAYS else None
+
+
+def _keep_used_setting(raw: str, source: str) -> dict[str, Any]:
+    if raw.strip().lower() in FILL_OFF_WORDS:
+        return {"window": None, "source": source, "note": "off"}
+    value = parse_keep_used(raw)
+    if value is None:
+        return {"window": None, "source": source,
+                "note": f"invalid value ignored (expected days 1..{MAX_KEEP_USED_DAYS} or '{KEEP_USED_ALL}')"}
+    return {"window": value, "source": source, "note": None}
+
+
+def resolve_keep_used(flag: int | str | None, claude_dir: Path) -> dict[str, Any]:
+    """The keep-used switch: {"window": days, "all" or None, "source", "note"}.
+
+    Same precedence and failure rule as ``resolve_fill``: the first PRESENT
+    source decides (flag, env, node-local file), and a present but unusable
+    value never falls through to the next source — the tier is off and
+    ``note`` says why.
+    """
+    if flag is not None:
+        return {"window": flag, "source": KEEP_USED_FLAG, "note": None}
+    raw = os.environ.get(KEEP_USED_ENV, "").strip()
+    if raw:
+        return _keep_used_setting(raw, f"env {KEEP_USED_ENV}")
+    path = claude_dir / KEEP_USED_FILE
+    source = f"file {path}"
+    try:
+        if path.stat().st_size > MAX_FILL_FILE_BYTES:
+            return _keep_used_setting("", source)
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return {"window": None, "source": None, "note": None}
+    except OSError:
+        return _keep_used_setting("", source)
+    values = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+    return _keep_used_setting(next((v for v in values if v), ""), source)
 
 
 def read_marker(path: Path) -> tuple[dict[str, Any], int] | None:
@@ -774,6 +904,46 @@ def place_fill(
     return promoted
 
 
+def place_keep_used(
+    skills: dict[str, dict[str, Any]],
+    fillable: set[str],
+    used: int,
+    keep_used: dict[str, dict[str, Any]] | None,
+    budget_chars: int | None,
+    max_desc: int,
+    fits: bool,
+) -> tuple[list[tuple[str, str, str]], int, bool]:
+    """(name, decision, reason) per keep-used candidate, the new estimate, fits (#2883).
+
+    Candidates are the ``fillable`` skills (not operator, core or recent) with
+    a recorded Skill-tool use in ``keep_used``, ranked by most recent use, then
+    use count, then name. A candidate is described while the running estimate
+    stays within ``budget_chars``; from the first one that does not fit, every
+    remaining candidate is name-only and ``fits`` is False, so a less recently
+    used skill is never described while a more recent one is not. Nothing is
+    placed when the tier is off or a recently used skill is already over
+    budget (``fits`` False on entry).
+    """
+    placed: list[tuple[str, str, str]] = []
+    if not fits or not keep_used or budget_chars is None:
+        return placed, used, fits
+    # Stable two-key sort: name ascending, then latest use / count descending.
+    ranked = sorted(name for name in fillable if name in keep_used)
+    ranked.sort(key=lambda n: (keep_used[n]["ts"], keep_used[n]["count"]), reverse=True)
+    for name in ranked:
+        desc_chars = skills[name]["desc_chars"]
+        extra = (entry_chars(name, desc_chars, "on", max_desc)
+                 - entry_chars(name, desc_chars, MANAGED_VALUE, max_desc))
+        last = keep_used[name]["ts"] or "unknown"
+        if fits and used + extra <= budget_chars:
+            placed.append((name, "keep", f"{REASON_USED_PREFIX}last {last}"))
+            used += extra
+        else:
+            fits = False
+            placed.append((name, MANAGED_VALUE, f"{REASON_USED_OVER_BUDGET} (last {last})"))
+    return placed, used, fits
+
+
 def decide(
     skills: dict[str, dict[str, Any]],
     operator: dict[str, Any],
@@ -783,6 +953,7 @@ def decide(
     max_desc: int = DEFAULT_MAX_DESC_CHARS,
     budget_chars: int | None = None,
     fill: dict[str, Any] | None = None,
+    keep_used: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
     """Per-skill decisions and the override entries this tool wants to own.
 
@@ -798,6 +969,12 @@ def decide(
     that would otherwise be plain name-only are then offered to ``place_fill``
     — only when every recent skill fitted, so fill never describes an unused
     skill while a recently used one is over budget.
+
+    With ``keep_used`` ({name: {"ts", "count"}}, #2883) the otherwise plain
+    name-only skills that have a recorded Skill-tool use are placed first, by
+    the same prefix rule against the full budget: most recent use first, and
+    from the first one that does not fit the rest are name-only (``skill-used,
+    over budget``). Fill then runs only when that tier fitted too.
     """
     decisions: dict[str, dict[str, str]] = {}
     desired: dict[str, str] = {}
@@ -845,6 +1022,12 @@ def decide(
             fits = False
             put(name, MANAGED_VALUE, f"{REASON_OVER_BUDGET} (used {recent[name]['ts']})")
 
+    placed, used, fits = place_keep_used(skills, fillable, used, keep_used, budget_chars, max_desc,
+                                         fits)
+    for name, decision, reason in placed:
+        put(name, decision, reason)
+        fillable.discard(name)
+
     promoted = place_fill(skills, fillable, used, fill if fits else None, max_desc)
     for name in sorted(fillable):
         if name in promoted:
@@ -885,8 +1068,10 @@ def compute(
     release: bool = False,
     context_tokens: int = DEFAULT_CONTEXT_TOKENS,
     fill: dict[str, Any] | None = None,
+    keep_used: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """``fill`` is {"fraction": F, "order": fill_order(...)} or None (off)."""
+    """``fill`` is {"fraction": F, "order": fill_order(...)} or None (off);
+    ``keep_used`` is keep_used_candidates(...) or None (off)."""
     current: dict[str, Any] = dict(settings.get(OVERRIDES_KEY) or {})
     owned_before: dict[str, str] = state["owned_overrides"]
     # An owned key is still ours only while its value is exactly what we wrote.
@@ -901,7 +1086,8 @@ def compute(
     if fill is not None and budget_chars is not None:
         fill_plan = {"limit": int(fill["fraction"] * budget_chars), "order": fill["order"]}
     decisions, desired_ours = decide(skills, operator, set(core), recent, release,
-                                     effective_max_desc(probe), budget_chars, fill_plan)
+                                     effective_max_desc(probe), budget_chars, fill_plan,
+                                     None if release else keep_used)
     if any(v != MANAGED_VALUE for v in desired_ours.values()):
         raise PolicyError("internal: refusing to write a value other than name-only")
 
@@ -939,7 +1125,18 @@ def compute(
         "removed": sorted(k for k in ours_now if k not in desired_ours),
         "budget_action": budget_action,
         "fill": fill_report(fill_plan, decisions),
+        "keep_used": None if release else keep_used_report(keep_used, decisions),
     }
+
+
+def keep_used_report(keep_used: dict[str, dict[str, Any]] | None,
+                     decisions: list[dict[str, str]]) -> dict[str, Any] | None:
+    """What the keep-used tier did: described / left name-only over budget."""
+    if keep_used is None:
+        return None
+    described = sum(1 for d in decisions if d["reason"].startswith(REASON_USED_PREFIX))
+    over = sum(1 for d in decisions if d["reason"].startswith(REASON_USED_OVER_BUDGET))
+    return {"described": described, "over_budget": over}
 
 
 def fill_report(fill_plan: dict[str, Any] | None, decisions: list[dict[str, str]]) -> dict[str, Any] | None:
@@ -1096,7 +1293,18 @@ def disabled(claude_dir: Path) -> str | None:
 def keep_kind(reason: str) -> str:
     if reason == "core":
         return "core"
+    if reason.startswith(REASON_USED_PREFIX):
+        return "used"
     return "fill" if reason.startswith(REASON_FILL_PREFIX) else "recent"
+
+
+def keep_used_line(switch: dict[str, Any], report: dict[str, Any] | None) -> str | None:
+    """The plan/apply line for the keep-used tier; None when no switch is present."""
+    if report is None:
+        return f"  keep-used: off ({switch['source']}: {switch['note']})" if switch["source"] else None
+    window = KEEP_USED_ALL if switch["window"] == KEEP_USED_ALL else f"{switch['window']}d"
+    return (f"  keep-used: window={window} ({switch['source']}); "
+            f"described by Skill-tool use={report['described']} over budget={report['over_budget']}")
 
 
 def fill_line(fill: dict[str, Any], report: dict[str, Any] | None, after: dict[str, Any]) -> str | None:
@@ -1112,9 +1320,10 @@ def fill_line(fill: dict[str, Any], report: dict[str, Any] | None, after: dict[s
 
 
 def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: dict[str, Any],
-              recent_days: int, context_tokens: int, fill: dict[str, Any] | None = None) -> list[str]:
+              recent_days: int, context_tokens: int, fill: dict[str, Any] | None = None,
+              keep_used: dict[str, Any] | None = None) -> list[str]:
     counts: dict[str, int] = {}
-    reasons = {"core": 0, "recent": 0, "fill": 0, "over": 0}
+    reasons = {"core": 0, "recent": 0, "used": 0, "fill": 0, "over": 0}
     for d in result["decisions"]:
         counts[d["decision"]] = counts.get(d["decision"], 0) + 1
         if d["decision"] == "keep":
@@ -1123,9 +1332,12 @@ def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: d
             reasons["over"] += 1
     report = result.get("fill")
     filled = f" fill={reasons['fill']}" if report is not None else ""
+    used_report = result.get("keep_used")
+    kept_used = f" skill-used={reasons['used']}" if used_report is not None else ""
     lines = [
         f"skill-listing-policy {cmd}: skills={len(result['decisions'])} "
-        f"keep={counts.get('keep', 0)} (core={reasons['core']} recent<{recent_days}d={reasons['recent']}{filled}) "
+        f"keep={counts.get('keep', 0)} "
+        f"(core={reasons['core']} recent<{recent_days}d={reasons['recent']}{kept_used}{filled}) "
         f"name-only={counts.get(MANAGED_VALUE, 0)} (recent over budget={reasons['over']}) "
         f"operator={counts.get('operator', 0)} unlisted={counts.get('unlisted', 0)}",
         f"  owned entries: +{len(result['added'])} -{len(result['removed'])}; "
@@ -1139,6 +1351,9 @@ def summarize(cmd: str, result: dict[str, Any], before: dict[str, Any], after: d
         f"  after: described chars={after['described_chars']} (core={after['core_desc_chars']}) "
         f"name-only chars={after['name_only_chars']} over_budget={str(after['over_budget']).lower()}",
     ]
+    line = keep_used_line(keep_used, used_report) if keep_used is not None else None
+    if line:
+        lines.append(line)
     line = fill_line(fill, report, after) if fill is not None else None
     if line:
         lines.append(line)
@@ -1164,13 +1379,17 @@ def print_plan(args: argparse.Namespace, claude_dir: Path, raw: bytes | None,
             "fill": {"enabled": result["fill"] is not None, "fraction": args.fill["fraction"],
                      "source": args.fill["source"], "note": args.fill["note"],
                      **(result["fill"] or {})},
+            "keep_used": {"enabled": result["keep_used"] is not None,
+                          "window": args.keep_used["window"], "source": args.keep_used["source"],
+                          "note": args.keep_used["note"], **(result["keep_used"] or {})},
             "changed": render(result["settings"]) != raw,
         }, indent=2, ensure_ascii=False))
         return
     if not args.summary:
         for d in result["decisions"]:
             print(f"{d['decision']:<9} {d['skill']}  [{d['reason']}]")
-    for line in summarize("plan", result, before, after, args.days, args.context_tokens, args.fill):
+    for line in summarize("plan", result, before, after, args.days, args.context_tokens, args.fill,
+                          args.keep_used):
         print(line)
     print(f"  context window: {args.context_tokens // 1000}k ({args.context_source})")
 
@@ -1220,6 +1439,13 @@ def run(args: argparse.Namespace) -> int:
         print(f"skill-listing-policy: fill mode off — {args.fill['source']}: {args.fill['note']}",
               file=sys.stderr)
 
+    # Same for the keep-used tier (#2883): release never consults its switch.
+    used_off = {"window": None, "source": None, "note": None}
+    args.keep_used = used_off if cmd == "release" else resolve_keep_used(args.keep_used_days, claude_dir)
+    if args.keep_used["note"] and args.keep_used["note"] != "off":
+        print(f"skill-listing-policy: keep-used tier off — {args.keep_used['source']}: "
+              f"{args.keep_used['note']}", file=sys.stderr)
+
     # release needs no core list: it only removes what this tool owns.
     core = [] if cmd == "release" else load_core(resolve_core_path(args.core))
     now = now_utc()
@@ -1228,6 +1454,11 @@ def run(args: argparse.Namespace) -> int:
     fill = None
     if args.fill["fraction"] is not None:
         fill = {"fraction": args.fill["fraction"], "order": fill_order(skills, state_dir)}
+    keep_used = None
+    if args.keep_used["window"] is not None:
+        window = args.keep_used["window"]
+        keep_used = keep_used_candidates(
+            state_dir, None if window == KEEP_USED_ALL else now - timedelta(days=window))
 
     def evaluate() -> tuple[bytes | None, dict[str, Any] | None, dict[str, Any] | None]:
         raw, settings = load_settings(settings_path)
@@ -1235,7 +1466,7 @@ def run(args: argparse.Namespace) -> int:
             return None, None, None
         result = compute(settings, load_state(state_dir / STATE_FILE), skills, core, recent,
                          args.budget_fraction, release=(cmd == "release"),
-                         context_tokens=args.context_tokens, fill=fill)
+                         context_tokens=args.context_tokens, fill=fill, keep_used=keep_used)
         return raw, settings, result
 
     if cmd == "plan":
@@ -1256,7 +1487,8 @@ def run(args: argparse.Namespace) -> int:
     if not args.quiet:
         before = estimate(settings, skills, args.context_tokens, set(core))
         after = estimate(result["settings"], skills, args.context_tokens, set(core))
-        for line in summarize(cmd, result, before, after, args.days, args.context_tokens, args.fill):
+        for line in summarize(cmd, result, before, after, args.days, args.context_tokens, args.fill,
+                              args.keep_used):
             print(line)
         print(f"  context window: {args.context_tokens // 1000}k ({args.context_source})")
     return 0
@@ -1280,6 +1512,13 @@ def fraction(raw: str) -> float:
     value = float(raw)
     if not 0 < value <= 1:
         raise argparse.ArgumentTypeError("budget fraction must be in (0, 1]")
+    return value
+
+
+def keep_used_window(raw: str) -> int | str:
+    value = parse_keep_used(raw)
+    if value is None:
+        raise argparse.ArgumentTypeError(f"keep-used window must be days 1..{MAX_KEEP_USED_DAYS} or '{KEEP_USED_ALL}'")
     return value
 
 
@@ -1320,11 +1559,18 @@ def main(argv: list[str] | None = None) -> int:
                                 "skills while the estimated listing stays within F x budget, "
                                 f"0 < F <= 1 (default: env {FILL_ENV}, else the first non-comment line of "
                                 f"<claude-dir>/{FILL_FILE}, else off)")
+            p.add_argument(KEEP_USED_FLAG, type=keep_used_window, default=None, metavar="N|all",
+                           help="keep-used tier (#2883, default off): also describe skills with a "
+                                "recorded Skill-tool use in the last N days, or at any time (all), "
+                                "most recent first, while the estimated listing fits the budget "
+                                f"(default: env {KEEP_USED_ENV}, else the first non-comment line of "
+                                f"<claude-dir>/{KEEP_USED_FILE}, else off)")
         if name == "plan":
             p.add_argument("--summary", action="store_true", help="omit per-skill decision lines")
             p.add_argument("--json", action="store_true", help="machine-readable plan")
     args = parser.parse_args(argv)
     args.fill_budget_fraction = getattr(args, "fill_budget_fraction", None)
+    args.keep_used_days = getattr(args, "keep_used_days", None)
     args.env_context_tokens = defaults["context_tokens"]
     args.context_source = "--context-tokens"
     try:
