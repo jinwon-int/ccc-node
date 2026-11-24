@@ -322,6 +322,59 @@ def test_models_skills_outcomes_and_a2a(env):
     assert list(block["top_failure_classes"].values())[0] == 3
 
 
+# --- a2a worker contract (#2858) -------------------------------------------------
+
+#: Lines exactly as the a2a-nexus worker writes them
+#: (packages/broker/src/workers/a2a-span-writer.ts, ``A2ASpanWriter.record``):
+#: two tasks of claim → dispatch → receipt plus a timed-out dispatch whose
+#: completion report the broker rejected. Payload/result appear only as
+#: byte counts and sha256 prefixes.
+A2A_WORKER_LINES = [
+    '{"kind":"a2a","status":"ok","gen_ai.operation.name":"a2a.claim","start_ts":1793926800,"duration_ms":120,"ccc.node":"testnode","ccc.outcome":"claimed","ccc.a2a.task_ref":"cb45de7833575506","ccc.a2a.payload_bytes":43,"ccc.a2a.payload_sha256":"4402da1899f48e37"}',
+    '{"kind":"a2a","status":"ok","gen_ai.operation.name":"a2a.dispatch","start_ts":1793926800.2,"duration_ms":90000,"ccc.node":"testnode","ccc.outcome":"completed","ccc.a2a.task_ref":"cb45de7833575506","ccc.a2a.result_bytes":44,"ccc.a2a.result_sha256":"b7824438b438268e"}',
+    '{"kind":"a2a","status":"ok","gen_ai.operation.name":"a2a.receipt","start_ts":1793926890.3,"duration_ms":100,"ccc.node":"testnode","ccc.outcome":"complete","ccc.a2a.task_ref":"cb45de7833575506"}',
+    '{"kind":"a2a","status":"ok","gen_ai.operation.name":"a2a.claim","start_ts":1793926801,"duration_ms":100,"ccc.node":"testnode","ccc.outcome":"claimed","ccc.a2a.task_ref":"28905e9ccc89e153","ccc.a2a.payload_bytes":2,"ccc.a2a.payload_sha256":"44136fa355b3678a"}',
+    '{"kind":"a2a","status":"error","gen_ai.operation.name":"a2a.dispatch","start_ts":1793926801.2,"duration_ms":4000,"ccc.node":"testnode","error.type":"handler_exit_nonzero","ccc.outcome":"failed","ccc.a2a.task_ref":"28905e9ccc89e153"}',
+    '{"kind":"a2a","status":"ok","gen_ai.operation.name":"a2a.receipt","start_ts":1793926805.3,"duration_ms":100,"ccc.node":"testnode","ccc.outcome":"fail","ccc.a2a.task_ref":"28905e9ccc89e153"}',
+    '{"kind":"a2a","status":"timeout","gen_ai.operation.name":"a2a.dispatch","start_ts":1793926806,"duration_ms":3000,"ccc.node":"testnode","error.type":"handler_timeout","ccc.outcome":"failed","ccc.a2a.task_ref":"f0fdb386c77310f0"}',
+    '{"kind":"a2a","status":"error","gen_ai.operation.name":"a2a.receipt","start_ts":1793926809.1,"duration_ms":100,"ccc.node":"testnode","error.type":"receipt_http_500","ccc.outcome":"complete","ccc.a2a.task_ref":"f0fdb386c77310f0"}',
+]
+
+
+def test_a2a_worker_lines_survive_sanitize_unchanged():
+    sanitize = rollup.load_span_ledger().sanitize_span
+    for line in A2A_WORKER_LINES:
+        span = json.loads(line)
+        assert sanitize(span) == span, line
+
+
+def test_a2a_worker_lines_roll_up_into_real_a2a_values(env):
+    assert IN_DAY == 1793926800  # the fixture lines start at 10:00 KST on DAY
+    env.write_spans("2026-11-06", [turn(IN_DAY)], raw_lines=[line + "\n" for line in A2A_WORKER_LINES])
+    summary = summarize(env)
+    assert summary["a2a"] == {
+        "spans": 8, "ok": 5, "failed": 3,
+        "top_failure_classes": {"handler_exit_nonzero": 1, "handler_timeout": 1, "receipt_http_500": 1},
+    }
+    lines = rollup.evidence_lines(summary)
+    assert "a2a: spans=8 ok=5 failed=3" in lines
+    assert ("a2a top failure classes: handler_exit_nonzero=1, handler_timeout=1, "
+            "receipt_http_500=1") in lines
+
+
+def test_a2a_body_text_never_reaches_rollup_output(env, capsys):
+    hostile = {"kind": "a2a", "status": "error", "start_ts": IN_DAY + 5,
+               "gen_ai.operation.name": "a2a.dispatch", "error.type": BODY,
+               "ccc.outcome": BODY, "ccc.a2a.payload_sha256": BODY,
+               "task.payload": BODY, "error.message": BODY, "gen_ai.prompt": BODY}
+    env.write_spans("2026-11-06", [turn(IN_DAY), hostile])
+    assert env.run("--dry-run", "--json") == 0
+    out = capsys.readouterr().out
+    assert BODY not in out
+    assert json.loads(out)["a2a"] == {"spans": 1, "ok": 0, "failed": 1,
+                                      "top_failure_classes": {"error": 1}}
+
+
 # --- body-free contract ---------------------------------------------------------
 
 
