@@ -184,6 +184,12 @@ PARTIAL_GAP_RE="${NUNCHI_BENCH_PARTIAL_GAP_RE:-근거에 포함되지 않}"
 lead_block() {
   printf '%s\n' "$1" | awk 'NF == 0 { next } { print } !/^[[:space:]]*#/ { exit }'
 }
+# #2823 — the acceptance rule the Wiki layer applies to a synthesis, shared by
+# the first draw and the single re-synthesis so the two cannot drift apart.
+wiki_accepted() {
+  [ -n "${1//[[:space:]]/}" ] && ! is_refusal "$1" && ! printf '%s' "$1" | grep -qiE "$INVALID_RE"
+}
+
 is_refusal() {
   lead_block "$1" | grep -qE "$NO_RECORD_RE|$PARTIAL_GAP_RE"
 }
@@ -204,6 +210,15 @@ case "$WIKI_TIMEOUT" in
   ''|*[!0-9]*) WIKI_TIMEOUT=40 ;;
 esac
 { [ "$WIKI_TIMEOUT" -ge 1 ] && [ "$WIKI_TIMEOUT" -le 600 ]; } 2>/dev/null || WIKI_TIMEOUT=40
+# #2823 — one synthesis per row let the same Wiki context answer on one run and
+# refuse on the next (q20/q42, 2026-11-16: R/A on one node, R R R A on another),
+# so near-threshold nodes flipped PASS/FAIL on sample noise. A positive row whose
+# Wiki synthesis comes back as no-record is synthesized once more from the SAME
+# context; either answer counts. Negative controls are never retried — a second
+# draw there could only add fabrications. 1 = on (default), 0 = off; anything
+# else falls back to 1.
+WIKI_RESYNTH="${NUNCHI_BENCH_WIKI_RESYNTH:-1}"
+case "$WIKI_RESYNTH" in 0|1) ;; *) WIKI_RESYNTH=1 ;; esac
 [ -f "$QSET" ] || { echo "qset missing: $QSET" >&2; exit 2; }
 
 mkdir -p "$NUNCHI_HOME"
@@ -277,6 +292,19 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
   # 41-45s vs 40s on 2026-10-21) lost every Wiki answer and the sheet read
   # exactly like "the Wiki has nothing" — 0/48 with no trace of why.
   wiki_state=-
+  # #2823 — "-" = no re-synthesis tried; ok / no = tried and recovered / not.
+  resynth=-
+  # TM-2370 P1-A — `source=none` in the Q-set marks a negative-control row: a
+  # question with no true answer (q44-q48, category 부정형), where "기록 없음" IS
+  # the correct answer. Grading those like positive rows inverts the verdict
+  # twice — a correct refusal scores as retrieval failure, and a fabricated
+  # answer scores as a success. They must leave the positive denominator and be
+  # graded in reverse. Decided before the Wiki layer because the #2823
+  # re-synthesis runs on positive rows only.
+  case "$want_source" in
+    none) polarity=negative ;;
+    *)    polarity=positive ;;
+  esac
   if [ "$status" = OK ]; then
     if is_refusal "$ans"; then
       # nunchi found nothing — consult the layer TM-2029 made responsible for
@@ -293,11 +321,20 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
           wiki_ans="$(printf '%s' "$wiki_ctx" \
             | timeout "$WIKI_TIMEOUT" python3 "$HERE/nunchi.py" synthesize "$query" 2>&1)"
           synth_rc=$?
+          if [ "$synth_rc" != 124 ] && [ "$polarity" = positive ] \
+             && [ "$WIKI_RESYNTH" = 1 ] && ! wiki_accepted "$wiki_ans"; then
+            resynth=no
+            retry_ans="$(printf '%s' "$wiki_ctx" \
+              | timeout "$WIKI_TIMEOUT" python3 "$HERE/nunchi.py" synthesize "$query" 2>&1)"
+            retry_rc=$?
+            if [ "$retry_rc" != 124 ] && wiki_accepted "$retry_ans"; then
+              wiki_ans="$retry_ans"
+              resynth=ok
+            fi
+          fi
           if [ "$synth_rc" = 124 ]; then
             wiki_state=timeout
-          elif [ -n "${wiki_ans//[[:space:]]/}" ] \
-             && ! is_refusal "$wiki_ans" \
-             && ! printf '%s' "$wiki_ans" | grep -qiE "$INVALID_RE"; then
+          elif wiki_accepted "$wiki_ans"; then
             source=wiki
             wiki_state=ok
           else
@@ -309,16 +346,6 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
       source=nunchi
     fi
   fi
-  # TM-2370 P1-A — `source=none` in the Q-set marks a negative-control row: a
-  # question with no true answer (q44-q48, category 부정형), where "기록 없음" IS
-  # the correct answer. Grading those like positive rows inverts the verdict
-  # twice — a correct refusal scores as retrieval failure, and a fabricated
-  # answer scores as a success. They must leave the positive denominator and be
-  # graded in reverse.
-  case "$want_source" in
-    none) polarity=negative ;;
-    *)    polarity=positive ;;
-  esac
   # #832 — a negative control where the nunchi layer itself refused (its answer
   # matched NO_RECORD_RE) and only the Wiki supplement produced text is still a
   # correct rejection: the Q-set's own expect column blesses "보안 규칙 언급" /
@@ -351,7 +378,7 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
   [ -n "$cited_ids" ] || cited_ids=none
   # Column 6 (wiki_state) is appended: the summary reads columns by position,
   # so earlier columns keep their meaning.
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$qid" "$status" "$source" "$polarity" "$grade" "$wiki_state" >> "$LEDGER"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$qid" "$status" "$source" "$polarity" "$grade" "$wiki_state" "$resynth" >> "$LEDGER"
   {
     # grade= is emitted only for negative-control rows. On a positive row it is
     # a pure restatement of source= (ANSWERED iff source!=none), so adding it
@@ -362,6 +389,8 @@ tail -n +2 "$QSET" | while IFS=$'\t' read -r qid category query expect want_sour
     # source= so lines ending in `source=…` / `grade=…` keep their shape.
     wiki_tag=
     [ "$wiki_state" != - ] && wiki_tag=" wiki=$wiki_state"
+    # #2823 — before wiki= so the existing `wiki=… source=…` tail keeps its shape.
+    [ "$resynth" != - ] && wiki_tag=" resynth=$resynth$wiki_tag"
     if [ -n "$reason" ]; then
       echo "## $qid ($category) — ${dur}s cited_ids=$cited_ids rc=$rc status=$status reason=$reason$wiki_tag source=$source$suffix"
     else
@@ -398,6 +427,14 @@ read -r by_nunchi by_wiki answered unanswered correct_reject fabricated <<<"$(
 )"
 # #2434 — Wiki-layer outcome counts (column 6). A pre-#2434 5-column ledger
 # row has no $6 and counts as not consulted.
+# #2823 — re-synthesis outcomes (column 7). Older 6-column rows count as not tried.
+read -r resynth_tried resynth_ok <<<"$(
+  awk -F'\t' '
+    NF>=7 && $7!="-"                       {t++}
+    $7=="ok"                               {o++}
+    END { printf "%d %d", t+0, o+0 }
+  ' "$LEDGER"
+)"
 read -r wiki_consulted wiki_timeouts wiki_errors <<<"$(
   awk -F'\t' '
     NF>=6 && $6!="-"                       {c++}
@@ -445,6 +482,14 @@ fi
 # four of five healthy node-weeks while still failing the worst tail; ratchet
 # down as Wiki-layer coverage matures. Still overridable per node.
 UNANSWERED_MAX_PCT="${NUNCHI_BENCH_UNANSWERED_MAX_PCT:-40}"
+# #2823 — a node within this many points of the threshold (either side) is
+# BORDERLINE, not PASS/FAIL: one 43-question run cannot tell 38% from 42% apart
+# (2026-11-16: 41% FAIL one week after 27% PASS, one question from the line).
+# Integer 0..10, default 2; 0 turns the band off. No band once the threshold is
+# 100% or more — that calibration means "never fail on unanswered".
+BORDERLINE_PCT="${NUNCHI_BENCH_BORDERLINE_PCT:-2}"
+case "$BORDERLINE_PCT" in ''|*[!0-9]*) BORDERLINE_PCT=2 ;; esac
+[ "$BORDERLINE_PCT" -le 10 ] 2>/dev/null || BORDERLINE_PCT=2
 synth_model="$(python3 "$HERE/nunchi.py" synth-model </dev/null 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9._:[]-')"
 [ -n "$synth_model" ] || synth_model=unknown
 synth_cli="$(timeout 10 claude --version </dev/null 2>/dev/null | head -n1 | awk '{print $1}' | tr -cd 'A-Za-z0-9._-')"
@@ -485,6 +530,8 @@ unanswered_pct=0
   fi
   [ "$bh_total" -gt 0 ] \
     && echo "- backend attempts during run: $bh_total (failed: $bh_failed)"
+  [ "$resynth_tried" -gt 0 ] \
+    && echo "- wiki re-synthesis (#2823): tried $resynth_tried, recovered $resynth_ok"
   echo "- unanswered rate: ${unanswered_pct}% of $pos_valid positive (threshold ≤${UNANSWERED_MAX_PCT}%)"
   # The verdict is advisory and never changes the exit code. bench.sh is a cron
   # job on every node and #1078 already settled that the bench is not the
@@ -497,6 +544,10 @@ unanswered_pct=0
     verdict="FAIL — $fabricated fabrication(s) on negative controls (hard fail)"
   elif [ "$pos_valid" -eq 0 ]; then
     verdict="INDETERMINATE — no positive rows"
+  elif [ "$BORDERLINE_PCT" -gt 0 ] && [ "$UNANSWERED_MAX_PCT" -lt 100 ] \
+     && [ "$unanswered_pct" -ge $(( UNANSWERED_MAX_PCT - BORDERLINE_PCT )) ] \
+     && [ "$unanswered_pct" -le $(( UNANSWERED_MAX_PCT + BORDERLINE_PCT )) ]; then
+    verdict="BORDERLINE — unanswered ${unanswered_pct}% within ±${BORDERLINE_PCT} of ${UNANSWERED_MAX_PCT}% (sample-noise band; not a FAIL)"
   elif [ "$unanswered_pct" -gt "$UNANSWERED_MAX_PCT" ]; then
     verdict="FAIL — unanswered ${unanswered_pct}% > ${UNANSWERED_MAX_PCT}%"
   else
