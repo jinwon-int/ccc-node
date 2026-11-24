@@ -201,6 +201,9 @@ class NodeReportTests(unittest.TestCase):
         self.assertEqual((fleet["use_count_skill_tool"], fleet["use_count_ledger"], fleet["use_count"]), (2, 3, 3))
         self.assertEqual(fleet["window_use_count"], 3)
         self.assertEqual(fleet["runtimes"], {"claude": 2, "codex": 1})
+        # #2881: how the counted rows were recorded — facts only, use_count unchanged.
+        self.assertEqual(fleet["use_count_ledger_by_tool"], {"Read": 2, "Skill": 1})
+        self.assertEqual(skills["auto-idle"]["use_count_ledger_by_tool"], {}, "pre-creation row is not counted")
         self.assertEqual(fleet["last_used_at"], iso(1))
         self.assertEqual(fleet["installed_at"], iso(20))
         idle = skills["auto-idle"]
@@ -210,6 +213,25 @@ class NodeReportTests(unittest.TestCase):
         self.assertEqual(skills["user-one"]["window_use_count"], 0)
         self.assertEqual(skills["user-one"]["use_count"], 1)
         self.assertIsNone(skills["repo-one"]["curator_state"])
+
+    def test_ledger_tool_values_are_bounded(self) -> None:
+        # #2881: the by-tool keys never echo arbitrary ledger text.
+        self.assertEqual(report_mod._ledger_tool("Read"), "Read")
+        self.assertEqual(report_mod._ledger_tool("codex-skill"), "codex-skill")
+        self.assertEqual(report_mod._ledger_tool(None), "unknown")
+        for bad in ("", "x" * 40, "rm -rf /", "<b>", 3, True, ["Read"], "1Read"):
+            self.assertEqual(report_mod._ledger_tool(bad), "other", bad)
+
+    def test_merge_takes_per_tool_maximum(self) -> None:
+        merged = report_mod._merge_node_entries(
+            [
+                {"provider": "claude", "use_count": 3, "use_count_ledger_by_tool": {"Read": 2, "Skill": 1}},
+                {"provider": "codex", "use_count": 4, "use_count_ledger_by_tool": {"Read": 1, "Skill": 3, "x": True}},
+                {"provider": "piri", "use_count": 0},  # an older report without the field
+            ]
+        )
+        self.assertEqual(merged["use_count_ledger_by_tool"], {"Read": 2, "Skill": 3})
+        self.assertEqual(merged["use_count"], 4)
 
     def test_unknown_reasons_split_three_causes(self) -> None:
         # #2843: the three causes seen fleet-wide, one fixture each.
