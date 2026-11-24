@@ -139,6 +139,16 @@ install_managed_trees() { # <fixture-dir>
     mkdir -p "$dir/home/.claude/commands"
     cp "$dir/repo/claude/commands/"*.md "$dir/home/.claude/commands/" 2>/dev/null || true
   fi
+  # Node-agnostic sub-agents are installed on every node (setup.sh); only the
+  # a2a-* worker roster is role-gated. Mirror that, or a provisioned fixture
+  # reports the first plain agent (web-reader, #2892) as missing.
+  if [ -d "$dir/repo/claude/agents" ]; then
+    mkdir -p "$dir/home/.claude/agents"
+    for f in "$dir/repo/claude/agents/"*.md; do
+      [ -f "$f" ] || continue
+      case "$(basename "$f")" in a2a-*) ;; *) cp "$f" "$dir/home/.claude/agents/" ;; esac
+    done
+  fi
   skill_root="$dir/repo/skills"
   mkdir -p "$dir/home/.claude/skills"
   for skill in "$skill_root"/*/; do
