@@ -471,7 +471,9 @@ day it reads the two UTC files the KST day overlaps and keeps spans with
   `$CCC_STATE_DIR/wiki-candidates.md` (same human-gated queue as the weekly
   cost rollup), plus one owner-only push-spool record (`event=SpansRollup`,
   `tier=info`) that the fleet-alerts relay holds for its 09:00 KST
-  「🔔 플릿 알림」 digest. The spool file name is recorded in the entry as
+  「🔔 플릿 알림」 digest. The digest's first line ends with
+  `· a2a N(실패 M)` when the day has `kind=a2a` spans (#2858), so the
+  relay's first-line-plus-two view always shows them. The spool file name is recorded in the entry as
   `digest-spool:`. `--no-digest` queues only; `--dry-run` prints the entry
   and digest text and writes nothing (`--json` for the raw summary).
   Idempotent per `(date, node)` via `<!-- spans-rollup:DATE:NODE -->`.
