@@ -288,6 +288,42 @@ class AlwaysOnBudget(unittest.TestCase):
         self.write_local(["bash /root/.claude/hooks/load-tools.sh SessionStart"])
         self.assertIn("500 chars", self.source_rows(self.run_check())["tools-cheatsheet.md"])
 
+    # --- fleet notes appended by load-tools.sh (#2858) ---------------------------
+
+    def write_fleet_notes(self, text: str) -> None:
+        notes = self.claude / "hooks" / "lib" / "tools-fleet-notes.txt"
+        notes.parent.mkdir(parents=True, exist_ok=True)
+        notes.write_text(text, encoding="utf-8")
+
+    def cheatsheet_row(self, env: dict[str, str] | None = None) -> str:
+        return self.source_rows(self.run_check(env))["tools-cheatsheet.md"]
+
+    def test_cheatsheet_row_counts_the_fleet_notes_the_hook_appends(self) -> None:
+        # cheatsheet + blank line + notes, trailing newlines dropped as `$(cat …)` does.
+        self.seed(cheatsheet=3000)
+        self.write_fleet_notes("n" * 400 + "\n")
+        self.assertIn("3,402 chars / 3,402 B", self.cheatsheet_row())
+
+    def test_cheatsheet_row_without_fleet_notes_is_the_cheatsheet_alone(self) -> None:
+        self.seed(cheatsheet=3000)
+        self.assertIn("3,000 chars / 3,000 B", self.cheatsheet_row())
+        self.write_fleet_notes("")
+        self.assertIn("3,000 chars / 3,000 B", self.cheatsheet_row())
+
+    def test_cheatsheet_row_honours_the_fleet_notes_switch(self) -> None:
+        self.seed(cheatsheet=3000)
+        self.write_fleet_notes("n" * 400)
+        for value in ("0", "false", "off", "no"):
+            with self.subTest(value=value):
+                self.assertIn("3,000 chars", self.cheatsheet_row({"CCC_TOOLS_FLEET_NOTES": value}))
+
+    def test_cheatsheet_row_leaves_notes_out_at_the_same_bound_as_the_hook(self) -> None:
+        self.write_fleet_notes("n" * 13 + "\n")
+        self.seed(cheatsheet=9484)  # 9484 + 2 + 13 = 9499: appended
+        self.assertIn("9,499 chars", self.cheatsheet_row())
+        self.seed(cheatsheet=9486)  # 9486 + 2 + 13 = 9501: left out
+        self.assertIn("9,486 chars", self.cheatsheet_row())
+
     def test_canary_counts_only_when_armed(self) -> None:
         self.write_settings({"hooks": {"SessionStart": [{"hooks": [
             {"type": "command", "command": "bash /root/.claude/hooks/report-style-canary.sh SessionStart"},

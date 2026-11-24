@@ -667,6 +667,57 @@ ok "load-tools: CCC_HOOK_DIR resolves the cheatsheet" '[ "$rc" = 0 ] && grep -q 
 out="$(HOME="$TMP/home" bash "$ROOT/claude/hooks/load-tools.sh" SessionStart 2>&1)"
 ok "load-tools: default stays HOME/.claude/hooks" 'grep -q "cheatsheet missing: $TMP/home/.claude/hooks/tools-cheatsheet.md" <<<"$out"'
 
+# --- #2858: load-tools.sh appends the repo-managed fleet notes -----------------
+# The cheatsheet is node-owned (seeded once, never overwritten), so guidance
+# for every node ships in lib/tools-fleet-notes.txt and the hook appends it.
+ctx_lt() { jq -j '.hookSpecificOutput.additionalContext'; }
+fn_hooks="$TMP/fn-hooks"; mkdir -p "$fn_hooks/lib"
+printf 'FN_NODE_SHEET\n' > "$fn_hooks/tools-cheatsheet.md"
+printf 'FN_FLEET_NOTE line one\nFN_FLEET_NOTE line two\n' > "$fn_hooks/lib/tools-fleet-notes.txt"
+run_lt() { HOME="$TMP/home" CCC_HOOK_DIR="$fn_hooks" env "$@" bash "$ROOT/claude/hooks/load-tools.sh" SessionStart 2>/dev/null | ctx_lt; }
+# shellcheck disable=SC2034  # read via eval inside ok()
+fn_on="$(run_lt)"
+ok "fleet notes: appended after the node cheatsheet, one blank line apart" \
+  '[ "$fn_on" = "$(printf "FN_NODE_SHEET\n\nFN_FLEET_NOTE line one\nFN_FLEET_NOTE line two")" ]'
+fn_off_bad=0
+for fn_v in 0 false off no; do
+  [ "$(run_lt CCC_TOOLS_FLEET_NOTES="$fn_v")" = "FN_NODE_SHEET" ] || fn_off_bad=$((fn_off_bad+1))
+done
+ok "fleet notes: CCC_TOOLS_FLEET_NOTES=0/false/off/no leaves only the cheatsheet" '[ "$fn_off_bad" = 0 ]'
+ok "fleet notes: no notes file means the cheatsheet alone, as before" \
+  '[ "$(HOME="$TMP/home" CCC_HOOK_DIR="$lt_hooks" bash "$ROOT/claude/hooks/load-tools.sh" SessionStart 2>/dev/null | ctx_lt)" = "LT_CHEATSHEET_SENTINEL" ]'
+: > "$fn_hooks/lib/tools-fleet-notes.txt"
+ok "fleet notes: an empty notes file adds nothing" '[ "$(run_lt)" = "FN_NODE_SHEET" ]'
+# Never push a node over the hook output cap: with cheatsheet + notes past
+# 9,500 bytes the notes are left out and the cheatsheet is untouched.
+printf 'FN_FLEET_NOTE\n' > "$fn_hooks/lib/tools-fleet-notes.txt"
+python3 -c 'print("x" * 9484)' > "$fn_hooks/tools-cheatsheet.md"    # 9484 + 2 + 13 = 9499
+# shellcheck disable=SC2034  # read via eval inside ok()
+fn_fit="$(run_lt | wc -c)"
+python3 -c 'print("x" * 9486)' > "$fn_hooks/tools-cheatsheet.md"    # 9486 + 2 + 13 = 9501
+# shellcheck disable=SC2034  # read via eval inside ok()
+fn_over="$(run_lt)"
+ok "fleet notes: appended while the total stays within 9,500 bytes" '[ "$fn_fit" = 9499 ]'
+ok "fleet notes: left out when the total would pass 9,500 bytes" \
+  '[ "${#fn_over}" = 9486 ] && ! grep -q "FN_FLEET_NOTE" <<<"$fn_over"'
+# Hangul counts by bytes (3 each), the conservative side: 3,170 characters are
+# far under 9,500 characters but 9,510 bytes, so the notes stay out — in a
+# UTF-8 locale as well, where the shell would otherwise count characters.
+python3 -c 'print("가" * 3170)' > "$fn_hooks/tools-cheatsheet.md"
+ok "fleet notes: the bound is measured in bytes, whatever the locale" \
+  '[ "$(run_lt LC_ALL=C.UTF-8 | grep -c "FN_FLEET_NOTE")" = 0 ] && [ "$(run_lt LC_ALL=C | grep -c "FN_FLEET_NOTE")" = 0 ] && [ "$(run_lt LC_ALL=en_US.UTF-8 | grep -c "FN_FLEET_NOTE")" = 0 ]'
+rm -f "$fn_hooks/tools-cheatsheet.md"
+ok "fleet notes: a missing cheatsheet still reports itself, and the notes follow" \
+  'grep -q "tools cheatsheet missing" <<<"$(run_lt)" && grep -q "FN_FLEET_NOTE" <<<"$(run_lt)"'
+# The shipped notes: deployed by the hook-tree walk (not *.md), small, and
+# naming the daily span summary an agent can read on its own node.
+# shellcheck source=scripts/lib/harness-paths.sh
+. "$ROOT/scripts/lib/harness-paths.sh"
+ok "fleet notes: the shipped file is in the deployed hook tree" \
+  'ccc_hook_tree_files "$ROOT" | grep -qx "lib/tools-fleet-notes.txt"'
+ok "fleet notes: the shipped file is small and names the span summary path" \
+  '[ "$(wc -c < "$ROOT/claude/hooks/lib/tools-fleet-notes.txt")" -le 1500 ] && grep -q "spans-rollup/YYYY-MM-DD.json" "$ROOT/claude/hooks/lib/tools-fleet-notes.txt"'
+
 # --- #2884: character ceiling on the whole injection --------------------------
 # Claude Code caps a hook output string at 10,000 characters and replaces a
 # longer one with a file path and a short preview. The byte cap cannot hold

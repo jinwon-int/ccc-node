@@ -1,0 +1,2 @@
+## 플릿 공통 안내 (ccc-node 관리 — 노드 치트시트 파일이 아니라 load-tools.sh가 뒤에 붙임)
+- **자기 노드 스팬 일일 요약**: `~/.claude/state/spans-rollup/YYYY-MM-DD.json` (`CCC_STATE_DIR`를 쓰는 노드는 그 아래. KST 날짜, 새벽 롤업이 전날분을 만들고 90일 보관). 턴 수·도구 호출·도구 오류율·도구별 p50/p95·모델별 토큰·비용이 숫자로만 들어 있다(대화·명령 본문 없음). 예: `jq '.totals, .tools' ~/.claude/state/spans-rollup/$(date -d yesterday +%F).json`. 다른 노드 것은 여기 없다 — 스팬 원본은 노드 밖으로 내보내지 않는다.
