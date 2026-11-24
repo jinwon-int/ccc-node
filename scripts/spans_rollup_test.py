@@ -360,6 +360,24 @@ def test_a2a_worker_lines_roll_up_into_real_a2a_values(env):
     assert "a2a: spans=8 ok=5 failed=3" in lines
     assert ("a2a top failure classes: handler_exit_nonzero=1, handler_timeout=1, "
             "receipt_http_500=1") in lines
+    # The owner's 3-line digest carries the a2a counts at the end of its first line (#2858, owner "1").
+    digest = rollup.build_digest_text(summary).split("\n")
+    assert digest[0].endswith(" · a2a 8(실패 3)")
+    assert len(digest) <= 3
+
+
+def test_digest_has_no_a2a_suffix_without_a2a_spans(env):
+    env.write_spans("2026-11-06", [tool("Bash", IN_DAY, 10), turn(IN_DAY + 1)])
+    assert "a2a" not in rollup.build_digest_text(summarize(env))
+
+
+def test_digest_a2a_only_day_keeps_head_line(env):
+    env.write_spans("2026-11-06", [], raw_lines=[line + "\n" for line in A2A_WORKER_LINES[:1]])
+    summary = summarize(env)
+    assert not summary["empty"] and summary["a2a"]["spans"] == 1
+    head = rollup.build_digest_text(summary).split("\n")[0]
+    assert head.startswith("📊 스팬 롤업 2026-11-06 (testnode) — 턴 0")
+    assert head.endswith(f" · a2a 1(실패 {summary['a2a']['failed']})")
 
 
 def test_a2a_body_text_never_reaches_rollup_output(env, capsys):

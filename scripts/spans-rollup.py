@@ -622,9 +622,13 @@ def build_digest_text(summary: dict) -> str:
     head = f"📊 스팬 롤업 {summary['date']} ({summary['node']})"
     if summary["empty"]:
         return f"{head} — 스팬 없음"
-    lines = [f"{head} — 턴 {totals['turns']} · 도구 {totals['tool_calls']}회 · "
-             f"도구 오류율 {totals['tool_error_rate_pct']:.1f}%",
-             _check_line(summary["cost_ledger_check"])]
+    first = (f"{head} — 턴 {totals['turns']} · 도구 {totals['tool_calls']}회 · "
+             f"도구 오류율 {totals['tool_error_rate_pct']:.1f}%")
+    a2a = summary.get("a2a")
+    if a2a:
+        # #2858: on the first line, so the relay digest (first line + 2 details) always shows it.
+        first += f" · a2a {a2a['spans']}(실패 {a2a['failed']})"
+    lines = [first, _check_line(summary["cost_ledger_check"])]
     top = list(summary["tools"].items())[:3]
     if top:
         lines.append("상위 도구: " + " · ".join(
