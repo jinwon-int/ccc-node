@@ -19,6 +19,20 @@ refresh_note="A background refresh runs each session for the next one"
 [ "${CCC_MEMORY_NO_REFRESH:-0}" != "1" ] || refresh_note="Background cache refresh is disabled"
 TTL="${CCC_MEMORY_CACHE_TTL_SEC:-21600}"
 MAX_TOTAL="${CCC_MEMORY_MAX_BYTES:-12000}"
+# Character ceiling for the whole injection (#2884). Claude Code caps each hook
+# output string at 10,000 characters; a longer one is not truncated but replaced
+# by a file path and a ~2,000-character preview, so the session loses most of
+# it. The byte budgets cannot hold that line: 12,000 bytes is about 9,600
+# characters of mostly-Hangul memory and 12,000 characters of ASCII. Measured
+# on the fleet, two nodes lost the block on every session and three more on
+# some. Counted in UTF-16 code units, the cap's own unit; the default leaves
+# 500 of headroom. 0 turns it off — for a caller that is not a Claude Code hook
+# (the Codex/Piri materializer sets it, having its own caps downstream).
+MAX_CHARS="${CCC_MEMORY_MAX_CHARS:-9500}"
+case "$MAX_CHARS" in ''|*[!0-9]*) MAX_CHARS=9500 ;; esac
+# Plain decimal from here on: arithmetic would read a leading zero as octal,
+# and more digits than any real ceiling means "no ceiling".
+if [ "${#MAX_CHARS}" -gt 9 ]; then MAX_CHARS=0; else MAX_CHARS="$((10#$MAX_CHARS))"; fi
 MAX_MEM="${CCC_BUILTIN_MEMORY_MAX_BYTES:-4000}"
 MAX_WIKI="${CCC_WIKI_MAX_BYTES:-5000}"
 MAX_LOCAL="${CCC_LOCAL_MEMORY_MAX_BYTES:-3000}"
@@ -245,9 +259,9 @@ scan_injection_block() { # <label> <text>
   fi
 }
 
-limit_bytes() { # <max> <text>
+limit_bytes() { # <max-bytes> [max-chars] — stdin: text
   local max="$1"
-  python3 "$MEMORY_RENDER_PY" limit-bytes "$max"
+  python3 "$MEMORY_RENDER_PY" limit-bytes "$max" "${2:-}"
 }
 
 byte_len() { # <text> -> byte count, no fork (length is locale-dependent, so pin C)
@@ -775,16 +789,59 @@ ${ws_block}${promises_block}${detached_block}${alerts_block}
 ${local_hot:-(local hot memory disabled or no hits)}
 ${skills_block}${wiki_block}"
 
-# Final hard cap. limit-bytes passes an under-cap payload through unchanged, so
-# spend the interpreter only when there is something to cut; the shell-side
-# path only has to mirror the trailing-newline strip of the `$(...)` it replaces.
-# A non-numeric cap keeps going through the interpreter (its behaviour, not a
-# new one here).
+# Final hard cap: bytes (CCC_MEMORY_MAX_BYTES) and characters
+# (CCC_MEMORY_MAX_CHARS, #2884). The blocks above are laid out in priority
+# order — resume pointer and MEMORY/USER first, the Wiki prefetch last — so
+# cutting the tail drops the lowest-priority block first.
+# limit-bytes passes an under-cap payload through unchanged, so spend the
+# interpreter only when there may be something to cut; the shell-side path only
+# has to mirror the trailing-newline strip of the `$(...)` it replaces. The
+# shell cannot count characters without trusting the locale, but a string never
+# has more characters than bytes: one within the character cap in bytes needs
+# no interpreter. A non-numeric byte cap keeps going through the interpreter
+# (its behaviour, not a new one here).
+utf16_len() { # <text> -> UTF-16 code units, with no interpreter and no UTF-8 locale
+  local LC_ALL=C s="$1" lead astral
+  lead="${s//[$'\200'-$'\277']/}"    # continuation bytes dropped: one byte left per character
+  astral="${s//[!$'\360'-$'\367']/}" # 4-byte lead bytes: the characters that take two units
+  printf '%s' "$(( ${#lead} + ${#astral} ))"
+}
+cap_ctx() {
+  local capped
+  if capped="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL" "$MAX_CHARS")" && [ -n "$capped" ]; then
+    ctx="$capped"
+    return 0
+  fi
+  # No interpreter (memory_render.py missing or python3 broken). Before #2884
+  # this emptied a block over the byte cap; now the block is kept, and cut only
+  # when it is over a cap. The cut is a byte slice to the tighter cap that was
+  # exceeded: a string never has more characters than bytes, so that holds the
+  # character cap too. It may end inside a multi-byte character; jq replaces
+  # the stray bytes.
+  local bound=0
+  if [ "$MAX_TOTAL" -gt 0 ] && [ "$(byte_len "$ctx")" -gt "$MAX_TOTAL" ]; then
+    bound="$((10#$MAX_TOTAL))"
+  fi
+  if [ "$MAX_CHARS" -gt 0 ] && [ "$(utf16_len "$ctx")" -gt "$MAX_CHARS" ]; then
+    { [ "$bound" -gt 0 ] && [ "$bound" -le "$MAX_CHARS" ]; } || bound="$MAX_CHARS"
+  fi
+  if [ "$bound" -eq 0 ]; then
+    ctx="${ctx%"${ctx##*[!$'\n']}"}"
+    return 0
+  fi
+  local LC_ALL=C marker=$'\n… [truncated by CCC memory budget]' keep
+  keep="$(( bound - ${#marker} ))"
+  [ "$keep" -gt 0 ] || keep=0
+  ctx="${ctx:0:$keep}$marker"
+  return 0
+}
 case "$MAX_TOTAL" in
-  ''|*[!0-9]*) ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")" ;;
+  ''|*[!0-9]*) ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL" "$MAX_CHARS")" ;;
   *)
-    if [ "$MAX_TOTAL" -gt 0 ] && [ "$(byte_len "$ctx")" -gt "$MAX_TOTAL" ]; then
-      ctx="$(printf '%s' "$ctx" | limit_bytes "$MAX_TOTAL")"
+    ctx_bytes="$(byte_len "$ctx")"
+    if { [ "$MAX_TOTAL" -gt 0 ] && [ "$ctx_bytes" -gt "$MAX_TOTAL" ]; } \
+        || { [ "$MAX_CHARS" -gt 0 ] && [ "$ctx_bytes" -gt "$MAX_CHARS" ]; }; then
+      cap_ctx
     else
       ctx="${ctx%"${ctx##*[!$'\n']}"}"
     fi

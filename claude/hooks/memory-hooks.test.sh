@@ -667,6 +667,139 @@ ok "load-tools: CCC_HOOK_DIR resolves the cheatsheet" '[ "$rc" = 0 ] && grep -q 
 out="$(HOME="$TMP/home" bash "$ROOT/claude/hooks/load-tools.sh" SessionStart 2>&1)"
 ok "load-tools: default stays HOME/.claude/hooks" 'grep -q "cheatsheet missing: $TMP/home/.claude/hooks/tools-cheatsheet.md" <<<"$out"'
 
+# --- #2884: character ceiling on the whole injection --------------------------
+# Claude Code caps a hook output string at 10,000 characters and replaces a
+# longer one with a file path and a short preview. The byte cap cannot hold
+# that line (12,000 bytes of ASCII is 12,000 characters), so the loader bounds
+# its output in characters too — counted in UTF-16 units, the cap's own unit.
+cc_state="$TMP/cc-state"; cc_cache="$TMP/cc-cache"; cc_mem="$TMP/cc-mem"
+mkdir -p "$cc_state" "$cc_cache" "$cc_mem"
+units() { # stdin: UTF-8 text -> UTF-16 code units
+  python3 -c 'import sys; s = sys.stdin.buffer.read().decode("utf-8"); print(len(s) + sum(1 for c in s if ord(c) > 0xFFFF))'
+}
+ctx_of() { jq -j '.hookSpecificOutput.additionalContext'; }
+cc_fill() { # <unit text> <count> — one long paragraph of repeated words
+  python3 -c 'import sys; print(" ".join([sys.argv[1]] * int(sys.argv[2])))' "$1" "$2"
+}
+run_cc() { # [extra env...] — SessionStart on the #2884 fixtures
+  HOME="$TMP/home" CCC_STATE_DIR="$cc_state" CCC_MEMORY_CACHE_DIR="$cc_cache" CCC_MEMORY_DIR="$cc_mem" \
+    CCC_HOOK_DIR="$ROOT/claude/hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 \
+    CCC_MEMORY_NO_REFRESH=1 env "$@" bash "$ROOT/claude/hooks/load-memory.sh" SessionStart 2>/dev/null
+}
+# ASCII worst case: every block filled to its own byte cap with 1-byte text.
+{ printf 'MEM_HEAD_SENTINEL '; cc_fill memoryword 500; } > "$cc_mem/MEMORY.md"
+printf 'User memory: concise\n' > "$cc_mem/USER.md"
+{ printf 'RESUME_SENTINEL '; cc_fill resumeword 300; } > "$cc_state/resume.md"
+{ cc_fill wikiword 700; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_off="$(run_cc CCC_MEMORY_MAX_CHARS=0 | ctx_of)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_off_units="$(printf '%s' "$cc_off" | units)"
+ok "char cap: the ASCII fixture is over the 10,000-character hook cap when the ceiling is off" \
+  '[ "$cc_off_units" -gt 10000 ] && [ "$(printf "%s" "$cc_off" | wc -c)" -le 12000 ]'
+cc_on="$(run_cc | ctx_of)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_on_units="$(printf '%s' "$cc_on" | units)"
+ok "char cap: default cuts the ASCII worst case to the 9,500-character ceiling" \
+  '[ "$cc_on_units" -le 9500 ] && [ "$cc_on_units" -ge 9490 ]'
+ok "char cap: the cut is marked and falls on the tail (Wiki), not on resume or MEMORY" \
+  'grep -q "truncated by CCC memory budget" <<<"$cc_on" && grep -q "RESUME_SENTINEL" <<<"$cc_on" && grep -q "MEM_HEAD_SENTINEL" <<<"$cc_on" && ! grep -q "WIKI_TAIL_SENTINEL" <<<"$cc_on"'
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_small_units="$(run_cc CCC_MEMORY_MAX_CHARS=4000 | ctx_of | units)"
+ok "char cap: CCC_MEMORY_MAX_CHARS sets the ceiling" '[ "$cc_small_units" -le 4000 ] && [ "$cc_small_units" -ge 3990 ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_zero_units="$(run_cc CCC_MEMORY_MAX_CHARS=04000 | ctx_of | units)"
+ok "char cap: a zero-padded value is read as decimal" '[ "$cc_zero_units" = "$cc_small_units" ]'
+# A file in another encoding (PERSONA.md is injected as is): each undecodable
+# byte becomes one replacement character in the JSON, so it must be counted.
+# The fixture is inside the byte cap and, without those bytes, inside the
+# ceiling; only counting them shows it is over.
+python3 -c 'import sys; sys.stdout.buffer.write(("기억" * 300).encode("cp949"))' > "$cc_mem/PERSONA.md"
+{ cc_fill wikiword 300; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+fffd() { python3 -c 'import sys; print(sys.stdin.buffer.read().decode("utf-8").count(chr(0xFFFD)))'; }
+cc_persona_off="$(run_cc CCC_MEMORY_MAX_CHARS=0 | ctx_of)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_persona_on="$(run_cc | ctx_of)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_persona_off_units="$(printf '%s' "$cc_persona_off" | units)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_persona_off_bad="$(printf '%s' "$cc_persona_off" | fffd)"
+ok "char cap: the other-encoding fixture is over the ceiling only when its undecodable bytes are counted" \
+  '[ "$(printf "%s" "$cc_persona_off" | wc -c)" -le 12000 ] && [ "$cc_persona_off_units" -gt 9500 ] && [ "$((cc_persona_off_units - cc_persona_off_bad))" -le 9500 ]'
+ok "char cap: undecodable bytes are counted (a CP949 PERSONA.md cannot push past the ceiling)" \
+  '[ "$(printf "%s" "$cc_persona_on" | units)" -le 9500 ] && [ "$(printf "%s" "$cc_persona_on" | units)" -ge 9490 ] && [ "$(printf "%s" "$cc_persona_on" | fffd)" -gt 0 ]'
+rm -f "$cc_mem/PERSONA.md"
+{ cc_fill wikiword 700; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_bad_units="$(run_cc CCC_MEMORY_MAX_CHARS=lots | ctx_of | units)"
+ok "char cap: a non-numeric value falls back to the default" '[ "$cc_bad_units" = "$cc_on_units" ]'
+# Hangul: more than 9,500 BYTES but far fewer characters, so the ceiling must
+# leave the block alone (the shell sends it to the interpreter on the byte
+# count; the interpreter counts characters and passes it through).
+cc_age() { sed -E 's/\([0-9]+s old\)/(age)/'; } # the cache-age note moves between two runs
+{ printf 'MEM_HEAD_SENTINEL '; cc_fill 기억낱말 600; } > "$cc_mem/MEMORY.md"
+{ cc_fill 위키낱말 800; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+cc_ko_on="$(run_cc | ctx_of | cc_age)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_ko_off="$(run_cc CCC_MEMORY_MAX_CHARS=0 | ctx_of | cc_age)"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_ko_bytes="$(printf '%s' "$cc_ko_on" | wc -c)"
+ok "char cap: Hangul memory over 9,500 bytes but under 9,500 characters is left unchanged" \
+  '[ "$cc_ko_on" = "$cc_ko_off" ] && [ "$cc_ko_bytes" -gt 9500 ] && [ "$cc_ko_bytes" -le 12000 ] && [ "$(printf "%s" "$cc_ko_on" | units)" -le 9500 ] && grep -q "WIKI_TAIL_SENTINEL\|truncated by CCC" <<<"$cc_ko_on"'
+# Astral characters (most emoji) are one code point but two UTF-16 units.
+{ printf 'MEM_HEAD_SENTINEL '; cc_fill 🧱🚨 2000; } > "$cc_mem/MEMORY.md"
+{ cc_fill 🧱🚨 2000; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+printf 'short\n' > "$cc_state/resume.md"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_emoji_units="$(run_cc CCC_MEMORY_MAX_BYTES=40000 CCC_BUILTIN_MEMORY_MAX_BYTES=20000 CCC_WIKI_MAX_BYTES=20000 | ctx_of | units)"
+ok "char cap: emoji are counted as two units each" '[ "$cc_emoji_units" -le 9500 ] && [ "$cc_emoji_units" -ge 9000 ]'
+# Under both caps nothing changes: same bytes with the ceiling on and off.
+printf 'Node memory: safe fact\n' > "$cc_mem/MEMORY.md"; printf 'Cached wiki fact\n' > "$cc_cache/wiki.txt"
+ok "char cap: an injection within both caps is identical with the ceiling on and off" \
+  '[ "$(run_cc | ctx_of | cc_age)" = "$(run_cc CCC_MEMORY_MAX_CHARS=0 | ctx_of | cc_age)" ]'
+# Interpreter-free last resort: without memory_render.py the loader still holds
+# the ceiling (a byte slice — never more characters than bytes) instead of
+# emitting an empty or oversized block.
+{ printf 'MEM_HEAD_SENTINEL '; cc_fill memoryword 500; } > "$cc_mem/MEMORY.md"
+{ printf 'RESUME_SENTINEL '; cc_fill resumeword 300; } > "$cc_state/resume.md"
+{ cc_fill wikiword 700; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_nomod="$(HOME="$TMP/home" CCC_STATE_DIR="$cc_state" CCC_MEMORY_CACHE_DIR="$cc_cache" CCC_MEMORY_DIR="$cc_mem" \
+  CCC_HOOK_DIR="$nomod_hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+  bash "$nomod_hooks/load-memory.sh" SessionStart 2>/dev/null | ctx_of)"
+ok "char cap: without memory_render.py the block is still bounded and not empty" \
+  '[ "$(printf "%s" "$cc_nomod" | units)" -le 9500 ] && grep -q "MEM_HEAD_SENTINEL" <<<"$cc_nomod"'
+run_cc_nomod() { # [extra env...] — same fixtures, hooks without memory_render.py
+  HOME="$TMP/home" CCC_STATE_DIR="$cc_state" CCC_MEMORY_CACHE_DIR="$cc_cache" CCC_MEMORY_DIR="$cc_mem" \
+    CCC_HOOK_DIR="$nomod_hooks" CCC_MEMORY_TOOLS_DIR="$tools" CCC_HONCHO_MEMORY_ENABLED=0 CCC_MEMORY_NO_REFRESH=1 \
+    env "$@" bash "$nomod_hooks/load-memory.sh" SessionStart 2>"$TMP/cc-nomod.err" | ctx_of
+}
+ok "char cap: the interpreter-free cut is marked at the end" '[[ "$cc_nomod" == *"[truncated by CCC memory budget]" ]]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_nomod_tot="$(run_cc_nomod CCC_MEMORY_MAX_BYTES=6000 | wc -c)"
+ok "char cap: without memory_render.py a tighter byte cap still wins" '[ "$cc_nomod_tot" -le 6000 ] && [ "$cc_nomod_tot" -ge 5900 ]'
+# shellcheck disable=SC2034  # read via eval inside ok()
+cc_nomod_zero="$(run_cc_nomod CCC_MEMORY_MAX_CHARS=09500)"
+ok "char cap: without memory_render.py a zero-padded ceiling is read as decimal" \
+  '[ "$(printf "%s" "$cc_nomod_zero" | units)" -le 9500 ] && grep -q "MEM_HEAD_SENTINEL" <<<"$cc_nomod_zero" && ! grep -q "value too great" "$TMP/cc-nomod.err"'
+# Hangul over 9,500 bytes but far under 9,500 characters, with no interpreter:
+# the shell counts characters itself (in any locale) and leaves the block whole.
+{ printf 'MEM_HEAD_SENTINEL '; cc_fill 기억낱말 250; } > "$cc_mem/MEMORY.md"
+{ cc_fill 위키낱말 300; printf ' WIKI_TAIL_SENTINEL\n'; } > "$cc_cache/wiki.txt"
+cc_nomod_ko_bad=0
+for cc_loc in C C.UTF-8; do
+  cc_nomod_ko="$(run_cc_nomod LC_ALL="$cc_loc")"
+  # Whole = it still ends with the last block's last word (the resume block
+  # carries its own cap marker, so a marker alone says nothing here).
+  { [ "$(printf '%s' "$cc_nomod_ko" | wc -c)" -gt 9500 ] && [[ "$cc_nomod_ko" == *WIKI_TAIL_SENTINEL ]]; } \
+    || cc_nomod_ko_bad=$((cc_nomod_ko_bad+1))
+done
+ok "char cap: without memory_render.py Hangul inside both caps is left whole, in a C or UTF-8 locale" \
+  '[ "$cc_nomod_ko_bad" = 0 ]'
+# A non-numeric byte cap is not a new behaviour here: it still empties the block.
+ok "char cap: a non-numeric CCC_MEMORY_MAX_BYTES behaves as before (empty block), ceiling on or off" \
+  '[ -z "$(run_cc CCC_MEMORY_MAX_BYTES=abc | ctx_of)" ] && [ -z "$(run_cc CCC_MEMORY_MAX_BYTES=abc CCC_MEMORY_MAX_CHARS=0 | ctx_of)" ]'
+
 
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]

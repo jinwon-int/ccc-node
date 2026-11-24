@@ -2666,6 +2666,78 @@ def _constraint_budget():
     return v if v >= 0 else CONSTRAINT_BUDGET_DEFAULT
 
 
+# #2884 — character ceiling for the SessionStart block. The byte budgets above
+# bound storage, not what the session receives: Claude Code caps each hook
+# output string at 10,000 characters and replaces a longer one with a file
+# path plus a short preview, so a block that is fine in bytes can arrive as
+# its first ~2,000 characters only. Hangul is 3 bytes per character and ASCII
+# is 1, so 15,000 bytes is anywhere between 5,000 and 15,000 characters.
+#
+# The byte-budgeted block is used as is when it is inside the ceiling. When it
+# is over, the fact block keeps this share of the ceiling (or what it needs,
+# whichever is smaller) and the constraint block takes the rest; facts then
+# fill whatever the constraints left. 0.2 is the fact block's share of the
+# two byte budgets (3,000 of 15,000).
+INJECT_FACT_SHARE = 0.2
+# Room kept inside the constraint block for its "N건 생략 …" tail, which is
+# only known to be needed after the rows are chosen.
+_INJECT_TAIL_RESERVE = 96
+
+
+def _units(text):
+    """Length in UTF-16 code units — the unit of the hook output cap (a
+    character outside the BMP, e.g. most emoji, counts as two)."""
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def _fit_units(text, limit):
+    """Longest prefix of `text` that is at most `limit` UTF-16 code units."""
+    if limit <= 0:
+        return ""
+    if len(text) * 2 <= limit:
+        return text
+    used = 0
+    for i, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > limit:
+            return text[:i]
+    return text
+
+
+def _cap_lines(lines, max_chars):
+    """Last-resort bound for an assembled block: at most `max_chars` units
+    including one newline per line. The per-block shares keep the block under
+    the ceiling; this only acts when what they do not size — the header and
+    the one-line tails — is itself larger than the ceiling (a very small one).
+
+    Lines that do not fit are dropped WHOLE and one line counts them. A line
+    is never cut here: this runs before the injection scanner, and a
+    credential split by a cut no longer matches the scanner's patterns.
+    """
+    if max_chars <= 0 or sum(_units(ln) + 1 for ln in lines) <= max_chars:
+        return lines
+
+    def marker(n):
+        return (f"- … 글자 상한 {max_chars}자에 맞추려 {n}줄 생략"
+                " — 전체: nunchi.py constraints / nunchi.py recall")
+
+    room = max_chars - _units(marker(len(lines))) - 1
+    kept, used, dropped = [], 0, 0
+    for ln in lines:
+        u = _units(ln) + 1
+        if used + u > room:
+            dropped += 1
+            continue
+        kept.append(ln)
+        used += u
+    if room < 0:
+        # A ceiling smaller than the marker: only the marker's own (fixed)
+        # text is shortened.
+        return [_fit_units(marker(dropped), max_chars - 1)]
+    kept.append(marker(dropped))
+    return kept
+
+
 def _constraint_key(text):
     """Normalised identity for folding near-duplicate constraints: case- and
     whitespace-insensitive, first 40 chars. Session-scoped rules get
@@ -2765,12 +2837,16 @@ def _fold_similar(groups, threshold):
     return [(row, folded) for row, _n, folded in leaders]
 
 
-def _constraint_lines(c, hint_ids, budget):
+def _constraint_lines(c, hint_ids, budget, max_chars=0):
     """Render the constraint block: hint matches first, then recency (id
     DESC), near-duplicates folded (newest kept, `(+N 유사)` appended), bounded
     to `budget` bytes with a tail line counting what was left out. The first
     constraint is always emitted so a tiny budget degrades to one rule, not
     none. `budget` 0 keeps every open constraint (legacy).
+
+    `max_chars` (#2884) bounds the same block in characters as well (UTF-16
+    units, one per line break); a line must fit both bounds, the first one
+    included. 0 = bytes only.
 
     Folding is two-stage: the normalised 40-char prefix (#2216), then token
     Jaccard across the prefix groups (#2384, _fold_similar) so one rule is
@@ -2800,20 +2876,34 @@ def _constraint_lines(c, hint_ids, budget):
         folded.append((fid, o, f))
     clusters = _fold_similar([(r, extra.get(r[0], 0)) for r in folded],
                              _constraint_fold_jaccard())
-    out, used, omitted = [], 0, 0
+    out, used, used_chars, omitted = [], 0, 0, 0
+    char_room = max(0, max_chars - _INJECT_TAIL_RESERVE) if max_chars else 0
+    over_bytes = over_chars = False
     for (_fid, o, f), n in clusters:
         line = f"- [제약/{o}] {f}"
         if n:
             line += f" (+{n} 유사)"
         b = len(line.encode()) + 1
-        if budget and out and used + b > budget:
+        u = _units(line) + 1
+        no_bytes = bool(budget and out and used + b > budget)
+        # No "first row always" under the character bound: a row larger than
+        # the whole room would cost the block, so it is counted as left out.
+        no_chars = bool(max_chars and used_chars + u > char_room)
+        if no_bytes or no_chars:
             omitted += 1
+            over_bytes = over_bytes or no_bytes
+            over_chars = over_chars or (no_chars and not no_bytes)
             continue
         out.append(line)
         used += b
+        used_chars += u
     if omitted:
+        # Name the bound that left rows out, so the reader knows which knob it
+        # was; a block cut by bytes alone reads exactly as before #2884.
+        bounds = "·".join(part for part in (f"{budget}B" if over_bytes or not over_chars else "",
+                                            f"{max_chars}자" if over_chars else "") if part)
         out.append(
-            f"- [제약] {omitted}건 생략(예산 {budget}B, 열린 제약 {len(rows)}건)"
+            f"- [제약] {omitted}건 생략(예산 {bounds}, 열린 제약 {len(rows)}건)"
             " — 전체: nunchi.py constraints")
     return out
 
@@ -3592,8 +3682,77 @@ def reattribute_unknown(apply=False, node=None, revert=False, sample=10, as_json
     return report
 
 
-def assemble(budget, hint, limit=25):
+def _ranked_facts(c, hint_ids):
+    """Open non-constraint facts in assemble's rank order: hint matches first
+    (in relevance order), then recency (id DESC)."""
+    rest_rows = c.execute(
+        "SELECT id,observed,kind,fact,mutability,evidence FROM peer_facts WHERE valid_to IS NULL"
+        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC", ()).fetchall()
+    rest = {r[0]: r for r in rest_rows}
+    ordered, seen = [], set()
+    for fid in hint_ids:
+        if fid in rest and fid not in seen:
+            ordered.append(rest[fid])
+            seen.add(fid)
+    for r in rest_rows:
+        if r[0] not in seen:
+            ordered.append(r)
+            seen.add(r[0])
+    return ordered
+
+
+def _live_check_line(n):
+    return f"- ⟳ live-check {n}건 — 가변 운영 사실, 단정 전 실측(#1264 P1-4)"
+
+
+def _fact_block(ordered, budget, used, auto_cap, char_room=None):
+    """assemble's fact block (live-check line first), filtered in rank order.
+
+    `used` is the bytes already charged to `budget` (the header). A line that
+    does not fit is skipped — a later, shorter one can still fit — and the
+    first line is always taken for the byte budget. `char_room` None = bytes
+    only, exactly the pre-#2884 selection; otherwise the block, its live-check
+    line included, also stays within that many UTF-16 units, and the first
+    line is taken only when it fits (here an overshoot costs the whole block,
+    not one line).
+    """
+    used_u, auto_used, live = 0, 0, 0
+    picked = []
+    for _fid, o, k, f, m, ev in ordered:
+        marker = "" if m == "static" else "⟳ "
+        is_auto = str(ev or "").startswith("auto-distill:")
+        label = f"{o}/{k}·auto" if is_auto else f"{o}/{k}"
+        line = f"- {marker}({label}) {f}"
+        b = len(line.encode()) + 1
+        if picked and used + b > budget:
+            continue
+        if char_room is not None:
+            n_live = live + (1 if marker else 0)
+            tail = _units(_live_check_line(n_live)) + 1 if n_live else 0
+            if used_u + _units(line) + 1 + tail > char_room:
+                continue
+        if is_auto and auto_used + b > auto_cap:
+            continue
+        picked.append(line)
+        used += b
+        used_u += _units(line) + 1
+        live += 1 if marker else 0
+        if is_auto:
+            auto_used += b
+    return ([_live_check_line(live)] if live else []) + picked
+
+
+def assemble(budget, hint, limit=25, max_chars=0):
     """P2-7 — task-conditioned ranked snapshot assembly, bounded in bytes.
+
+    `max_chars` (#2884, `--max-chars`, 0 = off) adds a ceiling on the WHOLE
+    printed block in characters (UTF-16 units, the trailing newline counted).
+    The byte-budgeted block is printed as is when it is inside the ceiling.
+    When it is over, the constraint block takes the ceiling minus the header
+    and the fact block's share (INJECT_FACT_SHARE, or what the facts need if
+    that is less), facts fill what is left, and both keep their byte budgets.
+    The ranking contract below is unchanged — constraints are still placed
+    first and are never displaced by facts.
 
     Fixed ranking contract (#1264 P2-7):
       1. header warnings (backend state, review-queue surface) — always
@@ -3636,20 +3795,8 @@ def assemble(budget, hint, limit=25):
     # node: the fact block shrank to the one guaranteed line and the
     # auto-distill share computed to 0 bytes.
     used = sum(len(ln.encode()) + 1 for ln in lines)
-    lines.extend(_constraint_lines(c, hint_ids, _constraint_budget()))
-    rest_rows = c.execute(
-        "SELECT id,observed,kind,fact,mutability,evidence FROM peer_facts WHERE valid_to IS NULL"
-        " AND kind NOT IN ('constraint','observation') ORDER BY id DESC", ()).fetchall()
-    rest = {r[0]: r for r in rest_rows}
-    ordered, seen = [], set()
-    for fid in hint_ids:
-        if fid in rest and fid not in seen:
-            ordered.append(rest[fid])
-            seen.add(fid)
-    for r in rest_rows:
-        if r[0] not in seen:
-            ordered.append(r)
-            seen.add(r[0])
+    max_chars = max(0, int(max_chars or 0))
+    ordered = _ranked_facts(c, hint_ids)
     # #2186 — machine-extracted auto-distill rows are labelled `·auto` and
     # capped to a share of the budget, after relevance ordering, so they add
     # recall without displacing conversation memory.
@@ -3657,30 +3804,28 @@ def assemble(budget, hint, limit=25):
     # block is bounded separately — #2500), so auto rows can never take the
     # whole block and conversation memory keeps the rest (#2186 review P2-a).
     auto_cap = int(max(0, budget - used) * _auto_distill_share())
-    auto_used = 0
-    fact_lines = []  # (rendered line, is_live) — budget-filtered in order
-    for fid, o, k, f, m, ev in ordered:
-        marker = "" if m == "static" else "⟳ "
-        is_auto = str(ev or "").startswith("auto-distill:")
-        label = f"{o}/{k}·auto" if is_auto else f"{o}/{k}"
-        line = f"- {marker}({label}) {f}"
-        b = len(line.encode()) + 1
-        if fact_lines and used + b > budget:
-            continue
-        if is_auto and auto_used + b > auto_cap:
-            continue
-        fact_lines.append((line, marker != ""))
-        used += b
-        if is_auto:
-            auto_used += b
-    facts_added = len(fact_lines)
-    if facts_added:
-        live_included = sum(1 for _l, is_live in fact_lines if is_live)
-        if live_included:
-            lines.append(
-                f"- ⟳ live-check {live_included}건 — 가변 운영 사실, 단정 전 실측(#1264 P1-4)")
-        lines.extend(ln for ln, _m in fact_lines)
-    print("\n".join(lines))
+
+    def fact_block(char_room=None):
+        return _fact_block(ordered, budget, used, auto_cap, char_room)
+
+    def units_of(block):
+        return sum(_units(ln) + 1 for ln in block)
+
+    # Bytes first: when that rendering is already inside the ceiling it is
+    # used as is, so a block that fitted before #2884 is unchanged.
+    constraint_budget = _constraint_budget()
+    constraint_lines = _constraint_lines(c, hint_ids, constraint_budget)
+    fact_lines = fact_block()
+    if max_chars and units_of(lines) + units_of(constraint_lines) + units_of(fact_lines) > max_chars:
+        # Over the ceiling: constraints give way only as far as the facts'
+        # share (never more than the facts need), then facts fill what the
+        # constraints left.
+        header_chars = units_of(lines)
+        fact_share = min(units_of(fact_lines), int(max_chars * INJECT_FACT_SHARE))
+        constraint_lines = _constraint_lines(
+            c, hint_ids, constraint_budget, max(1, max_chars - header_chars - fact_share))
+        fact_lines = fact_block(max_chars - header_chars - units_of(constraint_lines))
+    print("\n".join(_cap_lines(lines + constraint_lines + fact_lines, max_chars)))
 
 
 # #2464 제안 4 — the queue is where unattended passes hand off, so the boundary
@@ -4044,7 +4189,7 @@ if __name__ == "__main__":
         snapshot(int(flag("--limit", 25)))
     elif cmd == "assemble":
         assemble(int(flag("--budget", "4096")), flag("--hint", ""),
-                 int(flag("--limit", "25")))
+                 int(flag("--limit", "25")), int(flag("--max-chars", "0")))
     elif cmd == "constraints":
         constraints_cmd()
     elif cmd == "constraints-triage":

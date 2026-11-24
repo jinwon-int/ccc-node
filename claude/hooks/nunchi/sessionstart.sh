@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # nunchi SessionStart injection (#816).
 # Prints the latest peer_facts snapshot so it lands in session context.
-# Fail-open: never blocks session start; byte-capped at 3000. Typically ~1s on
+# Fail-open: never blocks session start; bounded in bytes by the assemble
+# budgets and in characters by CCC_NUNCHI_INJECT_MAX_CHARS. Typically ~1s on
 # a phone node (assemble + task query + injection scan, #2191; hook timeout 5s).
 # No-op unless nunchi is enabled (state/nunchi.mode=on or CCC_NUNCHI_MODE=on).
 #
@@ -43,13 +44,13 @@ inject_legacy() { head -c 3000 "$SNAP" 2>/dev/null || true; }
 # (credential redaction + prompt-injection neutralization). Run it through
 # bash — exec'ing its `#!/usr/bin/env` shebang dies with 126 on Termux
 # (#1157). Fail-open like load-memory.sh, but say so on stderr (#1160).
-scan_block() { # <text> [max-bytes]
-  local text="$1" cap="${2:-}" scanned
+scan_block() { # <text> [max-bytes] [max-chars]
+  local text="$1" cap="${2:-}" chars="${3:-}" scanned
   if [ ! -f "$HOOKDIR/scan-injection.sh" ]; then
     printf '%s\n' "$text"
     return
   fi
-  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" nunchi "$cap" 2>/dev/null)"; then
+  if scanned="$(printf '%s' "$text" | bash "$HOOKDIR/scan-injection.sh" nunchi "$cap" "$chars" 2>/dev/null)"; then
     printf '%s\n' "$scanned"
   else
     printf 'nunchi sessionstart: scan-injection failed; injecting UNSCANNED block\n' >&2
@@ -75,6 +76,24 @@ hint_terms() { # <query-line>
   printf '%s' "${out# }"
 }
 
+# #2884: the byte budgets bound the block (constraints 12,000 + facts 3,000),
+# but Claude Code caps a hook's output at 10,000 CHARACTERS and replaces a
+# longer one with a file path and a ~2,000-character preview. 15,000 bytes of
+# mostly-Hangul facts is about 9,000-10,900 characters, so on some nodes every
+# session received the preview instead of the block. `assemble` now sizes the
+# block to this ceiling (UTF-16 units, the cap's own unit; 500 of headroom),
+# and the scanner re-applies it because a redaction marker can be longer than
+# what it replaces. 0 turns the ceiling off. The legacy `head -c 3000` path is
+# at most 3,000 characters and needs nothing.
+max_chars="${CCC_NUNCHI_INJECT_MAX_CHARS:-9500}"
+case "$max_chars" in ''|*[!0-9]*) max_chars=9500 ;; esac
+# Plain decimal from here on: arithmetic would read a leading zero as octal,
+# and more digits than any real ceiling means "no ceiling".
+if [ "${#max_chars}" -gt 9 ]; then max_chars=0; else max_chars="$((10#$max_chars))"; fi
+scan_chars=""
+# One character of the ceiling is the newline scan_block prints after the block.
+[ "$max_chars" -gt 0 ] && scan_chars="$((max_chars - 1))"
+
 cap=""
 if [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "0" ] || [ "${CCC_NUNCHI_ASSEMBLE:-1}" = "false" ]; then
   block="$(inject_legacy)"
@@ -90,12 +109,13 @@ else
   fi
   [ -n "$hint" ] || hint="$(cat "${STATE}/current-task.txt" 2>/dev/null || true)"
   if ! block="$(python3 "$HERE/nunchi.py" assemble \
-       --budget "${CCC_NUNCHI_ASSEMBLE_BUDGET:-3000}" --hint "$hint" 2>/dev/null)"; then
+       --budget "${CCC_NUNCHI_ASSEMBLE_BUDGET:-3000}" --max-chars "$max_chars" \
+       --hint "$hint" 2>/dev/null)"; then
     block="$(inject_legacy)"
     cap=3000
   fi
 fi
-[ -n "$block" ] && scan_block "$block" "$cap"
+[ -n "$block" ] && scan_block "$block" "$cap" "$scan_chars"
 
 # Regenerate asynchronously if stale (>15min); cron refreshes every 10min normally.
 # The background refresh updates the snapshot for the next session; this session

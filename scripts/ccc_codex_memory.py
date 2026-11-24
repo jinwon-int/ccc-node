@@ -1025,6 +1025,10 @@ def load_snapshot(options: MaterializeOptions) -> str:
     # Codex/Piri, so ask for it here; an explicit operator value still wins.
     loader_environ = dict(options.environ)
     loader_environ.setdefault("CCC_MEMORY_INJECT_WORKING_STATE", "1")
+    # The loader's character ceiling (#2884) exists for the Claude Code hook
+    # output cap. This path writes the snapshot to a file under its own byte
+    # caps, so leave the loader's output as it was; an operator value still wins.
+    loader_environ.setdefault("CCC_MEMORY_MAX_CHARS", "0")
     returncode, stdout = _run_loader_bounded(
         command,
         environ=loader_environ,

@@ -113,6 +113,35 @@ Folding changes only the injected text — `nunchi.py constraints` still lists
 every row, and `constraints-triage` is the reversible way to close duplicates
 in the DB.
 
+### Character ceiling (#2884)
+
+The budgets above are bytes, but Claude Code caps each hook output string at
+10,000 **characters** and replaces a longer one with a file path and a
+~2,000-character preview — the session then starts with a fraction of the
+block. 15,000 bytes is about 5,000 characters of Hangul and 15,000 of ASCII,
+so the byte budgets cannot hold that line. `sessionstart.sh` therefore passes
+`--max-chars` (`CCC_NUNCHI_INJECT_MAX_CHARS`, default 9500; 0 = off) to
+`assemble`, counted in UTF-16 code units, the cap's own unit:
+
+- a block that is inside the ceiling under its byte budgets is printed as it
+  was — nothing is set aside until something has to give;
+- when it is over, the fact block keeps 20% of the ceiling (or what it needs,
+  if that is less), the constraint block takes the rest, and facts fill what
+  the constraints left; both keep their byte budgets;
+- rows that do not fit are counted in the same `N건 생략` tail, which names
+  the bound that left them out (`예산 12000B`, `예산 7500자`, or both);
+- a constraint larger than the whole ceiling is left out and counted like any
+  other. No line is ever cut before the injection scanner runs: a credential
+  split by a cut would no longer match the scanner's patterns;
+- the injection scanner re-applies the ceiling after redaction, because a
+  redaction marker can be longer than the text it replaces.
+
+`load-memory.sh` has the same ceiling for its own output
+(`CCC_MEMORY_MAX_CHARS`, default 9500; 0 = off) next to `CCC_MEMORY_MAX_BYTES`.
+Its blocks are laid out in priority order, so the cut falls on the tail (the
+Wiki prefetch) first. The Codex/Piri materializer turns the loader's ceiling
+off: it writes a file under its own byte caps and is not a Claude Code hook.
+
 ## Acceptance after deployment
 
 Stage one runtime/channel, then all nodes. Capture per audience: source input

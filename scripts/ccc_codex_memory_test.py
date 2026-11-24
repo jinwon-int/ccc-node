@@ -654,6 +654,47 @@ class CodexMemoryMaterializerTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn(expected, (self.codex_home / "AGENTS.md").read_text())
 
+    def test_loader_character_ceiling_is_off_unless_operator_overrides(self) -> None:
+        # #2884: the loader's character ceiling exists for the Claude Code hook
+        # output cap. This path writes a file under its own byte caps, so it
+        # asks the loader for the unbounded-in-characters output it always got;
+        # an explicit operator value passes through untouched.
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        loader = hooks / "load-memory.sh"
+        loader.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '{\"hookSpecificOutput\":{\"additionalContext\":\"CHARS_FLAG=%s\"}}\n' "
+            "\"${CCC_MEMORY_MAX_CHARS:-unset}\"\n",
+            encoding="utf-8",
+        )
+        loader.chmod(0o700)
+        for override, expected in ((None, "CHARS_FLAG=0"), ("7000", "CHARS_FLAG=7000")):
+            with self.subTest(override=override):
+                env = os.environ.copy()
+                env.pop("CCC_MEMORY_MAX_CHARS", None)
+                env.update(
+                    {
+                        "HOME": str(self.home),
+                        "CODEX_HOME": str(self.codex_home),
+                        "CCC_CODEX_MEMORY_LOADER": str(loader),
+                        "CCC_MEMORY_NO_REFRESH": "1",
+                    }
+                )
+                if override is not None:
+                    env["CCC_MEMORY_MAX_CHARS"] = override
+                completed = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), "materialize", "--json"],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(expected, (self.codex_home / "AGENTS.md").read_text())
+
     def test_audience_scoped_env_requires_exact_keyring_backed_home(self) -> None:
         env = os.environ.copy()
         env.update(

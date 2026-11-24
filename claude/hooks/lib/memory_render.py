@@ -22,21 +22,91 @@ import sys
 # call ~18ms of pure module-load time.
 
 
-def cmd_limit_bytes(argv):
-    """stdin: raw bytes; argv: <max>; stdout: bytes capped at <max>."""
-    limit = int(argv[0])
-    data = sys.stdin.buffer.read()
-    if limit > 0 and len(data) > limit:
+TRUNCATION_MARKER = "\n… [truncated by CCC memory budget]\n"
+
+
+def utf16_units(text):
+    """Length in UTF-16 code units — the unit of the Claude Code hook output
+    cap (#2884). A character outside the BMP (most emoji) counts as two."""
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def fit_utf16_units(text, limit):
+    """Longest prefix of `text` that is at most `limit` UTF-16 code units."""
+    if limit <= 0:
+        return ""
+    if len(text) * 2 <= limit:
+        return text
+    used = 0
+    for index, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > limit:
+            return text[:index]
+    return text
+
+
+def limit_text(data, max_bytes, max_chars=0):
+    """Cap raw UTF-8 `data` to `max_bytes` bytes and `max_chars` UTF-16 units.
+
+    Either bound is off at 0. An input inside both bounds is returned as the
+    very same bytes. A cut output ends with the truncation marker, which is
+    reserved inside whichever bound cut it; a bound smaller than the marker
+    gets as much of the marker as fits.
+
+    Undecodable bytes: the byte cut drops them (as it always did). The
+    character bound counts each as one U+FFFD, which is what the JSON encoder
+    downstream turns it into, and when it has to look at such an input it
+    returns the text with them already replaced — so the count it checked is
+    the count that is emitted.
+    """
+    suffix = TRUNCATION_MARKER.encode("utf-8")
+    marker_units = utf16_units(TRUNCATION_MARKER)
+    text, cut = None, False
+    if max_bytes > 0 and len(data) > max_bytes:
         # Reserve room for the truncation marker so the total output stays within
         # <limit> bytes. Slicing to <limit> and THEN appending the suffix used to
         # overshoot the declared cap by the suffix length (~38 bytes).
-        suffix = "\n… [truncated by CCC memory budget]\n".encode("utf-8")
-        keep = max(0, limit - len(suffix))
-        text = data[:keep].decode("utf-8", errors="ignore")
-        sys.stdout.buffer.write(text.encode("utf-8"))
-        sys.stdout.buffer.write(suffix)
-    else:
-        sys.stdout.buffer.write(data)
+        keep = max(0, max_bytes - len(suffix))
+        text, cut = data[:keep].decode("utf-8", errors="ignore"), True
+    # A string never has more UTF-16 units than UTF-8 bytes, so anything within
+    # the character bound in bytes is within it in characters: no decode.
+    size = len(text.encode("utf-8")) + len(suffix) if cut else len(data)
+    if max_chars > 0 and size > max_chars:
+        if text is None:
+            text = data.decode("utf-8", errors="replace")
+        if utf16_units(text) + (marker_units if cut else 0) > max_chars:
+            text, cut = fit_utf16_units(text, max_chars - marker_units), True
+            # The marker is two bytes longer than it is units, so a character
+            # cut can sit just over the byte cap: give those back.
+            while max_bytes > 0 and text and len(text.encode("utf-8")) + len(suffix) > max_bytes:
+                text = text[:-1]
+        elif not cut and text.encode("utf-8") == data:
+            text = None  # valid UTF-8 inside the bound: the very same bytes
+    if text is None:
+        return data
+    if not cut:
+        return text.encode("utf-8")
+    out = text + TRUNCATION_MARKER
+    if max_chars > 0 and utf16_units(out) > max_chars:
+        out = fit_utf16_units(out, max_chars)
+    return out.encode("utf-8")
+
+
+def _ascii_int(raw):
+    """A plain ASCII decimal string as an int, anything else as 0 (`isdigit`
+    alone also accepts digits int() rejects or that are not meant here)."""
+    return int(raw) if raw.isascii() and raw.isdigit() else 0
+
+
+def cmd_limit_bytes(argv):
+    """stdin: raw bytes; argv: <max-bytes> [max-chars]; stdout: the capped bytes.
+
+    <max-chars> (#2884) is optional; empty, non-numeric or 0 means bytes only,
+    so every existing caller keeps its output byte for byte.
+    """
+    limit = int(argv[0])
+    max_chars = _ascii_int(argv[1]) if len(argv) > 1 else 0
+    sys.stdout.buffer.write(limit_text(sys.stdin.buffer.read(), limit, max_chars))
 
 
 # ---------------------------------------------------------------------------
