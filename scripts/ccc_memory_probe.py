@@ -665,6 +665,18 @@ def _safe_audience_item(path: Path, *, directory: bool) -> bool:
     )
 
 
+# The managed MemPalace refresh runs once a day (02:17, #2850/#2857) with a
+# 3300 s timeout, so its freshness window is a day plus slack — not the 6 h
+# cache TTL nunchi facts/ingest use. A morning check after a healthy 02:17
+# refresh must not read as refresh-stale (#2876).
+MEMPALACE_REFRESH_TTL_DEFAULT = 93600
+
+
+def mempalace_refresh_ttl() -> int:
+    raw = (os.environ.get("CCC_MEMORY_MEMPALACE_REFRESH_TTL_SEC") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else MEMPALACE_REFRESH_TTL_DEFAULT
+
+
 def _audience_refresh_state(
     path: Path, *, ttl: int, now: int
 ) -> tuple[str, bool, bool]:
@@ -1344,10 +1356,11 @@ def main() -> int:
         or nunchi_home / "snapshot.md"
     )
     ttl = int(os.environ.get("CCC_MEMORY_CACHE_TTL_SEC") or "21600")
+    refresh_ttl = mempalace_refresh_ttl()
     now_raw = os.environ.get("CCC_MEMORY_CHECK_NOW_EPOCH") or ""
     now = int(now_raw) if now_raw.isdigit() else int(time.time())
     audience_probe = probe_audience_scopes(
-        audience_root, audience_scoped, ttl=ttl, now=now
+        audience_root, audience_scoped, ttl=refresh_ttl, now=now
     )
     required = is_mempalace_required(home)
     mp_cli = resolve_mempalace_cli(home, managed_environment)
@@ -1382,7 +1395,7 @@ def main() -> int:
         managed_refresh_count,
         legacy_sweep_count,
         mempalace_environment,
-        ttl,
+        refresh_ttl,
         now,
     )
     if audience_scoped and mode == "on":
