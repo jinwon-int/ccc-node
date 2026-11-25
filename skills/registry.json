@@ -65,7 +65,7 @@
       "name": "ccc-wiki-record",
       "source": "codex/skills/ccc-wiki-record",
       "status": "active",
-      "tree_sha256": "29b3adfdc7ede9cb78fa9b08ce71746ce7f6e47c61b458b3a6ac19009c63c354"
+      "tree_sha256": "a75fdc6449a9873c78093ad2a33305675960b5d6d33a8f6ddb6202efe7479344"
     },
     {
       "audience": "codex",
@@ -461,7 +461,7 @@
       "name": "wiki-record",
       "source": "skills/wiki-record",
       "status": "active",
-      "tree_sha256": "65ec65c0a83d2444b00d365c7d48d973e135a8be80ee4d212f7d72b46fbadd73"
+      "tree_sha256": "bd15588163eaae864c74d247bcbcf67228d7f298c0596c3a2116871475220382"
     }
   ]
 }
