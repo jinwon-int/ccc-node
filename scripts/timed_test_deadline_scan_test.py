@@ -1133,6 +1133,150 @@ class RelativeFalsePositive2544Tests(unittest.TestCase):
         self.assertEqual(scanner.notify_candidates(findings, "high"), [])
 
 
+# --- relative mode: behaviour descriptions, interval units, others' habits (#2901)
+# Reduced from the 2026-11-25 relative list: four high findings, none of them a
+# timed test. The lines are the issues' own, shortened only where marked.
+LINE_2137 = (
+    "2. **PR을 닫아도 `closed-unmerged`가 장부에 자동으로 남지 않습니다.** 닫은 쪽이 "
+    "`decide --source manual`로 남기지 않으면 summary에는 24시간 뒤 `expired`로만 나옵니다. "
+    "GitHub 기준의 닫힘은 `reconcile`이 따로 보여 줍니다."
+)
+LINE_179_TABLE = (
+    "| `lockcal` · `notif-digest`는 실제 상태 폴더에 합성 줄을 POST해서 확인했다 | 합성 줄이 "
+    "**규칙의 근거와 건수**가 된다. 같은 문구 틀 3줄이면 자동 규칙이 생겨 폰으로 내려간다. 빈 큐만 "
+    "보내도 「수신 기록」이 한 줄 남아, 48시간 뒤 「기록 끊김」(R3) 알림이 한 번 간다 | POST는 임시 "
+    "상태 폴더 + 루프백 포트에서만 확인한다(A-3). |"
+)
+LINE_179_STEP = (
+    "끝난 뒤 `curl -s \"$BASE/healthz\"`의 `last_sync`가 여전히 `null`인지 본다. `null`이 아니면 "
+    "누가 실제 서비스에 POST 한 것이고, 48시간 뒤 「기록 끊김」(R3) 알림이 한 번 간다. 그 경우 이 "
+    "이슈에 적는다."
+)
+LINE_974 = "| 활동도 | 첫 화면 최근 글 조회수 1~46, 최근 글 간격 며칠 단위(10-18~10-28) — **활동이 낮은 편** |"
+LINE_2827 = (
+    "#2287(PR #2289)은 같은 성질을 스킬 문서에서만 고쳤다. 그 뒤에 생긴 `schedule` 명령의 schedule "
+    "절(178행~)에는 재부팅 경고가 없다. 그래서 에이전트들이 며칠~몇 주 뒤의 관측·알림을 이 명령으로 "
+    "걸고 있다."
+)
+
+
+class RelativeFalsePositive2901Tests(unittest.TestCase):
+    def _judge(self, issue: dict) -> scanner.Finding:
+        finding = scanner.judge_issue(issue, NOW, "relative")
+        assert finding is not None
+        return finding
+
+    def assertDemoted(self, issue: dict, reason: str) -> None:
+        finding = self._judge(issue)
+        self.assertEqual((finding.confidence, finding.weak_reason), ("low", reason))
+
+    def assertFlagged(self, issue: dict) -> None:
+        finding = self._judge(issue)
+        self.assertEqual((finding.confidence, finding.weak_reason), ("high", None))
+
+    # -- system-behaviour ------------------------------------------------------
+    def test_conditional_system_behaviour_is_demoted(self) -> None:
+        # ccc-node#2137, iphone-agent-cast#179 (table cell and step text).
+        for line in (
+            LINE_2137,
+            LINE_179_TABLE,
+            LINE_179_STEP,
+            "토큰이 갱신되지 않으면 24시간 뒤 경고가 뜹니다.",
+            "응답이 없어도 48시간 뒤 상태가 `stale`로 바뀐다",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(comments=[_rel_comment(line)]), "system-behaviour")
+
+    def test_system_behaviour_controls_stay_high(self) -> None:
+        for line in (
+            # No condition earlier in the sentence: a plain statement of when.
+            "24시간 뒤 알림이 간다",
+            "배포한다. 48시간 뒤 알림이 간다",
+            # The condition belongs to the previous sentence.
+            "문제가 없으면 배포한다. 48시간 뒤 알림이 간다",
+            # A judging word in the term's sentence is a booking.
+            "문제가 없으면 24시간 뒤 알림을 확인한다",
+            "에러가 없으면 48시간 뒤 상태를 점검합니다",
+            "조건이 맞으면 24시간 뒤 승격됩니다",
+            "문제가 없으면 24시간 뒤 알림이 가는지 보기로 했다",
+            # No alert/state noun: nothing says this is the system's own output.
+            "이상이 없으면 24시간 뒤 다음 단계로 간다",
+            # The condition comes after the term (#2635 control).
+            "24시간 뒤 에러가 없었다면 승격",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    def test_system_behaviour_follows_the_observation_guard(self) -> None:
+        # A paragraph that names an observation is never judged by wording.
+        line = "카나리가 실패하면 24시간 뒤 경고가 뜹니다"
+        self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    # -- interval-unit ---------------------------------------------------------
+    def test_interval_unit_is_demoted(self) -> None:
+        for line in (LINE_974, "게시 주기 몇 주 단위", "글 **간격** 며칠 단위로 올라옴"):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(comments=[_rel_comment(line)]), "interval-unit")
+
+    def test_interval_unit_controls_stay_high(self) -> None:
+        for line in (
+            "며칠 단위로 재확인",            # no interval noun before the term
+            "점검 주기 며칠 단위로 재확인한다",  # a judging word follows
+            "간격 며칠 뒤 판정",             # not a unit
+            "게시 간격은 넓다. 며칠 단위로 본다",  # the noun is not adjacent
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    # -- generic-practice ------------------------------------------------------
+    def test_described_habit_is_demoted_even_with_an_observation_word(self) -> None:
+        for line in (
+            LINE_2827,
+            "운영자들은 몇 주 후의 알림을 수동으로 걸고 있습니다.",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(body=line, author="seoseo-ai"), "generic-practice")
+
+    def test_generic_practice_controls_stay_high(self) -> None:
+        for line in (
+            "며칠 뒤의 관측 결과로 판정한다",              # no plural subject, no habitual ending
+            "우리는 며칠 뒤의 관측을 걸고 있다",            # not a plural subject
+            "에이전트들이 며칠 뒤 관측을 걸 예정이다",        # not attributive, a plan
+            "에이전트들이 며칠 뒤의 관측을 걸기로 했다",       # a decision, not a habit
+            # One described habit does not excuse a booking in the same line.
+            "에이전트들이 며칠 뒤의 관측을 걸고 있다, 이번에도 며칠 관측한다",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    # -- the four issues as the report states them -----------------------------
+    def test_the_four_issues_have_no_high_finding(self) -> None:
+        issues = [
+            _rel_issue(body=LINE_2827),
+            _rel_issue(comments=[_rel_comment(LINE_2137)]),
+            _rel_issue(comments=[_rel_comment(LINE_974)]),
+            _rel_issue(body=LINE_179_TABLE + "\n\n" + LINE_179_STEP, author="jinon86"),
+        ]
+        for number, issue in enumerate(issues, start=1):
+            issue["number"] = number
+        low = scanner.scan(issues, NOW, "relative")
+        self.assertEqual([f.confidence for f in low], ["low"] * 4)
+        self.assertEqual(
+            sorted(f.weak_reason for f in low),
+            ["generic-practice", "interval-unit", "system-behaviour", "system-behaviour"],
+        )
+        self.assertEqual(scanner.scan(issues, NOW, "relative", min_confidence="high"), [])
+        self.assertEqual(scanner.notify_candidates(low, "high"), [])
+
+    def test_a_real_window_beside_a_described_one_keeps_the_issue_high(self) -> None:
+        issue = _rel_issue(
+            comments=[_rel_comment(LINE_2137), _rel_comment("배포 후 며칠 관찰한 뒤 판정")]
+        )
+        finding = self._judge(issue)
+        self.assertEqual((finding.confidence, finding.paragraph), ("high", "배포 후 며칠 관찰한 뒤 판정"))
+        self.assertTrue(any(d.startswith("system-behaviour: ") for d in finding.dropped))
+
+
 # --- relative mode: later absolute booking / not-started marker (#2817) -------
 # Reduced from the 2026-11-15 relative list: iphone-agent-cast#87/#89 kept
 # their relative wording after a later comment booked an absolute end, and
