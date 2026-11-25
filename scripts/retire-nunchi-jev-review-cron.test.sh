@@ -99,5 +99,5 @@ okc "$RC" 2 "unknown option exits 2"
 RC=0; CCC_JEV_REVIEW_RETIRE_DATE=2026-11-25 CCC_CRONTAB_CMD="$STUB" bash "$SC" >"$OUT" 2>&1 || RC=$?
 okc "$RC" 2 "malformed date stamp exits 2"
 
-echo "retire-nunchi-jev-review-cron: $pass passed, $fail failed"
+echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
