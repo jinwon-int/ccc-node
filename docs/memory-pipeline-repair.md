@@ -58,3 +58,27 @@ Example separate schedule (existing collector stays installed):
 Deploy all sibling helpers together and preserve node-local backups. Rollback:
 remove these two schedules, restore feed scripts from backup, keep the receipt
 and advisory databases as evidence. No source-memory rollback is needed for Jev.
+
+### Retired: the `jev-review.py` schedule (#2905)
+
+Do not install the `jev-review.py` line above on new nodes. A fleet measurement
+on 2026-11-25 found it running every ten minutes on eleven nodes, about 9,300
+runs each, while the narrow boundary let almost nothing out: three Jev attempts
+(three `reviews` rows) on the whole fleet, none on ten nodes. The 2026-10-01
+audit had the same result (16,984 runs, zero attempts). The cost is a Python
+start every ten minutes per node for no review.
+
+Retire it per node with the helper (dry-run by default):
+
+```sh
+bash ~/ccc-node/scripts/retire-nunchi-jev-review-cron.sh            # preview
+bash ~/ccc-node/scripts/retire-nunchi-jev-review-cron.sh --apply    # comment out
+bash ~/ccc-node/scripts/retire-nunchi-jev-review-cron.sh --status
+```
+
+`--apply` keeps the line but puts `#jev-review-retired-YYYYMMDD# ` in front of
+it, after saving the previous crontab (0600) under `~/.claude/state/`. Lines
+that are already commented out stay as they are. `jev-review.db` and its log
+are not touched; they remain the evidence. Rollback is
+`--restore --apply`, which removes only that marker. `jev-review.py` itself
+stays in the tree so a manual run or a future, wider boundary can reuse it.
