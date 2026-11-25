@@ -67,9 +67,26 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
    ```bash
    wiki-agent pr     # creates the PR and enables auto-merge
    ```
+   `wiki-agent pr` runs the checks itself, so there is no separate scan step: added lines are checked for secret-like values (a fixed pattern list that always refuses the PR, plus gitleaks where it is installed — a warning by default), for conflict markers, and for an edited `pages/log.md` digest. A refusal is never worked around: replace the value with a location-only reference (or fix what it names) and run it again. A `warning - gitleaks found …` line did not block the PR, so act on it at once (see **Exposed credentials**).
+
+6. **Verify after merge**
+   ```bash
+   wiki-agent load pages/log.md | head -40    # your entry is the newest heading, with the expected ID and KST date
+   ```
+   For a new `TM-`/`ND-`/`DOC-` section, load its page and confirm the heading is there exactly once.
+
+## Exposed credentials
+
+If a raw credential reached a pushed branch or a merged page, removing it is not enough: Wiki history and caches keep it. Rotating or revoking a live credential can break every service that depends on it and cannot be undone, so never do either on your own judgement.
+
+1. Do not copy the exposed value anywhere else (notes, tickets, chat, the log entry).
+2. Report it by location only: which credential, where and since when it was exposed, its owner, and every known dependent service, node or automation.
+3. Ask the credential's owner for an explicit decision (rotate, revoke, or accept the risk). A confirmation for one credential does not cover another.
+4. After a rotation or revocation, record it as its own log entry through this procedure, and replace the value in the page with a location reference in a follow-up PR.
 
 ## Notes
 - `log.md` may be edited by other nodes between your read and write — re-Read the top before prepending if the Edit fails.
 - `wiki-agent` auto-resolves concurrent `pages/log.md` rebases for both regions and recomputes a taken same-node/same-day `<seq>` for you (wiki-agent [#183](https://github.com/jinwon-int/wiki-agent/pull/183); a node picks this up on its next `wiki-agent self-update`).
 - If a rebase still falls back to manual, update from the latest default branch, recompute this node's same-day sequence across both regions, and re-prepend at the top; never fall back to a global numeric ID.
 - One logical change per PR; include the IDs you added in your report back to the user.
+- A new `TM-`/`ND-`/`DOC-` section is for a persistent fact that later work will look up; a transient note stays in the log entry. Link the new section ID from the log entry.

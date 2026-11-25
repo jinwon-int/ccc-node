@@ -42,4 +42,12 @@ description: Record durable operating knowledge in the Seoyoon Family Wiki throu
    wiki-agent pr
    ```
 
-6. Confirm the PR and merge result. Report the new durable IDs and links.
+6. Confirm the PR and merge result (`wiki-agent load pages/log.md | head -40`
+   shows the entry as the newest heading). Report the new durable IDs and links.
+
+7. `wiki-agent pr` checks the added lines for secret-like values itself (fixed
+   patterns that refuse the PR, plus gitleaks where installed — a warning by
+   default). Never work around a refusal. If a raw credential reached a pushed
+   branch or a merged page, do not rotate or revoke it on your own judgement:
+   report it by location only (credential, where and since when, owner,
+   dependents) and ask its owner for an explicit decision.
