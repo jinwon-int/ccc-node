@@ -100,6 +100,8 @@ Usage:
                                              # fold near-dup / retire phase constraints (#2222)
   nunchi.py g5-legacy-close [--apply] [--close-only|--retag-only] [--sample N] [--json]
                                              # G5 legacy backlog: retag logs / policy reason (#2221)
+  nunchi.py merge-proposals [--apply] [--limit N] [--sample N] [--json]
+                                             # fold the judge report's g3-duplicate proposals in one pass (#2910)
   nunchi.py reattribute-unknown [--apply] [--node NAME] [--sample N] [--show-text] [--json]
   nunchi.py reattribute-unknown --revert [--apply] [--sample N] [--json]
                                              # legacy observed=unknown facts -> node name (#2759)
@@ -114,7 +116,7 @@ Curation authority (#2464 제안 4, docs/nunchi-curation-authority.md):
   only add facts, close under a deterministic gate (G1, B2, observation TTL,
   opt-in task-progress TTL, opt-in session-constraint idle TTL) and set/clear
   review flags. Tier 2 bulk closes
-  (review-stale, constraints-triage) are owner-invoked and dry-run by default;
+  (review-stale, constraints-triage, merge-proposals) are owner-invoked and dry-run by default;
   conflict-sweep only flags; g5-legacy-close only sets because/kind on the G5
   legacy backlog; reattribute-unknown only moves provable subject=node rows
   from observed=unknown to the node name (closing a legacy row only when the
@@ -2638,6 +2640,41 @@ def supersede(fid, new_text):
     print(f"#{fid} closed; inserted successor")
 
 
+def _merge_rows(c, dup_id, survivor_id, stamp=None):
+    """Fold one duplicate into its survivor on connection `c`, without commit.
+
+    Shared by `merge` (one pair) and `merge-proposals` (#2910, many pairs in
+    one transaction) so both leave the same lineage: the duplicate is closed
+    (`valid_to`) and both evidence fields get a greppable marker. Returns
+    ``(status, dup_row)`` — status is one of ``merged``, ``same``, ``no-dup``,
+    ``no-survivor``, ``dup-closed``, ``survivor-closed``, ``already``;
+    ``dup_row`` is ``(fact, evidence, valid_to)`` as read (None when the
+    duplicate does not exist). Nothing is written unless status is ``merged``.
+    """
+    if dup_id == survivor_id:
+        return "same", None
+    dup = c.execute(
+        "SELECT fact, evidence, valid_to FROM peer_facts WHERE id=?", (dup_id,)).fetchone()
+    survivor = c.execute(
+        "SELECT fact, evidence, valid_to FROM peer_facts WHERE id=?", (survivor_id,)).fetchone()
+    if not dup:
+        return "no-dup", None
+    if not survivor:
+        return "no-survivor", dup
+    if dup[2] is not None:
+        return "dup-closed", dup
+    if survivor[2] is not None:
+        return "survivor-closed", dup
+    marker = f"merged:#{dup_id}"
+    if marker in (survivor[1] or "").split():
+        return "already", dup
+    survivor_evidence = ((survivor[1] or "") + " " + marker).strip()
+    c.execute("UPDATE peer_facts SET valid_to=?, evidence=? WHERE id=?",
+              (stamp or now(), ((dup[1] or "") + f" merged-away:#{survivor_id}").strip(), dup_id))
+    c.execute("UPDATE peer_facts SET evidence=? WHERE id=?", (survivor_evidence, survivor_id))
+    return "merged", dup
+
+
 def merge(dup_id, survivor_id):
     """#1336 — fold a duplicate fact into its survivor. Closes the duplicate
     and stamps a greppable merge lineage into BOTH evidence fields; no new
@@ -2645,35 +2682,162 @@ def merge(dup_id, survivor_id):
     multiplies facts, while merge shrinks them. The full history of the
     duplicate (fact, evidence, because, dates) stays on its own row, so this
     is reversible by hand exactly like supersede (clear valid_to)."""
-    if dup_id == survivor_id:
-        sys.exit("merge: duplicate and survivor are the same fact")
     c = db()
-    dup = c.execute(
-        "SELECT fact, evidence, valid_to FROM peer_facts WHERE id=?", (dup_id,)).fetchone()
-    survivor = c.execute(
-        "SELECT fact, evidence, valid_to FROM peer_facts WHERE id=?", (survivor_id,)).fetchone()
-    if not dup:
+    stamp = now()
+    status, dup = _merge_rows(c, dup_id, survivor_id, stamp)
+    if status == "same":
+        sys.exit("merge: duplicate and survivor are the same fact")
+    if status == "no-dup":
         sys.exit(f"no fact #{dup_id}")
-    if not survivor:
+    if status == "no-survivor":
         sys.exit(f"no fact #{survivor_id}")
-    if dup[2] is not None:
+    if status == "dup-closed":
         sys.exit(f"#{dup_id} is already closed ({dup[2]}) — nothing to merge")
-    if survivor[2] is not None:
+    if status == "survivor-closed":
         sys.exit(f"#{survivor_id} is closed — the merge survivor must be open")
-    marker = f"merged:#{dup_id}"
-    survivor_evidence = ((survivor[1] or "") + " " + marker).strip()
-    if marker in (survivor[1] or "").split():
+    if status == "already":
         print(f"#{dup_id} already merged into #{survivor_id} — nothing to do")
         return
-    stamp = now()
-    c.execute("UPDATE peer_facts SET valid_to=?, evidence=? WHERE id=?",
-              (stamp, ((dup[1] or "") + f" merged-away:#{survivor_id}").strip(), dup_id))
-    c.execute("UPDATE peer_facts SET evidence=? WHERE id=?", (survivor_evidence, survivor_id))
     c.commit()
     print(f"#{dup_id} merged into #{survivor_id}")
     print(f"  duplicate: {dup[0][:90]}")
     print(f"  closed {stamp}; history intact on #{dup_id}; audit markers in evidence")
     print(f"  survivor review flag unchanged — clear if resolved: nunchi.py review {survivor_id} --clear")
+
+
+def _load_judge_batch():
+    """judge-batch.py owns the g3-duplicate rule — which sibling counts as a
+    near-identical copy and which side survives (#1891/#1898). `merge-proposals`
+    asks that code for its proposals instead of restating the rule here: a
+    second copy would drift from the one the report shows the owner."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "judge-batch.py")
+    spec = importlib.util.spec_from_file_location("nunchi_judge_batch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _merge_proposals_plan(c, jb):
+    """The report's proposals split into (to fold, held back). The only rule
+    added to judge-batch's list is G2: a duplicate that outranks its survivor
+    is never folded — an agent inference must not bury an owner statement."""
+    _queue, _deferred, duplicates = jb.fetch_queue(c)
+    plan, held = [], []
+    for _fid, _sid, ratio, dup_id, survivor_id in duplicates:
+        ranks = dict(c.execute(
+            "SELECT id, COALESCE(source_rank, 1) FROM peer_facts WHERE id IN (?, ?)",
+            (dup_id, survivor_id)))
+        if dup_id not in ranks or survivor_id not in ranks:
+            continue
+        if ranks[dup_id] > ranks[survivor_id]:
+            held.append((dup_id, survivor_id, ratio))
+        else:
+            plan.append((dup_id, survivor_id, ratio))
+    return plan, held, len(duplicates)
+
+
+def _merge_proposals_apply(c, jb, todo, held_count):
+    """Back the store up, fold `todo` in one transaction (each pair re-checked
+    by `_merge_rows` as it is written), then record one body-free audit row.
+    Returns ``(merged_pairs, skipped_counts, backup_path)``."""
+    backup = jb.backup_db()
+    stamp = now()
+    outcome, merged = {}, []
+    if c.in_transaction:
+        c.commit()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        for dup_id, survivor_id, _ratio in todo:
+            status, _dup = _merge_rows(c, dup_id, survivor_id, stamp)
+            outcome[status] = outcome.get(status, 0) + 1
+            if status == "merged":
+                merged.append([dup_id, survivor_id])
+        c.commit()
+    except sqlite3.Error:
+        c.rollback()
+        raise
+    skipped = {k: v for k, v in sorted(outcome.items()) if k != "merged"}
+    # Body-free, like every other judge audit row: ids and counts only.
+    jb.audit({"ts": stamp, "db": DB, "class": "g3-duplicate-merge", "mode": "apply",
+              "merged": len(merged), "skipped": skipped,
+              "held_higher_rank_duplicate": held_count, "backup": backup, "pairs": merged})
+    return merged, skipped, backup
+
+
+def _merge_proposals_print(report, todo, held, sample, threshold):
+    print(f"merge-proposals ({report['mode']}): proposals={report['proposals']}"
+          f" to_merge={report['to_merge']} held_higher_rank_duplicate={len(held)}"
+          f" (overlap >= {threshold:.2f})"
+          + (f" beyond_limit={report['beyond_limit']}" if report["beyond_limit"] else ""))
+    for d, sv, r in todo[:sample]:
+        print(f"  merge {d} --into {sv}  # overlap {r:.2f}")
+    if len(todo) > sample:
+        print(f"  ... and {len(todo) - sample} more")
+    for d, sv, r in held[:sample]:
+        print(f"  held: #{d} outranks its survivor #{sv} — decide by hand (overlap {r:.2f})")
+    if report["mode"] == "apply":
+        skipped = ", ".join(f"{k}={v}" for k, v in report["skipped"].items()) or "none"
+        print(f"merged={report['merged']} skipped: {skipped}"
+              + (f" backup={report['backup']}" if report.get("backup") else ""))
+        if report["merged"]:
+            print("  a flagged survivor is cleared by the next judge-batch run once it has no live sibling")
+    elif todo:
+        print("dry-run — nothing changed. Then: nunchi.py merge-proposals --apply")
+
+
+def merge_proposals(apply=False, limit=0, sample=20, as_json=False):
+    """`merge-proposals` — #2910 C, deterministic and LLM-free.
+
+    Applies the judge-batch report's g3-duplicate proposals
+    (`nunchi.py merge <dup> --into <survivor>`) in one pass. The proposals are
+    exactly the ones the hourly report lists; this command adds no rule of its
+    own except G2 (see `_merge_proposals_plan`). Each fold is the same write as
+    `merge` — the duplicate is closed (`valid_to`), both rows get the evidence
+    marker, nothing is deleted and no text changes. `--apply` takes the judge
+    lock, backs the store up, and folds every pair in one transaction with a
+    mutation-time recheck (both rows still open); pairs that no longer qualify
+    are skipped and counted. Review flags are left alone: a flagged duplicate
+    leaves the queue by closing, and a flagged survivor is cleared by the next
+    judge-batch run once it has no live sibling. Dry-run by default; a second
+    run finds nothing left to fold.
+    """
+    jb = _load_judge_batch()
+    if os.path.realpath(jb.DB) != os.path.realpath(DB):
+        sys.exit("merge-proposals: judge-batch.py resolves a different fact store — set NUNCHI_DB/NUNCHI_HOME consistently")
+    if not os.path.isfile(DB):
+        print(f"merge-proposals: no fact store at {DB} — nothing to do")
+        return None
+    ccc_secure_fs.ensure_private_directory(jb.Path(jb.HOME_DIR))
+    with os.fdopen(ccc_secure_fs.open_lock_descriptor(jb.LOCK), "r+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            sys.exit("merge-proposals: a judge-batch run holds the lock — try again in a minute")
+        c = db()
+        plan, held, proposals = _merge_proposals_plan(c, jb)
+        todo = plan[:limit] if limit else plan
+        pairs = lambda items: [{"dup": d, "survivor": sv, "overlap": round(r, 2)} for d, sv, r in items[:sample]]  # noqa: E731
+        report = {
+            "mode": "apply" if apply else "dry-run",
+            "threshold": jb.DUP_THRESHOLD,
+            "proposals": proposals,
+            "to_merge": len(todo),
+            "beyond_limit": len(plan) - len(todo),
+            "held_higher_rank_duplicate": len(held),
+            "pairs_sample": pairs(todo),
+            "held_sample": pairs(held),
+        }
+        if apply:
+            report["merged"], report["skipped"] = 0, {}
+        if apply and todo:
+            merged, report["skipped"], report["backup"] = _merge_proposals_apply(c, jb, todo, len(held))
+            report["merged"] = len(merged)
+        if as_json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            _merge_proposals_print(report, todo, held, sample, jb.DUP_THRESHOLD)
+        return report
 
 
 def _snapshot_header(c):
@@ -4346,6 +4510,16 @@ if __name__ == "__main__":
         g5_legacy_close(apply="--apply" in args, sample=sample_n,
                         do_retag="--close-only" not in args,
                         do_close="--retag-only" not in args, as_json="--json" in args)
+    elif cmd == "merge-proposals":
+        try:
+            limit_n = int(flag("--limit", "0"))
+            sample_n = int(flag("--sample", "20"))
+        except ValueError:
+            sys.exit("merge-proposals: --limit and --sample are integers")
+        if limit_n < 0 or sample_n < 0:
+            sys.exit("merge-proposals: need --limit >= 0 and --sample >= 0")
+        merge_proposals(apply="--apply" in args, limit=limit_n, sample=sample_n,
+                        as_json="--json" in args)
     elif cmd == "reattribute-unknown":
         try:
             sample_n = int(flag("--sample", "10"))

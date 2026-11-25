@@ -125,11 +125,36 @@ ok "reattribute-unknown selects the legacy peer only and proves each row" \
 ok "reattribute-unknown resolves a canonical target before the DB is opened" \
   'grep -qF "target, source = _reattr_target(node)  # refuse before the DB is opened" <<<"$reattr_src"'
 
+# ---- rule 3e: merge-proposals (#2910) folds the judge report's duplicate proposals with the
+# same two writes as `merge`; it never writes review, text, kind or rank, and holds back a
+# duplicate that outranks its survivor (G2) ------------------------------------------------
+mp_src="$(python3 - "$NP" <<'PY'
+import ast, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for node in ast.parse(src).body:
+    if isinstance(node, ast.FunctionDef) and (
+            node.name in ("_merge_rows", "merge_proposals", "merge") or node.name.startswith("_merge_proposals_")):
+        print(ast.get_source_segment(src, node))
+PY
+)"
+mp_writes="$(grep -oE "UPDATE peer_facts SET [a-z_=?, ]+" <<<"$mp_src" | sed 's/ *$//' | sort -u)"
+ok "merge-proposals functions found" \
+  'grep -q "^def merge_proposals" <<<"$mp_src" && grep -q "^def _merge_rows" <<<"$mp_src"'
+ok "merge / merge-proposals write peer_facts only as the two merge writes" \
+  '[ "$mp_writes" = "$(printf "%s\n%s" "UPDATE peer_facts SET evidence=?" "UPDATE peer_facts SET valid_to=?, evidence=?")" ]'
+ok "merge-proposals never writes the review flag, text, kind or rank" \
+  '! grep -qE "SET[^\"]*(review|fact|kind|mutability|source_rank|because)[[:space:]]*=" <<<"$mp_src"'
+ok "merge-proposals holds back a duplicate that outranks its survivor" \
+  'grep -qF "if ranks[dup_id] > ranks[survivor_id]:" <<<"$mp_src"'
+ok "merge-proposals takes its pairs from judge-batch fetch_queue, not a second rule" \
+  'grep -qF "jb.fetch_queue(c)" <<<"$mp_src" && ! grep -qE "_norm_tokens|DUP_THRESHOLD *=|ratio *>=" <<<"$mp_src"'
+ok "merge-proposals is dry-run by default" 'grep -qF "def merge_proposals(apply=False" <<<"$mp_src"'
+
 # ---- the boundary is stated where the owner reads it ------------------------------------
 ok "usage text carries the curation authority block" 'grep -q "^Curation authority (#2464 제안 4" "$NP"'
 ok "usage lists review and retag" 'grep -qE "^  nunchi.py review \[" "$NP" && grep -qE "^  nunchi.py retag " "$NP"'
 ok "authority doc exists" '[ -f "$DOC" ]'
-for cmd in review-stale constraints-triage conflict-sweep g5-legacy-close reattribute-unknown supersede merge annotate retag "review <id> --clear"; do
+for cmd in review-stale constraints-triage conflict-sweep g5-legacy-close merge-proposals reattribute-unknown supersede merge annotate retag "review <id> --clear"; do
   ok "doc names owner command: $cmd" 'grep -qF -- "$cmd" "$DOC"'
 done
 ok "docs index links the authority page" 'grep -qF "(nunchi-curation-authority.md)" "$ROOT/docs/README.md"'
