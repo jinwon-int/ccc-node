@@ -276,6 +276,9 @@ REL_PROCESS = "process-duration"  # family-messenger#338 "수일 소요"
 REL_PAST_EVENT = "past-event-offset"  # family-messenger#616 "15시간 뒤에야 일어났고" (#2635)
 REL_CLOCK_GLOSS = "anchored-clock-gloss"  # family-messenger#616 "10-31 11:27:19(약 15시간 뒤)"
 REL_GENERIC = "generic-duration"  # ccc-node#2659 "며칠씩 … 이어질 수 있습니다"
+REL_SYSTEM = "system-behaviour"  # ccc-node#2137 "…않으면 24시간 뒤 `expired`로만 나옵니다" (#2901)
+REL_INTERVAL = "interval-unit"  # nclex#974 "최근 글 간격 며칠 단위" (#2901)
+REL_PRACTICE = "generic-practice"  # ccc-node#2827 "에이전트들이 며칠~몇 주 뒤의 관측을 … 걸고 있다" (#2901)
 # Issue-level shapes (#2817), applied after the paragraph rules above:
 REL_SUPERSEDED = "superseded-by-absolute"  # iphone-agent-cast#87/#89
 REL_NOT_STARTED = "not-started"  # a2a-nexus#2395
@@ -378,6 +381,42 @@ CLOCK_GLOSS_LOOKBACK = 40
 # particle and the same clause ends in a "can/could" form (수 있다 …).
 DISTRIBUTIVE_SUFFIX = re.compile(r"[*_]*씩")
 POSSIBILITY_ENDING = re.compile(r"수\s*있(?:다|습니다|음|어요|고|으며|는)")
+# What the system does by itself once a condition holds — a description of
+# behaviour, not a judgement anyone booked (#2901): "…남기지 않으면 summary에는
+# 24시간 뒤 `expired`로만 나옵니다" (ccc-node#2137), "`null`이 아니면 …, 48시간 뒤
+# 「기록 끊김」(R3) 알림이 한 번 간다" (iphone-agent-cast#179). Three cues, all
+# required: a conditional or concessive ending earlier in the same sentence, an
+# alert/state noun in the term's own sentence remainder, and that remainder
+# closing on a plain present "appears / goes out" verb. A judging word there
+# (판정·확인·재확인·승격 …) keeps the term a window: "문제가 없으면 24시간 뒤
+# 알림을 확인한다" is a booking, and so is "… 24시간 뒤 승격됩니다".
+SENTENCE_END = re.compile(r"[.!?。](?:\s|$)|\n|\|")
+SYSTEM_CONDITION = re.compile(r"(?:면|[아어해여내]도)(?=[\s,，]|$)")
+SYSTEM_NOUN = re.compile(r"(알림|경고|통지|표시|상태|배지|만료|expired|stale|timeout)", re.IGNORECASE)
+SYSTEM_VERB = re.compile(
+    r"(?:간다|갑니다|온다|옵니다|뜬다|뜹니다|나온다|나옵니다|나간다|나갑니다"
+    r"|바뀐다|바뀝니다|보인다|보입니다|울린다|울립니다|남는다|남습니다)[\s*_`)）]*$"
+)
+JUDGING_WORD = re.compile(r"(판정|확인|재측정|검증|승격|롤백|삭제|정리|점검|본다|봅니다|기로|겠|예정)")
+SYSTEM_WINDOW_CHARS = 60
+# The unit of a gap being described, not a wait (#2901): "최근 글 간격 며칠
+# 단위(10-18~10-28)" (nclex#974) — an interval noun just before the term and
+# "단위" right after it, with no judging word in the rest of the sentence.
+INTERVAL_NOUN = re.compile(r"(간격|주기|빈도)[\s*_]*$")
+INTERVAL_UNIT = re.compile(r"[\s*_]*단위")
+INTERVAL_LOOKBACK = 8
+# Other people's habit, described — not this issue's booking (#2901):
+# "에이전트들이 며칠~몇 주 뒤의 관측·알림을 이 명령으로 걸고 있다" (ccc-node#2827).
+# The term is attributive ("… 뒤의 X": the X that comes that much later), the
+# sentence has a plural subject before it, and it ends in the habitual
+# progressive. This is the one wording shape judged even when the paragraph
+# names an observation: here the observation is the thing being described.
+PRACTICE_ATTRIBUTIVE = re.compile(
+    r"(?:\s*[~∼-]\s*(?:며칠|몇\s*일|수일|몇\s*주|한두\s*주))?\s*(?:뒤|후)의"
+)
+PRACTICE_SUBJECT = re.compile(r"[가-힣]들(?:이|은|도)\s")
+PRACTICE_PREDICATE = re.compile(r"고\s*있(?:다|습니다|음|어요)[\s*_`)）]*$")
+PRACTICE_WINDOW_CHARS = 80
 
 # Anchor + offset bookings (#2252). a2a-nexus#1504 booked Phase 7-B as
 # "실행 예약: … OnCalendar=2026-10-09 22:00:00 KST" with "B8: 관측 타이머
@@ -872,6 +911,47 @@ def _is_generic_possibility(paragraph: str, match: re.Match[str]) -> bool:
     )
 
 
+def _sentence_before(paragraph: str, match: re.Match[str]) -> str:
+    """The term's own sentence up to the term (cut at the last sentence end or table bar)."""
+    before = paragraph[: match.start()]
+    ends = list(SENTENCE_END.finditer(before))
+    return before[ends[-1].end():] if ends else before
+
+
+def _sentence_after(paragraph: str, match: re.Match[str], window: int) -> str:
+    """The rest of the term's sentence, at most ``window`` characters (commas do not end it)."""
+    after = paragraph[match.end(): match.end() + window]
+    end = SENTENCE_END.search(after)
+    return after[: end.start()] if end else after
+
+
+def _is_system_behaviour(paragraph: str, match: re.Match[str]) -> bool:
+    rest = _sentence_after(paragraph, match, SYSTEM_WINDOW_CHARS)
+    return bool(
+        SYSTEM_CONDITION.search(_sentence_before(paragraph, match))
+        and SYSTEM_NOUN.search(rest)
+        and SYSTEM_VERB.search(rest)
+        and not JUDGING_WORD.search(rest)
+    )
+
+
+def _is_interval_unit(paragraph: str, match: re.Match[str]) -> bool:
+    before = paragraph[max(0, match.start() - INTERVAL_LOOKBACK): match.start()]
+    return bool(
+        INTERVAL_NOUN.search(before)
+        and INTERVAL_UNIT.match(paragraph, match.end())
+        and not JUDGING_WORD.search(_sentence_after(paragraph, match, SYSTEM_WINDOW_CHARS))
+    )
+
+
+def _is_generic_practice(paragraph: str, match: re.Match[str]) -> bool:
+    return bool(
+        PRACTICE_ATTRIBUTIVE.match(paragraph, match.end())
+        and PRACTICE_SUBJECT.search(_sentence_before(paragraph, match))
+        and PRACTICE_PREDICATE.search(_sentence_after(paragraph, match, PRACTICE_WINDOW_CHARS))
+    )
+
+
 def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
     """Operational / planning / process / incident wording for one unquoted relative term."""
     if OPERATIONAL_TERM.match(match.group(0)):
@@ -891,6 +971,10 @@ def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
         return REL_PROCESS
     if _is_generic_possibility(paragraph, match):
         return REL_GENERIC
+    if _is_interval_unit(paragraph, match):
+        return REL_INTERVAL
+    if _is_system_behaviour(paragraph, match):
+        return REL_SYSTEM
     clause = _clause_after(paragraph, match)
     if PAST_PREDICATE.search(clause) and not FUTURE_INTENT.search(clause):
         return REL_PAST_EVENT
@@ -918,7 +1002,15 @@ def classify_relative_paragraph(
         A task-list item, and a verdict comment (strict, as in followup mode)
         was posted after it (family-messenger#167, PASS recorded).
 
-    The remaining six judge the wording, so they never apply when the
+    ``generic-practice``
+        Other people's habit, described (#2901): an attributive term
+        ("… 뒤의 X") after a plural subject in a sentence ending in the
+        habitual progressive ("에이전트들이 며칠~몇 주 뒤의 관측을 … 걸고
+        있다", ccc-node#2827). Every unquoted term must have this shape. It is
+        checked before the observation guard below, because here the
+        observation is what is being described.
+
+    The remaining eight judge the wording, so they never apply when the
     paragraph names an observation (``OBSERVATION_WORD``), and every unquoted
     term must be explained by one of them:
 
@@ -931,6 +1023,14 @@ def classify_relative_paragraph(
     ``process-duration``     how long an outside procedure takes ("수일 소요").
     ``generic-duration``     a distributive term (씩) in a possibility clause
                              ("며칠씩 이어질 수 있습니다", #2635).
+    ``interval-unit``        the unit of a gap being described: an interval
+                             noun before the term and "단위" after it
+                             ("최근 글 간격 며칠 단위", nclex#974, #2901).
+    ``system-behaviour``     what the system does by itself once a condition
+                             holds: a conditional earlier in the sentence,
+                             then an alert/state noun and a plain present
+                             verb ("…않으면 24시간 뒤 `expired`로만
+                             나옵니다", ccc-node#2137, #2901).
     ``past-event-offset``    how long something already took: a past-tense
                              predicate in the term's clause ("15시간 뒤에야
                              일어났고", #2635).
@@ -947,6 +1047,8 @@ def classify_relative_paragraph(
         return REL_QUOTED_TERM
     if verdict_after and CHECKBOX_LINE.match(paragraph):
         return REL_CHECKBOX_JUDGED
+    if all(_is_generic_practice(paragraph, m) for m in unquoted):
+        return REL_PRACTICE
     if OBSERVATION_WORD.search(paragraph):
         return None
     reasons = [_wording_reason(paragraph, m) for m in unquoted]
