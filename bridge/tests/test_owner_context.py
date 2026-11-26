@@ -299,3 +299,17 @@ def test_relay_exit_drain_does_not_wait_for_held_records(tmp_path: Path) -> None
     assert notifier.pending_count(relay_only=True) == 2
     assert gate.should_hold(p, data) is True
     assert notifier.pending_count(relay_only=True) == 1
+
+
+def test_owner_zone_falls_back_to_fixed_utc9_without_a_tz_database(monkeypatch):
+    # Termux has no system zoneinfo and the bridge venv sees no global tzdata; importing this
+    # module must not crash there (daegyo/gongyung bridges, 2026-11-27).
+    def missing(key):
+        raise oc.ZoneInfoNotFoundError(f"No time zone found with key {key}")
+
+    monkeypatch.setattr(oc, "ZoneInfo", missing)
+    zone = oc._owner_zone()
+    assert zone.utcoffset(None) == dt.timedelta(hours=9)
+    for ts in (DAY, NIGHT, dt.datetime(2026, 7, 1, 3, 0, tzinfo=dt.timezone.utc).timestamp()):
+        assert dt.datetime.fromtimestamp(ts, zone).utcoffset() == dt.timedelta(hours=9)
+        assert dt.datetime.fromtimestamp(ts, zone).time() == dt.datetime.fromtimestamp(ts, KST).time()
