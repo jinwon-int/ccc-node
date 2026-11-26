@@ -12,7 +12,8 @@ through the normal PR-first path (``wiki-agent write-path`` -> page -> ``wiki-ag
 
 What goes onto the page: repository name, number, title, labels, dates, the
 fields of the latest ``status:v1`` marker and of the latest ``issue-claim:v1``
-marker. Comment bodies are read only to find those markers and are never
+marker; for issues closed in the last 7 days only repository, number, title and
+closing date. Comment bodies are read only to find those markers and are never
 stored or rendered. Issues opened by authors outside the fleet are listed by
 number only (no title), and markers are read only from fleet authors' comments.
 
@@ -106,6 +107,14 @@ query($owner:String!, $name:String!, $after:String) {
 _COUNT_Q = """
 query($q:String!) { search(query:$q, type:ISSUE, first:1) { issueCount } }"""
 
+_CLOSED_Q = """
+query($q:String!, $after:String) {
+  search(query:$q, type:ISSUE, first:100, after:$after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on Issue { number title url closedAt author { login } repository { name } } }
+  }
+}"""
+
 
 def gh_graphql(gh_bin: str, query: str, variables: dict) -> dict:
     args = [gh_bin, "api", "graphql", "-f", f"query={query}"]
@@ -187,6 +196,35 @@ def _item_from_pr(repo: str, node: dict, fleet: Sequence[str]) -> dict:
     }
 
 
+def _item_from_closed(node: dict, fleet: Sequence[str]) -> dict:
+    author = ((node.get("author") or {}).get("login")) or ""
+    external = not is_fleet_author(author, fleet)
+    return {
+        "repo": ((node.get("repository") or {}).get("name")) or "", "kind": "closed",
+        "number": int(node["number"]), "title": "" if external else (node.get("title") or ""),
+        "url": node.get("url") or "", "author_external": external, "closed_at": node.get("closedAt") or "",
+    }
+
+
+def collect_closed(org: str, gh_bin: str, since: str, repo_names: Iterable[str],
+                   fleet: Sequence[str] = DEFAULT_FLEET_AUTHORS) -> list:
+    """Issues closed on or after ``since`` (YYYY-MM-DD) in the listed repositories.
+
+    Same fields as an open issue minus everything marker-related: no comment is
+    read. Issues in repositories outside ``repo_names`` (archived ones) are dropped.
+    """
+    names = set(repo_names)
+    q = f"org:{org} is:issue is:closed closed:>={since}"
+    out = []
+    for node in _paged(gh_bin, _CLOSED_Q, {"q": q}, ("search",)):
+        if not node or "number" not in node:
+            continue
+        item = _item_from_closed(node, fleet)
+        if item["repo"] in names:
+            out.append(item)
+    return out
+
+
 def collect(org: str, gh_bin: str = "gh", fleet: Sequence[str] = DEFAULT_FLEET_AUTHORS,
             now: Optional[datetime] = None) -> dict:
     now = now or datetime.now(timezone.utc)
@@ -201,15 +239,13 @@ def collect(org: str, gh_bin: str = "gh", fleet: Sequence[str] = DEFAULT_FLEET_A
         for node in _paged(gh_bin, _PRS_Q, {"owner": org, "name": name}, ("repository", "pullRequests")):
             items.append(_item_from_pr(name, node, fleet))
     since = (now - timedelta(days=7)).date().isoformat()
-    counts = {}
-    for key, q in (("opened_7d", f"org:{org} is:issue created:>={since}"),
-                   ("closed_7d", f"org:{org} is:issue is:closed closed:>={since}")):
-        data = gh_graphql(gh_bin, _COUNT_Q, {"q": q})
-        counts[key] = int(((data.get("search") or {}).get("issueCount")) or 0)
+    data = gh_graphql(gh_bin, _COUNT_Q, {"q": f"org:{org} is:issue created:>={since}"})
+    closed = collect_closed(org, gh_bin, since, [r.get("name") or "" for r in repos], fleet)
+    counts = {"opened_7d": int(((data.get("search") or {}).get("issueCount")) or 0), "closed_7d": len(closed)}
     return {
         "schema": SCHEMA, "org": org, "generated_at": now.astimezone(timezone.utc).isoformat(timespec="seconds"),
         "repos": [{"name": r.get("name"), "private": bool(r.get("isPrivate"))} for r in repos],
-        "items": items, "counts": counts,
+        "items": items, "closed": closed, "counts": counts,
     }
 
 
@@ -322,7 +358,7 @@ def _render_head(out: list, doc_id: str, org: str, gen: datetime) -> None:
         f"# [{doc_id}] 플릿 미진행 작업 현황판 (자동 생성)",
         "",
         f"{GENERATED_LINE}{gen.strftime('%Y-%m-%d %H:%M')} KST (매일)",
-        f"> - 이 페이지: `{org}` 조직의 보관되지 않은 저장소 전체의 열린 이슈·PR을 매일 다시 모은 현황판이다. **손으로 고치지 말 것** — 다음 실행 때 덮어쓴다.",
+        f"> - 이 페이지: `{org}` 조직의 보관되지 않은 저장소 전체의 열린 이슈·PR과 최근 7일 닫힌 이슈를 매일 다시 모은 현황판이다. **손으로 고치지 말 것** — 다음 실행 때 덮어쓴다.",
         "> - 분류: 이슈 코멘트의 가장 최근 `status:v1` 표식으로 오너 차례 · 날짜 대기 · 노드 작업 · 외부 대기를 나눈다. 표식이 없으면 「분류 안 됨」, 기한이 하루 넘게 지났으면 「기한 지남」이다.",
         "> - 근거: GitHub API — 제목 · 번호 · 날짜 · 라벨 · 표식 필드만 싣고 코멘트 본문은 싣지 않는다. 외부 작성자의 이슈는 번호만 싣는다. 생성기: ccc-node `scripts/ccc-work-board.py`(ccc-node#2914).",
         "> - stale 주의: 생성 시각의 스냅샷이다. 표식은 노드가 보고할 때 남긴 값이라 실제 진행보다 늦을 수 있다. 이슈가 없는 일은 여기에 오르지 않는다.",
@@ -349,6 +385,21 @@ def _render_buckets(out: list, by_bucket: dict) -> None:
         out += [header, "|" + "---|" * (header.count("|") - 1)]
         out += [row(i) for i in rows]
         out.append("")
+
+
+def _render_closed(out: list, closed: Optional[list]) -> None:
+    if closed is None:  # a snapshot written before the list existed
+        return
+    out += [f"## 최근 7일 닫힌 이슈 ({len(closed)}건)", "",
+            "완료와 「안 함」 처리가 모두 들어 있다. 닫힌 지 7일이 지나면 이 표에서 빠진다.", ""]
+    if not closed:
+        out += ["없음.", ""]
+        return
+    out += ["| 저장소 | 이슈 | 닫힌 날 |", "|---|---|---|"]
+    rows = sorted(closed, key=lambda i: (i["repo"], i["number"]))
+    rows.sort(key=lambda i: i.get("closed_at") or "", reverse=True)
+    out += [f"| {_cell(i['repo'])} | {_ref(i)} | {_day(i.get('closed_at') or '')} |" for i in rows]
+    out.append("")
 
 
 _REVIEW = {"APPROVED": "승인됨", "CHANGES_REQUESTED": "수정 요청", "REVIEW_REQUIRED": "리뷰 대기"}
@@ -431,6 +482,7 @@ def render(snapshot: dict, doc_id: str, today: Optional[date] = None) -> str:
     _render_head(out, doc_id, snapshot.get("org") or "", gen)
     _render_summary(out, issues, prs, by_bucket, stale, snapshot.get("counts") or {})
     _render_buckets(out, by_bucket)
+    _render_closed(out, snapshot.get("closed"))
     _render_prs(out, prs)
     _render_nodes(out, issues)
     _render_repos(out, issues, prs, stale)
