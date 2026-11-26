@@ -17,11 +17,14 @@ organisation, sorted by whose turn it is. It replaces hand-made snapshots of
 `pages/current/work-board.md` in the Wiki, rewritten once a day (05:30 KST by
 default). Sections: summary counts, owner's turn, waiting for a date (by due
 date), node's turn, waiting on an outside party, overdue, invalid marker,
-unclassified (oldest activity first), open PRs, per node, per repository.
+unclassified (oldest activity first), issues closed in the last 7 days
+(newest first), open PRs, per node, per repository.
 
 What it carries: repository, number, title, labels, dates, and the fields of
 the latest `status:v1` and `issue-claim:v1` markers. Comment bodies are read
-only to find markers and are never stored or rendered. Issues opened outside
+only to find markers and are never stored or rendered. A closed issue carries
+only repository, number, title and closing date; completed and "not planned"
+closes are both listed, and no comment of a closed issue is read. Issues opened outside
 the fleet appear by number only, and only fleet authors' comments can set a
 status. Titles are HTML-escaped and `|` is escaped for the table.
 

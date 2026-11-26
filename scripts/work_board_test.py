@@ -107,13 +107,14 @@ def _exe(path: Path, text: str) -> Path:
     return path
 
 
-def fake_gh(tmp: Path, issues: dict, prs: dict, repos=("alpha-repo", "beta-repo")) -> Path:
+def fake_gh(tmp: Path, issues: dict, prs: dict, repos=("alpha-repo", "beta-repo"), closed=()) -> Path:
     """A gh stand-in answering the board's GraphQL queries from fixtures.
 
     The repository list comes in two pages to exercise pagination.
     """
     fixture = tmp / "fixture.json"
-    fixture.write_text(json.dumps({"issues": issues, "prs": prs, "repos": list(repos)}), encoding="utf-8")
+    fixture.write_text(json.dumps({"issues": issues, "prs": prs, "repos": list(repos), "closed": list(closed)}),
+                       encoding="utf-8")
     script = f"""#!{sys.executable}
 import json, sys
 fx = json.load(open({str(fixture)!r}))
@@ -136,8 +137,12 @@ elif "issues(" in q:
     data = {{"repository": {{"issues": page(fx["issues"].get(vals["name"], []))}}}}
 elif "pullRequests(" in q:
     data = {{"repository": {{"pullRequests": page(fx["prs"].get(vals["name"], []))}}}}
+elif "search(" in q and "closedAt" in q:
+    assert "is:closed closed:>=" in vals.get("q", "")
+    data = {{"search": page(fx["closed"])}}
 elif "search(" in q:
-    data = {{"search": {{"issueCount": 5 if "created:" in vals.get("q", "") else 3}}}}
+    assert "created:>=" in vals.get("q", "")
+    data = {{"search": {{"issueCount": 5}}}}
 else:
     sys.stderr.write("unexpected query"); sys.exit(1)
 print(json.dumps({{"data": data}}))
@@ -181,7 +186,15 @@ def fixture_snapshot(tmp: Path) -> dict:
                           "createdAt": "2026-11-25T00:00:00Z", "updatedAt": "2026-11-25T00:00:00Z",
                           "isDraft": False, "reviewDecision": "REVIEW_REQUIRED", "author": {"login": "jinon86"},
                           "closingIssuesReferences": {"nodes": [{"number": 7}]}}]}
-    gh = fake_gh(tmp, issues, prs)
+    def done(number, repo, closed_at, title="Done thing", author="jinon86"):
+        return {"number": number, "title": title, "url": f"https://github.com/{ORG}/{repo}/issues/{number}",
+                "closedAt": closed_at, "author": {"login": author}, "repository": {"name": repo}}
+    closed = [done(20, "alpha-repo", "2026-11-21T00:00:00Z", title="Older | done"),
+              done(21, "beta-repo", "2026-11-25T03:00:00Z"),
+              done(22, "beta-repo", "2026-11-24T00:00:00Z", title="Outside closed title", author="stranger"),
+              done(23, "archived-repo", "2026-11-25T00:00:00Z"),
+              {}]  # a search hit that is not an issue
+    gh = fake_gh(tmp, issues, prs, closed=closed)
     from datetime import datetime, timezone
     return board.collect(ORG, str(gh), now=datetime(2026, 11, 26, 20, 30, tzinfo=timezone.utc))
 
@@ -197,6 +210,26 @@ def test_collect_is_body_free_and_reads_fleet_markers_only(tmp_path):
     assert outside["author_external"] and outside["title"] == "" and outside["status"] is None
     assert by[("alpha-repo", 1)]["status"]["waiting"] == "owner"
     assert by[("beta-repo", 9)]["kind"] == "pr" and by[("beta-repo", 9)]["closes"] == [7]
+    closed = {(i["repo"], i["number"]): i for i in snap["closed"]}
+    assert sorted(closed) == [("alpha-repo", 20), ("beta-repo", 21), ("beta-repo", 22)]  # archived repo dropped
+    assert closed[("beta-repo", 22)]["author_external"] and closed[("beta-repo", 22)]["title"] == ""
+    assert set(closed[("beta-repo", 21)]) == {"repo", "kind", "number", "title", "url", "author_external", "closed_at"}
+
+
+def test_render_lists_recently_closed_newest_first(tmp_path):
+    snap = fixture_snapshot(tmp_path)
+    page = board.render(snap, "DOC-77")
+    section = page.split("## 최근 7일 닫힌 이슈 (3건)", 1)[1].split("\n## ", 1)[0]
+    rows = [r for r in section.splitlines() if r.startswith("| ") and "#" in r]
+    assert [re.search(r"\[#(\d+)\]", r).group(1) for r in rows] == ["21", "22", "20"]
+    assert "| 11-25 |" in rows[0] and "Older \\| done" in rows[2]
+    assert "Outside closed title" not in page and "(외부 작성)" in rows[1]
+    assert page.index("## 최근 7일 닫힌 이슈") < page.index("## 열린 PR")
+    assert "| 최근 7일 닫힌 이슈 | 3 |" in page
+    older = {k: v for k, v in snap.items() if k != "closed"}
+    assert "최근 7일 닫힌 이슈 (" not in board.render(older, "DOC-77")  # old snapshots still render
+    empty = board.render({**snap, "closed": []}, "DOC-77")
+    assert "## 최근 7일 닫힌 이슈 (0건)\n\n완료와" in empty and "없음." in empty.split("## 최근 7일 닫힌 이슈", 1)[1]
 
 
 def test_render_buckets_and_escaping(tmp_path):
