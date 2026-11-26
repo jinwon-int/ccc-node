@@ -139,6 +139,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `CCC_WEBHOOK_NUDGE_SECRET` | Nudge only | HMAC secret for `X-Hub-Signature-256` verification. Required when enabled — missing secret refuses to start the listener (fail-closed) |
 | `CCC_WEBHOOK_NUDGE_HOST` / `CCC_WEBHOOK_NUDGE_PORT` | No | Bind address for the nudge listener (default: `127.0.0.1:8791`; public ingress is a separate per-node decision) |
 | `CCC_WEBHOOK_NUDGE_MAX_BODY_BYTES` | No | Delivery body cap in bytes (default: 1048576, clamped to [4096, 16777216]) |
+| `CCC_OWNER_CONTEXT_FILE` | No | Opt-in owner-context delivery gate (default **off**; jinwon-int/iphone-agent-cast `docs/design/context-server.md`): path of the local `owner-context` state file. When set, `MatrixSpoolNotifier` asks `core/owner_context.py` per spool record whether to deliver now or keep the file for a later cycle (driving / sleep / work focus; `critical` and `info`/untiered records are never held; max hold 3 h / 08:00 KST / 4 h; anything unexpected = send). `CCC_OWNER_CONTEXT_MODE` = `shadow` (default: log `would-hold`, hold nothing) or `hold`; decisions go to `CCC_OWNER_CONTEXT_LOG` (default `~/.claude/state/owner-context-decisions.jsonl`, 0600, 14 days), never to the bridge log |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
 | `DRAFT_UPDATE_MIN_CHARS` | No | Min characters before draft update (default: 150) |
