@@ -29,9 +29,22 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
+
+
+def _owner_zone() -> dt.tzinfo:
+    """Asia/Seoul, or a fixed UTC+9 when this node has no time zone database.
+
+    Termux ships no system zoneinfo and the bridge venv does not see a global ``tzdata``, so
+    a bare ``ZoneInfo("Asia/Seoul")`` at import time crashed every Termux bridge on start
+    (Termux nodes, 2026-11-27). Korea has had no DST since 1988, so UTC+9 is exact here.
+    """
+    try:
+        return ZoneInfo("Asia/Seoul")
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return dt.timezone(dt.timedelta(hours=9), "KST")
 
 ENV_FILE = "CCC_OWNER_CONTEXT_FILE"
 ENV_MODE = "CCC_OWNER_CONTEXT_MODE"
@@ -40,7 +53,7 @@ MODE_SHADOW, MODE_HOLD = "shadow", "hold"
 DEFAULT_LOG = "~/.claude/state/owner-context-decisions.jsonl"
 LOG_RETENTION_SECONDS = 14 * 24 * 3600
 
-KST = ZoneInfo("Asia/Seoul")  # the owner's clock: night window and the 08:00 sleep release
+KST = _owner_zone()  # the owner's clock: night window and the 08:00 sleep release
 HOUR = 3600
 
 # Situations, first match wins.
