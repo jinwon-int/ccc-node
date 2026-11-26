@@ -39,7 +39,7 @@ def _owner_zone() -> dt.tzinfo:
 
     Termux ships no system zoneinfo and the bridge venv does not see a global ``tzdata``, so
     a bare ``ZoneInfo("Asia/Seoul")`` at import time crashed every Termux bridge on start
-    (daegyo/gongyung, 2026-11-27). Korea has had no DST since 1988, so UTC+9 is exact here.
+    (Termux nodes, 2026-11-27). Korea has had no DST since 1988, so UTC+9 is exact here.
     """
     try:
         return ZoneInfo("Asia/Seoul")
