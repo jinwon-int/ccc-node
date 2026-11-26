@@ -1514,6 +1514,7 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
             "",
             f"- near-identical open siblings (overlap >= {DUP_THRESHOLD:.2f}): **{len(duplicates)}** (#1891)",
             "- a clear would leave two open copies; the subset folds into the superset (#1898), then clear the survivor's flag:",
+            "- every proposal in one pass (dry-run first): `nunchi.py merge-proposals`, then `--apply` (#2910)",
             "",
             "```",
         ]

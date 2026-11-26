@@ -102,13 +102,45 @@ constraint lines.
 | `conflict-sweep [--apply]` | `review=1` on the newer fact plus a `conflict_sweep` ledger row; **never closes** ([nunchi-conflict-sweep.md](nunchi-conflict-sweep.md)) |
 | `g5-legacy-close [--apply]` | on the 2026-08 G5 legacy backlog only: retag progress-log rows to `task-progress`, set a fixed policy `because` on the rest, plus a `g5_legacy_close` ledger row; **never closes, never touches `review`** (see below) |
 | `reattribute-unknown [--apply]` | on provable `subject=node` rows stored under the legacy `observed='unknown'` peer only: set `observed` to the node name, plus a `reattribute_unknown` ledger row; closes a legacy row only when the same open fact already exists under the node name (`merged-away:#id`); **never rewrites text, kind, rank, `review`, `dedup` or timestamps** (see below) |
+| `merge-proposals [--apply]` | fold every g3-duplicate proposal in the judge-batch report in one pass: the same write as `merge` (close the duplicate, evidence markers on both rows) for each pair, plus one body-free audit row; a duplicate that outranks its survivor is held back (#2910) |
 
 Scheduling one of these turns it into a Tier 1 pass, so it then has to meet the Tier 1 rule: a
 sweep that closes facts cannot simply be put on a cron line. `review-stale` and
-`constraints-triage` close facts and stay owner-invoked. `conflict-sweep` only flags, so it may be
+`constraints-triage` close facts and stay owner-invoked, and so does `merge-proposals`.
+`conflict-sweep` only flags, so it may be
 scheduled: `install-nunchi.sh --apply --conflict-sweep` adds an opt-in daily line (#2479, see the
 Tier 1 table), and the enforcement test below keeps that line flag-only. `reattribute-unknown` is a
 one-off migration per node and is never scheduled.
+
+### `merge-proposals` — the judge report's duplicate proposals in one pass (#2910)
+
+```sh
+nunchi.py merge-proposals [--apply] [--limit N] [--sample N] [--json]
+```
+
+judge-batch holds a flagged fact out of the judge when it has a near-identical open sibling and
+one side's words contain the other's (#1891/#1898). It writes `nunchi.py merge <dup> --into
+<survivor>` into `nunchi-review-report.md` and leaves the fold to the owner. The report shows the
+first ten; on 2026-11-26 the fleet held 110 such proposals, 58 of them on one node, and each had
+to be run by hand.
+
+`merge-proposals` asks judge-batch for the same list and folds it:
+
+- **No rule of its own.** The pairs and their direction come from `fetch_queue`, the code that
+  writes the report. The only addition is G2: a duplicate that outranks its survivor is held back
+  and listed, never folded.
+- **Same write as `merge`.** The duplicate is closed (`valid_to`), both evidence fields get the
+  `merged-away:#id` / `merged:#id` markers, no text changes and nothing is deleted. Clearing
+  `valid_to` undoes one fold.
+- **`--apply`** takes the judge lock (so an hourly run cannot triage the same rows), backs the
+  store up with SQLite's backup API, and folds every pair in one transaction. Each pair is
+  re-checked as it is written; a pair whose rows are no longer both open is skipped and counted.
+  One body-free row (`class: g3-duplicate-merge`, ids and counts) goes to `judge-audit.jsonl`.
+- **Review flags are not written.** A flagged duplicate leaves the queue by closing. A flagged
+  survivor keeps its flag until the next judge-batch run, which clears a flag with no live sibling.
+- Dry run by default; a second run finds nothing left to fold. `--limit N` folds the first N
+  (oldest first). It works on the store `NUNCHI_DB` selects; audience-scoped stores are run one
+  at a time.
 
 ### `g5-legacy-close` — G5 legacy backlog, Tier C (#2221)
 
@@ -240,6 +272,9 @@ rows are derived from source files and rebuilt on the next refresh, so they are 
 - `conflict-sweep` gains a `valid_to` write;
 - `g5-legacy-close` writes `valid_to` or `review`, or writes `peer_facts` other than `because`
   or `kind`/`mutability`;
+- `merge-proposals` writes `peer_facts` anything other than the two `merge` writes (close the
+  duplicate, evidence on the survivor), writes `review`, fact text, kind or rank, or loses the
+  higher-rank guard;
 - `reattribute-unknown` writes a `peer_facts` column list that does not start from `observed`,
   writes fact text, kind, rank, `review`, `dedup` or a timestamp, loses the per-row guard on the
   current peer, the legacy-peer scope or the dedup proof, or resolves its target after opening

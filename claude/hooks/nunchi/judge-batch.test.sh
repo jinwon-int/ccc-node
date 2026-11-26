@@ -1122,5 +1122,89 @@ ok "NUNCHI_JUDGE_CLAUDE_STRUCTURED=0 restores the text contract" \
   '[ "$(grep -x -A1 -- "--output-format" "$TMP/claude-args" | tail -n 1)" = text ] && ! grep -qx -- "--json-schema" "$TMP/claude-args" && [ "$(review_of "$STRUCT_ID")" = 0 ]'
 rm -f "$TMP/claude-mode"
 
+# ---- 19. #2910 merge-proposals: the report's g3-duplicate proposals in one pass ----
+# Owner command in nunchi.py (judge-batch stays review=0-only). Pairs and direction
+# come from fetch_queue; the command adds only the higher-rank guard (G2).
+reset_db
+rm -rf "$NUNCHI_HOME/backup"
+cat >"$TMP/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 1
+STUB
+chmod +x "$TMP/bin/claude"
+col_of() { # col_of <id> <column>
+  python3 - "$1" "$2" <<'PY'
+import os, sqlite3, sys
+c = sqlite3.connect(os.environ["NUNCHI_DB"])
+print(c.execute(f"SELECT {sys.argv[2]} FROM peer_facts WHERE id=?", (int(sys.argv[1]),)).fetchone()[0])
+PY
+}
+open_of() { [ "$(col_of "$1" "valid_to IS NULL")" = 1 ]; }
+mp() { env NUNCHI_G3_DUP_THRESHOLD=0.85 python3 "$NP" merge-proposals "$@"; }
+# shellcheck disable=SC2034  # the mp* ids below are read via eval inside ok()
+{
+# identical pair: the flagged newcomer folds into the older copy
+mpa1="$(seed peer-a "배포 전 스모크는 항상 스테이징에서 먼저 돌린다" "$OLD" 1 0 mpa1)"
+mpa2="$(seed peer-a "배포 전 스모크는 항상 스테이징에서 먼저 돌린다" "$OLD" 1 1 mpa2)"
+# subset/superset: the unflagged subset folds into the flagged superset
+mpb1="$(seed peer-a "롤백은 태그 기준으로 수행한다" "$OLD" 1 0 mpb1)"
+mpb2="$(seed peer-a "롤백은 태그 기준으로 수행한다 그리고 로그를 남긴다" "$OLD" 1 1 mpb2)"
+# higher-rank duplicate: a rank-3 newcomer must not fold into a rank-1 copy
+mpc1="$(seed peer-a "머지 전 CI 그린을 확인한다" "$OLD" 1 0 mpc1)"
+mpc2="$(seed peer-a "머지 전 CI 그린을 확인한다" "$OLD" 3 1 mpc2)"
+# partial overlap: not a proposal, stays for the judge
+mpd1="$(seed peer-a "알림은 한데로 보낸다 그리고 기록한다" "$OLD" 1 0 mpd1)"
+mpd2="$(seed peer-a "알림은 한데로 보낸다 그리고 무시한다" "$OLD" 1 1 mpd2)"
+}
+run_batch NUNCHI_G3_DUP_THRESHOLD=0.85 >/dev/null
+ok "#2910 report points at the one-pass command" \
+  'grep -q "nunchi.py merge-proposals" "$CCC_STATE_DIR/nunchi-review-report.md"'
+out="$(mp 2>&1)"; rc=$?
+ok "#2910 dry-run exits 0 and states the plan" \
+  '[ "$rc" = 0 ] && grep -q "merge-proposals (dry-run): proposals=3 to_merge=2 held_higher_rank_duplicate=1" <<<"$out"'
+ok "#2910 dry-run lists the same directions as the report" \
+  'grep -q "merge $mpa2 --into $mpa1 " <<<"$out" && grep -q "merge $mpb1 --into $mpb2 " <<<"$out"'
+ok "#2910 dry-run names the held higher-rank duplicate" 'grep -q "held: #$mpc2 outranks its survivor #$mpc1" <<<"$out"'
+ok "#2910 dry-run changes nothing (rows open, no backup, no audit row)" \
+  'open_of "$mpa2" && open_of "$mpb1" && [ ! -d "$NUNCHI_HOME/backup" ] && ! grep -q "g3-duplicate-merge" "$NUNCHI_HOME/judge-audit.jsonl" 2>/dev/null && grep -q "dry-run — nothing changed" <<<"$out"'
+out="$(mp --json --sample 5 2>&1)"
+ok "#2910 --json is body-free (ids and counts only)" \
+  'python3 -c "import json,sys; d=json.loads(sys.argv[1]); assert d[\"mode\"]==\"dry-run\" and d[\"to_merge\"]==2 and len(d[\"pairs_sample\"])==2" "$out" && ! grep -q "스모크\|롤백" <<<"$out"'
+out="$(mp --limit -1 2>&1)"; rc=$?
+ok "#2910 rejects a negative --limit" '[ "$rc" != 0 ]'
+out="$(mp --apply --limit 1 2>&1)"; rc=$?
+ok "#2910 --limit 1 folds only the first pair" \
+  '[ "$rc" = 0 ] && grep -q "merged=1" <<<"$out" && grep -q "beyond_limit=1" <<<"$out" && ! open_of "$mpa2" && open_of "$mpb1"'
+out="$(mp --apply 2>&1)"; rc=$?
+ok "#2910 --apply folds the rest" '[ "$rc" = 0 ] && grep -q "merged=1" <<<"$out" && ! open_of "$mpb1" && open_of "$mpb2" && open_of "$mpa1"'
+ok "#2910 leaves the same lineage as merge (markers on both rows)" \
+  '[[ "$(col_of "$mpa2" evidence)" == *"merged-away:#$mpa1"* ]] && [[ "$(col_of "$mpa1" evidence)" == *"merged:#$mpa2"* ]] && [[ "$(col_of "$mpb2" evidence)" == *"merged:#$mpb1"* ]]'
+ok "#2910 never folds a higher-rank duplicate, nor a partial-overlap pair" \
+  'open_of "$mpc1" && open_of "$mpc2" && open_of "$mpd1" && open_of "$mpd2"'
+ok "#2910 does not write review flags or text" \
+  '[ "$(review_of "$mpb2")" = 1 ] && [ "$(review_of "$mpa2")" = 1 ] && [ "$(review_of "$mpa1")" = 0 ] && [ "$(col_of "$mpb2" fact)" = "롤백은 태그 기준으로 수행한다 그리고 로그를 남긴다" ]'
+ok "#2910 backs the store up before folding" '[ "$(find "$NUNCHI_HOME/backup" -name "facts-prejudge-*.db" | wc -l)" = 2 ]'
+ok "#2910 audit row is body-free and records the pairs" \
+  'grep -q "\"class\": \"g3-duplicate-merge\"" "$NUNCHI_HOME/judge-audit.jsonl" && grep -q "\[$mpb1, $mpb2\]" "$NUNCHI_HOME/judge-audit.jsonl" && ! grep "g3-duplicate-merge" "$NUNCHI_HOME/judge-audit.jsonl" | grep -q "스모크\|롤백"'
+out="$(mp --apply 2>&1)"
+ok "#2910 a second run finds nothing to fold" 'grep -q "to_merge=0" <<<"$out" && grep -q "merged=0" <<<"$out"'
+run_batch NUNCHI_JUDGE_APPLY=1 NUNCHI_G3_DUP_THRESHOLD=0.85 >/dev/null
+ok "#2910 the next judge-batch run clears the flagged survivor (no live sibling left)" '[ "$(review_of "$mpb2")" = 0 ]'
+# the judge lock is honoured: a running batch blocks the owner command
+python3 - "$NUNCHI_HOME/.judge.lock" <<'PY' &
+import fcntl, sys, time
+with open(sys.argv[1], "a+b") as fh:
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    time.sleep(3)
+PY
+lockpid=$!
+sleep 1
+# shellcheck disable=SC2034  # out is read via eval inside ok()
+out="$(mp --apply 2>&1)"; rc=$?
+ok "#2910 refuses to run while judge-batch holds the lock" '[ "$rc" != 0 ] && grep -q "holds the lock" <<<"$out"'
+wait "$lockpid"
+
+
 printf 'PASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
