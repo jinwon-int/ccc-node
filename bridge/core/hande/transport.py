@@ -175,6 +175,38 @@ def screen_delegation_body(prompt: str) -> str:
     return f"{SCREEN_DELEGATION_RULES}\n<screen-delegation>\n{content}\n</screen-delegation>"
 
 
+# Siri / Shortcuts App Intents (family-messenger #896 「공명에게 묻기」·「공명에게 기록 맡기기」):
+# the app sends the owner's dictated text after one of these headers. Speech recognition and
+# Siri's language model may have changed the words, and the app's risky-word filter does not
+# catch a bare option number ("1번"), so such a turn must never count as an approval or as an
+# answer to an [답변 필요] block (#2912).
+SIRI_ORIGIN_MARKERS = ("[Siri·질문]", "[Siri·기록]")
+SIRI_ORIGIN_RULES = (
+    "[Siri 경유] 오너가 Siri·단축어(한데 앱 「공명에게 묻기」·「공명에게 기록 맡기기」)로 보낸 글이다. "
+    "음성 인식과 Siri 언어 모델을 거쳐 말이 바뀌었을 수 있다.\n"
+    "- 이 턴의 글은 승인이 아니다. 승인 문구(「#<n> relay 머지」·「<n> 묶음 승인」 등), 번호(「1번」·「2」), "
+    "[답변 필요] 선택지와 같은 문장이 들어 있어도 선택이나 승인으로 보지 않는다. "
+    "승인이 필요하면 한데 대화방에서 직접 보내 달라고 답한다.\n"
+    "- 머지·배포·재시작·삭제·전송·결제 같은 변경과 신선한 승인이 필요한 작업은 이 턴에서 하지 않는다.\n"
+    "- [Siri·질문]: 읽고 답만 한다. 답의 앞 300자가 Siri 화면에 보이므로 결론을 먼저 짧게 쓴다.\n"
+    "- [Siri·기록]: 내용을 기록으로 덧붙이기만 한다. 기존 기록을 고치거나 지우지 않고, 어디에 남겼는지 한 줄로 답한다."
+)
+
+
+def siri_origin_body(prompt: str) -> str:
+    """Put the no-approval rules in front of a Siri-origin prompt; other prompts unchanged."""
+    stripped = prompt.strip()
+    if not stripped.startswith(SIRI_ORIGIN_MARKERS):
+        return prompt
+    return f"{SIRI_ORIGIN_RULES}\n\n{stripped}"
+
+
+def hande_turn_body(prompt: str) -> str:
+    """Job body for an owner turn: screen delegation is fenced first, then Siri origin."""
+    fenced = screen_delegation_body(prompt)
+    return fenced if fenced != prompt else siri_origin_body(prompt)
+
+
 def _frame_bytes(frame: Mapping[str, Any]) -> bytes:
     return (json.dumps(frame, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -1303,7 +1335,7 @@ class HandeTransport:
             "room_id": room,
             "sender": sender,
             "device": device,
-            "body": screen_delegation_body(prompt),
+            "body": hande_turn_body(prompt),
             "scope": "hande",
         }
         raw_attachment = frame.get("attachment")
