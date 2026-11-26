@@ -90,6 +90,7 @@ from telegram_bot.core.lifecycle_loops import (
     run_session_resource_guard,
     run_skill_candidate_collector,
 )
+from telegram_bot.core import owner_context
 from telegram_bot.core.matrix import lifecycle as matrix_lifecycle
 from telegram_bot.core.matrix.render import chunk_text, render_matrix_message
 from telegram_bot.core.matrix.wait_status import MatrixWaitStatusMixin
@@ -421,6 +422,9 @@ class MatrixSpoolNotifier:
             ).split(",")
             if e.strip()
         )
+        # Owner-context gate (iphone-agent-cast context-server): None unless
+        # CCC_OWNER_CONTEXT_FILE is set, so by default nothing below changes.
+        self._owner_context: Optional[owner_context.OwnerContextGate] = owner_context.gate_from_env()
 
     def attach_transport(self, transport: Any) -> None:
         """Give an early-started relay notifier (#2207) the opened transport.
@@ -437,6 +441,11 @@ class MatrixSpoolNotifier:
         return self.relay_mode and (
             str(data.get("event") or "") in self.direct_events or _record_room(data) is not None
         )
+
+    def _held_for_owner(self, p: Path, data: dict) -> bool:
+        """True when the owner-context gate (off unless CCC_OWNER_CONTEXT_FILE) keeps this record."""
+        gate = self._owner_context
+        return gate is not None and gate.should_hold(p, data)
 
     def _named_room(self, data: dict) -> Optional[str]:
         """The record's own ``room`` when this transport already serves it.
@@ -478,6 +487,8 @@ class MatrixSpoolNotifier:
             except (OSError, ValueError):
                 data = None
             if not (isinstance(data, dict) and self._is_direct(data)):
+                if self._owner_context is not None and self._owner_context.holding(p.name):
+                    continue  # kept for the owner's context; it cannot leave on exit either
                 count += 1
         return count
 
@@ -556,8 +567,10 @@ class MatrixSpoolNotifier:
             if ready is not None and p.name not in ready:
                 return  # not mirrored yet; keep file, preserve order
             direct = self._is_direct(data)
-            if direct and direct_deferred:
-                continue  # keep file; an earlier direct record is still waiting
+            if (direct and direct_deferred) or self._held_for_owner(p, data):
+                # keep file: an earlier direct record is still waiting, or the
+                # owner's context holds this one; records behind it still drain
+                continue
             now = time.time()
             key = data.get("dedup") or text
             if key in self._recent and now - self._recent[key] < _DEDUP_WINDOW_SECONDS:
