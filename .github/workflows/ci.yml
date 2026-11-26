@@ -247,6 +247,7 @@ jobs:
             scripts/main_model_switch_test.py \
             scripts/spans_rollup_test.py \
             scripts/spans_view_test.py \
+            scripts/work_board_test.py \
             scripts/tasker_stall_watchdog_test.py
 
   secret-scan:

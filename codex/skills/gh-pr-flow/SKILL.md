@@ -143,6 +143,14 @@ another option or says hold, add `… decide --repo <owner/repo> --pr <n>
 --decision decline|hold --source manual`. Record the class only; never put the
 owner's words in `--detail`.
 
+**Leave a status marker on the issue (#2914).** When the PR closes a tracked
+issue, run `python3 <ccc-node checkout>/scripts/ccc_issue_status.py set --repo
+<owner/repo> --issue <issue> --waiting owner --node <this node> --next "merge
+approval for PR #<n>"` so the fleet work board lists it under "owner's turn".
+`--next` is one line naming the next step, never the owner's words. Use
+`--waiting date --due YYYY-MM-DDTHH:MM` for a scheduled check, `--waiting node`
+when the next step is yours, `--waiting external` for an outside reply.
+
 | PR author | Review profile | Expected reviewer | Remote gh config |
 | --- | --- | --- | --- |
 | `jinon86` | `seoseo-ai` | `seoseo-ai` | isolated root-owned profile config |

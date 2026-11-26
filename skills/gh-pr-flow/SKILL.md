@@ -129,6 +129,21 @@ so the account name is not an identity.
      add `… decide --repo <owner/repo> --pr <n> --decision decline|hold
      --source manual`. Record the class only; never put the owner's words in
      `--detail`.
+   - **Leave a status marker on the issue (#2914).** When the PR closes a
+     tracked issue, put the same wait on that issue so the fleet work board
+     lists it under "owner's turn":
+
+     ```bash
+     python3 <ccc-node checkout>/scripts/ccc_issue_status.py set \
+       --repo <owner/repo> --issue <issue> --waiting owner --node <this node> \
+       --next "merge approval for PR #<n>"
+     ```
+
+     `--next` is one line naming the next step — never the owner's words or a
+     comment body. Use `--waiting date --due YYYY-MM-DDTHH:MM` when the next
+     step is a scheduled check, `--waiting node` when it is yours again, and
+     `--waiting external` for a store review or a support reply. The board reads
+     the newest marker on each issue (docs/work-board.md).
    - **Pushing to someone else's PR can delete the only remaining approver.**
      `jinwon-int/ccc-node` `main` sets `require_last_push_approval: true`, so
      the account that pushed last cannot approve that PR. Push a review fix to

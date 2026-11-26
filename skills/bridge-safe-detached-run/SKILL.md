@@ -268,6 +268,12 @@ Two traps, both silent (#2710):
   started yet" instead of lost; `--scope user` asks `systemctl --user`. The
   wait budget still applies: above 6 h it is notify-only, with no ⏳ line.
 
+When the scheduled check belongs to a tracked issue, mark the wait on that
+issue too, so the fleet work board lists it under "waiting for a date" (#2914):
+`python3 <ccc-node checkout>/scripts/ccc_issue_status.py set --repo <owner/repo>
+--issue <n> --waiting date --due <YYYY-MM-DDTHH:MM> --node <this node> --next
+"<what the check confirms>"`.
+
 To put the job's actual outcome in the notice ("7일 중 6일 통과", "설치 완료",
 the abort reason), have it write one line to a file and pass
 `--result-file <path>`: the last non-empty line is appended as `· 결과: …`,
