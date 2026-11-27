@@ -77,7 +77,7 @@ chmod +x "$TMP/fake-harness.sh"
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/node" <<EOF
 #!/usr/bin/env bash
-echo "guard: \$* root=\${A2A_WORKER_ROOT:-}" >> "$TMP/node.calls"
+echo "guard: \$* root=\${A2A_WORKER_ROOT:-} target=\${A2A_WORKER_TARGET_REVISION:-}" >> "$TMP/node.calls"
 cat "$TMP/guard.out" 2>/dev/null || echo '{"ok":true}'
 EOF
 chmod +x "$TMP/bin/node"
@@ -163,6 +163,14 @@ ok "dry-run guard runs --deployed against the preview root" \
 fresh; echo '{"ok":false}' > "$TMP/guard.out"
 out=$(deploy --artifact "$ART" --no-guard); rc=$?
 ok "dry-run --no-guard skips the shipped guard" '[ "$rc" = 0 ] && [ ! -e "$TMP/node.calls" ] && grep -q "guard=off" <<<"$out"'
+# A shipped guard together with --target-sha (the way an operator runs a real rollout): the guard gets the target
+# revision in its environment. Before this fix the assignment ran as the command (rc 127 on every such run).
+fresh; : > "$ART/scripts/worker-artifact-rollout-guard.mjs"
+out=$(deploy --artifact "$ART" --target-sha "$NEW_SHA"); rc=$?
+ok "dry-run guard + --target-sha: the guard runs and passes" \
+    '[ "$rc" = 0 ] && grep -q "DRY-RUN OK" <<<"$out" && ! grep -q "command not found" <<<"$out"'
+ok "dry-run guard + --target-sha: the guard sees the target revision" \
+    'grep -q -- "--deployed root=$TMP/stagetmp/.* target=$NEW_SHA\$" "$TMP/node.calls"'
 rm -f "$ART/scripts/worker-artifact-rollout-guard.mjs"
 
 # A symlinked live dist/ (release-dir layout) must not let the preview overlay

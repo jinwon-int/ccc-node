@@ -307,8 +307,11 @@ run_guard() { # <root>: the artifact's own rollout guard, when it ships one
     local root="${1:-$ROOT}" guard out
     guard="$root/scripts/worker-artifact-rollout-guard.mjs"
     (( GUARD )) && [[ -f "$guard" ]] || return 0
-    out=$(A2A_WORKER_ROOT="$root" ${TARGET_SHA:+A2A_WORKER_TARGET_REVISION="$TARGET_SHA"} \
-        node "$guard" --deployed 2>&1) || { say "guard rc!=0: ${out##*$'\n'}"; return 1; }
+    # The assignments go through `env`: an assignment produced by an expansion is not an assignment to bash,
+    # so `${TARGET_SHA:+VAR=...} node` ran "VAR=..." as the command (rc 127 on every --target-sha run).
+    local -a envs=("A2A_WORKER_ROOT=$root")
+    [[ -n "$TARGET_SHA" ]] && envs+=("A2A_WORKER_TARGET_REVISION=$TARGET_SHA")
+    out=$(env "${envs[@]}" node "$guard" --deployed 2>&1) || { say "guard rc!=0: ${out##*$'\n'}"; return 1; }
     python3 - "$out" <<'PY'
 import json, sys
 s = sys.argv[1]
