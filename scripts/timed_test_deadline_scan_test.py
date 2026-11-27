@@ -1455,6 +1455,115 @@ class BookingRecognition2863Tests(unittest.TestCase):
                 )
 
 
+# The five synthetic cases from the #2863 decision comment (2026-11-27): a
+# booking, then one comment after its end, judged in expired mode a week later.
+VERDICT_2863_BOOKING = "종료 일시 2026-11-20 09:00 KST · 판정 주체 오너"
+VERDICT_2863_BOOKED_AT = "2026-11-13T00:00:00Z"
+VERDICT_2863_AFTER = "2026-11-21T00:00:00Z"  # after the booked end
+VERDICT_2863_END = dt.datetime(2026, 11, 20, 9, 0)
+VERDICT_2863_NOW = dt.datetime(2026, 11, 27, 10, 0)
+
+
+class VerdictNegation2863Tests(unittest.TestCase):
+    """A post-deadline comment saying no verdict was given must not count as one."""
+
+    def _judge(self, follow_up: str | None, now: dt.datetime = VERDICT_2863_NOW) -> scanner.Finding | None:
+        comments = [_rel_comment(VERDICT_2863_BOOKING, VERDICT_2863_BOOKED_AT, author="jinon86")]
+        if follow_up is not None:
+            comments.append(_rel_comment(follow_up, VERDICT_2863_AFTER, author="jinon86"))
+        return scanner.judge_issue(_rel_issue(comments=comments), now, "expired")
+
+    def assertExpiredHigh(self, follow_up: str | None) -> None:
+        finding = self._judge(follow_up)
+        assert finding is not None, follow_up
+        self.assertEqual(
+            (finding.kind, finding.deadline, finding.confidence, finding.weak_reason),
+            ("expired-unjudged", VERDICT_2863_END, "high", None),
+        )
+
+    def test_no_follow_up_is_expired_high(self) -> None:
+        self.assertExpiredHigh(None)
+
+    def test_passed_without_a_verdict_is_expired_high(self) -> None:
+        self.assertExpiredHigh("종료 시각이 판정 없이 지났습니다")
+
+    def test_unjudged_state_is_expired_high(self) -> None:
+        self.assertExpiredHigh("미판정 상태로 종료 시각이 지났습니다")
+
+    def test_other_negated_or_role_wording_is_not_a_verdict(self) -> None:
+        for follow_up in ("## 판정이 없습니다 — 오너 확인 필요", "판정은 없고 로그만 남았습니다",
+                          "판정 예정 시각이 지났습니다", "판정 대기 중", "판정 주체: 오너"):
+            with self.subTest(follow_up=follow_up):
+                self.assertExpiredHigh(follow_up)
+
+    def test_rebooking_without_a_verdict_is_a_new_deadline(self) -> None:
+        rebooking = "판정이 없어 새 종료 일시를 정합니다: 2026-11-30 09:00 KST"
+        self.assertIsNone(self._judge(rebooking))  # the new end has not passed
+        finding = self._judge(rebooking, now=dt.datetime(2026, 12, 1, 10, 0))
+        assert finding is not None
+        self.assertEqual(
+            (finding.deadline, finding.confidence), (dt.datetime(2026, 11, 30, 9, 0), "high")
+        )
+
+    def test_a_given_verdict_still_settles(self) -> None:
+        for follow_up in ("판정: 합격 — 유지", "## 관측 종료 판정 — 불합격",
+                          "## 판정 기준 충족 — 유지", "## 판정은 합격"):
+            with self.subTest(follow_up=follow_up):
+                self.assertIsNone(self._judge(follow_up))
+
+    def test_verdict_strength_ignores_negated_wording(self) -> None:
+        # The heading window opens followup mode; a negation must not open it.
+        self.assertIsNone(scanner._verdict_strength("종료 시각이 판정 없이 지났습니다"))
+        self.assertIsNone(scanner._verdict_strength("미판정 상태로 종료 시각이 지났습니다"))
+        self.assertEqual(scanner._verdict_strength("## 관측 종료 판정 — 합격"), "strict")
+        self.assertEqual(scanner._verdict_strength("메모\n관측 종료 판정은 아래에"), "heading")
+
+
+# nclex#1112 (2026-11-27 relative rescan): an item table row whose clinical
+# content holds an hour offset.
+LINE_1112_ROW = "| 4 | `RN-BASIC-0039` | basic_care | 가설 우선순위 | 전완 골절 도수정복·석고붕대 6시간 후 사정 |"
+
+
+class TableCellContent2863Tests(unittest.TestCase):
+    _judge = RelativeFalsePositive2901Tests._judge
+    assertDemoted = RelativeFalsePositive2901Tests.assertDemoted
+    assertFlagged = RelativeFalsePositive2901Tests.assertFlagged
+
+    def test_hour_offset_in_a_table_row_is_demoted(self) -> None:
+        for line in (
+            LINE_1112_ROW,
+            "  | 2 | 수술 후 처치 | 배액관 24시간 뒤 제거 |",
+        ):
+            with self.subTest(line=line):
+                self.assertDemoted(_rel_issue(body=line, author="jinon86"), "table-cell-content")
+                self.assertDemoted(_rel_issue(comments=[_rel_comment(line)]), "table-cell-content")
+
+    def test_a_test_word_in_the_row_keeps_it_high(self) -> None:
+        for line in (
+            "| 롤백 | 배포 24시간 후 판정 |",
+            "| 3 | 배포 | 6시간 후 확인 |",
+            "| 소크 | 48시간 뒤 정리 |",
+            "| 카나리 | 12시간 뒤 승격 |",
+            "| 관측 | 24시간 후 |",
+            "| 배포 | 24시간 후 종료 |",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+
+    def test_only_hour_offsets_in_table_rows(self) -> None:
+        for line in (
+            # Not a table row: the same content as prose stays a window.
+            "전완 골절 도수정복·석고붕대 6시간 후 사정",
+            # A table row, but the term is not an hour offset.
+            "| 4 | 배포 | 며칠 운영 |",
+            "| 4 | 배포 | T+24h |",
+        ):
+            with self.subTest(line=line):
+                self.assertFlagged(_rel_issue(comments=[_rel_comment(line)]))
+        # The documented true positives (family-messenger#404, a2a-nexus#2395)
+        # are not table rows; RelativeFalsePositive2544Tests keeps them high.
+
+
 class ReposFileTests(unittest.TestCase):
     """An unconfigured scheduled scan must never look like a clean scan.
 
