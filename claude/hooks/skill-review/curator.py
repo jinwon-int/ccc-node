@@ -338,6 +338,40 @@ def _read_ledger_tail(path: Path, uid: int) -> tuple[str, bytes]:
     return "read", data
 
 
+#: #2881 proposal 3: a burst of SKILL.md *reads* (Read/Bash rows) naming at
+#: least AUDIT_BURST_MIN_SKILLS distinct skills inside AUDIT_BURST_WINDOW is an
+#: audit/review/comparison pass, not use. Rows stay in the ledger; consumers
+#: that count every row skip them. Skill-tool rows are never part of a burst.
+#: Keep in step with ccc-skill-listing-policy.py (_audit_burst_indices; parity
+#: test in scripts/ccc_skill_usage_report_test.py).
+AUDIT_BURST_WINDOW = timedelta(minutes=10)
+AUDIT_BURST_MIN_SKILLS = 5
+AUDIT_BURST_VIEW_TOOLS = frozenset({"Read", "Bash"})
+
+
+def audit_burst_indices(rows) -> set[int]:
+    """Indices of ``rows`` ((skill, tool, ts) triples) inside a read burst.
+
+    Node-wide sliding window over view rows sorted by time: whenever the
+    rows within AUDIT_BURST_WINDOW of each other name AUDIT_BURST_MIN_SKILLS
+    or more distinct skills, every row of that window is flagged.
+    """
+    views = sorted(
+        (when, idx, skill)
+        for idx, (skill, tool, when) in enumerate(rows)
+        if isinstance(skill, str) and tool in AUDIT_BURST_VIEW_TOOLS and when is not None
+    )
+    flagged: set[int] = set()
+    start = 0
+    for end in range(len(views)):
+        while views[end][0] - views[start][0] > AUDIT_BURST_WINDOW:
+            start += 1
+        window = views[start:end + 1]
+        if len({skill for _when, _idx, skill in window}) >= AUDIT_BURST_MIN_SKILLS:
+            flagged.update(idx for _when, idx, _skill in window)
+    return flagged
+
+
 def _read_usage_ledger(context) -> tuple[str, dict[str, datetime]]:
     """Latest use per skill from ``usage.jsonl``: (status, {name: ts}).
 
@@ -349,7 +383,7 @@ def _read_usage_ledger(context) -> tuple[str, dict[str, datetime]]:
     status, data = _read_ledger_tail(context.state_dir / _READ_LEDGER_FILE, context.uid)
     if status != "read":
         return status, {}
-    latest: dict[str, datetime] = {}
+    parsed: list[tuple[str, Any, datetime]] = []
     for line in data.splitlines():
         try:
             row = json.loads(line)
@@ -360,6 +394,12 @@ def _read_usage_ledger(context) -> tuple[str, dict[str, datetime]]:
         name = row.get("skill")
         when = _parse_ts(row.get("ts"))
         if not isinstance(name, str) or not ownership._NAME_RE.fullmatch(name) or when is None:
+            continue
+        parsed.append((name, row.get("tool"), when))
+    burst = audit_burst_indices(parsed)
+    latest: dict[str, datetime] = {}
+    for idx, (name, _tool, when) in enumerate(parsed):
+        if idx in burst:
             continue
         if name not in latest or when > latest[name]:
             latest[name] = when
