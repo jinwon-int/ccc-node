@@ -236,6 +236,55 @@ self-update only warns about it. Self-update may restart a stale supervise loop
 of its own checkout only on nodes that opt in with
 `CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=1` (default 0, docs/self-update.md).
 
+### Deploying `dist/worker.js` (#2791 stage 3)
+
+`scripts/a2a-termux-native-worker-deploy.sh` is the canonical tar deploy of
+the worker artifact. It replaces the per-rollout ad-hoc scripts and owns the
+worker restart after a redeploy. It is **dry-run by default**:
+
+```bash
+# Plan + idle gate only; nothing on the node changes.
+scripts/a2a-termux-native-worker-deploy.sh --env-file /path/canonical.env \
+    --artifact /path/artifact.tgz --target-sha <40-hex>
+# Perform it.
+scripts/a2a-termux-native-worker-deploy.sh --env-file /path/canonical.env \
+    --artifact /path/artifact.tgz --target-sha <40-hex> --apply
+```
+
+`--artifact` is a directory or a tar(.gz) whose top level (or one wrapping
+directory) holds `dist/worker.js`; tar members with absolute paths, `..`,
+device nodes or escaping links are refused. With `--apply` the order is:
+
+1. idle gate — `restart-worker --if-idle --dry-run` (busy → exit 10, nothing changed);
+2. backups of the worker root (without `node_modules`) and of each
+   `node_modules` package the artifact replaces (default
+   `$HOME/a2a-nexus-local-deploy-backups`, `--backup-dir`);
+3. copy `dist/`, `scripts/`, `handlers/` (overwrite) and replace the artifact's packages;
+4. pre-restart checks: build revision = target, the artifact's own
+   `scripts/worker-artifact-rollout-guard.mjs --deployed` when shipped
+   (`--no-guard` skips it), then `--smoke-cmd` (run with `A2A_WORKER_ROOT`);
+   failure → exact rollback, exit 20, no restart;
+5. `restart-worker --if-idle` — verified by `registered with` + health
+   `sup_count=1 workers=1 tunnel=UP`. Busy by now → rollback, exit 10 (never
+   signaled); not verified → rollback and restart on the old files, exit 30;
+6. write `<worker_root>/.deploy-source-sha`.
+
+| rc | meaning                                                              |
+|----|----------------------------------------------------------------------|
+| 0  | deployed and verified (dry-run: plan + gate ok)                      |
+| 2  | usage, invalid artifact, or revision ≠ `--target-sha`                |
+| 3  | no canonical supervisor / worker — nothing changed                   |
+| 4  | another deploy holds the lock                                        |
+| 10 | busy — nothing changed (or files rolled back before any signal)      |
+| 11 | idle state unknown — nothing changed                                 |
+| 20 | pre-restart check failed — rolled back, no restart                   |
+| 30 | restart not verified — rolled back and restarted on the old files    |
+| 31 | rollback failed — restore manually from the printed backups          |
+
+Run it from the same checkout the supervisor runs (`restart-worker` only acts
+on the supervisor whose script is beside it). Live rollouts still need the
+usual per-node approval.
+
 ## No-provider adapter smoke
 
 Before any real provider canary, run the bridge with a fake Claude binary so the JSON contract, executable path, and Node runtime are proven without spending provider quota:
