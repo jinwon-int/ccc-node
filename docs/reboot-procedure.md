@@ -15,7 +15,7 @@ must include. The commands themselves are documented in
 ## Before the reboot
 
 1. **Check what is waiting.** On the node, as **each harness account** that
-   schedules jobs (root on most nodes; the service user, e.g. `gongmyoung`, where
+   schedules jobs (root on most nodes; the dedicated service user, where
    the harness does not run as root):
 
    ```bash
