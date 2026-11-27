@@ -2718,6 +2718,47 @@ ok "opt-in: a stale worker.js stays action=none (deploy-side restart)" 'nw_line 
 CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=1 run2357 >/dev/null 2>&1; rc=$?
 ok "opt-in: a busy worker defers the restart without failing the tick" \
   '[ "$rc" = 0 ] && grep -qF "native-supervisor-restart result=deferred-busy rc=10 tick=up-to-date" "$STATE/self-update.log"'
+# Owner decision 2026-11-27: the per-node opt-in may also be the operator file
+# ~/.claude/self-update.native-supervisor-restart. The env var, when set, wins
+# (same precedence as self-update.notify): `0` keeps a node off despite the file.
+NWSUP_OPTIN="$CLAUDE/self-update.native-supervisor-restart"
+: > "$NWSUP_OPTIN"
+: > "$STATE/self-update.log"; rm -f "$TMP/nw-harness.calls" "$TMP/nw-harness.rc"
+CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 run2357 >/dev/null 2>&1; rc=$?
+ok "opt-in file (env unset): stale supervise loop triggers restart-supervisor --if-idle" \
+  '[ "$rc" = 0 ] && sup_line restart-supervisor >/dev/null && [ "$(cat "$TMP/nw-harness.calls")" = "restart-supervisor --if-idle" ]'
+: > "$STATE/self-update.log"; rm -f "$TMP/nw-harness.calls"
+CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=0 run2357 >/dev/null 2>&1; rc=$?
+ok "env =0 wins over the opt-in file (warn only, no restart call)" \
+  '[ "$rc" = 0 ] && sup_line none >/dev/null && [ ! -e "$TMP/nw-harness.calls" ]'
+: > "$STATE/self-update.log"; rm -f "$TMP/nw-harness.calls"
+CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART='' run2357 >/dev/null 2>&1; rc=$?
+ok "an empty env var counts as unset (the opt-in file decides)" \
+  '[ "$rc" = 0 ] && sup_line restart-supervisor >/dev/null && [ -e "$TMP/nw-harness.calls" ]'
+kill -KILL "$NWSUP_PID" 2>/dev/null || true; wait "$NWSUP_PID" 2>/dev/null || true
+# Owner decision 2026-11-27: a changed lib/a2a-supervisor-identity.sh (sourced
+# by the supervise script) alone makes the loop stale, and the opt-in restart
+# still matches it (changed= sits before file=, which stays last).
+mkdir -p "$TMP/seed/scripts/lib"
+printf '# fake identity lib\n' > "$TMP/seed/scripts/lib/a2a-supervisor-identity.sh"
+bump2357 native-supervisor-identity-lib
+CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=0 run2357 >/dev/null 2>&1
+NWLIB="$REPO/scripts/lib/a2a-supervisor-identity.sh"
+python3 -c 'import os, sys; [os.utime(p, (946684800, 946684800)) for p in sys.argv[1:]]' "$NWSUP" "$NWLIB"
+sleep 1.1
+python3 -c 'import time; time.sleep(600)' "$NWSUP" supervise --env-file /x &
+NWSUP_PID=$!
+sleep 0.3
+: > "$STATE/self-update.log"; rm -f "$TMP/nw-harness.calls"
+CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 run2357 >/dev/null 2>&1; rc=$?
+ok "unchanged script + identity lib: no supervise warning, no restart" \
+  '[ "$rc" = 0 ] && ! grep -qF "kind=supervise pids=$NWSUP_PID " "$STATE/self-update.log" && [ ! -e "$TMP/nw-harness.calls" ]'
+python3 -c 'import os, sys, time; t = time.time() + 120; os.utime(sys.argv[1], (t, t))' "$NWLIB"
+: > "$STATE/self-update.log"; rm -f "$TMP/nw-harness.calls"
+CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK=1 run2357 >/dev/null 2>&1; rc=$?
+ok "identity lib changed after start: logged with changed=<lib> and restarted under the opt-in file" \
+  '[ "$rc" = 0 ] && grep -F "native-worker-stale kind=supervise pids=$NWSUP_PID " "$STATE/self-update.log" | grep -qF "changed=$(realpath "$NWLIB") file=$(realpath "$NWSUP") tick=up-to-date action=restart-supervisor (#2791)" && [ "$(cat "$TMP/nw-harness.calls")" = "restart-supervisor --if-idle" ]'
+rm -f "$NWSUP_OPTIN"
 kill -KILL "$NWSUP_PID" 2>/dev/null || true; wait "$NWSUP_PID" 2>/dev/null || true
 # A stale supervise loop of another checkout is not ours to restart.
 NWOTHER="$TMP/nw-other/scripts/a2a-termux-native-worker.sh"; mkdir -p "${NWOTHER%/*}"; : > "$NWOTHER"
