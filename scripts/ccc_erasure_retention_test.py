@@ -603,7 +603,7 @@ class RetentionTests(unittest.TestCase):
             "wiki-candidates.md.bak-20261001", "fleet-update-abc1234.log.validate",
             "distill.log.1.gz.tmp")]
         one_offs = [self.seed(nunchi / n, 1) for n in (
-            "gotgan-stage2-manual.time", "journal-matrix-XYZ-receipts.jsonl",
+            "handover-manual-stage.time", "journal-matrix-XYZ-receipts.jsonl",
             "jev-review.db-wal2")]
         unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
         for path in harness:
@@ -793,8 +793,8 @@ class RetentionTests(unittest.TestCase):
         state = self.scratch_fixture()
         self.seed(self.home / ".nunchi/facts.db", 0)
         self.live_env()
-        nunchi_one_off = self.seed(self.home / ".nunchi/gotgan-stage2-manual.time", HORIZON_DAYS)
-        bot_one_off = self.seed(self.bot / "jev-skill-advice.json.incoming.ABC123", HORIZON_DAYS)
+        nunchi_one_off = self.seed(self.home / ".nunchi/handover-manual-stage.time", HORIZON_DAYS)
+        bot_one_off = self.seed(self.bot / "jev-skill-advice.json.partial-ABC123", HORIZON_DAYS)
         nested = self.seed(state / "somedir" / "old.sh", HORIZON_DAYS)
         unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
         self.assertIn(str(nunchi_one_off), unknown)
@@ -804,6 +804,52 @@ class RetentionTests(unittest.TestCase):
             self.assertNotIn(str(path), report, path.name)
         roots = planner.fallback_roots(self.scratch_entry())
         self.assertEqual(roots, [os.path.realpath(state)])
+
+    def test_observed_fleet_blockers_are_classified_2026_11_27(self):
+        """#1468 0단계: the 58 blockers seen fleet-wide on 2026-11-27 are named
+        classes, not a widened fallback — ~/.nunchi and the bot dir still have
+        no fallback scope (test above)."""
+        nunchi = self.home / ".nunchi"
+        self.seed(nunchi / "facts.db", 0)
+        self.scratch_fixture()
+        self.live_env()
+        expected = {
+            nunchi / "facts.db.bak-1401-20261020T010203Z": ("nunchi.facts_db_backups", "b-sensitive-backup"),
+            nunchi / "retired-1472-20261011.json": ("nunchi.operator_memory_copies", "b-sensitive-backup"),
+            nunchi / "review-report-legacy-20261001.md": ("nunchi.operator_memory_copies", "b-sensitive-backup"),
+            nunchi / ".judge-baseline-20261001.txt": ("nunchi.operator_memory_copies", "b-sensitive-backup"),
+            nunchi / "bench-both.cron.log": ("nunchi.operator_logs", "operator-scratch"),
+            nunchi / "codex-feed.cron.log": ("nunchi.operator_logs", "operator-scratch"),
+            nunchi / "full-mine.done": ("nunchi.operator_logs", "operator-scratch"),
+            nunchi / "gotgan-stage2-manual.time": ("nunchi.operator_logs", "operator-scratch"),
+            nunchi / "bench-20261001.indeterminate-1107.md": ("nunchi.operator_logs", "operator-scratch"),
+            nunchi / "codex-oneoff-mine-20261101.log": ("nunchi.operator_logs", "operator-scratch"),
+            self.bot / "jev-skill-advice.json.incoming.NY3zXS": ("bot.jev_skill_advice_leftovers", "operator-scratch"),
+            self.bot / "jev-skill-advice.json.retained.Ab12Cd": ("bot.jev_skill_advice_leftovers", "operator-scratch"),
+            self.bot / "restart_20260901T010203.log": ("bot.operator_logs", "operator-scratch"),
+            self.bot / "health.json.bak-20261001": ("bot.operator_logs", "operator-scratch"),
+        }
+        for path in expected:
+            self.seed(path, HORIZON_DAYS)
+        live = [self.seed(nunchi / n, HORIZON_DAYS) for n in (
+            "mempalace-search.status.json", "mempalace-refresh.fingerprint.json",
+            "bench-wiki-timeout-sec")]
+        live += [self.seed(self.bot / n, HORIZON_DAYS) for n in (
+            "restart-handoff.json", "restart-handoff.last.json", "crash-budget.json")]
+        helpers = [self.seed(self.bot / n, HORIZON_DAYS) for n in (
+            "restart_bridge.sh", "apply_bridge_update.sh", "cccb_systemd_transition.sh")]
+        unknown = {u["path"] for u in planner._run_scan(self.inventory)["unknown"]}
+        for path in list(expected) + live + helpers:
+            self.assertNotIn(str(path), unknown, path.name)
+        report = self.report()
+        actions = self.plan_actions()
+        for path, (artifact, group) in expected.items():
+            self.assertEqual(report[str(path)]["artifact"], artifact, path.name)
+            self.assertEqual(report[str(path)]["group"], group, path.name)
+            self.assertEqual(actions[str(path)], "delete", path.name)
+        for path in live + helpers:
+            self.assertNotIn(str(path), report, path.name)
+            self.assertNotEqual(actions.get(str(path)), "delete", path.name)
 
     def test_scratch_sidecars_follow_their_db_orphans_block(self):
         state = self.scratch_fixture()
