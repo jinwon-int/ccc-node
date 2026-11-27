@@ -111,7 +111,14 @@ rather than composing the steps ad hoc.
    5-minute `a2a-termux-native-worker-health.sh` cron reports the same state
    (docs/a2a-claude-worker.md). A stale `worker.js` is never restarted here —
    that belongs to the deploy side (`scripts/a2a-termux-native-worker-deploy.sh`).
-   Opt-in per node: with `CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=1`, a stale
+   For the supervise loop, "the file it runs" also covers the
+   `lib/a2a-supervisor-identity.sh` it sourced at start-up: a changed lib alone
+   makes the loop stale, and the line then names it as `changed=<lib>` before
+   `file=<script>` (owner decision 2026-11-27).
+   Opt-in per node: with `CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=1`, or the
+   operator-owned file `~/.claude/self-update.native-supervisor-restart`
+   (exists → on; the env var, when set, wins — `0` keeps the node off despite
+   the file, the same precedence as `self-update.notify`), a stale
    supervise loop running this checkout's own script is restarted through
    `a2a-termux-native-worker.sh restart-supervisor --if-idle` (line
    `action=restart-supervisor`, then `native-supervisor-restart result=<ok|deferred-busy|deferred-unknown|failed> rc=…`).
@@ -466,7 +473,7 @@ still does not include a complete previous dependency environment.
 | `CCC_SELF_UPDATE_REAPPLY` | `1` | set to `0` to skip installer cron re-apply; equivalent operator file: `~/.claude/self-update.no-reapply` |
 | `CCC_SELF_UPDATE_A2A_HANDLERS` | `1` | set to `0` to skip refreshing drifted installed A2A handler copies (#2357) |
 | `CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK` | `auto` | Termux-native A2A worker serving≠installed log line (step 5c, #2791): `auto` = Termux only, `1` = always, `0` = off. Never restarts or notifies |
-| `CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART` | `0` | Opt-in (step 5c, #2791 stage 2b): `1` restarts a stale supervise loop of this checkout via `restart-supervisor --if-idle`; busy defers. Never restarts for a stale `worker.js` |
+| `CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART` | unset (off) | Opt-in (step 5c, #2791 stage 2b): `1` restarts a stale supervise loop of this checkout via `restart-supervisor --if-idle`; busy defers. Never restarts for a stale `worker.js`. Equivalent operator file: `~/.claude/self-update.native-supervisor-restart` (exists → on, used only while the env var is unset/empty; `0` overrides it) |
 | `CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART_TIMEOUT` | `300` | Seconds the opt-in supervisor restart may take before it is killed (the health cron respawns a missing supervisor) |
 | `CCC_A2A_HANDLER_SYSTEM_DEST` | `/usr/local/sbin` | system destination of the installed A2A handlers checked by the refresh step and by `ccc-doctor` (tests point it at a temp dir); the home destination is always `$HOME/a2a-broker-worker` |
 | `CCC_SELF_UPDATE_NOTIFY` | `all` | which owner notices are queued (#2589). `all` (also any unknown value): every notice. `failures`, and `none`/`off` (same behaviour): only the success notices — update completed (`ok-*`) and pending activation reconciled (`reconciled-*`) — are muted, each logged as `notify=suppressed reason=operator-notify-<mode> dedup=… class=info`; every failure, stall, warning, recovery and incomplete activation (e.g. `prepare-fail-*`, `fail-*`, `pending-*`, `stalled-*`) is still pushed and logged as `notify=pushed mode=<mode> class=alert`. `silent`: deliberate full mute — alerts are suppressed too (`class=alert` in the log line) and every run logs `notify=warning mode=silent` and warns on stderr. `status` prints the effective mode. Equivalent operator file: `~/.claude/self-update.notify` (first non-comment line) |

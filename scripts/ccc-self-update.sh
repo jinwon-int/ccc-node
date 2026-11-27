@@ -38,6 +38,11 @@
 #   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
 #      file exists, installer-managed cron is never rewritten. Env override:
 #      CCC_SELF_UPDATE_REAPPLY=0. Agent must not write the file.)
+#   ~/.claude/self-update.native-supervisor-restart (optional: per-node opt-in,
+#      #2791 — when this file exists, a stale Termux-native supervise loop of
+#      this checkout is restarted via `restart-supervisor --if-idle`. Env
+#      override: CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART (1 on, 0 off even
+#      with the file). Agent must not write the file.)
 #
 # Procedure (run):
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
@@ -2064,11 +2069,23 @@ a2a_handlers_refresh() { # <tick: changed|up-to-date>
 # and only when the node opted in: `restart-supervisor --if-idle` (busy → it
 # refuses and the next tick retries; a busy worker is never killed).
 #   CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK          auto (default: Termux only) | 1 | 0
-#   CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART          0 (default, warn only) | 1 (opt-in)
+#   CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART          unset (default: the file below decides) | 1 on | 0 off
+#   ~/.claude/self-update.native-supervisor-restart    operator-owned opt-in file: exists → on when
+#                                                      the env var is unset/empty (env wins, like
+#                                                      self-update.notify). Agent must not write it.
 #   CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART_TIMEOUT  seconds (default 300)
+NATIVE_SUPERVISOR_RESTART_FILE="$CLAUDE_DIR/self-update.native-supervisor-restart"
+native_supervisor_restart_enabled() { # env set → only `1` is on; unset/empty → the operator file
+  local v="${CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART:-}"
+  if [ -n "$v" ]; then
+    [ "$v" = 1 ]
+    return
+  fi
+  [ -f "$NATIVE_SUPERVISOR_RESTART_FILE" ]
+}
 native_worker_stale_check() { # <tick>
   local mode="${CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK:-auto}" lib report line
-  local harness own action restart_due=0
+  local harness own action restart_due=0 restart_on=0
   case "$mode" in
     0) return 0 ;;
     1) ;;
@@ -2082,10 +2099,11 @@ native_worker_stale_check() { # <tick>
   [ -n "$report" ] || return 0
   harness="$REPO/scripts/a2a-termux-native-worker.sh"
   own="$(realpath "$harness" 2>/dev/null || printf '%s' "$harness")"
+  native_supervisor_restart_enabled && restart_on=1
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     action=none
-    if [ "${CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART:-0}" = 1 ]; then
+    if [ "$restart_on" = 1 ]; then
       case "$line" in
         "kind=supervise "*" file=$own") action=restart-supervisor; restart_due=1 ;;
       esac

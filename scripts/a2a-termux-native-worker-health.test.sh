@@ -490,6 +490,51 @@ ok "a deleted worker.js is reported as installed=missing" \
     'grep -F "file=$WJS" <<<"$report" | grep -q "installed=missing"'
 : > "$WJS"; set_future_mtime "$WJS"
 
+# Owner decision 2026-11-27 (#2791): the supervise loop sourced
+# lib/a2a-supervisor-identity.sh at start-up, so a changed lib alone makes the
+# loop stale. The line names the lib in changed= and keeps file= (the script)
+# last, which is what self-update's restart match relies on.
+ID_DIR="$STALE_DIR/idcheck/scripts"
+mkdir -p "$ID_DIR/lib"
+ID_SUP="$ID_DIR/a2a-termux-native-worker.sh"
+ID_LIB="$ID_DIR/lib/a2a-supervisor-identity.sh"
+: > "$ID_SUP"; : > "$ID_LIB"
+sleep 1.1
+python3 -c 'import time; time.sleep(3600)' "$ID_SUP" supervise --env-file x &
+ID_FAKE=$!
+OWNED_PIDS+=("$ID_FAKE")
+sleep 0.3
+report=$(A2A_NATIVE_WORKER_STALE_SLACK_SECONDS=0 a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "unchanged script + identity lib: supervise loop is current" '! grep -qF "pids=$ID_FAKE " <<<"$report"'
+set_future_mtime "$ID_LIB"
+report=$(a2a_native_worker_stale_report "$STALE_DIR/wroot")
+# shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.
+id_line=$(grep -F "pids=$ID_FAKE " <<<"$report" | head -n1)
+ok "a changed identity lib alone makes the supervise loop stale (changed= names it, file= stays last)" \
+    '[[ "$id_line" == "kind=supervise pids=$ID_FAKE started="*" changed=$ID_LIB file=$ID_SUP" ]]'
+# A redeploy that keeps the build mtime is still caught by the lib's ctime.
+python3 -c 'import os, sys; os.utime(sys.argv[1], (946684800, 946684800))' "$ID_LIB"
+report=$(A2A_NATIVE_WORKER_STALE_SLACK_SECONDS=0 a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "a replaced identity lib with an old mtime is caught by its ctime" \
+    'grep -F "pids=$ID_FAKE " <<<"$report" | grep -qF "changed=$ID_LIB file=$ID_SUP"'
+set_future_mtime "$ID_SUP"
+python3 -c 'import os, sys, time; t = time.time() + 60; os.utime(sys.argv[1], (t, t))' "$ID_LIB"
+report=$(a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "when the script itself is the newest change, no changed= field is added" \
+    'grep -F "pids=$ID_FAKE " <<<"$report" | grep -q "installed=[0-9TZ:-]* file=$ID_SUP\$"'
+# A missing lib is ignored: only the script's absence means installed=missing.
+rm -f "$ID_LIB"
+: > "$ID_SUP"
+sleep 1.1
+kill -KILL "$ID_FAKE" 2>/dev/null || true; wait "$ID_FAKE" 2>/dev/null || true
+python3 -c 'import time; time.sleep(3600)' "$ID_SUP" supervise --env-file x &
+ID_FAKE=$!
+OWNED_PIDS+=("$ID_FAKE")
+sleep 0.3
+report=$(A2A_NATIVE_WORKER_STALE_SLACK_SECONDS=0 a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "a missing identity lib is ignored (no report, no installed=missing)" '! grep -qF "pids=$ID_FAKE " <<<"$report"'
+kill -KILL "$ID_FAKE" 2>/dev/null || true; wait "$ID_FAKE" 2>/dev/null || true
+
 # Health integration: same rc with and without the warning; log + JSON carry it.
 : > "$A2A_SUPERVISOR_HEALTH_LOG"
 # shellcheck disable=SC2034  # consumed by the eval-based ok() assertion.

@@ -77,7 +77,7 @@ chmod +x "$TMP/fake-harness.sh"
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/node" <<EOF
 #!/usr/bin/env bash
-echo "guard: \$*" >> "$TMP/node.calls"
+echo "guard: \$* root=\${A2A_WORKER_ROOT:-}" >> "$TMP/node.calls"
 cat "$TMP/guard.out" 2>/dev/null || echo '{"ok":true}'
 EOF
 chmod +x "$TMP/bin/node"
@@ -126,6 +126,55 @@ ok "dry-run plan lists dirs and replaced packages" \
 ok "dry-run runs only the gate (restart-worker --if-idle --dry-run)" \
     '[ "$(gate_calls)" = 1 ] && [ "$(restart_calls)" = 0 ]'
 ok "dry-run changes nothing and writes no backup" '[ "$(snapshot)" = "$BEFORE" ] && [ ! -e "$BK" ]'
+ok "dry-run reports the preview checks" 'grep -q "dry-run checks ok on staged preview (revision, guard=auto, smoke=no)" <<<"$out"'
+
+# ---- 2b. dry-run runs the pre-restart checks on a temp preview ----------------
+# Owner decision 2026-11-27: the dry-run includes the handler smoke (and the
+# artifact's rollout guard) the --apply path runs before its restart. They see
+# the post-deploy layout in a temp dir; the live root and backups stay untouched.
+SMOKE_OUT="$TMP/smoke.seen"
+# shellcheck disable=SC2016  # the smoke command is expanded by the deploy's bash -c.
+PROBE='{ echo "root=$A2A_WORKER_ROOT"; echo "worker=$(cat "$A2A_WORKER_ROOT/dist/worker.js")"; echo "legacy=$(cat "$A2A_WORKER_ROOT/dist/legacy.js")"; echo "handler=$(cat "$A2A_WORKER_ROOT/handlers/h.mjs")"; echo "core=$(cat "$A2A_WORKER_ROOT/node_modules/a2a-core/index.js")"; echo "kept=$(cat "$A2A_WORKER_ROOT/node_modules/left-alone/index.js")"; echo "state=$(cat "$A2A_WORKER_ROOT/worker-state.json")"; } > '"$SMOKE_OUT"'; echo scribble > "$A2A_WORKER_ROOT/dist/worker.js"; echo junk > "$A2A_WORKER_ROOT/node_modules/a2a-core/index.js"'
+for kind in dir tar; do
+    fresh; rm -f "$SMOKE_OUT"
+    src="$ART"; [[ "$kind" = tar ]] && src="$TMP/artifact.tgz"
+    out=$(deploy --artifact "$src" --smoke-cmd "$PROBE"); rc=$?
+    ok "$kind dry-run: smoke runs and the dry-run succeeds" \
+        '[ "$rc" = 0 ] && [ -f "$SMOKE_OUT" ] && grep -q "dry-run checks ok on staged preview (revision, guard=auto, smoke=yes)" <<<"$out" && grep -q "DRY-RUN OK" <<<"$out"'
+    ok "$kind dry-run: smoke sees the post-deploy layout (new files, kept files, kept packages)" \
+        'grep -qx "worker=new worker" "$SMOKE_OUT" && grep -qx "legacy=old only" "$SMOKE_OUT" && grep -qx "handler=handler" "$SMOKE_OUT" && grep -qx "core=new core" "$SMOKE_OUT" && grep -qx "kept=keep" "$SMOKE_OUT" && grep -qx "state=state" "$SMOKE_OUT"'
+    ok "$kind dry-run: smoke root is a temp preview, not the live root" \
+        'r=$(sed -n "s/^root=//p" "$SMOKE_OUT"); [ -n "$r" ] && [ "$r" != "$WROOT" ] && [[ "$r" == "$TMP/stagetmp/"* ]]'
+    ok "$kind dry-run: live root, backups and preview dir untouched / removed" \
+        '[ "$(snapshot)" = "$BEFORE" ] && [ ! -e "$BK" ] && [ -z "$(ls -A "$TMP/stagetmp")" ] && [ "$(restart_calls)" = 0 ] && [ "$(gate_calls)" = 1 ]'
+done
+
+fresh
+out=$(deploy --artifact "$ART" --smoke-cmd 'test "$(cat "$A2A_WORKER_ROOT/dist/worker.js")" = "never"'); rc=$?
+ok "dry-run smoke failure: exit 20, nothing changed, gate never reached" \
+    '[ "$rc" = 20 ] && grep -q "dry-run pre-restart check failed on the staged preview: smoke command failed — nothing changed" <<<"$out" && [ "$(snapshot)" = "$BEFORE" ] && [ ! -e "$BK" ] && [ ! -e "$TMP/harness.calls" ] && [ -z "$(ls -A "$TMP/stagetmp")" ]'
+
+fresh; : > "$ART/scripts/worker-artifact-rollout-guard.mjs"; echo '{"ok":false}' > "$TMP/guard.out"
+out=$(deploy --artifact "$ART"); rc=$?
+ok "dry-run guard ok=false: exit 20 on the preview, nothing changed" \
+    '[ "$rc" = 20 ] && grep -q "staged preview: rollout guard failed" <<<"$out" && [ "$(snapshot)" = "$BEFORE" ] && [ ! -e "$TMP/harness.calls" ]'
+ok "dry-run guard runs --deployed against the preview root" \
+    'grep -q -- "--deployed root=$TMP/stagetmp/" "$TMP/node.calls" && ! grep -q "root=$WROOT\$" "$TMP/node.calls"'
+fresh; echo '{"ok":false}' > "$TMP/guard.out"
+out=$(deploy --artifact "$ART" --no-guard); rc=$?
+ok "dry-run --no-guard skips the shipped guard" '[ "$rc" = 0 ] && [ ! -e "$TMP/node.calls" ] && grep -q "guard=off" <<<"$out"'
+rm -f "$ART/scripts/worker-artifact-rollout-guard.mjs"
+
+# A symlinked live dist/ (release-dir layout) must not let the preview overlay
+# write through to its target.
+fresh
+REL="$TMP/release-dist"; rm -rf "$REL"; mv "$WROOT/dist" "$REL"; ln -s "$REL" "$WROOT/dist"
+# shellcheck disable=SC2034  # REL_BEFORE is read by the eval-based ok() assertion.
+REL_BEFORE=$( (cd "$REL" && find . -type f -print0 | sort -z | xargs -0 sha256sum; find . | sort) | sha256sum)
+out=$(deploy --artifact "$ART" --smoke-cmd 'grep -qx "new worker" "$A2A_WORKER_ROOT/dist/worker.js" && [ -f "$A2A_WORKER_ROOT/dist/legacy.js" ] && [ ! -L "$A2A_WORKER_ROOT/dist" ]'); rc=$?
+ok "symlinked live dist/: dry-run preview is a dereferenced copy; the link target is untouched" \
+    '[ "$rc" = 0 ] && [ "$( (cd "$REL" && find . -type f -print0 | sort -z | xargs -0 sha256sum; find . | sort) | sha256sum)" = "$REL_BEFORE" ] && [ "$(cat "$REL/worker.js")" = "old worker" ] && [ -L "$WROOT/dist" ]'
+rm -f "$WROOT/dist"; rm -rf "$REL"
 
 # ---- 3. idle refusal ----------------------------------------------------------
 fresh; echo 10 > "$TMP/gate.rc"
