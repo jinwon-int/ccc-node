@@ -479,6 +479,22 @@
       "extra_paths": [
         {
           "path": "~/.nunchi/mempalace-refresh.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "mempalace-search.status.json"
+        },
+        {
+          "path": "~/.nunchi/mempalace-search.status.json"
+        },
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "mempalace-refresh.fingerprint.json"
+        },
+        {
+          "path": "~/.nunchi/mempalace-refresh.fingerprint.json"
         }
       ]
     },
@@ -802,7 +818,17 @@
         "node-decommission": "retain"
       },
       "derived_copies": [],
-      "verification": "sheet count"
+      "verification": "sheet count",
+      "extra_paths": [
+        {
+          "env": "NUNCHI_HOME",
+          "join": true,
+          "path": "bench-wiki-timeout-sec"
+        },
+        {
+          "path": "~/.nunchi/bench-wiki-timeout-sec"
+        }
+      ]
     },
     {
       "id": "audience.state_root",
@@ -2076,6 +2102,30 @@
         },
         {
           "path": "~/.telegram_bot/tasks.json.bak"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "restart-handoff.json"
+        },
+        {
+          "path": "~/.telegram_bot/restart-handoff.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "restart-handoff.last.json"
+        },
+        {
+          "path": "~/.telegram_bot/restart-handoff.last.json"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "crash-budget.json"
+        },
+        {
+          "path": "~/.telegram_bot/crash-budget.json"
         }
       ]
     },
@@ -2642,6 +2692,333 @@
       },
       "derived_copies": [],
       "verification": "file presence"
+    },
+    {
+      "id": "nunchi.facts_db_backups",
+      "path_class": "node-local memory backup",
+      "contains": [
+        "distilled-fact",
+        "because-reason",
+        "source_refs"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "facts\\.db\\.bak-[A-Za-z0-9._+-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/facts\\.db\\.bak-[A-Za-z0-9._+-]+"
+          }
+        ]
+      },
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "group b (#1468): manual copies of the nunchi facts DB taken before cleanups/merges; 30 days from max(mtime,ctime), then eligible for destruction at the apply boundary; the live DB is nunchi.peer_facts",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "mtime age, body-free",
+      "last_copy_guard": {
+        "counterpart": "facts.db"
+      }
+    },
+    {
+      "id": "nunchi.operator_memory_copies",
+      "path_class": "node-local operational scratch",
+      "contains": [
+        "retired-fact-exports",
+        "judge-baselines",
+        "legacy-review-reports"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "retired-[0-9]+-[A-Za-z0-9._+-]+\\.json"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/retired-[0-9]+-[A-Za-z0-9._+-]+\\.json"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "review-report-legacy-[A-Za-z0-9._+-]+\\.md"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/review-report-legacy-[A-Za-z0-9._+-]+\\.md"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "\\.judge-baseline-[A-Za-z0-9._+-]+\\.txt"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/\\.judge-baseline-[A-Za-z0-9._+-]+\\.txt"
+          }
+        ]
+      },
+      "scheduler_guard": true,
+      "retention_policy": {
+        "group": "b-sensitive-backup"
+      },
+      "retention": "group b (#1468, 2026-11-27): one-off exports of memory content left in ~/.nunchi by past cleanups (retired-<issue>-*.json, review-report-legacy-*.md, .judge-baseline-*.txt); no producer in the harness; 30 days, then eligible at the apply boundary; scheduler-referenced files are kept",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "max(mtime,ctime) age + scheduler references, body-free"
+    },
+    {
+      "id": "nunchi.operator_logs",
+      "path_class": "node-local operational scratch",
+      "contains": [
+        "one-time-logs",
+        "run-markers"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "(bench-both|ingest\\.matrix|codex-feed)\\.cron\\.log"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/(bench-both|ingest\\.matrix|codex-feed)\\.cron\\.log"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "(matrix-unify-first|full-mine)\\.log"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/(matrix-unify-first|full-mine)\\.log"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "full-mine\\.done"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/full-mine\\.done"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "gotgan-stage2-manual\\.time"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/gotgan-stage2-manual\\.time"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "bench-rerun-[A-Za-z0-9._+-]+\\.log"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/bench-rerun-[A-Za-z0-9._+-]+\\.log"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "bench-[0-9]{8}[A-Za-z0-9._+-]*\\.indeterminate-[0-9]+\\.md"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/bench-[0-9]{8}[A-Za-z0-9._+-]*\\.indeterminate-[0-9]+\\.md"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "codex-oneoff-mine-[A-Za-z0-9._+-]+\\.log"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/codex-oneoff-mine-[A-Za-z0-9._+-]+\\.log"
+          },
+          {
+            "env": "NUNCHI_HOME",
+            "join": true,
+            "kind": "pattern",
+            "path": "mempalace-refresh\\.codex-oneoff\\.status\\.json"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.nunchi/mempalace-refresh\\.codex-oneoff\\.status\\.json"
+          }
+        ]
+      },
+      "scheduler_guard": true,
+      "retention_policy": {
+        "group": "operator-scratch",
+        "max_age_days": 90
+      },
+      "retention": "operator scratch (#1468, 2026-11-27): named one-off logs and run markers observed in ~/.nunchi with no producer in the harness; listed explicitly because ~/.nunchi has no fallback scope; 90 days, then eligible at the apply boundary; scheduler-referenced files are kept",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "max(mtime,ctime) age + scheduler references, body-free"
+    },
+    {
+      "id": "bot.jev_skill_advice_leftovers",
+      "path_class": "node-local operational scratch",
+      "contains": [
+        "skill-advice-temp-copies"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "jev-skill-advice\\.json\\.(incoming|retained)\\.[A-Za-z0-9]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/jev-skill-advice\\.json\\.(incoming|retained)\\.[A-Za-z0-9]+"
+          }
+        ]
+      },
+      "scheduler_guard": true,
+      "retention_policy": {
+        "group": "operator-scratch",
+        "max_age_days": 30
+      },
+      "retention": "operator scratch (#1468, 2026-11-27): temporary incoming/retained copies of jev-skill-advice.json left by an earlier writer (no producer in the current bridge; Jev scope reduced in #2905); 30 days, then eligible at the apply boundary; the live file is bot.jev_skill_advice_config",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "max(mtime,ctime) age, body-free"
+    },
+    {
+      "id": "bot.operator_logs",
+      "path_class": "node-local operational scratch",
+      "contains": [
+        "one-time-logs",
+        "health-snapshots"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "(restart|apply)_[0-9][A-Za-z0-9._+-]*\\.log"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/(restart|apply)_[0-9][A-Za-z0-9._+-]*\\.log"
+          },
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "kind": "pattern",
+            "path": "health\\.json\\.bak-[A-Za-z0-9._+-]+"
+          },
+          {
+            "kind": "pattern",
+            "path": "~/.telegram_bot/health\\.json\\.bak-[A-Za-z0-9._+-]+"
+          }
+        ]
+      },
+      "scheduler_guard": true,
+      "retention_policy": {
+        "group": "operator-scratch",
+        "max_age_days": 90
+      },
+      "retention": "operator scratch (#1468, 2026-11-27): timestamped restart/apply logs and health.json snapshots in the bot data dir; 90 days, then eligible at the apply boundary; scheduler-referenced files are kept",
+      "requests": {
+        "prune-expired": "delete",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "max(mtime,ctime) age + scheduler references, body-free"
+    },
+    {
+      "id": "bot.operator_helpers",
+      "path_class": "node-local operator scripts",
+      "contains": [
+        "operator-helper-scripts"
+      ],
+      "role": "operational",
+      "owner": "node",
+      "resolve": {
+        "candidates": [
+          {
+            "env": "CCC_BOT_DATA_DIR",
+            "join": true,
+            "path": "restart_bridge.sh"
+          },
+          {
+            "path": "~/.telegram_bot/restart_bridge.sh"
+          }
+        ]
+      },
+      "retention": "operator helper scripts kept in the bot data dir (restart helper referenced by node runbooks); retained, never age-pruned",
+      "requests": {
+        "prune-expired": "retain",
+        "node-decommission": "delete"
+      },
+      "derived_copies": [],
+      "verification": "file presence",
+      "extra_paths": [
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "apply_bridge_update.sh"
+        },
+        {
+          "path": "~/.telegram_bot/apply_bridge_update.sh"
+        },
+        {
+          "env": "CCC_BOT_DATA_DIR",
+          "join": true,
+          "path": "cccb_systemd_transition.sh"
+        },
+        {
+          "path": "~/.telegram_bot/cccb_systemd_transition.sh"
+        }
+      ]
     },
     {
       "id": "state.operator_scratch",
