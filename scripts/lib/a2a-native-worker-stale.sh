@@ -11,8 +11,11 @@
 #   Scans this user's processes for the canonical supervise loop
 #   (`a2a-termux-native-worker.sh supervise`) and for `.../dist/worker.js`
 #   workers. Each process is compared with the file it actually runs: when that
-#   file's mtime is newer than the process start (plus a small slack) or the file
-#   is gone, one line per (kind, file) is printed:
+#   file changed after the process start (plus a small slack) or the file is
+#   gone, one line per (kind, file) is printed. "Changed" is the later of mtime
+#   and ctime: a tar redeploy keeps the build's mtime (2026-11-24: worker.js
+#   mtime 10:29:40, deployed 14:03 on daegyo / 14:06 on gongyung), and only the
+#   ctime says the file was replaced:
 #     kind=<supervise|worker> pids=<p1,p2> started=<UTC> installed=<UTC|missing> file=<path>
 #   With worker_root, only `<worker_root>/dist/worker.js` counts as a worker.
 #   Prints nothing when nothing is stale or when the check cannot run
@@ -91,7 +94,8 @@ for proc in glob.glob("/proc/[0-9]*"):
         continue
     started = wall_now - (boot_now - start_ticks / tick)
     try:
-        installed = os.stat(path).st_mtime
+        st = os.stat(path)
+        installed = max(st.st_mtime, st.st_ctime)  # tar keeps the build's mtime; ctime is the install (#2791 2a)
     except OSError:
         installed = None
     if installed is not None and installed <= started + slack:
