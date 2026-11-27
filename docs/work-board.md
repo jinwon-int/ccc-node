@@ -49,7 +49,7 @@ written in this public repository.
 | `waiting=external` | an outside party: a store review, a support reply, a vendor |
 | `node` | the node that owns the next step |
 | `due` | KST date or date-time |
-| `next` | the next step, one line, at most 80 characters — never an owner's message or a comment body |
+| `next` | the next step in Korean, one line, at most 80 characters — never an owner's message or a comment body |
 
 - The marker is the first line of a comment, like the issue-claim marker.
 - The newest valid marker on an issue is its state. A newer invalid marker is
@@ -62,7 +62,7 @@ Post one with the helper rather than by hand:
 
 ```bash
 python3 scripts/ccc_issue_status.py set --repo OWNER/REPO --issue N \
-  --waiting date --due 2026-11-29T20:00 --node <node> --next "lock-screen session"
+  --waiting date --due 2026-11-29T20:00 --node <node> --next "잠금 화면 측정 세션"
 python3 scripts/ccc_issue_status.py show --repo OWNER/REPO --issue N
 ```
 

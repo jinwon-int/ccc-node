@@ -456,7 +456,7 @@ def _render_howto(out: list) -> None:
         "```",
         '<!-- status:v1 waiting=owner|node|date|external node=<노드> due=YYYY-MM-DD[THH:MM] next="<80자 이내 한 줄>" -->',
         "```", "",
-        "`waiting=date`에는 `due`가 필요하다. `next`에는 다음 행동만 적고 오너 지시 원문이나 코멘트 본문을 옮기지 않는다.",
+        "`waiting=date`에는 `due`가 필요하다. `next`에는 다음 행동만 한국어로 적고 오너 지시 원문이나 코멘트 본문을 옮기지 않는다.",
         "",
     ]
 

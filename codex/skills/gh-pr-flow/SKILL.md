@@ -145,9 +145,9 @@ owner's words in `--detail`.
 
 **Leave a status marker on the issue (#2914).** When the PR closes a tracked
 issue, run `python3 <ccc-node checkout>/scripts/ccc_issue_status.py set --repo
-<owner/repo> --issue <issue> --waiting owner --node <this node> --next "merge
-approval for PR #<n>"` so the fleet work board lists it under "owner's turn".
-`--next` is one line naming the next step, never the owner's words. Use
+<owner/repo> --issue <issue> --waiting owner --node <this node> --next "PR #<n>
+머지 승인"` so the fleet work board lists it under "owner's turn".
+`--next` is one line naming the next step, in Korean, never the owner's words. Use
 `--waiting date --due YYYY-MM-DDTHH:MM` for a scheduled check, `--waiting node`
 when the next step is yours, `--waiting external` for an outside reply.
 

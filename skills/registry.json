@@ -76,7 +76,7 @@
       "name": "gh-pr-flow",
       "source": "codex/skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "39d8d8c6fec240cde451e4ec0ea2314d29db46b35ee9cb473e808946bd560c0a"
+      "tree_sha256": "5de53fa59c8ba391fe1ff8cd6085f5e65b1fd03d79d873d2640c739fac01d8a1"
     },
     {
       "audience": "codex",
@@ -131,7 +131,7 @@
       "name": "bridge-safe-detached-run",
       "source": "skills/bridge-safe-detached-run",
       "status": "active",
-      "tree_sha256": "21e7534d1581f89a644f086086d14c7b4a12442305327921cfeed54101b7b6aa"
+      "tree_sha256": "f3405412ff3ae0dd5d40227a2baf3ee57bd98851d553032c0e059775fc1fc74f"
     },
     {
       "audience": "claude",
@@ -285,7 +285,7 @@
       "name": "gh-pr-flow",
       "source": "skills/gh-pr-flow",
       "status": "active",
-      "tree_sha256": "cde427c7a282b6d17060f8c56bd6b4d8ec3a6a22c4d88d07a582add860768a38"
+      "tree_sha256": "0e85e00cdd8e86690fadde92de4a066a072e72a6390ab3e5db0333795e2ade17"
     },
     {
       "audience": "claude",
