@@ -476,6 +476,14 @@ report=$(a2a_native_worker_stale_report "$TMP/elsewhere")
 ok "worker_root limits workers but not the supervise loop" \
     '! grep -qF "file=$WJS" <<<"$report" && grep -qF "file=$SUP_FILE" <<<"$report"'
 
+# #2791 2a: a tar redeploy keeps the build's mtime, so only the ctime shows the
+# file was replaced after its process started.
+sleep 1.1
+python3 -c 'import os, sys; os.utime(sys.argv[1], (946684800, 946684800))' "$WJS"
+report=$(A2A_NATIVE_WORKER_STALE_SLACK_SECONDS=0 a2a_native_worker_stale_report "$STALE_DIR/wroot")
+ok "a redeployed worker.js with its build mtime is caught by its ctime" \
+    'grep -F "file=$WJS" <<<"$report" | grep -q "^kind=worker pids=$W_FAKE "'
+
 rm -f "$WJS"
 report=$(a2a_native_worker_stale_report "$STALE_DIR/wroot")
 ok "a deleted worker.js is reported as installed=missing" \
