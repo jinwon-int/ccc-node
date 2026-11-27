@@ -14,14 +14,14 @@ Fields:
   waiting  owner | node | date | external          (required)
   node     the node that owns the next step         (optional)
   due      YYYY-MM-DD or YYYY-MM-DDTHH:MM (KST)     (required when waiting=date)
-  next     the next step, one line, <= 80 chars, double-quoted (optional)
+  next     the next step in Korean, one line, <= 80 chars, double-quoted (optional)
 
 Only the marker fields are ever read; the rest of a comment is ignored and never
 stored. ``next`` is free text written by the node: it must not carry an owner's
 message or a comment body.
 
 CLI:
-  ccc_issue_status.py format --waiting owner --node <node> --next "merge approval"
+  ccc_issue_status.py format --waiting owner --node <node> --next "머지 승인"
   ccc_issue_status.py set --repo OWNER/REPO --issue N --waiting date --due 2026-11-29T20:00 \
       [--node NODE] [--next TEXT] [--note TEXT] [--dry-run]
   ccc_issue_status.py show --repo OWNER/REPO --issue N

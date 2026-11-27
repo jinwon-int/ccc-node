@@ -136,11 +136,11 @@ so the account name is not an identity.
      ```bash
      python3 <ccc-node checkout>/scripts/ccc_issue_status.py set \
        --repo <owner/repo> --issue <issue> --waiting owner --node <this node> \
-       --next "merge approval for PR #<n>"
+       --next "PR #<n> 머지 승인"
      ```
 
-     `--next` is one line naming the next step — never the owner's words or a
-     comment body. Use `--waiting date --due YYYY-MM-DDTHH:MM` when the next
+     `--next` is one line naming the next step, written in Korean (the owner reads
+     the board in Korean) — never the owner's words or a comment body. Use `--waiting date --due YYYY-MM-DDTHH:MM` when the next
      step is a scheduled check, `--waiting node` when it is yours again, and
      `--waiting external` for a store review or a support reply. The board reads
      the newest marker on each issue (docs/work-board.md).
