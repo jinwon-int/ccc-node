@@ -48,6 +48,7 @@ Living operator docs stay at the top level of `docs/`; historical closeouts and 
 | [`timed-test-deadline-scan.md`](timed-test-deadline-scan.md) | Expired-unjudged timed-test scanner cron, the follow-up scan cron (#2324), the relative scan cron and its false-positive demotion (#2544), and their owner spool notice (#1870). |
 | [`quality-baseline.md`](quality-baseline.md) | Bridge quality gates and measured coverage baseline (#348). |
 | [`service-control.md`](service-control.md) | Service control and the real enforcement split (post TM-1306). |
+| [`reboot-procedure.md`](reboot-procedure.md) | Node reboot procedure: export scheduled timers before, restore and verify after (#2827). |
 | [`version-and-provenance.md`](version-and-provenance.md) | Version anchor, provenance, and self-update identity. |
 | [`examples/`](examples/) | Non-secret example env/scripts. |
 | [`archive/`](archive/) | Historical roadmap and closeout records. |
