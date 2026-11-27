@@ -343,6 +343,26 @@ def build_environment(work: Path, api: int, jobs: int) -> dict[str, str]:
     return env
 
 
+def reap(child: subprocess.Popen) -> None:
+    """Reap ``child`` without ``Popen.wait``'s internal lock.
+
+    A signal that interrupts ``Popen.wait(timeout=...)`` can raise between the
+    lock acquire and the ``try`` that releases it. The lock then stays held
+    and a later ``child.wait()`` blocks forever, so a cancelled run never
+    writes its receipt (#2903).
+    """
+    if child.returncode is not None:
+        return
+    try:
+        _, status = os.waitpid(child.pid, 0)
+    except ChildProcessError:
+        # The interrupted wait already reaped it and lost the status; match
+        # Popen's own fallback for an unknowable exit status.
+        child.returncode = 0
+        return
+    child.returncode = os.waitstatus_to_exitcode(status)
+
+
 class Runner:
     def __init__(self, work: Path, env: dict[str, str], seconds: float):
         self.work, self.env = work, env
@@ -383,7 +403,7 @@ class Runner:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    child.wait()
+                    reap(child)
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         stage["duration_ms"] = round((time.monotonic() - started) * 1000)
         if stage["status"] != "pass":
