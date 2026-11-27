@@ -8,6 +8,10 @@
 #   supervise     --env-file <p>   Singleton SSH tunnel + worker respawn loop.
 #   stop                           SIGTERM the supervisor holding the lock.
 #   status                         Read-only supervisor/tunnel/worker snapshot.
+#   restart-worker --if-idle       SIGTERM only an idle dist/worker.js; the
+#                                  supervise loop relaunches it (#2791).
+#   restart-supervisor --if-idle   Idle-gated stop + respawn of the whole
+#                                  supervise loop (#2791, opt-in path).
 #
 # Historical context — Wiki ND-1236: gongyung and daegyo used to hand-roll the
 # supervise/stop/status logic in ~/.hermes/scripts/native-worker-supervisor.sh.
@@ -61,6 +65,10 @@ LOG_DIR="${A2A_SUPERVISOR_LOG_DIR:-$HOME/.hermes/logs}"
 mkdir -p "$LOCK_DIR" "$LOG_DIR" 2>/dev/null || true
 
 LOG="${A2A_SUPERVISOR_LOG:-$LOG_DIR/a2a-native-worker-supervisor.log}"
+# The health check spawns supervisors with stdout on its own log, so the
+# worker's "registered with" line lands there (restart verification reads it).
+HEALTH_LOG="${A2A_SUPERVISOR_HEALTH_LOG:-$LOG_DIR/a2a-native-worker-health.log}"
+HEALTH_SCRIPT="$SCRIPT_DIR/a2a-termux-native-worker-health.sh"
 LOCK="${A2A_SUPERVISOR_LOCK:-$LOCK_DIR/a2a-native-worker-supervisor.lock}"
 # PID file is separate from the flock file so `stop`/`status` (and the health
 # checker) can identify the current supervisor without racing bash's fd
@@ -489,6 +497,366 @@ cmd_status() {
     return 0
 }
 
+# ---- idle-gated restart (#2791 stage 2b) ----
+#
+# The native worker is no systemd unit, so self-update's #2138 cgroup gate and
+# restart never reach it. These two commands are the Termux equivalent:
+#
+#   restart-worker --if-idle      SIGTERM only the supervisor's dist/worker.js
+#       child. The supervise loop relaunches it (after its 8 s retry delay)
+#       from whatever is installed now; the tunnel stays up. This is the deploy
+#       side's restart (scripts/a2a-termux-native-worker-deploy.sh).
+#   restart-supervisor --if-idle  stop the supervisor (tunnel + worker) and
+#       respawn it through the health check's --self-heal path. Needed when the
+#       supervise script or its lib changed. The tunnel drops for a moment, so
+#       the broker briefly sees the worker offline.
+#
+# Idle keeps #2138's meaning: the worker spawns each task's handler as a child
+# process, so any descendant of the worker pid younger than BUSY_MAX means a
+# task is running. A descendant older than BUSY_MAX counts as hung and does not
+# block (it is reported, never killed). Unlike #2138 the gate fails CLOSED: when
+# the worker's process tree cannot be read, nothing is signaled. There is no
+# unconditional mode — a busy worker is never killed.
+#
+# After the signal, success needs all of: a new worker child under the expected
+# supervisor, a fresh "registered with" line in the supervisor or health log,
+# that worker still alive after the settle window, and the health check
+# reporting sup_count=1 workers=1 tunnel=UP rc=0.
+#
+#   A2A_NATIVE_WORKER_BUSY_MAX_SECONDS   handler age cap; default
+#                                        $CCC_SELF_UPDATE_BUSY_MAX_SECONDS or 1800
+#   A2A_NATIVE_WORKER_RESTART_TIMEOUT    seconds to wait for registration (90)
+#   A2A_NATIVE_WORKER_RESTART_SETTLE     seconds the new worker must survive (20)
+#   A2A_NATIVE_WORKER_REGISTERED_PATTERN fixed string proving registration
+#                                        (default "registered with")
+#   A2A_NATIVE_WORKER_PROC_ROOT          proc tree the idle gate reads (/proc;
+#                                        tests point it at a mock tree)
+#
+# Exit codes: 0 restarted + verified (--dry-run: would restart), 2 usage/env,
+# 3 no canonical supervisor or not exactly one worker, 10 busy (nothing
+# signaled), 11 idle state unknown (nothing signaled), 30 signaled but the
+# restart was not verified.
+RESTART_RC_NO_TARGET=3
+RESTART_RC_BUSY=10
+RESTART_RC_UNKNOWN=11
+RESTART_RC_UNVERIFIED=30
+
+restart_say() { # <cmd> <message...>: success line on stdout + supervisor log
+    local cmd="$1"; shift
+    printf '%s: %s\n' "$cmd" "$*"
+    log "$cmd: $*"
+}
+
+restart_fail() { # <cmd> <message...>: failure line on stderr + supervisor log
+    local cmd="$1"; shift
+    printf '%s: %s\n' "$cmd" "$*" >&2
+    log "$cmd: $*"
+}
+
+valid_restart_uint() { # <name> <value> <min> <max>
+    if [[ "$2" =~ ^[0-9]{1,6}$ ]] && (( 10#$2 >= $3 && 10#$2 <= $4 )); then
+        return 0
+    fi
+    printf '%s must be an integer in %s..%s (got %q)\n' "$1" "$3" "$4" "$2" >&2
+    return 1
+}
+
+# Validate the restart tuning once per invocation.
+restart_settings() {
+    BUSY_MAX="${A2A_NATIVE_WORKER_BUSY_MAX_SECONDS:-${CCC_SELF_UPDATE_BUSY_MAX_SECONDS:-1800}}"
+    RESTART_TIMEOUT="${A2A_NATIVE_WORKER_RESTART_TIMEOUT:-90}"
+    RESTART_SETTLE="${A2A_NATIVE_WORKER_RESTART_SETTLE:-20}"
+    valid_restart_uint A2A_NATIVE_WORKER_BUSY_MAX_SECONDS "$BUSY_MAX" 1 86400 &&
+        valid_restart_uint A2A_NATIVE_WORKER_RESTART_TIMEOUT "$RESTART_TIMEOUT" 1 3600 &&
+        valid_restart_uint A2A_NATIVE_WORKER_RESTART_SETTLE "$RESTART_SETTLE" 0 600
+}
+
+# The worker.js the supervisor's `run` executes (same rule as the Python
+# harness: A2A_WORKER_SCRIPT, else $A2A_WORKER_ROOT/dist/worker.js).
+native_worker_script() { # <env_file>
+    local script root
+    script=$(extract_env_value A2A_WORKER_SCRIPT "$1")
+    if [[ -z "$script" ]]; then
+        root=$(extract_env_value A2A_WORKER_ROOT "$1")
+        [[ -n "$root" ]] || return 1
+        script="$root/dist/worker.js"
+    fi
+    printf '%s' "${script/#\~/$HOME}"
+}
+
+# Print "PID START_TOKEN" for every direct child of <sup_pid> whose argv names
+# <worker_script> (compared as real paths, never as a regex).
+supervisor_worker_records() { # <sup_pid> <worker_script>
+    python3 - "$1" "$2" <<'PY'
+import glob
+import os
+import sys
+
+sup, expected = sys.argv[1], os.path.realpath(sys.argv[2])
+for proc in glob.glob("/proc/[0-9]*"):
+    try:
+        fields = open(proc + "/stat", encoding="ascii", errors="replace").read().rsplit(")", 1)[1].split()
+        raw = open(proc + "/cmdline", "rb").read()
+    except (OSError, IndexError):
+        continue
+    if len(fields) < 20 or fields[1] != sup:
+        continue
+    argv = [os.fsdecode(arg) for arg in raw.split(b"\0") if arg]
+    if any(os.path.realpath(arg) == expected for arg in argv[1:]):
+        print(proc.rsplit("/", 1)[1], fields[19])
+PY
+}
+
+# Idle gate (#2138 semantics on a process tree instead of a cgroup). Prints a
+# one-line state and returns 0 idle, 10 busy, anything else unknown. Process
+# age uses CLOCK_BOOTTIME like the stale check: Android denies /proc/uptime.
+worker_busy_probe() { # <worker_pid> <busy_max_seconds>
+    python3 - "$1" "$2" "${A2A_NATIVE_WORKER_PROC_ROOT:-/proc}" <<'PY'
+import glob
+import os
+import sys
+import time
+
+worker, busy_max, root = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
+
+
+def boot_seconds():
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return float(open("/proc/uptime", encoding="ascii").read().split()[0])
+
+
+def read_stat(path):
+    fields = open(path, encoding="ascii", errors="replace").read().rsplit(")", 1)[1].split()
+    return int(fields[1]), int(fields[19])  # ppid, starttime (proc(5) field 22)
+
+
+try:
+    tick = os.sysconf("SC_CLK_TCK")
+    now = boot_seconds()
+    read_stat(os.path.join(root, str(worker), "stat"))
+except Exception:
+    print("state=unknown reason=worker-stat-unreadable")
+    sys.exit(11)
+
+children, starts = {}, {}
+for path in glob.glob(os.path.join(root, "[0-9]*", "stat")):
+    try:
+        pid = int(os.path.basename(os.path.dirname(path)))
+        ppid, start = read_stat(path)
+    except (OSError, IndexError, ValueError):
+        continue  # exited between listing and reading
+    children.setdefault(ppid, []).append(pid)
+    starts[pid] = start
+
+seen, stack, ages = {worker}, list(children.get(worker, [])), []
+while stack:
+    pid = stack.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    ages.append(now - starts[pid] / tick)
+    stack.extend(children.get(pid, []))
+
+live = [age for age in ages if age < busy_max]
+hung = [age for age in ages if age >= busy_max]
+suffix = " hung=%d hung_oldest=%ds" % (len(hung), int(max(hung))) if hung else ""
+if live:
+    print("state=busy children=%d youngest=%ds%s" % (len(live), int(min(live)), suffix))
+    sys.exit(10)
+print("state=idle children=0%s" % suffix)
+PY
+}
+
+log_size() { # <file>: byte size, 0 when absent
+    local n
+    n=$(wc -c < "$1" 2>/dev/null) || n=0
+    n="${n//[!0-9]/}"
+    printf '%s' "${n:-0}"
+}
+
+log_tail_since() { # <file> <offset>: bytes appended after offset (all if rotated)
+    [[ -r "$1" ]] || return 0
+    if (( $(log_size "$1") < $2 )); then
+        cat "$1"
+    else
+        tail -c +"$(( $2 + 1 ))" "$1"
+    fi
+}
+
+registered_since() { # <supervisor_log_offset> <health_log_offset>
+    local pattern="${A2A_NATIVE_WORKER_REGISTERED_PATTERN:-registered with}"
+    { log_tail_since "$LOG" "$1"; log_tail_since "$HEALTH_LOG" "$2"; } |
+        grep -qF -- "$pattern"
+}
+
+# Health check verdict in the shape operators already read from its log line.
+health_summary() { # <env_file>: prints "sup_count=N workers=N tunnel=X rc=R"
+    local out
+    out=$(bash "$HEALTH_SCRIPT" --env-file "$1" --no-self-heal --json --quiet 2>/dev/null)
+    python3 - "$out" <<'PY'
+import json
+import sys
+
+line = next((l for l in reversed(sys.argv[1].splitlines()) if l.startswith("{")), "")
+try:
+    d = json.loads(line)
+except ValueError:
+    print("health=unparsable")
+    sys.exit(1)
+got = (d.get("supervisor_count"), d.get("workers"), d.get("tunnel"), d.get("rc"))
+print("sup_count=%s workers=%s tunnel=%s rc=%s" % got)
+sys.exit(0 if got == (1, 1, "UP", 0) else 1)
+PY
+}
+
+# Shared lookup: canonical supervisor, its env file, worker script and the
+# worker children. Sets RT_SUP ("PID TOKEN"), RT_ENV, RT_SCRIPT, RT_WORKERS.
+restart_prepare() { # <cmd> <env_file|''>
+    local cmd="$1"
+    RT_SUP=$(current_supervisor_record)
+    if [[ -z "$RT_SUP" ]]; then
+        restart_fail "$cmd" "result=no-supervisor lock=$LOCK — nothing restarted (the health check's --self-heal starts one)"
+        return "$RESTART_RC_NO_TARGET"
+    fi
+    RT_ENV="$2"
+    [[ -n "$RT_ENV" ]] || RT_ENV=$(a2a_supervisor_env_file "${RT_SUP%% *}" 2>/dev/null || true)
+    if [[ -z "$RT_ENV" || ! -f "$RT_ENV" ]]; then
+        restart_fail "$cmd" "result=no-env-file sup=${RT_SUP%% *} — pass --env-file"
+        return 2
+    fi
+    if ! RT_SCRIPT=$(native_worker_script "$RT_ENV"); then
+        restart_fail "$cmd" "result=no-worker-root env=$RT_ENV — set A2A_WORKER_ROOT"
+        return 2
+    fi
+    mapfile -t RT_WORKERS < <(supervisor_worker_records "${RT_SUP%% *}" "$RT_SCRIPT")
+    return 0
+}
+
+restart_gate() { # <cmd> <worker_pid>: 0 idle; sets RT_PROBE
+    local rc
+    RT_PROBE=$(worker_busy_probe "$2" "$BUSY_MAX"); rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        10)
+            restart_fail "$1" "result=busy worker_pid=$2 $RT_PROBE busy_max=${BUSY_MAX}s — a task is running; not restarted, retry later"
+            return "$RESTART_RC_BUSY" ;;
+        *)
+            restart_fail "$1" "result=unknown worker_pid=$2 ${RT_PROBE:-state=unknown} — idle state unreadable; not restarted (fail-closed)"
+            return "$RESTART_RC_UNKNOWN" ;;
+    esac
+}
+
+# Wait for the relaunched worker and prove it serves. mode=worker keeps the
+# same supervisor; mode=supervisor expects a new one. Sets VERIFIED_WORKER and
+# VERIFIED_HEALTH on success.
+verify_restart() { # <cmd> <mode> <old_sup> <old_worker> <script> <env_file> <sup_off> <health_off>
+    local cmd="$1" mode="$2" old_sup="$3" old_worker="$4" script="$5" env_file="$6"
+    local sup_off="$7" h_off="$8" deadline sup="" worker="" summary
+    local -a records
+    deadline=$(( SECONDS + RESTART_TIMEOUT ))
+    while (( SECONDS <= deadline )); do
+        sup=$(current_supervisor_record)
+        if [[ "$mode" == worker && "$sup" != "$old_sup" ]]; then
+            restart_fail "$cmd" "result=unverified reason=supervisor-changed old_sup=${old_sup%% *} now=${sup:-none}"
+            return "$RESTART_RC_UNVERIFIED"
+        fi
+        if [[ -n "$sup" && ( "$mode" == worker || "$sup" != "$old_sup" ) ]]; then
+            mapfile -t records < <(supervisor_worker_records "${sup%% *}" "$script")
+            if (( ${#records[@]} == 1 )) && [[ "${records[0]}" != "$old_worker" ]] &&
+                    registered_since "$sup_off" "$h_off"; then
+                worker="${records[0]}"
+                break
+            fi
+        fi
+        sleep 1
+    done
+    if [[ -z "$worker" ]]; then
+        restart_fail "$cmd" "result=unverified reason=no-registered-worker timeout=${RESTART_TIMEOUT}s sup=${sup:-none}"
+        return "$RESTART_RC_UNVERIFIED"
+    fi
+    sleep "$RESTART_SETTLE"
+    if [[ "$(current_supervisor_record)" != "$sup" ]] ||
+            ! a2a_process_identity_matches "${worker%% *}" "${worker##* }"; then
+        restart_fail "$cmd" "result=unverified reason=worker-not-stable new_pid=${worker%% *} settle=${RESTART_SETTLE}s"
+        return "$RESTART_RC_UNVERIFIED"
+    fi
+    if ! summary=$(health_summary "$env_file"); then
+        restart_fail "$cmd" "result=unverified reason=health $summary"
+        return "$RESTART_RC_UNVERIFIED"
+    fi
+    VERIFIED_WORKER="$worker"
+    VERIFIED_HEALTH="$summary"
+}
+
+cmd_restart_worker() { # <env_file|''> <dry_run 0|1>
+    local cmd=restart-worker dry_run="$2" wpid wtoken sup_off h_off
+    restart_prepare "$cmd" "$1" || return $?
+    if (( ${#RT_WORKERS[@]} != 1 )); then
+        restart_fail "$cmd" "result=no-worker workers=${#RT_WORKERS[@]} sup=${RT_SUP%% *} script=$RT_SCRIPT — need exactly one worker child; not restarted"
+        return "$RESTART_RC_NO_TARGET"
+    fi
+    wpid="${RT_WORKERS[0]%% *}"; wtoken="${RT_WORKERS[0]##* }"
+    restart_gate "$cmd" "$wpid" || return $?
+    if (( dry_run )); then
+        restart_say "$cmd" "result=would-restart worker_pid=$wpid sup=${RT_SUP%% *} $RT_PROBE (dry-run: nothing signaled)"
+        return 0
+    fi
+    sup_off=$(log_size "$LOG"); h_off=$(log_size "$HEALTH_LOG")
+    # Re-check right before the signal: a task may have started since the gate.
+    if ! a2a_process_identity_matches "$wpid" "$wtoken"; then
+        restart_fail "$cmd" "result=no-worker reason=worker-exited worker_pid=$wpid — not restarted"
+        return "$RESTART_RC_NO_TARGET"
+    fi
+    restart_gate "$cmd" "$wpid" || return $?
+    log "$cmd: SIGTERM worker pid=$wpid sup=${RT_SUP%% *} $RT_PROBE"
+    kill -TERM "$wpid" 2>/dev/null || {
+        restart_fail "$cmd" "result=no-worker reason=signal-failed worker_pid=$wpid"
+        return "$RESTART_RC_NO_TARGET"
+    }
+    verify_restart "$cmd" worker "$RT_SUP" "${RT_WORKERS[0]}" "$RT_SCRIPT" "$RT_ENV" \
+        "$sup_off" "$h_off" || return $?
+    restart_say "$cmd" "result=ok old_pid=$wpid new_pid=${VERIFIED_WORKER%% *} sup=${RT_SUP%% *} registered=yes $VERIFIED_HEALTH"
+}
+
+cmd_restart_supervisor() { # <env_file|''> <dry_run 0|1>
+    local cmd=restart-supervisor dry_run="$2" old_worker="" wpid="" sup_off h_off hrc
+    restart_prepare "$cmd" "$1" || return $?
+    if (( ${#RT_WORKERS[@]} > 1 )); then
+        restart_fail "$cmd" "result=no-worker workers=${#RT_WORKERS[@]} sup=${RT_SUP%% *} — more than one worker child; not restarted"
+        return "$RESTART_RC_NO_TARGET"
+    fi
+    if (( ${#RT_WORKERS[@]} == 1 )); then
+        old_worker="${RT_WORKERS[0]}"; wpid="${old_worker%% *}"
+        restart_gate "$cmd" "$wpid" || return $?
+    else
+        RT_PROBE="state=idle worker=none"  # respawn gap: no task can be running
+    fi
+    if (( dry_run )); then
+        restart_say "$cmd" "result=would-restart sup=${RT_SUP%% *} worker_pid=${wpid:-none} $RT_PROBE (dry-run: nothing signaled)"
+        return 0
+    fi
+    sup_off=$(log_size "$LOG"); h_off=$(log_size "$HEALTH_LOG")
+    if [[ -n "$wpid" ]] && a2a_process_identity_matches "$wpid" "${old_worker##* }"; then
+        restart_gate "$cmd" "$wpid" || return $?
+    fi
+    log "$cmd: stopping sup=${RT_SUP%% *} worker_pid=${wpid:-none} $RT_PROBE"
+    cmd_stop >/dev/null 2>&1
+    if a2a_validate_supervisor_identity "${RT_SUP%% *}" "${RT_SUP##* }" \
+            "$SCRIPT_DIR/a2a-termux-native-worker.sh" "$LOCK" >/dev/null 2>&1; then
+        restart_fail "$cmd" "result=unverified reason=old-supervisor-still-running sup=${RT_SUP%% *}"
+        return "$RESTART_RC_UNVERIFIED"
+    fi
+    # Respawn through the same path cron uses, so the new supervisor's stdout
+    # (and the worker's "registered with") goes to the health log as usual.
+    bash "$HEALTH_SCRIPT" --env-file "$RT_ENV" --self-heal --quiet >/dev/null 2>&1; hrc=$?
+    (( hrc == 0 )) || log "$cmd: health --self-heal rc=$hrc; verifying anyway"
+    verify_restart "$cmd" supervisor "$RT_SUP" "$old_worker" "$RT_SCRIPT" "$RT_ENV" \
+        "$sup_off" "$h_off" || return $?
+    restart_say "$cmd" "result=ok old_sup=${RT_SUP%% *} new_sup=$(current_supervisor_pid) worker_pid=${VERIFIED_WORKER%% *} registered=yes $VERIFIED_HEALTH"
+}
+
 usage() {
     cat <<EOF >&2
 Usage: $(basename "$0") <command> [--env-file <path>]
@@ -507,6 +875,18 @@ Supervisor commands (singleton SSH tunnel + worker respawn):
   status
       Print supervisor / tunnel / worker state (read-only, no side effects).
 
+Idle-gated restart (#2791; --if-idle is mandatory, a busy worker is never killed):
+  restart-worker --if-idle [--env-file <path>] [--dry-run]
+      SIGTERM only the supervisor's dist/worker.js child when no handler child
+      younger than A2A_NATIVE_WORKER_BUSY_MAX_SECONDS runs; the supervise loop
+      relaunches it.  Verifies "registered with" + health sup_count=1 workers=1.
+  restart-supervisor --if-idle [--env-file <path>] [--dry-run]
+      Same gate, then stop + respawn the supervisor via the health check's
+      --self-heal path (the tunnel drops briefly).  Same verification.
+  --env-file defaults to the running supervisor's own --env-file.  --dry-run
+  runs the gate only.  rc: 0 ok, 3 no supervisor / not one worker, 10 busy,
+  11 idle state unknown, 30 restarted but not verified.
+
 Health check (separate script — call directly, or from cron):
   scripts/a2a-termux-native-worker-health.sh --env-file <path> [--self-heal]
 
@@ -523,6 +903,11 @@ Environment overrides (supervisor paths):
   A2A_TUNNEL_GATE_TIMEOUT   Tunnel /livez gate bound in seconds before the
                             worker spawns anyway (fail-open); default 30.
   A2A_TUNNEL_GATE_INTERVAL  Gate poll interval in seconds; default 0.5.
+  A2A_SUPERVISOR_HEALTH_LOG Health log (default \$LOG_DIR/a2a-native-worker-health.log)
+  A2A_NATIVE_WORKER_BUSY_MAX_SECONDS  Restart gate handler-age cap; default
+                            \$CCC_SELF_UPDATE_BUSY_MAX_SECONDS or 1800.
+  A2A_NATIVE_WORKER_RESTART_TIMEOUT   Registration wait after restart; default 90.
+  A2A_NATIVE_WORKER_RESTART_SETTLE    Seconds the new worker must survive; default 20.
 EOF
     return 2
 }
@@ -531,7 +916,7 @@ main() {
     local cmd="${1:-}"
     [[ -z "$cmd" ]] && { usage; return 2; }
     shift
-    local env_file=""
+    local env_file="" if_idle=0 dry_run=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --env-file)
@@ -541,11 +926,30 @@ main() {
                 # loop unbounded, flooding the supervisor log.
                 [[ $# -ge 2 ]] || { echo "--env-file requires a value" >&2; usage; return 2; }
                 env_file="$2"; shift 2 ;;
+            --if-idle)  if_idle=1; shift ;;
+            --dry-run)  dry_run=1; shift ;;
             -h|--help)  usage; return 2 ;;
             *)          echo "unknown arg: $1" >&2; usage; return 2 ;;
         esac
     done
     case "$cmd" in
+        restart-worker|restart-supervisor) ;;
+        *)
+            if (( if_idle || dry_run )); then
+                echo "--if-idle/--dry-run apply only to restart-worker/restart-supervisor" >&2
+                usage; return 2
+            fi ;;
+    esac
+    case "$cmd" in
+        restart-worker|restart-supervisor)
+            if (( ! if_idle )); then
+                echo "$cmd requires --if-idle: there is no unconditional restart (a busy worker is never killed, #2791)" >&2
+                return 2
+            fi
+            restart_settings || return 2
+            local fn="${cmd//-/_}"
+            "cmd_$fn" "$env_file" "$dry_run"
+            ;;
         check|print-command|run)
             [[ -n "$env_file" ]] || { echo "--env-file required for $cmd" >&2; return 2; }
             local fn="${cmd//-/_}"

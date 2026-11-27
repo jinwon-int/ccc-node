@@ -200,6 +200,42 @@ redeployed `worker.js` or changed supervise script still needs a manual
 supervisor restart. Process age comes from `CLOCK_BOOTTIME`, because Android
 denies `/proc/uptime` and `/proc/stat` to Termux.
 
+Idle-gated restart (#2791 stage 2b). Both commands refuse without `--if-idle`
+— there is no unconditional mode, and a busy worker is never killed:
+
+```bash
+# SIGTERM only dist/worker.js; the supervise loop relaunches it (tunnel stays up).
+scripts/a2a-termux-native-worker.sh restart-worker --if-idle [--dry-run]
+# Stop + respawn the whole supervise loop via the health check's --self-heal
+# path (needed after a supervise-script change; the tunnel drops briefly).
+scripts/a2a-termux-native-worker.sh restart-supervisor --if-idle [--dry-run]
+```
+
+"Idle" keeps the #2138 meaning on the worker's process tree instead of a
+cgroup: a descendant of the worker pid younger than
+`A2A_NATIVE_WORKER_BUSY_MAX_SECONDS` (default `CCC_SELF_UPDATE_BUSY_MAX_SECONDS`
+or 1800) is a running task handler; an older one counts as hung and does not
+block (it is reported as `hung=N`, never killed). An unreadable process tree
+fails closed. After the signal the command waits for a new worker child, a fresh
+`registered with` line in the supervisor or health log, a settle window, and a
+health check reporting `sup_count=1 workers=1 tunnel=UP`. `--env-file` defaults
+to the running supervisor's own; `--dry-run` runs the gate only.
+
+| rc | meaning                                                         |
+|----|-----------------------------------------------------------------|
+| 0  | restarted and verified (`--dry-run`: would restart)             |
+| 2  | usage / env error, or `--if-idle` missing                       |
+| 3  | no canonical supervisor, or not exactly one worker child        |
+| 10 | busy — a task handler is running; nothing was signaled          |
+| 11 | idle state unknown (process tree unreadable); nothing signaled |
+| 30 | signaled, but the restart could not be verified                 |
+
+Who restarts what (owner decision 2026-11-27): a redeployed `worker.js` is
+restarted by the deploy side (`scripts/a2a-termux-native-worker-deploy.sh`);
+self-update only warns about it. Self-update may restart a stale supervise loop
+of its own checkout only on nodes that opt in with
+`CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=1` (default 0, docs/self-update.md).
+
 ## No-provider adapter smoke
 
 Before any real provider canary, run the bridge with a fake Claude binary so the JSON contract, executable path, and Node runtime are proven without spending provider quota:
