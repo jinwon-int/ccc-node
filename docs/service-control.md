@@ -33,7 +33,10 @@ subset.
   and reboot that host.
 - **Reboot is autonomous on the LOCAL node and managed nodes** — `reboot` /
   `shutdown -r` is disruptive but recoverable (the node comes back). It stays
-  fresh-approval for an unlisted remote host.
+  fresh-approval for an unlisted remote host. Every reboot follows
+  [`reboot-procedure.md`](reboot-procedure.md): export the waiting scheduled
+  timers before it and restore them after it (#2827), because a reboot erases
+  transient timers.
 - **Local non-fleet apps the node self-manages are autonomous**: `systemctl`/
   `service`/`pm2`/`docker`/`podman` lifecycle of a LOCAL unit/container the
   operator designated as self-managed. System services you did not designate
