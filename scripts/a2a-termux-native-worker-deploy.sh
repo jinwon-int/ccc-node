@@ -11,8 +11,16 @@
 #       [--target-sha <40-hex>] [--backup-dir <dir>] [--smoke-cmd <cmd>]
 #       [--no-guard] [--apply]
 #
-# Dry-run by default: validates the artifact, prints the plan and runs the idle
-# gate (`restart-worker --if-idle --dry-run`) — nothing on the node changes.
+# Dry-run by default: validates the artifact, prints the plan, runs the step-4
+# pre-restart checks (revision, the artifact's rollout guard, --smoke-cmd)
+# against a throw-away preview of the post-deploy worker root, then runs the
+# idle gate (`restart-worker --if-idle --dry-run`) — nothing on the node
+# changes. The preview lives in a private mktemp dir under $TMPDIR (removed on
+# exit): the live root without node_modules/ and dist.bak* (the root backup's
+# scope; dist/ scripts/ handlers/ dereferenced) with the artifact copied over
+# it, and node_modules/ holding the artifact's packages plus symlinks to every
+# other live package. A failing check exits 20 with nothing changed (owner
+# decision 2026-11-27: the dry-run includes the handler smoke).
 # --apply performs, in order:
 #   1. idle gate: `a2a-termux-native-worker.sh restart-worker --if-idle --dry-run`
 #      (busy → exit 10, nothing changed)
@@ -32,11 +40,12 @@
 #      the old files, exit 30
 #   6. write <worker_root>/.deploy-source-sha
 #
-# Exit codes: 0 ok (dry-run: plan ok), 2 usage / invalid artifact, 3 no
-# supervisor or worker (nothing changed), 4 another deploy holds the lock,
-# 10 busy (nothing changed — or files rolled back before any signal),
-# 11 idle state unknown (nothing changed), 20 pre-restart check failed (rolled
-# back, no restart), 30 restart not verified (rolled back + restarted),
+# Exit codes: 0 ok (dry-run: plan + preview checks + gate ok), 2 usage /
+# invalid artifact, 3 no supervisor or worker (nothing changed), 4 another
+# deploy holds the lock, 10 busy (nothing changed — or files rolled back before
+# any signal), 11 idle state unknown (nothing changed), 20 pre-restart check
+# failed (rolled back, no restart; dry-run: failed on the preview, nothing
+# changed), 30 restart not verified (rolled back + restarted),
 # 31 rollback failed — MANUAL RESTORE from the printed backups.
 #
 # Env: A2A_DEPLOY_BACKUP_DIR (default $HOME/a2a-nexus-local-deploy-backups),
@@ -50,7 +59,7 @@ DEPLOY_DIRS=(dist scripts handlers)
 
 ENV_FILE=""; ARTIFACT=""; TARGET_SHA=""; SMOKE_CMD=""; APPLY=0; GUARD=1
 BACKUP_DIR="${A2A_DEPLOY_BACKUP_DIR:-$HOME/a2a-nexus-local-deploy-backups}"
-STAGE_TMP=""; STAGE=""; ROOT=""
+STAGE_TMP=""; STAGE=""; ROOT=""; PREVIEW_TMP=""; PREVIEW_ROOT=""; STAGED_REV=""; CHECK_FAILED=""
 
 say() { printf 'deploy: %s\n' "$*"; }
 die() { printf 'deploy: %s\n' "$2" >&2; exit "$1"; }
@@ -60,7 +69,10 @@ usage() {
     exit 2
 }
 
-cleanup() { if [[ -n "$STAGE_TMP" ]]; then rm -rf "$STAGE_TMP"; fi; }
+cleanup() {
+    if [[ -n "$STAGE_TMP" ]]; then rm -rf "$STAGE_TMP"; fi
+    if [[ -n "$PREVIEW_TMP" ]]; then rm -rf "$PREVIEW_TMP"; fi
+}
 trap cleanup EXIT
 
 # Same quoting rules as the Python validator.
@@ -226,24 +238,76 @@ rollback_or_die() { # <exit_rc> <message>
     die "$1" "$2; rolled back"
 }
 
-copy_artifact() {
-    local d p
+copy_artifact() { # [dest root, default $ROOT]
+    local dest="${1:-$ROOT}" d p
     for d in "${DEPLOY_DIRS[@]}"; do
         [[ -d "$STAGE/$d" ]] || continue
-        mkdir -p "$ROOT/$d" && cp -a "$STAGE/$d/." "$ROOT/$d/" || return 1
+        mkdir -p "$dest/$d" && cp -a "$STAGE/$d/." "$dest/$d/" || return 1
     done
     if (( ${#NM_REPLACED[@]} )); then
-        mkdir -p "$ROOT/node_modules" || return 1
+        mkdir -p "$dest/node_modules" || return 1
         for p in "${NM_REPLACED[@]}"; do
-            rm -rf "${ROOT:?}/node_modules/$p" && cp -a "$STAGE/node_modules/$p" "$ROOT/node_modules/$p" || return 1
+            rm -rf "${dest:?}/node_modules/$p" && cp -a "$STAGE/node_modules/$p" "$dest/node_modules/$p" || return 1
         done
     fi
 }
 
-run_guard() { # the artifact's own rollout guard, when it ships one
-    local guard="$ROOT/scripts/worker-artifact-rollout-guard.mjs" out
+# Dry-run preview of the post-deploy root in a private temp dir. Nothing
+# under $ROOT is written: the deploy dirs are copied dereferenced (a symlinked
+# dist/ must not let the overlay write through to the live target), unchanged
+# node_modules packages are symlinks, and any symlink left in a deploy dir
+# refuses the preview. Sets PREVIEW_ROOT (runs in the main shell so the EXIT
+# trap removes PREVIEW_TMP).
+build_preview() {
+    local base parent preview d e name
+    base="$(basename "$ROOT")"; parent="$(dirname "$ROOT")"
+    PREVIEW_TMP=$(mktemp -d "${TMPDIR:-/tmp}/a2a-worker-preview.XXXXXX") || return 1
+    preview="$PREVIEW_TMP/$base"
+    tar cf - -C "$parent" --exclude="$base/node_modules" --exclude="$base/dist.bak*" \
+        --exclude="$base/dist" --exclude="$base/scripts" --exclude="$base/handlers" "$base" |
+        tar xf - -C "$PREVIEW_TMP" || return 1
+    for d in "${DEPLOY_DIRS[@]}"; do
+        [[ -e "$ROOT/$d" ]] || continue
+        tar chf - -C "$ROOT" "$d" | tar xf - -C "$preview" || return 1
+    done
+    for d in "${DEPLOY_DIRS[@]}"; do
+        if [[ -e "$preview/$d" && -n "$(find "$preview/$d" -type l -print -quit)" ]]; then
+            say "preview refused: $d/ still holds a symlink after dereferencing"; return 1
+        fi
+    done
+    mkdir "$preview/node_modules" || return 1
+    if [[ -d "$ROOT/node_modules" ]]; then
+        for e in "$ROOT/node_modules"/* "$ROOT/node_modules"/.[!.]*; do
+            [[ -e "$e" || -L "$e" ]] || continue
+            name="${e##*/}"
+            printf '%s\n' "${NM_REPLACED[@]}" | grep -qxF -- "$name" && continue
+            ln -s "$e" "$preview/node_modules/$name" || return 1
+        done
+    fi
+    copy_artifact "$preview" || return 1
+    PREVIEW_ROOT="$preview"
+}
+
+# Step-4 checks on <root> (the live root after the copy, or the dry-run
+# preview). On failure sets CHECK_FAILED and returns 1.
+pre_restart_checks() { # <root>
+    local root="$1" new_rev
+    new_rev=$(build_rev "$root")
+    if [[ -n "$STAGED_REV" && "$new_rev" != "$STAGED_REV" ]]; then
+        CHECK_FAILED="deployed revision ${new_rev:-none} != artifact $STAGED_REV"; return 1
+    fi
+    run_guard "$root" || { CHECK_FAILED="rollout guard failed"; return 1; }
+    if [[ -n "$SMOKE_CMD" ]]; then
+        A2A_WORKER_ROOT="$root" bash -c "$SMOKE_CMD" || { CHECK_FAILED="smoke command failed"; return 1; }
+    fi
+    return 0
+}
+
+run_guard() { # <root>: the artifact's own rollout guard, when it ships one
+    local root="${1:-$ROOT}" guard out
+    guard="$root/scripts/worker-artifact-rollout-guard.mjs"
     (( GUARD )) && [[ -f "$guard" ]] || return 0
-    out=$(A2A_WORKER_ROOT="$ROOT" ${TARGET_SHA:+A2A_WORKER_TARGET_REVISION="$TARGET_SHA"} \
+    out=$(A2A_WORKER_ROOT="$root" ${TARGET_SHA:+A2A_WORKER_TARGET_REVISION="$TARGET_SHA"} \
         node "$guard" --deployed 2>&1) || { say "guard rc!=0: ${out##*$'\n'}"; return 1; }
     python3 - "$out" <<'PY'
 import json, sys
@@ -294,6 +358,7 @@ main() {
     stage_artifact
     local staged_rev current_rev source_sha
     staged_rev=$(build_rev "$STAGE"); current_rev=$(build_rev "$ROOT")
+    STAGED_REV="$staged_rev"
     if [[ -n "$TARGET_SHA" && -n "$staged_rev" && "$staged_rev" != "$TARGET_SHA" ]]; then
         die 2 "artifact revision $staged_rev != --target-sha $TARGET_SHA"
     fi
@@ -308,6 +373,14 @@ main() {
     say "plan rev ${current_rev:-unknown} -> $source_sha (artifact ${staged_rev:-no build-info})"
     say "plan copy ${present[*]} node_modules=[${NM_REPLACED[*]}] guard=$([[ $GUARD = 1 ]] && echo auto || echo off) smoke=$([[ -n $SMOKE_CMD ]] && echo yes || echo no)"
     say "plan backups -> $BACKUP_DIR; restart via $(basename "$HARNESS") restart-worker --if-idle"
+
+    # Dry-run: step-4 checks on a temp preview of the post-deploy root.
+    if (( ! APPLY )); then
+        build_preview || die 2 "could not build the dry-run preview — nothing changed"
+        pre_restart_checks "$PREVIEW_ROOT" ||
+            die 20 "dry-run pre-restart check failed on the staged preview: $CHECK_FAILED — nothing changed"
+        say "dry-run checks ok on staged preview (revision, guard=$([[ $GUARD = 1 ]] && echo auto || echo off), smoke=$([[ -n $SMOKE_CMD ]] && echo yes || echo no))"
+    fi
 
     # 1. idle gate (nothing changes on refusal).
     local out rc
@@ -337,15 +410,7 @@ main() {
     copy_artifact || rollback_or_die 20 "artifact copy failed (no restart)"
 
     # 4. pre-restart checks.
-    local new_rev
-    new_rev=$(build_rev "$ROOT")
-    if [[ -n "$staged_rev" && "$new_rev" != "$staged_rev" ]]; then
-        rollback_or_die 20 "deployed revision ${new_rev:-none} != artifact $staged_rev (no restart)"
-    fi
-    run_guard || rollback_or_die 20 "rollout guard failed (no restart)"
-    if [[ -n "$SMOKE_CMD" ]]; then
-        A2A_WORKER_ROOT="$ROOT" bash -c "$SMOKE_CMD" || rollback_or_die 20 "smoke command failed (no restart)"
-    fi
+    pre_restart_checks "$ROOT" || rollback_or_die 20 "$CHECK_FAILED (no restart)"
 
     # 5. restart worker.js only; the harness verifies registration + health.
     out=$(harness restart-worker --if-idle 2>&1); rc=$?
