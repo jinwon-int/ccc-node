@@ -548,6 +548,48 @@ Nothing is installed on the other nodes and no raw span leaves a node.
 - **Who can read the pages** is decided by where `--out-dir` is served, not
   by these scripts: check that folder's access policy before installing.
 
+### Weekly fleet span summary on the Wiki (#2899)
+
+The hub folds the daily view records into one section per week on a Family
+Wiki page so agents on any node can read fleet trends (`wiki-agent find`).
+
+- **Input:** only the records the daily view keeps
+  (`$CCC_STATE_DIR/spans-view/data/<day>/<node>.json`, `_status.json`); no
+  node is contacted. A day the hub did not collect shows as `no-run`, a node
+  missing from that day's status as `no-result`, otherwise the collector's
+  detail code (`no-folder`, `ssh-255`, …); a record that fails the shape check
+  counts as `record-invalid`.
+- **Section** (`scripts/spans-weekly.py`, previous Monday–Sunday KST by
+  default, `--week YYYY-Www` for another one within the kept 12 weeks):
+  per-node table (days n/7, turns, tool calls, tool error rate, cost USD,
+  largest daily cost-ledger difference, a2a ok/failed when present), a fleet
+  total, the top 5 tools by errors (largest daily p95), big changes against
+  the week before (tool error rate +2 %p, turns per collected day ≤0.5× or
+  ≥2× — provisional; `--error-rate-pp`, `--turns-low`, `--turns-high` or
+  `CCC_SPANS_WEEKLY_ERROR_PP` / `_TURNS_LOW` / `_TURNS_HIGH`) and the gaps
+  per node. No collected day at all → one 「수집 없음」 line. Output is the
+  same for the same records (no timestamps). Tool names keep only
+  `A-Z a-z 0-9 . _ : / @ + -` (others become `?`, 60 chars max) and sit in
+  code spans; a section is capped at 24 KiB.
+- **Page:** `pages/services/span-rollup.md` (`--page`). Each section starts
+  with `<!-- span-weekly:YYYY-Www -->`; a week already on the page or in its
+  yearly archive is skipped, and nothing is submitted when every week is
+  present. Newest 12 weeks, newest first, with one `에이전트 다이제스트`
+  line for the newest week at the top; older sections move to
+  `span-rollup-archive-<ISO year>.md`. New pages get the next `[DOC-N]` from
+  the worktree (the work-board rule). A page that exists without that
+  header, a symlinked target, or a dirty worktree stops the run unchanged.
+- **Submit:** `wiki-agent write-path` → write → `wiki-agent pr` (existing
+  gate). `--catch-up N` (default 1) also adds up to N earlier weeks still
+  missing, so a failed PR is retried on the next week's run. `--dry-run`
+  prints the target week's Markdown and opens no worktree.
+- **Schedule:** `scripts/install-spans-weekly-timer.sh --nodes "…"` prints
+  the service + timer (Monday 05:00 Asia/Seoul, after the 04:30 view and
+  before the 05:30 work board that shares the wiki-agent worktree;
+  `Persistent=true`, 1500 s cap, failure notice through `detached_jobs.py`
+  when present); `--apply` installs, `--uninstall --apply` removes the units
+  and keeps the page. Hub only, after owner approval.
+
 ## Group rows still holding a DM session (#2075)
 
 Before #2092, a group/room row in `sessions.json` could end up holding the

@@ -74,7 +74,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 KST = timezone(timedelta(hours=9))
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-SUGGESTED_PATH = "pages/fleet/span-rollup.md"
+SUGGESTED_PATH = "pages/services/span-rollup.md"
 ENTRY_CLASS = "metrics/span-rollup"
 NOTIFY_EVENT = "SpansRollup"
 #: Issue #2684 completion target for span totals vs the cost ledger.
