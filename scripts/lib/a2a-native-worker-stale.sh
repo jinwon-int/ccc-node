@@ -14,7 +14,7 @@
 #   file changed after the process start (plus a small slack) or the file is
 #   gone, one line per (kind, file) is printed. "Changed" is the later of mtime
 #   and ctime: a tar redeploy keeps the build's mtime (2026-11-24: worker.js
-#   mtime 10:29:40, deployed 14:03 on daegyo / 14:06 on gongyung), and only the
+#   mtime 10:29:40 on both Termux nodes, deployed ~3.5 h later), and only the
 #   ctime says the file was replaced:
 #     kind=<supervise|worker> pids=<p1,p2> started=<UTC> installed=<UTC|missing> file=<path>
 #   With worker_root, only `<worker_root>/dist/worker.js` counts as a worker.
