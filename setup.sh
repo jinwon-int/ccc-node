@@ -1163,6 +1163,11 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
       repo_hash="$(skill_tree_hash "$source")"
       run rm -rf "$stage"
       run cp -r "$source" "$stage"
+      # (#2843 2b) cp -r applies the caller's umask: a service account with
+      # umask 0002 installed group-writable SKILL.md/dirs, which the skill
+      # ownership contract (mode & 0o022) then fail-closes as unsafe_*.
+      # Strip group/other write regardless of umask; exec bits stay.
+      run chmod -R go-w "$stage"
       if [ -d "$target" ]; then
         fleet_copy=0
         if [ -f "$target/.ccc-fleet-skill.json" ]; then
@@ -1188,6 +1193,9 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
             # local edits and change nothing else. Keep the node copy and keep
             # the recorded baseline so later runs re-derive the same verdict.
             note "kept node-modified skill $name (repo unchanged; local edits preserved — diff vs $source to reconcile)"
+            # (#2843 2b) the kept copy may predate the umask fix; mode bits
+            # only — the tree hash is content-only, so verdicts do not move.
+            run chmod -R go-w "$target"
             current+=("$name")
             record_hash+=("$recorded_hash")
             SKILLS_KEPT_NODE_MODIFIED+=("$name")
@@ -1246,7 +1254,10 @@ install_repo_skills_into() { # install_repo_skills_into <dest-root> <manifest> <
       printf '%s %s\n' "${current[$idx]}" "${record_hash[$idx]}" >> "$manifest.tmp"
     done
     run mv "$manifest.tmp" "$manifest"
+    run chmod go-w "$manifest"
   fi
+  # (#2843 2b) the skills root itself (mkdir -p under umask 0002 -> 0775)
+  if [ -d "$dest_root" ]; then run chmod go-w "$dest_root"; fi
   # Publish what was actually installed so the canonical-path rewrite (step 2b)
   # can target exactly these directories (#1072). Deriving the rewrite set from
   # the install result — rather than re-enumerating source trees beside it — is

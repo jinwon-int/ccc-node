@@ -489,6 +489,29 @@ unit_run fresh '
 ok "unit: fresh install writes the skill and records its hash" \
   '[ "$(cat "$TMP/unit/fresh/skills/skill-a/SKILL.md")" = "repo bytes" ] && grep -q "^skill-a " "$(unit_manifest fresh)"'
 
+# Case (#2843 2b): a umask-0002 account installs no group/other-writable skill
+# files or dirs, fixes a kept node-modified copy, and never moves the verdict.
+unit_run umask002 '
+  umask 0002
+  mkdir -p repo-skills/skill-a/sub repo-skills/skill-b skills/skill-b state
+  printf "repo bytes\n" > repo-skills/skill-a/SKILL.md
+  printf "x\n" > repo-skills/skill-a/sub/run.sh; chmod 775 repo-skills/skill-a/sub/run.sh
+  printf "repo b\n" > repo-skills/skill-b/SKILL.md
+  printf "node edits\n" > skills/skill-b/SKILL.md; chmod 664 skills/skill-b/SKILL.md; chmod 775 skills/skill-b
+  printf "skill-b %s\n" "$(tree_hash_of repo-skills/skill-b)" > state/repo-skills.manifest
+  chmod 775 skills
+  install_repo_skills_into skills state/repo-skills.manifest repo-skills
+' >/dev/null
+u2="$TMP/unit/umask002"
+ok "unit(#2843): umask 0002 install leaves no group/other-writable file or dir" \
+  '[ -z "$(find "$u2/skills" -perm /022 -print)" ]'
+ok "unit(#2843): exec bit survives the go-w normalisation" \
+  '[ "$(stat -c %a "$u2/skills/skill-a/sub/run.sh")" = 755 ] && [ "$(stat -c %a "$u2/skills/skill-a/SKILL.md")" = 644 ]'
+ok "unit(#2843): kept node-modified copy is fixed in place, bytes and baseline intact" \
+  '[ "$(cat "$u2/skills/skill-b/SKILL.md")" = "node edits" ] && grep -q "^skill-b $(tree_hash_of "$u2/repo-skills/skill-b")$" "$u2/state/repo-skills.manifest"'
+ok "unit(#2843): manifest is not group/other-writable" \
+  '[ -z "$(find "$u2/state/repo-skills.manifest" -perm /022 -print)" ]'
+
 # Case: node edited, repo unchanged -> keep the node copy, baseline preserved.
 out="$(unit_run keep '
   mkdir -p repo-skills/skill-a skills/skill-a state
