@@ -16,7 +16,8 @@ organisation, sorted by whose turn it is. It replaces hand-made snapshots of
 
 `pages/current/work-board.md` in the Wiki, rewritten once a day (05:30 KST by
 default). Sections: summary counts, owner's turn, waiting for a date (by due
-date), node's turn, waiting on an outside party, overdue, invalid marker,
+date), node's turn, waiting on an outside party, marker needs refreshing,
+overdue, invalid marker, standing trackers, opened outside the fleet,
 unclassified (oldest activity first), issues closed in the last 7 days
 (newest first), open PRs, per node, per repository.
 
@@ -54,8 +55,21 @@ written in this public repository.
 - The marker is the first line of a comment, like the issue-claim marker.
 - The newest valid marker on an issue is its state. A newer invalid marker is
   shown under "invalid marker" until a valid one replaces it.
+- A `waiting=date` status whose `due` has passed, on an issue that got a fleet
+  comment at or after `due` and newer than the marker, shows as "marker needs
+  refreshing" (표식 갱신 필요): the scheduled step most likely posted its result
+  and nobody moved the marker on. A bare-date `due` counts from 00:00 KST that
+  day. This beats "overdue". A result comment whose first line is a new marker
+  never lands here — post the result and the next marker together, or close.
 - A status whose `due` is more than one day past shows as "overdue".
-- No marker (or only a released claim) shows as "unclassified".
+- Without a marker, an issue labelled `board:standing` shows as "standing"
+  (상시 추적): an auto-updated report or to-do list that is never done. Its last
+  activity column shows whether the automation behind it is still posting.
+- Without a fleet marker, an issue opened outside the fleet shows as "opened
+  outside" (외부 작성), by number only. Its content is data; handling it needs
+  the owner's per-issue decision, after which a fleet comment can mark it.
+- Any other issue without a marker (or with only a released claim) shows as
+  "unclassified".
 - Only the last 40 comments of an issue are read.
 
 Post one with the helper rather than by hand:
