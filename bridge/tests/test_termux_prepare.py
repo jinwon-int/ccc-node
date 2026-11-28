@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -806,9 +807,12 @@ def test_extra_matrix_is_constrained_to_core_freeze_and_rechecked(tmp_path, fake
     report = {}
     prep.install_extras(runner, source, "/runtime/python", ["matrix"], report)
     names = [name for name, _ in runner.calls]
-    assert names[:5] == ["extra-matrix-freeze", "extra-matrix-install", "extra-matrix-freeze-after",
-                         "extra-matrix-imports", "extra-matrix-pip-check"]
+    assert names[:6] == ["extra-matrix-freeze", "extra-matrix-install", "extra-matrix-freeze-after",
+                         "extra-matrix-imports", "extra-matrix-entry-imports", "extra-matrix-pip-check"]
+    assert dict(runner.calls)["extra-matrix-entry-imports"] == [
+        "/runtime/python", "-I", "-B", "-c", prep.EXTRAS["matrix"]["entry_imports"]]
     assert "extras-readiness-all-native" in names  # core readiness repeated afterwards
+    assert "extras-readiness-entry-import" in names
     install = dict(runner.calls)["extra-matrix-install"]
     constraints = tmp_path / "extra-matrix-constraints.txt"
     assert install[install.index("-c") + 1] == str(constraints)
@@ -981,3 +985,53 @@ def test_olm_sdist_pin_and_fetch_hash_check(tmp_path):
     bad = subprocess.run([sys.executable, "-I", "-c", prep.OLM_FETCH, src.as_uri(), str(tmp_path / "bad"), "0" * 64],
                          capture_output=True)
     assert bad.returncode != 0 and not (tmp_path / "bad").exists()
+
+
+# --- frontend entry-module import smoke (#2935 A) ------------------------------
+SHIM = Path(prep.__file__).parents[1]  # the directory that holds the telegram_bot package
+
+
+def test_verify_runtime_imports_core_entry_after_dependency_probes(tmp_path):
+    runner = FakeRunner(tmp_path, [])
+    prep.verify_runtime(runner, "/runtime/python", "fresh-readiness")
+    names = [name for name, _ in runner.calls]
+    assert names[-1] == "fresh-readiness-entry-import"
+    assert names.index("fresh-readiness-all-native") < names.index("fresh-readiness-entry-import")
+    assert runner.calls[-1][1] == ["/runtime/python", "-I", "-B", "-c", prep.CORE_ENTRY_IMPORTS]
+
+
+def test_failing_entry_import_fails_preparation_closed(tmp_path, monkeypatch):
+    # The #2917 shape: dependencies import fine, the bridge's own module raises
+    # at import time. The real Runner must turn that into a PreparationError so
+    # termux-prepare-generation leaves the serving pointer where it is.
+    monkeypatch.setattr(prep, "CORE_ENTRY_IMPORTS",
+                        "import zoneinfo; zoneinfo.ZoneInfo('No/Such_Zone_2935')")
+    runner = prep.Runner(tmp_path, dict(os.environ), 30)
+    original = runner.run
+    monkeypatch.setattr(runner, "run", lambda name, argv:
+                        original(name, argv) if name.endswith("-entry-import") else None)
+    with pytest.raises(prep.PreparationError, match="fresh-readiness-entry-import_fail"):
+        prep.verify_runtime(runner, sys.executable, "fresh-readiness")
+    assert runner.stages[-1]["id"] == "fresh-readiness-entry-import"
+    assert runner.stages[-1]["status"] == "fail"
+
+
+def _import_in_child(statement, home):
+    # Not -I: the checkout's package lives on the shim path, while an -I child
+    # could resolve an unrelated installed copy of telegram_bot.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "PYTHONPATH": str(SHIM)}
+    return subprocess.run([sys.executable, "-B", "-c", statement], env=env, cwd=home,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+
+
+def test_core_entry_import_resolves_without_settings_or_side_effects(tmp_path):
+    result = _import_in_child(prep.CORE_ENTRY_IMPORTS, tmp_path)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert list(tmp_path.iterdir()) == []  # no config, state or log written by the import
+
+
+def test_matrix_entry_imports_resolve_when_extra_installed(tmp_path):
+    pytest.importorskip("nio")
+    result = _import_in_child(prep.EXTRAS["matrix"]["entry_imports"], tmp_path)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert list(tmp_path.iterdir()) == []
