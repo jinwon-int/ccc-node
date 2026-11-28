@@ -69,8 +69,21 @@ expectation -- ``--expect 90m`` / ``--until "05:30"`` -- and decides:
 ``EXIT=`` marker and emits one body-free spool notice through ``notify``
 instead of a wake. ``notify`` writes that spool record on its own too, for
 hand-written units. A transient timer does not survive a reboot (#2827): use
-``schedule`` only for waits that cannot cross one, and a persistent
-``Persistent=true`` unit for waits spanning nights or days.
+plain ``schedule`` only for waits that cannot cross one, and ``schedule
+--durable`` for waits spanning nights or days.
+
+Durable schedule (#2827 proposal A)
+-----------------------------------
+``schedule --durable`` writes the same wrapper as a persistent pair,
+``<unit>.service`` (oneshot) + ``<unit>.timer`` (``Persistent=true``), into the
+unit directory, enables the timer, and has the wrapper disable the timer and
+delete both files after the run. The unit files live on disk, so a reboot
+keeps the timer; ``Persistent=true`` fires a run whose time passed while the
+node was down once, at the next boot. It is one-shot by construction, so the
+time must be an absolute, future instant (``YYYY-MM-DD HH:MM[:SS] [zone]``).
+Writing unit files is a node configuration change: it needs the same approval
+as a hand-written persistent unit. ``--print`` shows both files and the
+``systemctl`` commands without writing anything.
 
 Reboot export / restore (#2827)
 -------------------------------
@@ -93,7 +106,7 @@ Usage::
                               [--expect 90m | --until "YYYY-MM-DD HH:MM"] [--no-wait] [--user]
     detached_jobs.py schedule --unit U --at "<systemd calendar>" --log P
                               [--summary S] [--workdir W] [--tier T] [--fail-tier T]
-                              [--result-file P] [--user] [--print] -- <cmd…>
+                              [--result-file P] [--user] [--durable] [--print] -- <cmd…>
     detached_jobs.py notify   --unit U --exit N [--summary S] [--log P]
                               [--tier T] [--fail-tier T] [--result-file P]
     detached_jobs.py export-timers  [--out FILE]
@@ -173,6 +186,11 @@ SCOPE_SYSTEM = "system"
 # exact argv it launched under LAUNCH_KEY; the TIMER_* values say where a
 # scheduled job that has not started stands.
 LAUNCH_KEY = "launch_argv"
+# ``schedule --durable`` rows (#2827 proposal A): persistent unit files instead
+# of a transient timer, so there is nothing to replay after a reboot.
+DURABLE_KEY = "durable"
+SYSTEM_UNIT_DIR = "/etc/systemd/system"
+UNIT_DIR_ENV = "CCC_DETACHED_UNIT_DIR"  # tests and unusual layouts only
 EXPORT_VERSION = 1
 TIMER_ARMED = "armed"                # its .timer is active: nothing to do
 TIMER_MISSING = "missing"            # timer gone, still due: restore re-creates it
@@ -182,7 +200,7 @@ TIMER_UNRESTORABLE = "unrestorable"  # timer gone and no usable launch argv
 # replayed exactly like the registry row it was copied from.
 _EXPORT_KEYS = (
     "unit", "log", "log_offset", "started_at", "scheduled_at", "scheduled_epoch",
-    "scope", "summary", "workdir", "tier", LAUNCH_KEY,
+    "scope", "summary", "workdir", "tier", LAUNCH_KEY, DURABLE_KEY, "unit_files",
 )
 # Unit-file settings compared by value between a snapshot and the live unit.
 _LIVE_KEYS = ("OnCalendar", "Environment", "WorkingDirectory", "ExecStart")
@@ -868,11 +886,168 @@ def cmd_notify(argv: List[str]) -> int:
 _SCHEDULE_USAGE = (
     "usage: detached_jobs.py schedule --unit U --at \"<systemd calendar>\" --log PATH"
     " [--summary S] [--workdir W] [--tier T (default notice)] [--fail-tier T]"
-    " [--result-file P] [--user] [--print] -- <command…>\n"
+    " [--result-file P] [--user] [--durable] [--print] -- <command…>\n"
     "note: the timer is transient and a reboot erases it (#2827) — for a wait that\n"
-    "spans nights or days use a persistent Persistent=true unit instead. Around a\n"
-    "reboot: `export-timers --out FILE` before, `restore-timers --from FILE` after.\n"
+    "spans nights or days add --durable (persistent unit files, Persistent=true,\n"
+    "removed after the run; needs an absolute future --at). Around a reboot:\n"
+    "`export-timers --out FILE` before, `restore-timers --from FILE` after.\n"
 )
+
+
+def _job_env() -> Tuple[str, str]:
+    """HOME and PATH for the job: transient and persistent units inherit neither."""
+    return os.environ.get("HOME", "/root"), os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+
+def _wrapper_script(
+    *, unit: str, log_path: str, command: List[str], summary: str = "", module: str = "",
+    tier: str = SCHEDULE_DEFAULT_TIER, fail_tier: str = "", result_file: str = "", cleanup: str = "",
+) -> str:
+    """The bash body shared by transient and durable schedules.
+
+    Output appended to the log, ``EXIT=<rc>`` as the last line, then ``notify``;
+    ``cleanup`` (durable only) runs after the notice and before the exit.
+    """
+    module = module or os.path.abspath(__file__)
+    notify = [sys.executable or "python3", module, "notify", "--unit", unit, "--log", log_path, "--tier", tier]
+    if fail_tier:
+        notify += ["--fail-tier", fail_tier]
+    if result_file:
+        notify += ["--result-file", result_file]
+    if summary:
+        notify += ["--summary", summary]
+    return (
+        f"{shlex.join(command)} >> {shlex.quote(log_path)} 2>&1; rc=$?; "
+        f"echo \"EXIT=$rc\" >> {shlex.quote(log_path)}; "
+        f"{shlex.join(notify)} --exit \"$rc\" >/dev/null 2>&1 || true; "
+        + (f"{cleanup}; " if cleanup else "")
+        + "exit \"$rc\""
+    )
+
+
+def durable_unit_dir(*, user: bool = False) -> str:
+    """Where ``schedule --durable`` writes its unit files."""
+    override = os.environ.get(UNIT_DIR_ENV, "").strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if user:
+        base = os.environ.get("XDG_CONFIG_HOME", "").strip() or os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base, "systemd", "user")
+    return SYSTEM_UNIT_DIR
+
+
+def _unit_exec_quote(arg: str) -> str:
+    """One ``ExecStart=`` word: double-quoted, with systemd's own expansions escaped.
+
+    systemd expands ``$VAR`` / ``${VAR}`` and ``%`` specifiers inside
+    ``ExecStart=``, so the wrapper's ``$rc`` would be emptied before bash saw
+    it; ``$$`` and ``%%`` keep both literal.
+    """
+    escaped = arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+    return f'"{escaped}"'
+
+
+def build_durable_units(
+    *, unit: str, at: str, log_path: str, command: List[str], summary: str = "", workdir: str = "", module: str = "",
+    tier: str = SCHEDULE_DEFAULT_TIER, fail_tier: str = "", result_file: str = "", user: bool = False,
+    unit_dir: str = "",
+) -> Dict[str, str]:
+    """``{path: content}`` of the persistent ``.service`` + ``.timer`` pair (#2827 A).
+
+    Same wrapper as the transient schedule, plus a cleanup that disables the
+    timer and deletes both files once the run has announced itself, so a
+    one-shot durable job leaves nothing behind.
+    """
+    unit_dir = unit_dir or durable_unit_dir(user=user)
+    service_path = os.path.join(unit_dir, f"{unit}.service")
+    timer_path = os.path.join(unit_dir, f"{unit}.timer")
+    ctl = "systemctl --user" if user else "systemctl"
+    cleanup = (
+        f"{ctl} disable {shlex.quote(unit + '.timer')} >/dev/null 2>&1; "
+        f"rm -f {shlex.quote(timer_path)} {shlex.quote(service_path)}; "
+        f"{ctl} daemon-reload >/dev/null 2>&1 || true"
+    )
+    script = _wrapper_script(
+        unit=unit, log_path=log_path, command=command, summary=summary, module=module,
+        tier=tier, fail_tier=fail_tier, result_file=result_file, cleanup=cleanup,
+    )
+    home, path_env = _job_env()
+    header = "# Written by detached_jobs.py schedule --durable (#2827); removes itself after the run.\n"
+    service = header + (
+        "[Unit]\n"
+        f"Description=detached job {unit} (durable schedule)\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"Environment={_unit_exec_quote('HOME=' + home)}\n"
+        f"Environment={_unit_exec_quote('PATH=' + path_env)}\n"
+        + (f"WorkingDirectory={workdir}\n" if workdir else "")
+        + f"ExecStart=/bin/bash -c {_unit_exec_quote(script)}\n"
+    )
+    timer = header + (
+        "[Unit]\n"
+        f"Description=timer for detached job {unit} (durable schedule)\n\n"
+        "[Timer]\n"
+        f"OnCalendar={at}\n"
+        "Persistent=true\n"
+        "AccuracySec=1min\n"
+        f"Unit={unit}.service\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    return {service_path: service, timer_path: timer}
+
+
+def _durable_systemctl(args: List[str], *, user: bool) -> Tuple[bool, str]:
+    argv = ["systemctl"] + (["--user"] if user else []) + args
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{shlex.join(argv)}: {exc}"
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "ignore").strip().splitlines()
+        return False, f"{shlex.join(argv)} rc={proc.returncode}: {tail[-1] if tail else ''}"
+    return True, ""
+
+
+def install_durable(files: Dict[str, str], unit: str, *, user: bool) -> str:
+    """Write the unit files, reload, enable the timer. '' on success, else why.
+
+    Refuses to overwrite an existing file (a name collision with a real unit)
+    and removes what it wrote when any step fails, so a failed install leaves
+    the node as it was.
+    """
+    existing = [path for path in files if os.path.lexists(path)]
+    if existing:
+        return f"unit file already exists, not overwritten: {existing[0]}"
+    written: List[str] = []
+    try:
+        for path, content in files.items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp-{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+            written.append(path)
+    except OSError as exc:
+        for path in written:
+            _remove_quietly(path)
+        return f"cannot write unit files: {exc}"
+    for args in (["daemon-reload"], ["enable", "--now", f"{unit}.timer"]):
+        ok, why = _durable_systemctl(args, user=user)
+        if not ok:
+            for path in written:
+                _remove_quietly(path)
+            _durable_systemctl(["daemon-reload"], user=user)
+            return why
+    return ""
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def build_schedule_command(
@@ -889,20 +1064,10 @@ def build_schedule_command(
     so it is delivered at once instead of in the next morning's digest;
     ``user=True`` launches on the caller's user manager (non-root nodes).
     """
-    module = module or os.path.abspath(__file__)
-    home = os.environ.get("HOME", "/root")
-    path_env = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-    notify = [sys.executable or "python3", module, "notify", "--unit", unit, "--log", log_path, "--tier", tier]
-    if fail_tier:
-        notify += ["--fail-tier", fail_tier]
-    if result_file:
-        notify += ["--result-file", result_file]
-    if summary:
-        notify += ["--summary", summary]
-    script = (
-        f"{shlex.join(command)} >> {shlex.quote(log_path)} 2>&1; rc=$?; "
-        f"echo \"EXIT=$rc\" >> {shlex.quote(log_path)}; "
-        f"{shlex.join(notify)} --exit \"$rc\" >/dev/null 2>&1 || true; exit \"$rc\""
+    home, path_env = _job_env()
+    script = _wrapper_script(
+        unit=unit, log_path=log_path, command=command, summary=summary, module=module,
+        tier=tier, fail_tier=fail_tier, result_file=result_file,
     )
     argv = ["systemd-run"] + (["--user"] if user else []) + [
         "--unit", unit, "--collect",
@@ -943,6 +1108,11 @@ def cmd_schedule(argv: List[str]) -> int:
     if result_file:
         result_file = os.path.abspath(os.path.expanduser(result_file))
     user = "--user" in opts
+    if "--durable" in opts:
+        return _schedule_durable(
+            opts, unit=unit, at=at, log_path=log_path, command=command, summary=summary,
+            workdir=workdir, tier=tier, fail_tier=fail_tier, result_file=result_file, user=user,
+        )
     cmd = build_schedule_command(
         unit=unit, at=at, log_path=log_path, command=command, summary=summary, workdir=workdir,
         tier=tier, fail_tier=fail_tier, result_file=result_file, user=user,
@@ -984,6 +1154,67 @@ def cmd_schedule(argv: List[str]) -> int:
         sys.stdout.write(
             f"scheduled: unit={unit} at={at!r} scope={SCOPE_USER if user else SCOPE_SYSTEM} tier={tier}"
             " (no ⏳ wait; completion arrives as a spool notice)\n"
+        )
+    return rc
+
+
+def _schedule_durable(
+    opts: List[str], *, unit: str, at: str, log_path: str, command: List[str], summary: str, workdir: str,
+    tier: str, fail_tier: str, result_file: str, user: bool,
+) -> int:
+    """``schedule --durable``: persistent unit files that survive a reboot (#2827 A)."""
+    if "\n" in at or "\r" in at:
+        sys.stderr.write("detached_jobs: --at must be one line\n")
+        return 2
+    due = calendar_instant(at)
+    if due is None:
+        sys.stderr.write(
+            "detached_jobs: --durable is one-shot and needs an absolute time"
+            " (\"YYYY-MM-DD HH:MM[:SS] [zone]\"); recurring or relative specs are refused\n"
+        )
+        return 2
+    if due <= time.time():
+        sys.stderr.write(f"detached_jobs: --at {at!r} is already in the past\n")
+        return 2
+    files = build_durable_units(
+        unit=unit, at=at, log_path=log_path, command=command, summary=summary, workdir=workdir,
+        tier=tier, fail_tier=fail_tier, result_file=result_file, user=user,
+    )
+    ctl = "systemctl --user" if user else "systemctl"
+    if "--print" in opts or "--dry-run" in opts:
+        for path, content in files.items():
+            sys.stdout.write(f"### {path}\n{content}\n")
+        sys.stdout.write(f"### then: {ctl} daemon-reload && {ctl} enable --now {unit}.timer\n")
+        return 0
+    baseline = marker_baseline(log_path, unit, user=user, scheduled=True)
+    problem = install_durable(files, unit, user=user)
+    if problem:
+        sys.stderr.write(f"detached_jobs: durable schedule not installed: {problem}\n")
+        return 3
+    rec: Dict[str, Any] = {
+        "unit": unit,
+        "log": log_path,
+        "started_at": int(time.time()),
+        "scheduled_at": at[:80],
+        "scheduled_epoch": int(due),
+        "notify_on_exit": True,
+        "tier": tier,
+        DURABLE_KEY: True,
+        "unit_files": sorted(files),
+    }
+    if baseline:
+        rec["log_offset"] = baseline
+    if user:
+        rec["scope"] = SCOPE_USER
+    if summary:
+        rec["summary"] = summary
+    if workdir:
+        rec["workdir"] = workdir
+    rc = _append(registry_path(_opt(opts, "registry")), rec)
+    if rc == 0:
+        sys.stdout.write(
+            f"scheduled (durable): unit={unit} at={at!r} scope={SCOPE_USER if user else SCOPE_SYSTEM} tier={tier}"
+            f" files={','.join(sorted(files))} (survives reboot; removed after the run)\n"
         )
     return rc
 
@@ -1089,6 +1320,16 @@ def timer_status(rec: Dict[str, Any], *, now: Optional[float] = None) -> Optiona
         return None
     if unit_is_active(unit, user=user):
         return None
+    if rec.get(DURABLE_KEY) is True:
+        # Persistent unit files: a reboot keeps the timer, so there is nothing
+        # to replay. Report where it stands and never re-arm it from here.
+        if unit_is_active(unit, suffix=".timer", user=user):
+            return {"state": TIMER_ARMED, "restorable": True, "detail": "durable: persistent unit, survives a reboot"}
+        detail = (
+            f"durable timer {unit}.timer is not active and no EXIT marker was written;"
+            " check `systemctl status` and the unit files — not re-armed automatically"
+        )
+        return {"state": TIMER_UNRESTORABLE, "restorable": False, "detail": detail}
     problem = launch_argv_error(rec)
     if unit_is_active(unit, suffix=".timer", user=user):
         return {"state": TIMER_ARMED, "restorable": not problem, "detail": problem}
