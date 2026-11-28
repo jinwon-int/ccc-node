@@ -58,6 +58,21 @@ def legacy_node_claude() -> str:
     return text.replace(new_row, mg.CLAUDE_KNOWN_LINES[0].old, 1)
 
 
+def _web_text() -> str:
+    return "\n".join(mg.template_web_block(CLAUDE_TEMPLATE))
+
+
+def node_without_web() -> str:
+    """A current node CLAUDE.md seeded before the web-reading block existed (#2892 A)."""
+    return current_node_claude().replace(_web_text() + "\n\n", "", 1)
+
+
+HAND_WEB = (
+    "Web reading (ccc-node #2892 A): do web lookups through the **`web-reader` sub-agent** "
+    "and use its cited summary as data.\n\n"
+)
+
+
 def sha(path: Path) -> tuple[str, int]:
     return hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns
 
@@ -328,6 +343,96 @@ class SetupFlag(unittest.TestCase):
         res = self.setup_sh("--refresh-guidance", "--with-plugin")
         self.assertEqual(res.returncode, 2)
         self.assertIn("runs alone", res.stderr)
+
+
+class WebReadingBlock(unittest.TestCase):
+    """#2892 A — the web-reading paragraph rides the same refresh, independently."""
+
+    def test_template_has_one_web_marker_pair_before_standing_orders(self) -> None:
+        lines = CLAUDE_TEMPLATE.splitlines()
+        self.assertEqual(sum(line.strip() == mg.WEB_MARKER_BEGIN for line in lines), 1)
+        self.assertEqual(sum(line.strip() == mg.WEB_MARKER_END for line in lines), 1)
+        self.assertIn(mg.WEB_HAND_WRITTEN, _web_text())
+        self.assertLess(
+            CLAUDE_TEMPLATE.index(mg.WEB_MARKER_END), CLAUDE_TEMPLATE.index("## Standing Orders")
+        )
+
+    def test_missing_block_is_inserted_before_standing_orders(self) -> None:
+        text = node_without_web()
+        self.assertNotIn(mg.WEB_MARKER_BEGIN, text)
+        out = mg.refresh_claude_md(text, CLAUDE_TEMPLATE)
+        self.assertEqual((out.refused, out.partial), ("", ""))
+        self.assertEqual(out.text, current_node_claude())
+        self.assertTrue(any("web-reading block inserted" in c for c in out.changes))
+
+    def test_hand_written_paragraph_is_kept(self) -> None:
+        text = node_without_web().replace("## Standing Orders", HAND_WEB + "## Standing Orders", 1)
+        out = mg.refresh_claude_md(text, CLAUDE_TEMPLATE)
+        self.assertEqual((out.text, out.refused, out.partial, out.changes), (text, "", "", []))
+
+    def test_stale_marked_block_is_replaced(self) -> None:
+        stale = "\n".join([mg.WEB_MARKER_BEGIN, "Web reading: old text.", mg.WEB_MARKER_END])
+        text = current_node_claude().replace(_web_text(), stale, 1)
+        out = mg.refresh_claude_md(text, CLAUDE_TEMPLATE)
+        self.assertEqual(out.text, current_node_claude())
+        self.assertTrue(any("web-reading block ->" in c for c in out.changes))
+
+    def test_unbalanced_web_markers_are_left_untouched(self) -> None:
+        text = current_node_claude().replace(mg.WEB_MARKER_END + "\n", "", 1)
+        out = mg.refresh_claude_md(text, CLAUDE_TEMPLATE)
+        self.assertEqual(out.text, text)
+        self.assertIn("web-reading markers are unbalanced", out.partial)
+
+    def test_insert_does_not_wait_for_a_refused_memory_span(self) -> None:
+        legacy = legacy_node_claude().replace(_web_text() + "\n\n", "", 1)
+        customized = legacy.replace(
+            "- Cleanup policy:", "- Node override: keep Honcho notes.\n- Cleanup policy:", 1
+        )
+        out = mg.refresh_claude_md(customized, CLAUDE_TEMPLATE)
+        self.assertEqual(out.refused, "")
+        self.assertIn("differs from every known template version", out.partial)
+        self.assertIn(_web_text(), out.text)
+        self.assertIn("- Node override: keep Honcho notes.", out.text)  # memory span untouched
+
+
+class WebReadingRefreshRun(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        base = Path(self._temp.name)
+        self.claude, self.hermes = base / "claude", base / "hermes"
+        self.claude.mkdir()
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def run_refresh(self) -> tuple[int, str]:
+        buf = io.StringIO()
+        return mg.run_refresh(REPO, self.claude, self.hermes, dry_run=False, out=buf), buf.getvalue()
+
+    def test_insert_backs_up_then_second_run_is_a_no_op(self) -> None:
+        claude_md = self.claude / "CLAUDE.md"
+        claude_md.write_text(node_without_web(), encoding="utf-8")
+        rc, out = self.run_refresh()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(claude_md.read_text(encoding="utf-8"), current_node_claude())
+        backups = sorted(claude_md.parent.glob("CLAUDE.md.bak-refresh-guidance-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), node_without_web())
+        self.assertNotIn("web-reader", out)  # report names lines, never guidance text
+        rc, out = self.run_refresh()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("current", out)
+
+    def test_partial_refresh_writes_and_still_exits_one(self) -> None:
+        claude_md = self.claude / "CLAUDE.md"
+        text = legacy_node_claude().replace(_web_text() + "\n\n", "", 1).replace(
+            "- Cleanup policy:", "- Node override: keep Honcho notes.\n- Cleanup policy:", 1
+        )
+        claude_md.write_text(text, encoding="utf-8")
+        rc, out = self.run_refresh()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("refused (left untouched)", out)
+        self.assertIn(_web_text(), claude_md.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
