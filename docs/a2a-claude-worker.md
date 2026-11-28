@@ -192,13 +192,116 @@ overrides the default cap of 1.
 Serving≠installed warning (#2791): every run also compares the supervise
 loop and each `$A2A_WORKER_ROOT/dist/worker.js` worker with the file it runs.
 When that file is newer than the process (or gone) the health log gets
-`worker-stale: kind=<supervise|worker> pids=… started=… installed=… file=…`,
+`worker-stale: kind=<supervise|worker> pids=… started=… installed=… [changed=…] file=…`,
 the `OK` line ends with `stale=<kinds>` (plus a `WARN worker-stale:` line
 unless `--quiet`), and `--json` carries `"stale": [...]` (`[]` when current).
 It is a warning only — the rc does not change and nothing is restarted; a
 redeployed `worker.js` or changed supervise script still needs a manual
-supervisor restart. Process age comes from `CLOCK_BOOTTIME`, because Android
+supervisor restart. "Newer" is the later of mtime and ctime. The supervise
+loop is also stale when the `lib/a2a-supervisor-identity.sh` it sourced changed
+after it started; `changed=<lib>` then names it (`file=` stays the script, last
+on the line). Process age comes from `CLOCK_BOOTTIME`, because Android
 denies `/proc/uptime` and `/proc/stat` to Termux.
+
+Idle-gated restart (#2791 stage 2b). Both commands refuse without `--if-idle`
+— there is no unconditional mode, and a busy worker is never killed:
+
+```bash
+# SIGTERM only dist/worker.js; the supervise loop relaunches it (tunnel stays up).
+scripts/a2a-termux-native-worker.sh restart-worker --if-idle [--dry-run]
+# Stop + respawn the whole supervise loop via the health check's --self-heal
+# path (needed after a supervise-script change; the tunnel drops briefly).
+scripts/a2a-termux-native-worker.sh restart-supervisor --if-idle [--dry-run]
+```
+
+"Idle" keeps the #2138 meaning on the worker's process tree instead of a
+cgroup: a descendant of the worker pid younger than
+`A2A_NATIVE_WORKER_BUSY_MAX_SECONDS` (default `CCC_SELF_UPDATE_BUSY_MAX_SECONDS`
+or 1800) is a running task handler; an older one counts as hung and does not
+block (it is reported as `hung=N`, never killed). An unreadable process tree
+fails closed. After the signal the command waits for a new worker child, a fresh
+`registered with` line in the supervisor or health log, a settle window, and a
+health check reporting `sup_count=1 workers=1 tunnel=UP`. `--env-file` defaults
+to the running supervisor's own; `--dry-run` runs the gate only.
+
+| rc | meaning                                                         |
+|----|-----------------------------------------------------------------|
+| 0  | restarted and verified (`--dry-run`: would restart)             |
+| 2  | usage / env error, or `--if-idle` missing                       |
+| 3  | no canonical supervisor, or not exactly one worker child        |
+| 10 | busy — a task handler is running; nothing was signaled          |
+| 11 | idle state unknown (process tree unreadable); nothing signaled |
+| 30 | signaled, but the restart could not be verified                 |
+
+Who restarts what (owner decision 2026-11-27): a redeployed `worker.js` is
+restarted by the deploy side (`scripts/a2a-termux-native-worker-deploy.sh`);
+self-update only warns about it. Self-update may restart a stale supervise loop
+of its own checkout only on nodes that opt in with
+`CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART=1` or the operator-owned file
+`~/.claude/self-update.native-supervisor-restart` (default off; a set env var
+wins over the file, docs/self-update.md). A worker that stays busy is never
+force-restarted, and hung children are only reported (`hung=N`).
+
+### Deploying `dist/worker.js` (#2791 stage 3)
+
+`scripts/a2a-termux-native-worker-deploy.sh` is the canonical tar deploy of
+the worker artifact. It replaces the per-rollout ad-hoc scripts and owns the
+worker restart after a redeploy. It is **dry-run by default**:
+
+```bash
+# Plan + pre-restart checks on a temp preview + idle gate; nothing on the node changes.
+scripts/a2a-termux-native-worker-deploy.sh --env-file /path/canonical.env \
+    --artifact /path/artifact.tgz --target-sha <40-hex>
+# Perform it.
+scripts/a2a-termux-native-worker-deploy.sh --env-file /path/canonical.env \
+    --artifact /path/artifact.tgz --target-sha <40-hex> --apply
+```
+
+`--artifact` is a directory or a tar(.gz) whose top level (or one wrapping
+directory) holds `dist/worker.js`; tar members with absolute paths, `..`,
+device nodes or escaping links are refused.
+
+The dry-run also runs step 4's checks (build revision, the shipped rollout
+guard, `--smoke-cmd`) against a preview of the post-deploy root in a private
+temp dir under `$TMPDIR`, removed on exit (owner decision 2026-11-27). The
+preview is the live root without `node_modules/` and `dist.bak*`, with
+`dist/`, `scripts/` and `handlers/` copied dereferenced (a symlinked release
+`dist/` is never written through) and the artifact copied over it;
+`node_modules/` holds the artifact's packages plus symlinks to the other live
+packages, so a smoke command must not write into `node_modules`. A failing
+check exits 20 before the idle gate, with nothing changed.
+
+With `--apply` the order is:
+
+1. idle gate — `restart-worker --if-idle --dry-run` (busy → exit 10, nothing changed);
+2. backups of the worker root (without `node_modules`) and of each
+   `node_modules` package the artifact replaces (default
+   `$HOME/a2a-nexus-local-deploy-backups`, `--backup-dir`);
+3. copy `dist/`, `scripts/`, `handlers/` (overwrite) and replace the artifact's packages;
+4. pre-restart checks: build revision = target, the artifact's own
+   `scripts/worker-artifact-rollout-guard.mjs --deployed` when shipped
+   (`--no-guard` skips it), then `--smoke-cmd` (run with `A2A_WORKER_ROOT`);
+   failure → exact rollback, exit 20, no restart;
+5. `restart-worker --if-idle` — verified by `registered with` + health
+   `sup_count=1 workers=1 tunnel=UP`. Busy by now → rollback, exit 10 (never
+   signaled); not verified → rollback and restart on the old files, exit 30;
+6. write `<worker_root>/.deploy-source-sha`.
+
+| rc | meaning                                                              |
+|----|----------------------------------------------------------------------|
+| 0  | deployed and verified (dry-run: plan + preview checks + gate ok)     |
+| 2  | usage, invalid artifact, or revision ≠ `--target-sha`                |
+| 3  | no canonical supervisor / worker — nothing changed                   |
+| 4  | another deploy holds the lock                                        |
+| 10 | busy — nothing changed (or files rolled back before any signal)      |
+| 11 | idle state unknown — nothing changed                                 |
+| 20 | pre-restart check failed — rolled back, no restart (dry-run: failed on the preview, nothing changed) |
+| 30 | restart not verified — rolled back and restarted on the old files    |
+| 31 | rollback failed — restore manually from the printed backups          |
+
+Run it from the same checkout the supervisor runs (`restart-worker` only acts
+on the supervisor whose script is beside it). Live rollouts still need the
+usual per-node approval.
 
 ## No-provider adapter smoke
 

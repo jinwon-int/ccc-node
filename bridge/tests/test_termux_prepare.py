@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -304,18 +305,42 @@ raise SystemExit(m.main(["--work-dir", {str(work)!r}]))
         os.kill(probe_pid, 0)  # The direct probe was reaped.
 
 
+def _wait_for_state(pid, states, *, timeout=10.0):
+    """Poll ``/proc`` until ``pid`` is in one of ``states`` (``None``: reaped).
+
+    Each step of a signal choreography waits for the state it needs instead
+    of sleeping a fixed time that a busy runner can outlast (#2903).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            state = stat.rpartition(")")[2].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            state = None
+        if state in states:
+            return state
+        if time.monotonic() >= deadline:
+            pytest.fail(f"pid {pid} stayed in state {state!r}, wanted one of {states!r}")
+        time.sleep(0.01)
+
+
 def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
     import signal
     import subprocess
 
     marker = tmp_path / "pids"
+    release = tmp_path / "release"
     source = Path(prep.__file__).resolve().parent
     publish = _publish_pids(marker, "str(os.getpid())+' '+str(p.pid)")
+    # The leader exits only once the test has stopped the driver, so its exit
+    # is always the unreaped one; the deadline only bounds a broken run.
     probe = ("import os,subprocess,sys,time; from pathlib import Path; "
              "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-             f"{publish}; time.sleep(0.7)")
+             f"{publish}; d=time.monotonic()+30\n"
+             f"while not os.path.exists({str(release)!r}) and time.monotonic()<d: time.sleep(0.01)")
     code = (f"import sys,signal; sys.path.insert(0,{str(source)!r}); import termux_prepare as m; "
-            f"r=m.Runner(m.Path({str(tmp_path)!r}),dict(m.os.environ),10); "
+            f"r=m.Runner(m.Path({str(tmp_path)!r}),dict(m.os.environ),60); "
             f"r.run('fixture',[sys.executable,'-c',{probe!r}])")
     with subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as driver:
@@ -323,20 +348,13 @@ def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
         try:
             leader, worker = _read_pids(marker, 2)
             os.kill(driver.pid, signal.SIGSTOP)
-            time.sleep(0.9)  # The leader exits while the driver cannot reap it.
+            _wait_for_state(driver.pid, ("T",))  # The driver can no longer reap.
+            release.touch()
+            _wait_for_state(leader, ("Z",))  # Exited, held unreaped by the driver.
             os.kill(driver.pid, signal.SIGINT)
             os.kill(driver.pid, signal.SIGCONT)
-            assert driver.wait(timeout=5) != 0
-            proc = Path(f"/proc/{worker}/stat")
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                try:
-                    if proc.read_text().split()[2] == "Z":
-                        return
-                except (FileNotFoundError, ProcessLookupError):
-                    return
-                time.sleep(0.01)
-            pytest.fail("worker survived cancellation after leader exit")
+            assert driver.wait(timeout=30) != 0
+            _wait_for_state(worker, ("Z", None))
         finally:
             for group in (driver.pid, leader):
                 if group is not None:
@@ -345,6 +363,25 @@ def test_cancellation_kills_workers_after_group_leader_exits(tmp_path):
                     except ProcessLookupError:
                         pass
             driver.wait()
+
+
+def test_cancelled_run_reaps_despite_leaked_popen_wait_lock(tmp_path, monkeypatch):
+    # #2903: an interrupt between Popen.wait's lock acquire and its ``try``
+    # leaves the lock held. Pin that window: the timed wait takes the lock and
+    # is interrupted. A cleanup that still went through Popen.wait would spin
+    # on the held lock until the bounded wait below raised TimeoutExpired.
+    class InterruptedPopen(prep.subprocess.Popen):
+        def wait(self, timeout=None):
+            if timeout is None:
+                return super().wait(timeout=5)
+            self._waitpid_lock.acquire()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(prep.subprocess, "Popen", InterruptedPopen)
+    runner = prep.Runner(tmp_path, dict(os.environ), 30)
+    with pytest.raises(prep.PreparationError, match="fixture_cancelled"):
+        runner.run("fixture", [sys.executable, "-c", "import time; time.sleep(30)"])
+    assert runner.stages[0]["status"] == "cancelled"
 
 
 # --- #2175: same-node native wheel reuse and base-interpreter guard ---------
@@ -770,9 +807,12 @@ def test_extra_matrix_is_constrained_to_core_freeze_and_rechecked(tmp_path, fake
     report = {}
     prep.install_extras(runner, source, "/runtime/python", ["matrix"], report)
     names = [name for name, _ in runner.calls]
-    assert names[:5] == ["extra-matrix-freeze", "extra-matrix-install", "extra-matrix-freeze-after",
-                         "extra-matrix-imports", "extra-matrix-pip-check"]
+    assert names[:6] == ["extra-matrix-freeze", "extra-matrix-install", "extra-matrix-freeze-after",
+                         "extra-matrix-imports", "extra-matrix-entry-imports", "extra-matrix-pip-check"]
+    assert dict(runner.calls)["extra-matrix-entry-imports"] == [
+        "/runtime/python", "-I", "-B", "-c", prep.EXTRAS["matrix"]["entry_imports"]]
     assert "extras-readiness-all-native" in names  # core readiness repeated afterwards
+    assert "extras-readiness-entry-import" in names
     install = dict(runner.calls)["extra-matrix-install"]
     constraints = tmp_path / "extra-matrix-constraints.txt"
     assert install[install.index("-c") + 1] == str(constraints)
@@ -945,3 +985,53 @@ def test_olm_sdist_pin_and_fetch_hash_check(tmp_path):
     bad = subprocess.run([sys.executable, "-I", "-c", prep.OLM_FETCH, src.as_uri(), str(tmp_path / "bad"), "0" * 64],
                          capture_output=True)
     assert bad.returncode != 0 and not (tmp_path / "bad").exists()
+
+
+# --- frontend entry-module import smoke (#2935 A) ------------------------------
+SHIM = Path(prep.__file__).parents[1]  # the directory that holds the telegram_bot package
+
+
+def test_verify_runtime_imports_core_entry_after_dependency_probes(tmp_path):
+    runner = FakeRunner(tmp_path, [])
+    prep.verify_runtime(runner, "/runtime/python", "fresh-readiness")
+    names = [name for name, _ in runner.calls]
+    assert names[-1] == "fresh-readiness-entry-import"
+    assert names.index("fresh-readiness-all-native") < names.index("fresh-readiness-entry-import")
+    assert runner.calls[-1][1] == ["/runtime/python", "-I", "-B", "-c", prep.CORE_ENTRY_IMPORTS]
+
+
+def test_failing_entry_import_fails_preparation_closed(tmp_path, monkeypatch):
+    # The #2917 shape: dependencies import fine, the bridge's own module raises
+    # at import time. The real Runner must turn that into a PreparationError so
+    # termux-prepare-generation leaves the serving pointer where it is.
+    monkeypatch.setattr(prep, "CORE_ENTRY_IMPORTS",
+                        "import zoneinfo; zoneinfo.ZoneInfo('No/Such_Zone_2935')")
+    runner = prep.Runner(tmp_path, dict(os.environ), 30)
+    original = runner.run
+    monkeypatch.setattr(runner, "run", lambda name, argv:
+                        original(name, argv) if name.endswith("-entry-import") else None)
+    with pytest.raises(prep.PreparationError, match="fresh-readiness-entry-import_fail"):
+        prep.verify_runtime(runner, sys.executable, "fresh-readiness")
+    assert runner.stages[-1]["id"] == "fresh-readiness-entry-import"
+    assert runner.stages[-1]["status"] == "fail"
+
+
+def _import_in_child(statement, home):
+    # Not -I: the checkout's package lives on the shim path, while an -I child
+    # could resolve an unrelated installed copy of telegram_bot.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "PYTHONPATH": str(SHIM)}
+    return subprocess.run([sys.executable, "-B", "-c", statement], env=env, cwd=home,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+
+
+def test_core_entry_import_resolves_without_settings_or_side_effects(tmp_path):
+    result = _import_in_child(prep.CORE_ENTRY_IMPORTS, tmp_path)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert list(tmp_path.iterdir()) == []  # no config, state or log written by the import
+
+
+def test_matrix_entry_imports_resolve_when_extra_installed(tmp_path):
+    pytest.importorskip("nio")
+    result = _import_in_child(prep.EXTRAS["matrix"]["entry_imports"], tmp_path)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert list(tmp_path.iterdir()) == []

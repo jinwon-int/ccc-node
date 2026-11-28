@@ -38,6 +38,11 @@
 #   ~/.claude/self-update.no-reapply (optional: operator kill-switch; when this
 #      file exists, installer-managed cron is never rewritten. Env override:
 #      CCC_SELF_UPDATE_REAPPLY=0. Agent must not write the file.)
+#   ~/.claude/self-update.native-supervisor-restart (optional: per-node opt-in,
+#      #2791 — when this file exists, a stale Termux-native supervise loop of
+#      this checkout is restarted via `restart-supervisor --if-idle`. Env
+#      override: CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART (1 on, 0 off even
+#      with the file). Agent must not write the file.)
 #
 # Procedure (run):
 #   1. take a lock; resolve the repo (env > repo file > script location > ~/ccc-node)
@@ -2057,10 +2062,30 @@ a2a_handlers_refresh() { # <tick: changed|up-to-date>
 # not a systemd unit, so the #2138 gate/restart never reaches it: after a
 # changed supervise script (this repo) or a redeployed
 # ~/a2a-broker-worker/dist/worker.js it keeps serving the old code. Log-only —
-# no restart, no notification, never fails the tick.
-#   CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK  auto (default: Termux only) | 1 | 0
+# no notification, never fails the tick. A stale worker.js is never restarted
+# here: that restart belongs to the deploy side
+# (scripts/a2a-termux-native-worker-deploy.sh, owner decision 2026-11-27).
+# Only a stale supervise loop running THIS checkout's script may be restarted,
+# and only when the node opted in: `restart-supervisor --if-idle` (busy → it
+# refuses and the next tick retries; a busy worker is never killed).
+#   CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK          auto (default: Termux only) | 1 | 0
+#   CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART          unset (default: the file below decides) | 1 on | 0 off
+#   ~/.claude/self-update.native-supervisor-restart    operator-owned opt-in file: exists → on when
+#                                                      the env var is unset/empty (env wins, like
+#                                                      self-update.notify). Agent must not write it.
+#   CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART_TIMEOUT  seconds (default 300)
+NATIVE_SUPERVISOR_RESTART_FILE="$CLAUDE_DIR/self-update.native-supervisor-restart"
+native_supervisor_restart_enabled() { # env set → only `1` is on; unset/empty → the operator file
+  local v="${CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART:-}"
+  if [ -n "$v" ]; then
+    [ "$v" = 1 ]
+    return
+  fi
+  [ -f "$NATIVE_SUPERVISOR_RESTART_FILE" ]
+}
 native_worker_stale_check() { # <tick>
   local mode="${CCC_SELF_UPDATE_NATIVE_WORKER_STALE_CHECK:-auto}" lib report line
+  local harness own action restart_due=0 restart_on=0
   case "$mode" in
     0) return 0 ;;
     1) ;;
@@ -2072,9 +2097,39 @@ native_worker_stale_check() { # <tick>
   . "$lib"
   report="$(a2a_native_worker_stale_report)"
   [ -n "$report" ] || return 0
+  harness="$REPO/scripts/a2a-termux-native-worker.sh"
+  own="$(realpath "$harness" 2>/dev/null || printf '%s' "$harness")"
+  native_supervisor_restart_enabled && restart_on=1
   while IFS= read -r line; do
-    [ -n "$line" ] && log "native-worker-stale $line tick=$1 action=none (#2791)"
+    [ -n "$line" ] || continue
+    action=none
+    if [ "$restart_on" = 1 ]; then
+      case "$line" in
+        "kind=supervise "*" file=$own") action=restart-supervisor; restart_due=1 ;;
+      esac
+    fi
+    log "native-worker-stale $line tick=$1 action=$action (#2791)"
   done <<<"$report"
+  [ "$restart_due" = 1 ] && native_supervisor_restart "$1" "$harness"
+  return 0
+}
+
+native_supervisor_restart() { # <tick> <harness> — opt-in, idle-gated, log-only
+  local out rc result limit="${CCC_SELF_UPDATE_NATIVE_SUPERVISOR_RESTART_TIMEOUT:-300}"
+  case "$limit" in ''|*[!0-9]*) limit=300 ;; esac
+  if command -v timeout >/dev/null 2>&1; then
+    out="$(timeout --kill-after=5 "$limit" bash "$2" restart-supervisor --if-idle </dev/null 2>&1)"; rc=$?
+  else
+    out="$(bash "$2" restart-supervisor --if-idle </dev/null 2>&1)"; rc=$?
+  fi
+  case "$rc" in
+    0) result=ok ;;
+    10) result=deferred-busy ;;
+    11) result=deferred-unknown ;;
+    *) result=failed ;;
+  esac
+  out="$(printf '%s\n' "$out" | tail -n 1)"
+  log "native-supervisor-restart result=$result rc=$rc tick=$1 detail=${out:-none} (#2791)"
   return 0
 }
 
