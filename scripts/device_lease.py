@@ -8,10 +8,10 @@ name the node). Read-only work (``dumpsys``, ``logcat``, ``screencap``) needs no
 lease; anything that changes the screen (tap, swipe, key, ``am start``, CDP
 click) takes one first and releases it when done.
 
-    device_lease.py --target daegyo status
-    device_lease.py --target daegyo acquire --purpose "Play 0.1.7 출시" [--ttl 15m] [--wait 300]
-    device_lease.py --target daegyo renew   [--ttl 15m]
-    device_lease.py --target daegyo release
+    device_lease.py --target phone-a status
+    device_lease.py --target phone-a acquire --purpose "Play 0.1.7 출시" [--ttl 15m] [--wait 300]
+    device_lease.py --target phone-a renew   [--ttl 15m]
+    device_lease.py --target phone-a release
 
 ``--target HOST`` runs this same file on the device (``ssh HOST python3 - …``);
 ``--local`` runs it here (on the device, or in tests with ``--state-file``).
