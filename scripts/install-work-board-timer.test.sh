@@ -45,6 +45,17 @@ out="$(inst --org example-org --page pages/team/x/board.md --on-calendar '*-*-* 
 ok "page and calendar can be overridden" \
   'grep -q -- "--page pages/team/x/board.md " <<<"$out" && grep -qx "OnCalendar=\*-\*-\* 06:00:00 Asia/Seoul" <<<"$out"'
 
+out="$(inst --org example-org --schedule-nodes alpha,beta-2,hub --self-node hub)"
+ok "stage 3 schedule collection is passed through when asked" \
+  'grep -q -- "--result-file $ST/ccc-work-board.result --schedule-nodes alpha,beta-2,hub --self-node hub$" <<<"$out"'
+out="$(inst --org example-org)"
+ok "schedule collection stays off by default" '! grep -q -- "--schedule-nodes" <<<"$out"'
+inst --org example-org --schedule-nodes 'alpha beta' >/dev/null 2>&1; rs1=$?
+inst --org example-org --schedule-nodes 'alpha,;x' >/dev/null 2>&1; rs2=$?
+inst --org example-org --schedule-nodes alpha --self-node 'h b' >/dev/null 2>&1; rs3=$?
+inst --org example-org --self-node hub >/dev/null 2>&1; rs4=$?
+ok "bad schedule node lists and a lone --self-node are refused" '[ "$rs1$rs2$rs3$rs4" = 2222 ]'
+
 # 2. input gates: every value lands in a unit file
 inst >/dev/null 2>&1; rc0=$?
 inst --org 'bad org' >/dev/null 2>&1; rc1=$?

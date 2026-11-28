@@ -408,3 +408,69 @@ def test_run_cli_writes_result_line_and_holds_lock(tmp_path):
         busy = subprocess.run(cmd, capture_output=True, text=True)
     assert busy.returncode == 1 and "holds the lock" in busy.stdout
     assert "실패" in result.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- node schedules (stage 3)
+
+def _fake_runner(tmp: Path, name: str) -> Path:
+    """Stands in for ssh (and for the hub's own python): answers by node name and
+    records the sha256 of what it was fed on stdin."""
+    return _exe(tmp / name, r"""#!/usr/bin/env python3
+import hashlib, json, sys
+src = sys.stdin.read()
+open(sys.argv[0] + ".fed", "a").write(hashlib.sha256(src.encode()).hexdigest() + "\n")
+node = sys.argv[-1].split()[-1]
+if node == "down":
+    sys.exit(255)
+if node == "junk":
+    print("not json"); sys.exit(0)
+items = {
+  "alpha": [
+    {"source": "detached-job", "name": "check-1", "next_at": "2026-11-26 09:00:00 Asia/Seoul", "schedule": "",
+     "summary": "alpha-repo#2 결과 확인", "persistent": False, "enabled": True, "issues": [{"repo": "alpha-repo", "number": 2}]},
+    {"source": "systemd", "name": "old-shot.timer", "next_at": "", "schedule": "", "summary": "beta-repo#21 done",
+     "persistent": True, "enabled": True, "issues": [{"repo": "beta-repo", "number": 21}]},
+    {"source": "systemd", "name": "tmp.timer", "next_at": "2026-11-30T02:40:00+00:00", "schedule": "", "summary": "x",
+     "persistent": False, "enabled": True, "issues": []},
+    {"source": "cron", "name": "nightly.sh", "next_at": "", "schedule": "3 6 * * 1", "summary": "unknown-repo#5",
+     "persistent": True, "enabled": True, "issues": [{"repo": "unknown-repo", "number": 5}, {"repo": "", "number": 1}]}],
+  "self-hub": [{"source": "agent-cron", "name": "weekly", "next_at": "", "schedule": "0 9 * * 1", "summary": "",
+                "persistent": True, "enabled": True, "issues": []}],
+}[node]
+print(json.dumps({"schema": "ccc.node-schedules.v1", "node": "whatever", "generated_at": "2026-11-28T00:00:00+00:00",
+                  "items": items, "errors": []}))
+""")
+
+
+def test_collect_schedules_pipes_the_collector_and_marks_failures(tmp_path):
+    ssh = _fake_runner(tmp_path, "ssh")
+    py = _fake_runner(tmp_path, "py")
+    doc = board.collect_schedules(["alpha", "down", "junk", "self-hub"], self_node="self-hub",
+                                  ssh_bin=str(ssh), python_bin=str(py))
+    assert doc["schema"] == board.SCHEDULES_SCHEMA
+    by = {d["node"]: d for d in doc["nodes"]}
+    assert [d["node"] for d in doc["nodes"]] == ["alpha", "down", "junk", "self-hub"]  # hub's names win
+    assert by["down"]["error"] and by["junk"]["error"] and not by["alpha"].get("error")
+    import hashlib
+    want = hashlib.sha256(board.COLLECTOR.read_text(encoding="utf-8").encode()).hexdigest()
+    assert set(Path(str(ssh) + ".fed").read_text().split()) == {want}
+    assert Path(str(py) + ".fed").read_text().split() == [want]  # self node: no ssh
+    with pytest.raises(board.BoardError):
+        board._node_list("alpha; rm -rf /")
+
+
+def test_render_schedule_sections(tmp_path):
+    snap = fixture_snapshot(tmp_path)
+    ssh = _fake_runner(tmp_path, "ssh2")
+    snap["schedules"] = board.collect_schedules(["alpha", "down"], ssh_bin=str(ssh))
+    page = board.render(snap, "DOC-77")
+    sec = page.split("## 예약 점검", 1)[1].split("\n## ", 1)[0]
+    assert "| alpha | 2 | 1 | 1 | 1 | 1 | 0 | ok |" in sec and "| down | 0 | 0 | 0 | 0 | 0 | 0 | 수집 실패 |" in sec
+    linked = sec.split("### 이슈에 걸린 예약 (2건)", 1)[1].split("###", 1)[0]
+    assert "check-1" in linked and "날짜 대기" in linked and "old-shot.timer" in linked and "다시 안 돎" in linked
+    assert "unknown-repo" not in sec  # a reference to nothing open or recently closed is not listed
+    assert "### 닫힌 이슈에 걸린 예약 (1건)" in sec and "| alpha | old-shot.timer | 타이머 | beta-repo #21 |" in sec
+    assert "### 노드 예약이 안 보이는 날짜 대기 (0건)" in sec  # alpha-repo#2 (date) is referenced
+    assert "### 지난 예약 작업 — 확인 안 됨 (1건)" in sec and "| alpha | check-1 | 11-26 09:00 |" in sec
+    assert page.index("## 예약 점검") < page.index("## 최근 7일 닫힌 이슈")
+    assert "## 예약 점검" not in board.render({k: v for k, v in snap.items() if k != "schedules"}, "DOC-77")
