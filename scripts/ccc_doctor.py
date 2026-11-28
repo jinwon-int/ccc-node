@@ -177,6 +177,12 @@ CRON_MARKER_INSTALLERS = (
     ("skill-promotion-results", "# ccc-node:skill-promotion-results",
      "scripts/install-skill-promotion-results-cron.sh",
      "run scripts/install-skill-promotion-results-cron.sh --apply (publisher only)"),
+    # dns-health-watch (#2937): Termux-only 5-minute watch for the Android
+    # system resolver failing while raw DNS works (VPN-DNS stall). Registered
+    # in the same commit as the installer.
+    ("dns-health-watch", "# ccc-node:dns-health-watch",
+     "scripts/install-termux-dns-health-watch-cron.sh",
+     "run scripts/install-termux-dns-health-watch-cron.sh --apply (Termux nodes only)"),
 )
 # Managed markers that carry no generation stamp by design: the installers'
 # block guards are exact-match parsed by the shared block awk (#1077).
@@ -205,6 +211,8 @@ CRON_AUX_MARKERS = (
     "# ccc-node:timed-relative-scan:end",
     "# ccc-node:skill-promotion-results:begin",
     "# ccc-node:skill-promotion-results:end",
+    "# ccc-node:dns-health-watch:begin",
+    "# ccc-node:dns-health-watch:end",
 )
 # Hand-installed markers the repo documents but no installer renders: the
 # self-update and live-backups schedule lines are operator-placed by design
