@@ -173,8 +173,18 @@ UTC_TO_KST = dt.timedelta(hours=9)
 # reported at high confidence. Bare "완료" and "✅" stay out — both lead
 # ordinary progress updates ("yukson 연결 완료") that say nothing about the
 # test — and the whole regex still only sees the heading window.
+#
+# "판정" counts only as a verdict that was given (_GIVEN_VERDICT, shared with
+# SETTLED below). A post-deadline comment saying none was given — "종료 시각이
+# 판정 없이 지났습니다", "미판정 상태로 종료 시각이 지났습니다" — is exactly
+# the case expired mode exists for, yet the bare word read it as a heading
+# verdict and silenced the alert (#2863). Excluded: 미판정, 판정(이/은/도) 없…,
+# 판정 주체/예정/대기. "판정 기준" stays a verdict word: real verdicts write
+# "판정 기준 충족". A re-booking ("판정이 없어 새 종료 일시를 정합니다: …")
+# carries its own later deadline, which is judged on its own.
+_GIVEN_VERDICT = r"(?<!미)판정(?!\s*(?:이|은|도)?\s*없|\s*(?:주체|예정|대기))"
 VERDICT = re.compile(
-    r"(판정|결과\s*보고|종료\s*보고|합격|불합격|연장|재관측"
+    r"(" + _GIVEN_VERDICT + r"|결과\s*보고|종료\s*보고|합격|불합격|연장|재관측"
     r"|실제\s*종료|결과\s*갱신|(검증|관측|테스트|카나리)\s*완료)",
     re.IGNORECASE,
 )
@@ -194,8 +204,14 @@ VERDICT = re.compile(
 # nor a topic ("판정은 종료 후") — a real one then still says 합격/불합격.
 # Matching the 200-char window instead cleared ccc-node#1528 on
 # "## 오너 결정 반영 — TM-3353 판정표 후속", which judged nothing.
+#
+# The negations VERDICT excludes are excluded here too (#2863): "판정 없이
+# 지났습니다" on a first line read as a strict verdict, which also opened the
+# follow-up window and checkbox-verdict-recorded on a comment that judged
+# nothing.
 EARLY_VERDICT = re.compile(
-    r"((?<!중간\s)(?<!중간)판정(?!\s*(표|기준|대기|예정|보류|일정|요청|전)|은|는)"
+    r"((?<!중간\s)(?<!중간)(?<!미)판정"
+    r"(?!\s*(표|기준|대기|예정|보류|일정|요청|전|주체)|은|는|\s*(?:이|도)?\s*없)"
     r"|결과\s*보고|종료\s*보고|합격|불합격"
     r"|실제\s*종료|결과\s*갱신|(검증|관측|테스트|카나리)\s*완료)",
     re.IGNORECASE,
@@ -224,10 +240,10 @@ def _first_line(body: str) -> str:
 # "판정 주체 오너" each demoted a real booking to already-settled, which is
 # never a booking (NOT_A_BOOKING), so the deadline it set was not tracked
 # (#2863; iphone-agent-cast#87/#89, 2026-11-15). Excluded: 미판정, 판정(이/은/도)
-# 없…, 판정 주체/예정/대기. VERDICT is deliberately left as it is.
+# 없…, 판정 주체/예정/대기 — the same _GIVEN_VERDICT that VERDICT uses.
 SETTLED = re.compile(
     r"(완료|✅|통과|합격|불합격|종료\s*보고|결과\s*갱신|실제\s*종료"
-    r"|(?<!미)판정(?!\s*(?:이|은|도)?\s*없|\s*(?:주체|예정|대기)))",
+    r"|" + _GIVEN_VERDICT + r")",
 )
 
 # How much of a comment counts as its "header" when deciding whether the whole
@@ -279,6 +295,7 @@ REL_GENERIC = "generic-duration"  # ccc-node#2659 "며칠씩 … 이어질 수 �
 REL_SYSTEM = "system-behaviour"  # ccc-node#2137 "…않으면 24시간 뒤 `expired`로만 나옵니다" (#2901)
 REL_INTERVAL = "interval-unit"  # nclex#974 "최근 글 간격 며칠 단위" (#2901)
 REL_PRACTICE = "generic-practice"  # ccc-node#2827 "에이전트들이 며칠~몇 주 뒤의 관측을 … 걸고 있다" (#2901)
+REL_TABLE_CELL = "table-cell-content"  # nclex#1112 "| … | 석고붕대 6시간 후 사정 |" (#2863)
 # Issue-level shapes (#2817), applied after the paragraph rules above:
 REL_SUPERSEDED = "superseded-by-absolute"  # iphone-agent-cast#87/#89
 REL_NOT_STARTED = "not-started"  # a2a-nexus#2395
@@ -417,6 +434,17 @@ PRACTICE_ATTRIBUTIVE = re.compile(
 PRACTICE_SUBJECT = re.compile(r"[가-힣]들(?:이|은|도)\s")
 PRACTICE_PREDICATE = re.compile(r"고\s*있(?:다|습니다|음|어요)[\s*_`)）]*$")
 PRACTICE_WINDOW_CHARS = 80
+# An hour offset inside a markdown table row is the row's content, not a
+# booking (#2863): nclex#1112's item table had "| 4 | `RN-BASIC-0039` | … |
+# 전완 골절 도수정복·석고붕대 6시간 후 사정 |" — a nursing step in a question,
+# re-reported every three days. Only "N시간 후/뒤" is judged this way, and a
+# test word anywhere in the same row keeps it a window: an observation word
+# (the guard before every wording rule), a judging word (판정·확인 …) or
+# TABLE_TEST_WORD (종료). The rows of a test plan ("| 롤백 | 24시간 뒤 판정 |")
+# say one of these.
+TABLE_ROW = re.compile(r"^\s*\|")
+TABLE_HOUR_OFFSET = re.compile(r"^\d+\s*시간\s*(?:후|뒤)$")
+TABLE_TEST_WORD = re.compile(r"종료")
 
 # Anchor + offset bookings (#2252). a2a-nexus#1504 booked Phase 7-B as
 # "실행 예약: … OnCalendar=2026-10-09 22:00:00 KST" with "B8: 관측 타이머
@@ -978,7 +1006,18 @@ def _wording_reason(paragraph: str, match: re.Match[str]) -> str | None:
     clause = _clause_after(paragraph, match)
     if PAST_PREDICATE.search(clause) and not FUTURE_INTENT.search(clause):
         return REL_PAST_EVENT
+    if _is_table_cell_content(paragraph, match):
+        return REL_TABLE_CELL
     return None
+
+
+def _is_table_cell_content(paragraph: str, match: re.Match[str]) -> bool:
+    return bool(
+        TABLE_ROW.match(paragraph)
+        and TABLE_HOUR_OFFSET.match(match.group(0))
+        and not JUDGING_WORD.search(paragraph)
+        and not TABLE_TEST_WORD.search(paragraph)
+    )
 
 
 def classify_relative_paragraph(
@@ -1010,7 +1049,7 @@ def classify_relative_paragraph(
         checked before the observation guard below, because here the
         observation is what is being described.
 
-    The remaining eight judge the wording, so they never apply when the
+    The remaining nine judge the wording, so they never apply when the
     paragraph names an observation (``OBSERVATION_WORD``), and every unquoted
     term must be explained by one of them:
 
@@ -1034,6 +1073,10 @@ def classify_relative_paragraph(
     ``past-event-offset``    how long something already took: a past-tense
                              predicate in the term's clause ("15시간 뒤에야
                              일어났고", #2635).
+    ``table-cell-content``   an hour offset ("N시간 후/뒤") in a markdown
+                             table row with no judging word or 종료 in the
+                             row ("| … | 석고붕대 6시간 후 사정 |",
+                             nclex#1112, #2863).
     """
     if author is not None and not is_fleet_author(author):
         return REL_EXTERNAL_AUTHOR

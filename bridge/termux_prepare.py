@@ -57,6 +57,16 @@ MIN_FREE_BYTES = 2 * 1024**3
 REUSE_MATCH_FIELDS = ("android_api", "linker_threads", "lock_subset_sha256", "toolchain")
 LOCK_SUBSET_KEYS = tuple(key for key, _, _ in locks.LOCK_SOURCES)
 MAX_RECEIPT_BYTES = 1024**2
+# Frontend entry-module import smoke (#2935 A). The dependency probes above
+# never import the bridge's own modules, so an import-time error in the target
+# source (#2917: a module-level ZoneInfo("Asia/Seoul") without tzdata) passed
+# readiness, the pointer switched, and the new process crash-looped only after
+# the healthy bridge was stopped. Importing the entry module is side-effect
+# free (settings are bound later by __main__), needs no token or network, and
+# fails the preparation so the pointer never moves to a generation that
+# cannot start. The core runtime carries only the Telegram frontend's
+# dependencies; Matrix/hande entries are checked once their extra is installed.
+CORE_ENTRY_IMPORTS = "import telegram_bot.core.bot"
 # Optional frontend extras (#2175 B). They stay outside the hash lock by design
 # (see each requirements file), so they are installed *constrained to the core
 # runtime's own freeze*: an extra may add packages but never move a core pin.
@@ -66,6 +76,8 @@ EXTRAS = {
         "probe": ("import aiohttp, nio, nio.crypto, olm; "
                   "from nio import AsyncClient, AsyncClientConfig; "
                   "assert nio.crypto.ENCRYPTION_ENABLED, 'matrix-nio built without e2e'"),
+        # The hande frontend rides on the Matrix frontend and its extra.
+        "entry_imports": "import telegram_bot.core.matrix.bot, telegram_bot.core.hande.bot",
         "termux_olm": True,
     },
 }
@@ -343,6 +355,26 @@ def build_environment(work: Path, api: int, jobs: int) -> dict[str, str]:
     return env
 
 
+def reap(child: subprocess.Popen) -> None:
+    """Reap ``child`` without ``Popen.wait``'s internal lock.
+
+    A signal that interrupts ``Popen.wait(timeout=...)`` can raise between the
+    lock acquire and the ``try`` that releases it. The lock then stays held
+    and a later ``child.wait()`` blocks forever, so a cancelled run never
+    writes its receipt (#2903).
+    """
+    if child.returncode is not None:
+        return
+    try:
+        _, status = os.waitpid(child.pid, 0)
+    except ChildProcessError:
+        # The interrupted wait already reaped it and lost the status; match
+        # Popen's own fallback for an unknowable exit status.
+        child.returncode = 0
+        return
+    child.returncode = os.waitstatus_to_exitcode(status)
+
+
 class Runner:
     def __init__(self, work: Path, env: dict[str, str], seconds: float):
         self.work, self.env = work, env
@@ -383,7 +415,7 @@ class Runner:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    child.wait()
+                    reap(child)
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         stage["duration_ms"] = round((time.monotonic() - started) * 1000)
         if stage["status"] != "pass":
@@ -569,6 +601,8 @@ def install_extras(runner: Runner, source: Path, runtime: str, extras: list[str]
         if not before <= after:
             raise PreparationError(f"extra_{name}_changed_core")
         runner.run(f"extra-{name}-imports", [runtime, "-I", "-B", "-c", spec["probe"]])
+        if spec.get("entry_imports"):
+            runner.run(f"extra-{name}-entry-imports", [runtime, "-I", "-B", "-c", spec["entry_imports"]])
         runner.run(f"extra-{name}-pip-check", [*pip, "check"])
         added = _freeze_names(after - before)
         results[name] = {"status": "pass",
@@ -589,6 +623,7 @@ def verify_runtime(runner: Runner, runtime: str, name: str) -> None:
         runner.run(f"{name}-{probe_name}", [runtime, "-I", "-B", *args])
     runner.run(f"{name}-all-native", [runtime, "-I", "-B", "-c",
                "import cryptography.hazmat.bindings._rust,jiter,pydantic_core,rpds,pyromark,claude_agent_sdk"])
+    runner.run(f"{name}-entry-import", [runtime, "-I", "-B", "-c", CORE_ENTRY_IMPORTS])
 
 
 def timeout_value(value: str) -> float:

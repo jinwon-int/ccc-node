@@ -11,9 +11,18 @@
 #   Scans this user's processes for the canonical supervise loop
 #   (`a2a-termux-native-worker.sh supervise`) and for `.../dist/worker.js`
 #   workers. Each process is compared with the file it actually runs: when that
-#   file's mtime is newer than the process start (plus a small slack) or the file
-#   is gone, one line per (kind, file) is printed:
-#     kind=<supervise|worker> pids=<p1,p2> started=<UTC> installed=<UTC|missing> file=<path>
+#   file changed after the process start (plus a small slack) or the file is
+#   gone, one line per (kind, file) is printed. "Changed" is the later of mtime
+#   and ctime: a tar redeploy keeps the build's mtime (2026-11-24: worker.js
+#   mtime 10:29:40 on both Termux nodes, deployed ~3.5 h later), and only the
+#   ctime says the file was replaced:
+#     kind=<supervise|worker> pids=<p1,p2> started=<UTC> installed=<UTC|missing> [changed=<path>] file=<path>
+#   The supervise loop also runs what it sourced at start-up, so for
+#   kind=supervise "installed" is the latest of the script and its
+#   lib/a2a-supervisor-identity.sh (owner decision 2026-11-27). When that
+#   latest file is the lib, `changed=<lib path>` names it; `file=` stays the
+#   script the process runs and stays last on the line (consumers match on it).
+#   A missing lib is ignored (only the script's absence means installed=missing).
 #   With worker_root, only `<worker_root>/dist/worker.js` counts as a worker.
 #   Prints nothing when nothing is stale or when the check cannot run
 #   (fail-open: always returns 0).
@@ -30,6 +39,7 @@ import time
 root, slack = sys.argv[1], float(sys.argv[2])
 want_worker = os.path.realpath(os.path.join(root, "dist", "worker.js")) if root else ""
 SUPERVISE = "a2a-termux-native-worker.sh"
+SUPERVISE_SOURCED = ("lib/a2a-supervisor-identity.sh",)  # sourced by the supervise script
 
 
 def boot_seconds():
@@ -62,6 +72,15 @@ def classify(pid, argv):
     return None, ""
 
 
+def changed_at(path):
+    """Later of mtime and ctime: tar keeps the build's mtime; ctime is the install (#2791 2a)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return max(st.st_mtime, st.st_ctime)
+
+
 def utc(epoch):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
@@ -90,19 +109,24 @@ for proc in glob.glob("/proc/[0-9]*"):
     except (IndexError, ValueError):
         continue
     started = wall_now - (boot_now - start_ticks / tick)
-    try:
-        installed = os.stat(path).st_mtime
-    except OSError:
-        installed = None
+    installed = changed_at(path)
+    changed = path
+    if kind == "supervise" and installed is not None:
+        for rel in SUPERVISE_SOURCED:
+            dep = os.path.join(os.path.dirname(path), rel)
+            dep_at = changed_at(dep)
+            if dep_at is not None and dep_at > installed:
+                installed, changed = dep_at, os.path.realpath(dep)
     if installed is not None and installed <= started + slack:
         continue
-    entry = groups.setdefault((kind, path), {"pids": [], "started": started, "installed": installed})
+    entry = groups.setdefault((kind, path), {"pids": [], "started": started, "installed": installed, "changed": changed})
     entry["pids"].append(pid)
     entry["started"] = min(entry["started"], started)
 
 for (kind, path), entry in sorted(groups.items()):
     installed = "missing" if entry["installed"] is None else utc(entry["installed"])
     pids = ",".join(str(p) for p in sorted(entry["pids"]))
-    print(f"kind={kind} pids={pids} started={utc(entry['started'])} installed={installed} file={path}")
+    changed = f" changed={entry['changed']}" if entry["changed"] != path else ""
+    print(f"kind={kind} pids={pids} started={utc(entry['started'])} installed={installed}{changed} file={path}")
 PY
 }

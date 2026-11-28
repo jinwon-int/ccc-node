@@ -60,7 +60,10 @@ later comment promised a follow-up at an absolute datetime that has passed with
   verdict so far), `cross-reference`, `already-settled`, `claim-eta`,
   `date-only`. "판정" marks a completion report only as a verdict that was
   given: `미판정`, `판정이 없어` / `판정 없이` and `판정 주체/예정/대기` do not
-  demote a booking (#2863). A time already past when the comment was posted is a record,
+  demote a booking (#2863), and they are not a verdict either: a comment after
+  the end that says `판정 없이 지났습니다` or `미판정 상태로 …` leaves the
+  expired finding up, and does not open the follow-up window. `판정 기준`
+  stays a verdict word. A time already past when the comment was posted is a record,
   not a promise (`past-at-posting`), and is never reported.
 - `--include-closed-days N` (followup mode only, default 0 = open issues only)
   also fetches issues closed on or after `now - N days` with a second
@@ -136,8 +139,9 @@ under `dropped_candidates`. Checked in this order:
 | `interval-unit` | the unit of a gap being described: an interval noun (`간격`, `주기`, `빈도`) within 8 characters before the term and `단위` right after it, with no judging word (`판정`, `확인`, `점검`, `승격`, …) in the rest of the sentence | nclex#974 (#2901) |
 | `system-behaviour` | what the system does by itself once a condition holds: a conditional or concessive ending (`…면`, `…아도/어도/해도`) earlier in the **same sentence**, then — within 60 characters after the term, up to the sentence end or table bar — an alert/state noun (`알림`, `경고`, `표시`, `상태`, `만료`, `expired`, `stale`, …) and a closing plain present verb (`나옵니다`, `간다`, `뜬다`, `바뀐다`, …), with no judging word in between. `문제가 없으면 24시간 뒤 알림을 확인한다` and `조건이 맞으면 24시간 뒤 승격됩니다` stay high | ccc-node#2137, iphone-agent-cast#179 (#2901) |
 | `past-event-offset` | how long something already took, in incident forensics: a past-tense predicate (`일어났고`, `걸렸다`, `였다`, `이었습니다`, `했습니다` — a syllable ending in ㅆ other than `있`/`겠`, with a finished ending) within 25 characters after the term, in the same clause (no comma or sentence end in between). `없었다면`, `됐는지`, `뒤에야 판정할 수 있다` stay windows | family-messenger#616, ccc-node#2635 |
+| `table-cell-content` | an hour offset (`N시간 후`/`N시간 뒤`) in a markdown table row (a line starting with `\|`), with no judging word (`판정`, `확인`, `점검`, `승격`, …) and no `종료` anywhere in the row: the row's content, such as a nursing step in a question table. `\| 롤백 \| 24시간 후 판정 \|` stays high, and so does the same content outside a table or a `며칠`/`T+24h` in a row | nclex#1112 (#2863) |
 
-The last eight (from `operational-wording` down) judge the wording, so they never apply when the paragraph names
+The last nine (from `operational-wording` down) judge the wording, so they never apply when the paragraph names
 an observation (`관찰`, `관측`, `소크`, `카나리`, `모니터링`, `파일럿`,
 `시범 운영`, `soak`, `canary`, `monitor`, `observ…`, `pilot`, `burn-in`), and
 every unquoted term in the paragraph must be explained by one of them. The
