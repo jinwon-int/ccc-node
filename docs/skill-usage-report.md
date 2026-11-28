@@ -31,22 +31,36 @@ not counted, matching the curator.
 were recorded (`{"Read": n, "Skill": m, ...}`; a row without `tool` is
 `unknown`, an unexpected value is `other`) (#2881). Reading a `SKILL.md` to
 audit, review or compare skills writes the same row as a `Skill` call, so this
-shows how much of a skill's evidence is reads. It is reported only:
-`use_count`, `window_use_count` and every list below still count all rows.
+shows how much of a skill's evidence is reads. `view_count` is the `Read` +
+`Bash` part of it (owner decision 2026-11-27, #2881 proposal 2): reported
+only, `use_count` and the verdicts still include single reads, because on some
+nodes reading the file is the normal way a skill is used.
 
-The consumers of `usage.jsonl` do not count it the same way (#2881):
+**Audit bursts (#2881 proposal 3).** Rows of `Read`/`Bash` that name at least
+5 distinct skills within 10 minutes (node-wide sliding window) are an audit,
+review or comparison pass, not use. They stay in `usage.jsonl` but every
+all-rows consumer below skips them; the report shows the skipped count per
+skill as `audit_burst_rows`. `Skill` rows are never part of a burst. The rule
+lives in `curator.audit_burst_indices`, with an identical copy in the listing
+policy (`_audit_burst_indices`, parity test in
+`scripts/ccc_skill_usage_report_test.py`).
+
+**Suppressing rows (#2881 proposal 1).** An audit run that reads skill bodies
+on purpose sets `CCC_SKILL_USAGE_SUPPRESS=1`; `skill-usage-log.sh` then writes
+no row (any other value logs as usual). Telling an in-session subagent apart
+from the main session is not done yet: it needs a subagent field in the
+PostToolUse hook input, which is still to be confirmed.
+
+The consumers of `usage.jsonl` count it as follows:
 
 | Consumer | Rows it counts |
 |---|---|
-| this report (`scripts/ccc-skill-usage-report.py`) | all rows (`use_count`, `window_use_count`) |
-| curator (`claude/hooks/skill-review/curator.py` `_read_usage_ledger`) | all rows — stale/archive decisions |
-| listing policy, recent-use tier (`scripts/ccc-skill-listing-policy.py` `recent_usage`) | all rows in the window |
+| this report (`scripts/ccc-skill-usage-report.py`) | all rows except audit bursts (`use_count`, `window_use_count`) |
+| curator (`claude/hooks/skill-review/curator.py` `_read_usage_ledger`) | all rows except audit bursts — stale/archive decisions |
+| listing policy, recent-use tier (`scripts/ccc-skill-listing-policy.py` `recent_usage`) | all rows in the window except audit bursts |
 | listing policy, keep-used tier and fill rank (`skill_tool_used`, `keep_used_candidates`) | `Skill` rows only |
 | promotion usage gate (`scripts/ccc-skill-promotion.py` `_skill_tool_uses`) | `Skill` rows only (plus the Skill-tool record) |
 | skill router (`claude/hooks/lib/skill_router.py`) | `Skill` rows only |
-
-Which of the all-rows consumers should stop counting reads is an open
-decision on #2881; this table describes the code, not a policy.
 
 Missing telemetry is never treated as zero use (#1739, #1675). Each node
 reports `usage_ledgers.<provider>.evidence`:

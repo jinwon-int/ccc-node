@@ -140,6 +140,20 @@ class DecisionTests(PolicyCase):
         self.assertEqual(ov["codex-lane-only"], "name-only")
         self.assertNotIn("absent-core", ov)
 
+    def test_audit_burst_reads_are_not_recent_use(self) -> None:
+        # #2881 proposal 3: five distinct SKILL.md Reads within 10 minutes are an
+        # audit pass — they must not give a stale skill its description back.
+        names = ("burst-a", "burst-b", "burst-c", "burst-d", "stale-one")
+        for name in names[:4]:
+            self.skill(name, f"Describe {name} in enough words to matter for the listing.")
+        self.usage(*({"ts": f"2026-09-26T10:0{i}:00Z", "skill": n, "tool": "Read"} for i, n in enumerate(names)))
+        self.usage({"ts": "2026-09-26T11:00:00Z", "skill": "burst-a", "tool": "Read"})  # a lone read counts
+        self.apply()
+        ov = self.settings()["skillOverrides"]
+        for name in ("burst-b", "burst-c", "burst-d", "stale-one"):
+            self.assertEqual(ov.get(name), "name-only", name)
+        self.assertNotIn("burst-a", ov)
+
     def test_unrelated_settings_keys_survive(self) -> None:
         self.apply()
         doc = self.settings()

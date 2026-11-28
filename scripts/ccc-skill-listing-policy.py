@@ -385,6 +385,32 @@ def claude_autosave_records(state_dir: Path) -> Iterator[tuple[str, dict[str, An
         yield (name if sep else key), rec
 
 
+#: #2881 proposal 3 — same rule as curator.audit_burst_indices (kept in step;
+#: parity test in scripts/ccc_skill_usage_report_test.py): SKILL.md reads that
+#: name >= 5 distinct skills within 10 minutes are an audit pass, not use.
+AUDIT_BURST_WINDOW_SECONDS = 600
+AUDIT_BURST_MIN_SKILLS = 5
+AUDIT_BURST_VIEW_TOOLS = frozenset({"Read", "Bash"})
+
+
+def _audit_burst_indices(rows) -> set[int]:
+    """Indices of (skill, tool, ts) rows inside a SKILL.md read burst."""
+    views = sorted(
+        (when, idx, skill)
+        for idx, (skill, tool, when) in enumerate(rows)
+        if isinstance(skill, str) and tool in AUDIT_BURST_VIEW_TOOLS and when is not None
+    )
+    flagged: set[int] = set()
+    start = 0
+    for end in range(len(views)):
+        while (views[end][0] - views[start][0]).total_seconds() > AUDIT_BURST_WINDOW_SECONDS:
+            start += 1
+        window = views[start:end + 1]
+        if len({skill for _when, _idx, skill in window}) >= AUDIT_BURST_MIN_SKILLS:
+            flagged.update(idx for _when, idx, _skill in window)
+    return flagged
+
+
 def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, dict[str, Any]]:
     """skill -> {"ts": latest ISO timestamp at/after ``cutoff``, "count": n}.
 
@@ -405,13 +431,18 @@ def recent_usage(state_dir: Path, cutoff: datetime) -> dict[str, dict[str, Any]]
             latest[skill] = when
 
     raw = _read_bounded(state_dir / "skill-usage" / "usage.jsonl", MAX_LEDGER_BYTES)
+    rows: list[tuple[Any, Any, Any]] = []
     for line in (raw or b"").splitlines():
         try:
             row = json.loads(line)
         except ValueError:
             continue
         if isinstance(row, dict):
-            note(row.get("skill"), row.get("ts"))
+            rows.append((row.get("skill"), row.get("tool"), row.get("ts")))
+    burst = _audit_burst_indices([(skill, tool, parse_ts(ts)) for skill, tool, ts in rows])
+    for idx, (skill, _tool, ts) in enumerate(rows):
+        if idx not in burst:
+            note(skill, ts)
 
     for skill, rec in claude_autosave_records(state_dir):
         stamps = [t for t in (parse_ts(rec.get(f)) for f in ("last_used_at", "last_viewed_at")) if t]

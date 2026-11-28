@@ -27,6 +27,10 @@ report() { # report [days] — "skill count" lines, newest window first
   exit 0
 }
 [ "$mode" = "report" ] && report "$@"
+# (#2881 proposal 1) An audit/review run that reads SKILL.md bodies sets
+# CCC_SKILL_USAGE_SUPPRESS=1 so the reads never become use evidence. Exact
+# value "1" only; anything else logs as before.
+[ "${CCC_SKILL_USAGE_SUPPRESS:-}" = 1 ] && exit 0
 
 { input="$(cat 2>/dev/null)"; } 2>/dev/null
 [ -n "$input" ] || exit 0

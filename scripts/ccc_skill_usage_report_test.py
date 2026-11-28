@@ -214,6 +214,60 @@ class NodeReportTests(unittest.TestCase):
         self.assertEqual(skills["user-one"]["use_count"], 1)
         self.assertIsNone(skills["repo-one"]["curator_state"])
 
+    def test_audit_burst_rows_leave_every_count(self) -> None:
+        # #2881 proposal 3: Reads naming >= 5 distinct skills within 10 minutes
+        # are an audit pass; proposal 2: view_count is shown apart.
+        base = NOW - timedelta(hours=3)
+        burst = [
+            {"ts": (base + timedelta(seconds=20 * i)).strftime("%Y-%m-%dT%H:%M:%SZ"), "skill": name, "tool": "Read"}
+            for i, name in enumerate(("auto-idle", "fleet-one", "repo-one", "user-one", "ext-one"))
+        ]
+        self.node.ledger(
+            [
+                {"ts": iso(1), "skill": "fleet-one", "tool": "Skill", "runtime": "claude"},
+                {"ts": iso(2), "skill": "fleet-one", "tool": "Read", "runtime": "codex"},
+                {"ts": iso(10), "skill": "fleet-one", "tool": "Read"},
+                {"ts": iso(40), "skill": "user-one", "tool": "Read"},
+                *burst,
+            ]
+        )
+        skills = {s["name"]: s for s in self.node_json()["skills"]}
+        self.assertEqual(skills["repo-one"]["use_count"], 0, "a burst read is not use")
+        self.assertIsNone(skills["repo-one"]["last_used_at"])
+        self.assertEqual(skills["repo-one"]["audit_burst_rows"], 1)
+        self.assertEqual((skills["user-one"]["use_count"], skills["user-one"]["audit_burst_rows"]), (1, 1))
+        fleet = skills["fleet-one"]
+        self.assertEqual((fleet["use_count_ledger"], fleet["view_count"], fleet["audit_burst_rows"]), (3, 2, 1))
+        self.assertEqual(fleet["last_used_at"], iso(1))
+
+    def test_audit_burst_rule_edges_and_parity_with_listing_policy(self) -> None:
+        curator = report_mod._load_curator()
+        spec = importlib.util.spec_from_file_location("listing_policy_parity", HERE / "ccc-skill-listing-policy.py")
+        assert spec is not None and spec.loader is not None
+        listing = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(listing)
+        t0 = NOW
+        at = lambda s: t0 + timedelta(seconds=s)  # noqa: E731
+        four = [(f"s{i}", "Read", at(i)) for i in range(4)]
+        self.assertEqual(curator.audit_burst_indices(four), set(), "four skills is not a burst")
+        five = four + [("s4", "Bash", at(30))]
+        self.assertEqual(curator.audit_burst_indices(five), {0, 1, 2, 3, 4})
+        spread = [(f"s{i}", "Read", at(i * 200)) for i in range(5)]  # 800 s > 10 min
+        self.assertEqual(curator.audit_burst_indices(spread), set())
+        tool_calls = [(f"s{i}", "Skill", at(i)) for i in range(6)]
+        self.assertEqual(curator.audit_burst_indices(tool_calls), set(), "Skill-tool rows never burst")
+        mixed = five + [("s9", "Skill", at(5)), ("s0", "Read", at(5000))]
+        self.assertEqual(curator.audit_burst_indices(mixed), {0, 1, 2, 3, 4})
+        import random
+        rng = random.Random(2881)
+        for _ in range(200):
+            rows = [
+                (rng.choice(["a", "b", "c", "d", "e", "f", 7]), rng.choice(["Read", "Bash", "Skill", None]),
+                 rng.choice([None, at(rng.randint(0, 3600))]))
+                for _ in range(rng.randint(0, 30))
+            ]
+            self.assertEqual(curator.audit_burst_indices(rows), listing._audit_burst_indices(rows), rows)
+
     def test_ledger_tool_values_are_bounded(self) -> None:
         # #2881: the by-tool keys never echo arbitrary ledger text.
         self.assertEqual(report_mod._ledger_tool("Read"), "Read")

@@ -259,6 +259,22 @@ def _ledger_rows(curator: ModuleType, context: Any) -> tuple[str, list[tuple[str
     return ("present" if rows else "missing"), rows
 
 
+def _split_audit_bursts(curator: ModuleType, status: str, rows: list[tuple[str, str, str, datetime]]):
+    """(status, kept rows, burst rows) — #2881 proposal 3.
+
+    Rows inside a SKILL.md read burst (curator.audit_burst_indices) are an
+    audit pass, not use: they leave every count and verdict and are reported
+    per skill as ``audit_burst_rows``. Status follows the kept rows, as in
+    curator._read_usage_ledger (only bursts left = nothing that proves use).
+    """
+    if status != "present":
+        return status, rows, []
+    burst = curator.audit_burst_indices([(skill, tool, when) for skill, _rt, tool, when in rows])
+    kept = [row for idx, row in enumerate(rows) if idx not in burst]
+    dropped = [row for idx, row in enumerate(rows) if idx in burst]
+    return ("present" if kept else "missing"), kept, dropped
+
+
 def _skill_tool_usage(curator: ModuleType, context: Any) -> tuple[str, dict[str, Any]]:
     path = context.state_dir / curator._USAGE_FILE
     try:
@@ -305,6 +321,7 @@ def _node_skill(
     usage: dict[str, Any],
     ledger: list[tuple[str, str, str, datetime]],
     window_start: datetime,
+    bursts: list[tuple[str, str, str, datetime]] | None = None,
 ) -> dict[str, Any]:
     base = classification["base_classification"]
     record = usage["records"].get(curator._record_key(context, name))
@@ -341,6 +358,14 @@ def _node_skill(
         "use_count_skill_tool": tool_count,
         "use_count_ledger": len(rows),
         "use_count_ledger_by_tool": dict(sorted(by_tool.items())),
+        # #2881 proposal 2: SKILL.md reads among the counted rows, shown apart.
+        # Facts only — use_count and the verdicts still include them.
+        "view_count": sum(n for tool, n in by_tool.items() if tool in curator.AUDIT_BURST_VIEW_TOOLS),
+        # #2881 proposal 3: rows dropped from every count as an audit burst.
+        "audit_burst_rows": sum(
+            1 for skill, _rt, _tool, when in (bursts or ())
+            if skill == name and (created is None or when >= created)
+        ),
         "window_use_count": window_count,
         "runtimes": dict(sorted(runtimes.items())),
         "last_used_at": _ts(last_used),
@@ -468,7 +493,7 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
         # The pending queue is node-global (ownership.py state anchor).
         state_dir = state_dir or Path(context.state_dir)
         tool_status, usage = _skill_tool_usage(curator, context)
-        ledger_status, ledger = _ledger_rows(curator, context)
+        ledger_status, ledger, ledger_bursts = _split_audit_bursts(curator, *_ledger_rows(curator, context))
         evidence = curator._usage_evidence(usage, ledger_status)
         if tool_status == "unreadable":
             evidence = "unreadable"
@@ -495,7 +520,7 @@ def build_node_report(providers: Iterable[str], window_days: int) -> dict[str, A
                     # Counted, not listed: it is no skill, so it must not
                     # inflate the unknown origin or read as a never-used skill.
                     continue
-            entry = _node_skill(curator, context, name, classification, usage, ledger, window_start)
+            entry = _node_skill(curator, context, name, classification, usage, ledger, window_start, ledger_bursts)
             entry["usage_evidence"] = evidence
             if family is not None:
                 entry["unknown_reason"] = family
@@ -595,6 +620,8 @@ def _merge_node_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "providers": [e.get("provider") for e in entries],
         "use_count": max(int(e.get("use_count") or 0) for e in entries),
         "use_count_ledger_by_tool": _max_by_key(e.get("use_count_ledger_by_tool") for e in entries),
+        "view_count": max(int(e.get("view_count") or 0) for e in entries),
+        "audit_burst_rows": max(int(e.get("audit_burst_rows") or 0) for e in entries),
         "window_use_count": max(int(e.get("window_use_count") or 0) for e in entries),
         "last_used_at": _latest(_parse_ts(e.get("last_used_at")) for e in entries),
         "created_at": _earliest(_parse_ts(e.get("created_at")) for e in entries),

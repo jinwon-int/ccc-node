@@ -166,5 +166,20 @@ rc=0
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"cat /a/skills/x/SKILL.md"}' | bash "$HOOK" || rc=$?
 ok "#2748: malformed Bash payload fails open with exit 0" '[ "$rc" = 0 ]'
 
+# #2881 proposal 1: an audit run suppresses rows; only the exact value 1 does.
+# Own claude dir so the counts above are untouched.
+SUP_DIR="$TMP/suppress/.claude"; mkdir -p "$SUP_DIR"; chmod 700 "$SUP_DIR"
+# shellcheck disable=SC2034  # SUP_LEDGER is read via eval inside ok()
+SUP_LEDGER="$SUP_DIR/state/skill-usage/usage.jsonl"
+sup_payload='{"tool_name":"Read","tool_input":{"file_path":"/home/x/.claude/skills/wiki-record/SKILL.md"}}'
+rc=0
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+printf '%s' "$sup_payload" | CCC_CLAUDE_DIR="$SUP_DIR" CCC_SKILL_USAGE_SUPPRESS=1 bash "$HOOK" || rc=$?
+ok "CCC_SKILL_USAGE_SUPPRESS=1 records no row and exits 0 (#2881)" \
+  '[ "$rc" = 0 ] && [ ! -s "$SUP_LEDGER" ]'
+printf '%s' "$sup_payload" | CCC_CLAUDE_DIR="$SUP_DIR" CCC_SKILL_USAGE_SUPPRESS=yes bash "$HOOK"
+ok "any other CCC_SKILL_USAGE_SUPPRESS value still records (#2881)" \
+  '[ "$(wc -l < "$SUP_LEDGER")" = 1 ]'
+
 echo "----"; echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ]
