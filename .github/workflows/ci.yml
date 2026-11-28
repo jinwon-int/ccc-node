@@ -250,7 +250,8 @@ jobs:
             scripts/spans_weekly_test.py \
             scripts/work_board_test.py \
             scripts/node_schedules_test.py \
-            scripts/tasker_stall_watchdog_test.py
+            scripts/tasker_stall_watchdog_test.py \
+            scripts/device_lease_test.py
 
   secret-scan:
     name: secret-scan
