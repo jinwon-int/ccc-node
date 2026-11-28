@@ -32,7 +32,41 @@ ok "non-allowlisted unit is denied" test "$rc" -ne 0
 ok "denied unit emits no dry-run execution" test "$(grep -c '^DRY-RUN:' "$TMP/out")" -eq 0
 
 run_wrapper stop a2a-broker.service >/dev/null 2>&1; rc=$?
-ok "unsupported action is denied" test "$rc" -ne 0
+ok "bare entry does not allow stop (restart,status only)" test "$rc" -ne 0
+
+run_wrapper reload a2a-broker.service >/dev/null 2>&1; rc=$?
+ok "unknown action is denied" test "$rc" -ne 0
+
+run_wrapper status a2a-broker.service >"$TMP/out" 2>&1; rc=$?
+ok "bare entry allows read-only status" test "$rc" -eq 0
+ok "status is a fixed systemctl show call" grep -qx -- 'DRY-RUN: /usr/bin/systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ActiveEnterTimestamp,NRestarts -- a2a-broker.service' "$TMP/out"
+
+# Per-unit verbs (#2892 B1)
+printf '%s\n' 'a2a-broker.service' 'inbox.service start,stop,status' 'app.service   restart' > "$ALLOW"
+chmod 600 "$ALLOW"
+run_wrapper start inbox.service >"$TMP/out" 2>&1; rc=$?
+ok "listed start succeeds" test "$rc" -eq 0
+ok "start dry-run is exact" grep -qx -- 'DRY-RUN: /usr/bin/systemctl start -- inbox.service' "$TMP/out"
+run_wrapper stop inbox.service >"$TMP/out" 2>&1; rc=$?
+ok "listed stop succeeds" test "$rc" -eq 0
+ok "stop dry-run is exact" grep -qx -- 'DRY-RUN: /usr/bin/systemctl stop -- inbox.service' "$TMP/out"
+run_wrapper restart inbox.service >"$TMP/out" 2>&1; rc=$?
+ok "unlisted verb restart is denied for start,stop unit" test "$rc" -ne 0
+ok "denied verb emits no dry-run execution" test "$(grep -c '^DRY-RUN:' "$TMP/out")" -eq 0
+run_wrapper restart app.service >/dev/null 2>&1; rc=$?
+ok "explicit restart-only entry (extra spaces) restarts" test "$rc" -eq 0
+run_wrapper status app.service >/dev/null 2>&1; rc=$?
+ok "explicit restart-only entry does not grant status" test "$rc" -ne 0
+run_wrapper start inbox.servicex >/dev/null 2>&1; rc=$?
+ok "near-miss unit name is denied" test "$rc" -ne 0
+
+printf '%s\n' 'inbox.service start,enable' > "$ALLOW"
+run_wrapper start inbox.service >/dev/null 2>&1; rc=$?
+ok "unknown verb in allowlist fails closed" test "$rc" -ne 0
+printf '%s\n' 'inbox.service start' 'inbox.service stop' > "$ALLOW"
+run_wrapper start inbox.service >/dev/null 2>&1; rc=$?
+ok "duplicate unit entry fails closed" test "$rc" -ne 0
+printf '%s\n' 'a2a-broker.service' > "$ALLOW"
 
 printf '%s\n' 'a2a-broker.service' > "$ALLOW"
 chmod 666 "$ALLOW"

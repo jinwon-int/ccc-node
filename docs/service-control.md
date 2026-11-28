@@ -54,8 +54,9 @@ subset.
 - Pre-reviewed self-update remains available through `ccc-self-update.sh`; its
   operator config must be root-owned and unavailable for agent writes.
 - Where a real privilege boundary is required (unprivileged agent account),
-  pre-approved restarts use the installed `ccc-service-control` wrapper and
-  exact `.service` names in `/etc/ccc-node/service-control.allow`.
+  pre-approved service lifecycle uses the installed `ccc-service-control`
+  wrapper (`restart`/`start`/`stop`/`status`, #2892 B1) and exact `.service`
+  names with their allowed verbs in `/etc/ccc-node/service-control.allow`.
 - Broker Compose reconciliation uses the installed `ccc-broker-reconcile`
   wrapper (root-owned, so the agent cannot alter the wrapper or its operator
   config) instead of raw `docker compose up -d`. New runbook needs are reviewed
@@ -69,7 +70,10 @@ to the mutable copy inside a Git checkout.
 1. Install `scripts/ccc-service-control.sh` as
    `/usr/local/libexec/ccc-service-control`, owned by `root:root`, mode `0755`.
 2. Create `/etc/ccc-node/service-control.allow`, owned by `root:root`, mode
-   `0600`, with one exact `.service` unit per line.
+   `0600`, with one exact `.service` unit per line, optionally followed by the
+   verbs it may receive (`restart`, `start`, `stop`, `status`, comma-separated).
+   A bare unit line keeps its pre-#2892 meaning: `restart` plus read-only
+   `status`. A unit listed twice or an unknown verb makes every call fail.
 3. Grant the agent account passwordless sudo only for the installed wrapper.
    Do not use `SETENV`; the wrapper ignores allowlist overrides for real runs.
 4. Keep the agent itself unprivileged and unable to write the wrapper,
@@ -82,19 +86,29 @@ Example allowlist:
 
 ```text
 # exact names; globs and aliases are rejected
-a2a-hermes-worker.service
+a2a-hermes-worker.service   restart,start,stop,status
 ccc-telegram-bridge.service
+# an on-demand app the operator starts and stops per session
+example-inbox.service       start,stop,status
 ```
 
 Example sudoers shape (replace `ccc-agent` with the node's dedicated account):
 
 ```text
-ccc-agent ALL=(root) NOPASSWD: /usr/local/libexec/ccc-service-control restart *
+ccc-agent ALL=(root) NOPASSWD: /usr/local/libexec/ccc-service-control restart *, \
+    /usr/local/libexec/ccc-service-control start *, \
+    /usr/local/libexec/ccc-service-control stop *, \
+    /usr/local/libexec/ccc-service-control status *
 ```
 
-The wildcard does not grant arbitrary service control: the immutable wrapper
-accepts only `restart <exact-unit.service>` and rechecks the root-owned
-allowlist before invoking `/usr/bin/systemctl`.
+The wildcards do not grant arbitrary service control: the immutable wrapper
+accepts only `<restart|start|stop|status> <exact-unit.service>`, rechecks the
+root-owned allowlist for that unit **and verb** before invoking
+`/usr/bin/systemctl`, and never passes `enable`, `disable`, `mask`,
+`daemon-reload` or any other verb. `status` runs a fixed
+`systemctl show --property=…` (state, PID, start time, restart count) and prints
+no journal lines. The allowlist bounds what the account *can* do; whether an
+action also needs owner approval (non-fleet units) is still the policy above.
 
 ### Token lock lifetime
 

@@ -196,7 +196,32 @@
       "reconcile": "query",
       "compensation": "none",
       "audit_surface": "wrapper stderr naming only the unit plus systemd journal records for the restarted unit",
-      "approval_boundary": "root-owned regular wrapper plus exact-unit allowlist /etc/ccc-node/service-control.allow with no group/world writable paths",
+      "approval_boundary": "root-owned regular wrapper plus exact-unit allowlist /etc/ccc-node/service-control.allow (per-unit verbs; a bare entry allows restart and status) with no group/world writable paths",
+      "recovery": {
+        "before_intent": "safe-replay",
+        "after_intent_before_call": "safe-replay",
+        "after_external_success_before_ack": "reconcile",
+        "after_ack_before_terminal": "safe-replay",
+        "duplicate_restart_replay": "reconcile"
+      }
+    },
+    {
+      "operation": "service_control.lifecycle",
+      "owner": "root-installed service start/stop wrapper (#2892 B1)",
+      "registration": {
+        "kind": "shell-main",
+        "path": "scripts/ccc-service-control.sh",
+        "symbol": "<top-level>"
+      },
+      "external": true,
+      "idempotency": "none",
+      "idempotency_key": "none",
+      "retry_class": "manual-only",
+      "ambiguous_window": "systemctl accepted the start or stop before the unit reached its target state or the wrapper exited while the job was still queued",
+      "reconcile": "query",
+      "compensation": "none",
+      "audit_surface": "wrapper stderr naming only the unit plus systemd journal records for the started or stopped unit",
+      "approval_boundary": "root-owned regular wrapper plus exact-unit allowlist /etc/ccc-node/service-control.allow where the unit line names start or stop explicitly, with no group/world writable paths",
       "recovery": {
         "before_intent": "safe-replay",
         "after_intent_before_call": "safe-replay",
