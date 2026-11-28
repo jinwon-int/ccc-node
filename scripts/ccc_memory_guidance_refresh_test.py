@@ -350,8 +350,8 @@ class WebReadingBlock(unittest.TestCase):
 
     def test_template_has_one_web_marker_pair_before_standing_orders(self) -> None:
         lines = CLAUDE_TEMPLATE.splitlines()
-        self.assertEqual(sum(l.strip() == mg.WEB_MARKER_BEGIN for l in lines), 1)
-        self.assertEqual(sum(l.strip() == mg.WEB_MARKER_END for l in lines), 1)
+        self.assertEqual(sum(line.strip() == mg.WEB_MARKER_BEGIN for line in lines), 1)
+        self.assertEqual(sum(line.strip() == mg.WEB_MARKER_END for line in lines), 1)
         self.assertIn(mg.WEB_HAND_WRITTEN, _web_text())
         self.assertLess(
             CLAUDE_TEMPLATE.index(mg.WEB_MARKER_END), CLAUDE_TEMPLATE.index("## Standing Orders")
