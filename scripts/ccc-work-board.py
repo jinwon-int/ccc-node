@@ -257,6 +257,51 @@ def collect(org: str, gh_bin: str = "gh", fleet: Sequence[str] = DEFAULT_FLEET_A
     }
 
 
+# ---------------------------------------------------------------------------- node schedules (stage 3)
+
+SCHEDULES_SCHEMA = "ccc.work-board.schedules.v1"
+COLLECTOR = HERE / "ccc-node-schedules.py"
+NODE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+
+
+def _node_list(value: str) -> list:
+    nodes = [n for n in re.split(r"[\s,]+", value or "") if n]
+    bad = [n for n in nodes if not NODE_RE.match(n)]
+    if bad:
+        raise BoardError("node names must be lowercase [a-z0-9._-]")
+    return nodes
+
+
+def collect_schedules(nodes: Sequence[str], self_node: str = "", ssh_bin: str = "ssh",
+                      python_bin: str = sys.executable, timeout: int = 90,
+                      now: Optional[datetime] = None) -> dict:
+    """Run the read-only collector on every node and keep only its JSON.
+
+    The collector source is piped over SSH (``python3 -``), so the nodes need no
+    install and run the hub's version. A node that cannot be reached, or answers
+    with anything that is not a collector document, becomes an ``error`` row;
+    its stderr is never kept."""
+    src = COLLECTOR.read_text(encoding="utf-8")
+    out = []
+    for node in nodes:
+        if node == self_node:
+            argv = [python_bin, "-", "--node", node]
+        else:
+            argv = [ssh_bin, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", node, f"python3 - --node {node}"]
+        try:
+            proc = subprocess.run(argv, input=src, capture_output=True, text=True, timeout=timeout)
+            doc = json.loads(proc.stdout) if proc.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            doc = None
+        if not isinstance(doc, dict) or doc.get("schema") != "ccc.node-schedules.v1" or not isinstance(doc.get("items"), list):
+            out.append({"node": node, "error": "수집 실패", "items": []})
+            continue
+        doc["node"] = node  # the hub's name for it, not what the node calls itself
+        out.append(doc)
+    now = now or datetime.now(timezone.utc)
+    return {"schema": SCHEDULES_SCHEMA, "collected_at": now.isoformat(timespec="seconds"), "nodes": out}
+
+
 # ---------------------------------------------------------------------------- classify / render
 
 def _kst(ts: str) -> Optional[datetime]:
@@ -514,6 +559,120 @@ def _render_repos(out: list, issues: list, prs: list, stale: list) -> None:
     out.append("")
 
 
+_SCHED_AT = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})")
+
+
+def _sched_at(value: str) -> Optional[datetime]:
+    """A detached-job time like ``2026-11-30 11:40:00 Asia/Seoul`` (fleet time is KST)
+    or an ISO instant from systemd."""
+    if not value:
+        return None
+    if re.search(r"[+-]\d{2}:\d{2}$|Z$", value):
+        return _kst(value)
+    mt = _SCHED_AT.match(value)
+    if not mt:
+        return None
+    return datetime.strptime(f"{mt.group(1)} {mt.group(2)}:{mt.group(3)}", "%Y-%m-%d %H:%M").replace(tzinfo=KST)
+
+
+def _when(item: dict) -> str:
+    at = _sched_at(item.get("next_at") or "")
+    if at is not None:
+        return at.astimezone(KST).strftime("%m-%d %H:%M")
+    if (item.get("source") or "").startswith("systemd"):
+        return "다시 안 돎"  # an elapsed one-shot timer: nothing scheduled any more
+    return _cell(item.get("schedule") or "—", 24)
+
+
+_SOURCE_TITLE = {"systemd": "타이머", "systemd-user": "타이머(사용자)", "cron": "cron", "detached-job": "예약 작업",
+                 "agent-cron": "agent-cron"}
+
+
+def _render_schedules(out: list, schedules: Optional[dict], issues: list, closed: Optional[list],
+                      gen: datetime) -> None:
+    if not schedules:  # stage 3 not wired on this hub, or an older snapshot
+        return
+    nodes = schedules.get("nodes") or []
+    open_keys = {(i["repo"], i["number"]): i for i in issues}
+    closed_keys = {(i["repo"], i["number"]): i for i in closed or []}
+    out += ["## 예약 점검", "",
+            "노드마다 읽기 전용으로 모은 예약(타이머 · cron · 예약 작업 · agent-cron)이다. 이름 · 일정 · 한 줄 설명만 "
+            "모으고 명령줄 · 환경 · 프롬프트는 모으지 않는다. 「일시」 타이머는 재부팅하면 사라진다(#2827).", "",
+            "| 노드 | 타이머 | 일시 타이머 | cron | 예약 작업 | 지난 예약 작업(미확인) | agent-cron(켜짐) | 수집 |",
+            "|---|---|---|---|---|---|---|---|"]
+    linked, stale_jobs = [], []
+    for doc in sorted(nodes, key=lambda d: d.get("node") or ""):
+        items = doc.get("items") or []
+        c = Counter(i.get("source") for i in items)
+        timers = c["systemd"] + c["systemd-user"]
+        transient = sum(1 for i in items if i.get("source", "").startswith("systemd") and i.get("persistent") is False)
+        past = [i for i in items if i.get("source") == "detached-job"
+                and (_sched_at(i.get("next_at") or "") or gen) < gen - timedelta(hours=1)]
+        stale_jobs += [(doc.get("node"), i) for i in past]
+        enabled_ac = sum(1 for i in items if i.get("source") == "agent-cron" and i.get("enabled"))
+        state = doc.get("error") or ("일부 실패" if doc.get("errors") else "ok")
+        out.append(f"| {_cell(doc.get('node'))} | {timers} | {transient} | {c['cron']} | {c['detached-job']} | "
+                   f"{len(past)} | {enabled_ac} | {_cell(state)} |")
+        for i in items:
+            for ref in i.get("issues") or []:
+                key = (ref.get("repo") or "", int(ref.get("number") or 0))
+                if key in open_keys or key in closed_keys:
+                    linked.append((doc.get("node"), i, key))
+    out.append("")
+
+    out += [f"### 이슈에 걸린 예약 ({len(linked)}건)", "",
+            "설명이나 이름에 `저장소#번호`로 적힌 이슈가 열려 있거나 최근 7일 안에 닫힌 것만 싣는다.", ""]
+    if linked:
+        out += ["| 노드 | 다음 실행 · 일정 | 종류 | 이름 | 설명 | 이슈 | 이슈 상태 |", "|---|---|---|---|---|---|---|"]
+        for node, i, key in sorted(linked, key=lambda r: (r[0] or "", r[2])):
+            ref = open_keys.get(key) or closed_keys.get(key)
+            state = "닫힘" if key in closed_keys and key not in open_keys else BUCKET_TITLE.get(ref.get("_bucket", ""), "열림")
+            kind = _SOURCE_TITLE.get(i.get("source"), i.get("source") or "")
+            if i.get("persistent") is False and i.get("source", "").startswith("systemd"):
+                kind += "(일시)"
+            out.append(f"| {_cell(node)} | {_when(i)} | {_cell(kind)} | {_cell(i.get('name'), 60)} | "
+                       f"{_cell(i.get('summary') or '—', 80)} | {_cell(key[0])} {_ref(ref)} | {_cell(state)} |")
+    else:
+        out.append("없음.")
+    out.append("")
+
+    on_closed = [(n, i, k) for n, i, k in linked if k in closed_keys and k not in open_keys]
+    out += [f"### 닫힌 이슈에 걸린 예약 ({len(on_closed)}건)", "",
+            "이슈는 닫혔는데 예약이 남아 있다. 끝난 확인이면 예약을 지운다(지우는 것은 그 노드의 일).", ""]
+    if on_closed:
+        out += ["| 노드 | 이름 | 종류 | 이슈 |", "|---|---|---|---|"]
+        out += [f"| {_cell(n)} | {_cell(i.get('name'), 60)} | {_cell(_SOURCE_TITLE.get(i.get('source'), ''))} | "
+                f"{_cell(k[0])} #{k[1]} |" for n, i, k in on_closed]
+    else:
+        out.append("없음.")
+    out.append("")
+
+    reached = [d for d in nodes if not d.get("error")]
+    referenced = {k for _, _, k in linked}
+    waiting = [i for i in issues if i.get("_bucket") == "date" and (i["repo"], i["number"]) not in referenced]
+    out += [f"### 노드 예약이 안 보이는 날짜 대기 ({len(waiting)}건)", "",
+            "날짜 대기 표식이 있지만 어느 노드의 예약 설명에도 이 이슈가 없다. 오너 입회 세션처럼 노드 예약이 "
+            "필요 없는 일일 수 있다 — 결함이 아니라 확인용 목록이다. 예약을 걸 때 설명에 `저장소#번호`를 적으면 "
+            f"여기서 빠진다. (수집된 노드 {len(reached)}/{len(nodes)})", ""]
+    if waiting:
+        out += [_STATUS_HEADER, "|---|---|---|---|---|---|"]
+        out += [_status_row(i) for i in sorted(waiting, key=_by_due)]
+    else:
+        out.append("없음.")
+    out.append("")
+
+    out += [f"### 지난 예약 작업 — 확인 안 됨 ({len(stale_jobs)}건)", "",
+            "예정 시각이 한 시간 넘게 지났는데 예약 작업 레지스트리에서 확인(ack)되지 않았다. 결과를 보고 "
+            "`detached_jobs.py ack --unit <이름>`으로 닫는다.", ""]
+    if stale_jobs:
+        out += ["| 노드 | 이름 | 예정 | 설명 |", "|---|---|---|---|"]
+        out += [f"| {_cell(n)} | {_cell(i.get('name'), 60)} | {_when(i)} | {_cell(i.get('summary') or '—', 80)} |"
+                for n, i in sorted(stale_jobs, key=lambda r: (r[0] or "", r[1].get("next_at") or ""))]
+    else:
+        out.append("없음.")
+    out.append("")
+
+
 def _render_howto(out: list) -> None:
     out += [
         "## 표식 남기는 법", "",
@@ -550,6 +709,7 @@ def render(snapshot: dict, doc_id: str, today: Optional[date] = None) -> str:
     _render_head(out, doc_id, snapshot.get("org") or "", gen)
     _render_summary(out, issues, prs, by_bucket, stale, snapshot.get("counts") or {})
     _render_buckets(out, by_bucket)
+    _render_schedules(out, snapshot.get("schedules"), issues, snapshot.get("closed"), gen)
     _render_closed(out, snapshot.get("closed"))
     _render_prs(out, prs)
     _render_nodes(out, issues)
@@ -664,6 +824,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--gh-bin", default="gh")
     p.add_argument("--fleet-authors", type=_fleet, default=_fleet(os.environ.get("CCC_WORK_BOARD_FLEET_AUTHORS", "")))
+    p.add_argument("--schedules", default="", help="attach a schedules document (from the schedules command)")
+    p = sub.add_parser("schedules")
+    p.add_argument("--nodes", required=True, help="space/comma separated node names (ssh aliases)")
+    p.add_argument("--self", dest="self_node", default="", help="this hub's own node name (collected without ssh)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--ssh-bin", default="ssh")
     p = sub.add_parser("render")
     p.add_argument("--snapshot", required=True)
     p.add_argument("--doc-id", default="DOC-0")
@@ -678,6 +844,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             p.add_argument("--fleet-authors", type=_fleet,
                            default=_fleet(os.environ.get("CCC_WORK_BOARD_FLEET_AUTHORS", "")))
             p.add_argument("--snapshot-out", default="")
+            p.add_argument("--schedule-nodes", default=os.environ.get("CCC_WORK_BOARD_SCHEDULE_NODES", ""),
+                           help="also collect node schedules over ssh (stage 3); empty = skip")
+            p.add_argument("--self-node", default=os.environ.get("CCC_WORK_BOARD_SELF_NODE", ""))
             p.add_argument("--state-dir", default=os.environ.get("CCC_STATE_DIR", str(Path.home() / ".claude/state")))
         p.add_argument("--page", default=DEFAULT_PAGE)
         p.add_argument("--wiki-agent-bin", default="wiki-agent")
@@ -688,8 +857,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.cmd == "collect":
             snap = collect(args.org, args.gh_bin, args.fleet_authors)
+            if args.schedules:
+                snap["schedules"] = json.loads(Path(args.schedules).read_text(encoding="utf-8"))
             Path(args.out).write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
             print(json.dumps({"ok": True, "items": len(snap["items"]), "repos": len(snap["repos"])}))
+            return 0
+        if args.cmd == "schedules":
+            doc = collect_schedules(_node_list(args.nodes), args.self_node, args.ssh_bin)
+            Path(args.out).write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+            failed = [d["node"] for d in doc["nodes"] if d.get("error")]
+            print(json.dumps({"ok": True, "nodes": len(doc["nodes"]), "failed": failed}, ensure_ascii=False))
             return 0
         if args.cmd == "render":
             snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
@@ -709,6 +886,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except OSError:
                 raise BoardError("another work-board run holds the lock") from None
             snap = collect(args.org, args.gh_bin, args.fleet_authors)
+            if args.schedule_nodes:
+                snap["schedules"] = collect_schedules(_node_list(args.schedule_nodes), args.self_node)
             if args.snapshot_out:
                 Path(args.snapshot_out).write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
         else:

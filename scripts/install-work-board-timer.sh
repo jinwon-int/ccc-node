@@ -7,6 +7,7 @@
 #   install-work-board-timer.sh --org ORG [--dry-run|--apply] [--uninstall]
 #       [--page pages/current/work-board.md] [--on-calendar SPEC]
 #       [--service-name NAME] [--state-dir DIR]
+#       [--schedule-nodes a,b,c --self-node NAME]   # stage 3: node schedules over ssh
 #
 # The unit runs scripts/ccc-work-board.py once a day (default 05:30
 # Asia/Seoul — after the 04:45 node self-update). It reads open issues and PRs
@@ -28,12 +29,16 @@ SYSTEMD_DIR="${CCC_SYSTEMD_DIR:-/etc/systemd/system}"
 SYSTEMCTL="${CCC_SYSTEMCTL:-systemctl}"
 # 52 repositories took about 70 s on 2026-11-26; wiki-agent pr can wait on CI.
 TIMEOUT_START="${CCC_WORK_BOARD_TIMEOUT_START:-1500}"
+# Stage 3 (#2914): read-only schedule collection over ssh. Empty = off (default).
+SCHEDULE_NODES="${CCC_WORK_BOARD_SCHEDULE_NODES:-}"
+SELF_NODE="${CCC_WORK_BOARD_SELF_NODE:-}"
 
 usage() {
   cat <<'EOF'
 Usage: install-work-board-timer.sh --org ORG [--dry-run|--apply] [--uninstall]
        [--page pages/current/work-board.md] [--on-calendar SPEC]
        [--service-name NAME] [--state-dir DIR]
+       [--schedule-nodes a,b,c --self-node NAME]
 
 Installs (or with --uninstall removes) the systemd service + timer that
 rebuilds the fleet work board Wiki page once a day on the hub node. Defaults
@@ -52,6 +57,8 @@ while [ $# -gt 0 ]; do
     --on-calendar) need_val "$1" "${2:-}"; ON_CALENDAR="$2"; shift ;;
     --service-name) need_val "$1" "${2:-}"; SERVICE_NAME="$2"; shift ;;
     --state-dir) need_val "$1" "${2:-}"; STATE_DIR="$2"; shift ;;
+    --schedule-nodes) need_val "$1" "${2:-}"; SCHEDULE_NODES="$2"; shift ;;
+    --self-node) need_val "$1" "${2:-}"; SELF_NODE="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -90,6 +97,16 @@ fi
 [[ "$ORG" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || { echo "bad --org" >&2; exit 2; }
 [[ "$PAGE" =~ ^pages/[A-Za-z0-9._/-]+\.md$ ]] && [[ "$PAGE" != *..* ]] || { echo "bad --page (want pages/<path>.md)" >&2; exit 2; }
 
+SCHEDULE_ARGS=""
+if [ -n "$SCHEDULE_NODES" ]; then
+  [[ "$SCHEDULE_NODES" =~ ^[a-z0-9][a-z0-9._-]*(,[a-z0-9][a-z0-9._-]*)*$ ]] \
+    || { echo "bad --schedule-nodes (want lowercase names joined by commas)" >&2; exit 2; }
+  [ -z "$SELF_NODE" ] || [[ "$SELF_NODE" =~ ^[a-z0-9][a-z0-9._-]{0,62}$ ]] || { echo "bad --self-node" >&2; exit 2; }
+  SCHEDULE_ARGS=" --schedule-nodes $SCHEDULE_NODES${SELF_NODE:+ --self-node $SELF_NODE}"
+elif [ -n "$SELF_NODE" ]; then
+  echo "--self-node needs --schedule-nodes" >&2; exit 2
+fi
+
 RESULT="$STATE_DIR/$SERVICE_NAME.result"
 NOTIFY="$HOME/.claude/hooks/lib/detached_jobs.py"
 NOTIFY_LINE=""
@@ -110,7 +127,7 @@ Environment=HOME=$HOME
 Environment=CCC_STATE_DIR=$STATE_DIR
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/env python3 $ROOT/scripts/ccc-work-board.py run --org $ORG --page $PAGE --state-dir $STATE_DIR --result-file $RESULT
+ExecStart=/usr/bin/env python3 $ROOT/scripts/ccc-work-board.py run --org $ORG --page $PAGE --state-dir $STATE_DIR --result-file $RESULT$SCHEDULE_ARGS
 ${NOTIFY_LINE:+$NOTIFY_LINE
 }TimeoutStartSec=$TIMEOUT_START
 Nice=10

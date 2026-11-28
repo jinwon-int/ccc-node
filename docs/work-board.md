@@ -101,5 +101,46 @@ finds another run holding `<state>/work-board.lock` exits 1.
 
 - Work without an issue (a promise made only in chat) does not appear. Open an
   issue for anything that should be on the board.
-- Scheduled checks on the nodes are not collected yet (planned as a later step
-  of #2914).
+- Node schedules are collected only when the hub is given `--schedule-nodes`
+  (see below); without it the page has no "예약 점검" section.
+
+## Node schedules (stage 3)
+
+`scripts/ccc-node-schedules.py` lists one node's scheduled checks as JSON,
+read-only. The hub pipes the file to each node over SSH
+(`ssh <node> "python3 - --node <node>" < scripts/ccc-node-schedules.py`), so
+nodes need nothing installed and always run the hub's version; the hub's own
+node runs it locally (`--self`).
+
+| source | kept | never kept |
+|---|---|---|
+| detached-jobs registry | unit, scheduled time, summary (scheduled, not acked) | log path, argv |
+| systemd timers (system, user) | timer unit, next run, transient or not, Description | the service's command |
+| crontab | the five schedule fields, the run script's basename, a trailing `# comment` | the command line, arguments, environment assignments |
+| agent-cron | id, name, schedule, enabled | the prompt, notify target |
+
+Free text is cut to one line of 120 characters. References written as
+`repo#123` (or `#123`) are extracted; only `repo#123` is matched to issues.
+
+```bash
+python3 scripts/ccc-work-board.py schedules --nodes "a b c" --self a --out sched.json
+python3 scripts/ccc-work-board.py collect --org <org> --out snap.json --schedules sched.json
+python3 scripts/ccc-work-board.py run --org <org> --schedule-nodes a,b,c --self-node a   # what the timer runs
+scripts/install-work-board-timer.sh --org <org> --schedule-nodes a,b,c --self-node a     # dry-run
+```
+
+A node that cannot be reached (or answers with anything but a collector
+document) becomes a "수집 실패" row; its stderr is not kept. The page then gets
+an "예약 점검" section:
+
+- per node: timers, transient timers (gone after a reboot, #2827), cron lines,
+  scheduled jobs, scheduled jobs more than an hour past and not acked,
+  enabled agent-cron tasks, collection state;
+- schedules that name an open or recently closed issue (`repo#123`);
+- schedules that name an issue closed in the last 7 days — likely leftovers;
+- dated waits that no node schedule names — a check list, not a defect
+  (an owner-attended session needs no node timer);
+- scheduled jobs past due and not acknowledged.
+
+Name the issue as `repo#123` in a schedule's summary or Description so the
+board can link it.
