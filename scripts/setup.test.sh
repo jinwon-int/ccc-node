@@ -502,6 +502,7 @@ unit_run umask002 '
   chmod 775 skills
   install_repo_skills_into skills state/repo-skills.manifest repo-skills
 ' >/dev/null
+# shellcheck disable=SC2034  # u2 is read via eval inside ok()
 u2="$TMP/unit/umask002"
 ok "unit(#2843): umask 0002 install leaves no group/other-writable file or dir" \
   '[ -z "$(find "$u2/skills" -perm /022 -print)" ]'
