@@ -1602,14 +1602,44 @@ def _fts_query_parts(query):
     return parts
 
 
-def _state_rerank(c, rows, query, where, args, limit):
-    """(a)+(c): bm25 position + recency position (+ vector RRF when vectors exist)."""
+# #2885 — how much of the recency weight an OPEN row of a durable kind receives.
+# The kinds are the ones `_mutability` calls static (preference, decision,
+# constraint, procedure): they stay true until someone changes them, so being
+# older is not evidence that they are out of date, and the full recency term
+# pushed exact matches of that kind out of rank 1. A closed row of those kinds
+# has been replaced and keeps the full weight, so a superseded decision still
+# sinks below its replacement (#2464). A small share is kept for open rows as a
+# tie-break: in a 48-row pool it moves a row by at most about one place. Every
+# other kind — task-progress (volatile), observation, context, correction and
+# the legacy/unknown kinds (live-check) — keeps the full weight.
+_RECENCY_STATIC_SHARE = 0.1
+
+
+def _recency_by_kind_enabled():
+    return os.environ.get("NUNCHI_RECENCY_BY_KIND", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _state_rerank(c, rows, query, where, args, limit, as_of=None):
+    """(a)+(c): bm25 position + recency position (+ vector RRF when vectors exist).
+
+    The recency term is scaled by the row's kind (#2885): `_RECENCY_STATIC_SHARE` of it for an
+    open row of a static kind, the full weight for every other row. NUNCHI_RECENCY_BY_KIND=0
+    gives every row the full weight, as before. With `as_of` a row closed after that instant
+    counts as open, as it was then."""
     if not rows:
         return rows
     weight = _env_float("NUNCHI_RECENCY_WEIGHT", 0.25, 0.0, 10.0)
     by_recency = sorted(rows, key=lambda r: (r[4] or "", r[0]), reverse=True)
     rec_pos = {r[0]: i for i, r in enumerate(by_recency)}
-    score = {r[0]: i + weight * rec_pos[r[0]] for i, r in enumerate(rows)}
+    if _recency_by_kind_enabled():
+        static = weight * _RECENCY_STATIC_SHARE
+
+        def share(r):
+            is_open = r[5] is None or (as_of is not None and r[5] > as_of)
+            return static if is_open and r[2] in _MUTABILITY_STATIC else weight
+        score = {r[0]: i + share(r) * rec_pos[r[0]] for i, r in enumerate(rows)}
+    else:
+        score = {r[0]: i + weight * rec_pos[r[0]] for i, r in enumerate(rows)}
     model = _embedder_cached()
     if model is not None:
         vec_ids = _vector_rank(c, model, query, where, args, max(limit * 4, 40))
@@ -1679,7 +1709,7 @@ def search(c, query, target=None, limit=10, include_history=False, state_aware=F
             [like, like] + args + [pool]).fetchall()
     if not state_aware:
         return rows
-    rows = _state_rerank(c, rows, query, where, args, limit)
+    rows = _state_rerank(c, rows, query, where, args, limit, as_of)
     window_n = min(_env_int("NUNCHI_STATE_WINDOW", 5, 0, 50), max(1, limit // 3))
     window = _state_window(c, target, {r[0] for r in rows}, window_n, as_of)
     if window:

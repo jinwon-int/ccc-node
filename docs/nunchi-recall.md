@@ -6,7 +6,7 @@ plain bm25 order on any failure.
 
 | Layer | What it does | Knob (default) |
 |---|---|---|
-| (a) recency re-rank | bm25 candidate pool `limit×4` (≥40) re-ordered by `bm25 position + w × recency position` | `NUNCHI_RECENCY_WEIGHT` (0.25; 0 = off). ≥0.5 starts hiding older facts — STALE sweep 2026-10-22 |
+| (a) recency re-rank | bm25 candidate pool `limit×4` (≥40) re-ordered by `bm25 position + w × recency position`; `w` depends on the row's kind (see below, #2885) | `NUNCHI_RECENCY_WEIGHT` (0.25; 0 = off). ≥0.5 starts hiding older facts — STALE sweep 2026-10-22. `NUNCHI_RECENCY_BY_KIND` (on; `0`/`false`/`off`/`no` = the same `w` for every row, as before) |
 | (b) recent-state window | the peer's newest open facts (not `observation`/`task-progress`) are appended regardless of lexical match, up to `min(N, limit//3)` slots | `NUNCHI_STATE_WINDOW` (5; 0 = off); needs a `--target` |
 | (c) vectors (optional) | if `fact_vecs` holds model2vec vectors, cosine rank is fused with the lexical order by RRF (k=60). Vectors are written at ingest when `numpy`+`model2vec` import; `nunchi.py reindex-vecs` backfills | same env as gotgan: `GOTGAN_EMBED` (auto/off), `GOTGAN_EMBED_MODEL` (`minishlab/potion-multilingual-128M`) |
 
@@ -31,6 +31,40 @@ The pooled shape is adversarial for recency (every fact is the same age); the re
 is what a real peer timeline looks like, and there the window makes the current state visible.
 Bridging two states that share no vocabulary at write time still needs a semantic signal
 (#2464 제안 2); this change only makes the latest state reachable at read time.
+
+## Recency weight by kind (#2885)
+
+The full recency term moved the fact that matched the query best out of rank 1 whenever newer,
+weaker matches surrounded it. That is the point for state (the newest `task-progress` is the
+current one) but not for rules and choices, which stay true until someone changes them. The term
+is therefore scaled by kind:
+
+| row | recency weight |
+|---|---|
+| open `preference`, `decision`, `constraint`, `procedure` (the kinds `_mutability` calls static) | `0.1 × w` — in a 48-row pool it moves a row by at most about one place |
+| every other row: `task-progress`, `observation`, `context`, `correction`, the legacy `fact`/`node` and unknown kinds (live-check), and a **closed** row of any kind | `w`, as before |
+
+A closed static row has been replaced, so a superseded decision still sinks below its
+replacement (#2464). With `--as-of`, a row closed after that instant counts as open. Legacy
+`fact` rows keep the full weight on purpose: their durability is unknown (`_mutability` says
+live-check), and the STALE fixture models state with them. The bench is unchanged (B M_new@5 4/40,
+R both@10 38/40).
+
+Measured on a read-only copy of one node's fact store, production path (`include_history`,
+`state_aware`, 12 rows), the same 59 questions as below; the code before is `main` with the
+query-prefix change:
+
+| question style | in 12 | top 3 | top 1 | MRR |
+|---|---|---|---|---|
+| keyword, before → after | 1.00 → 1.00 | 0.58 → 0.58 | 0.32 → 0.36 | 0.512 → 0.531 |
+| natural language, before → after | 0.97 → 0.97 | 0.75 → 0.75 | 0.37 → 0.44 | 0.587 → 0.616 |
+
+In each style 5 targets moved up (static kinds, mostly to rank 1) and 8 moved down by one or two
+places (legacy `fact` and `correction` targets that open static rows now sit above); none was
+lost. 38 of the 59 targets are legacy `fact` rows, which this change does not touch, so most of
+the rank-1 loss measured in the issue remains. `claude/hooks/nunchi/recency-by-kind.test.sh` pins
+the behaviour on a synthetic fixture, including that the switch off is byte-identical to the
+previous re-rank.
 
 ## Inflected Korean words in the query (#2885)
 
