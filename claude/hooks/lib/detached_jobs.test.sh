@@ -828,6 +828,100 @@ ok "#2827B: an unexpected error stays silent for sweep (rc 0) and is loud for ex
   '[ "$(sed -n 1p <<<"$out")" = "rc=0" ] && grep -q "restore-timers failed: RuntimeError" <<<"$out" && grep -q "export-timers failed: RuntimeError" <<<"$out" && [ "$(grep -c "^rc=1$" <<<"$out")" = 2 ]'
 unset FAKE_SYSTEMD SDR_LOG
 
+
+# ---- #2827 proposal A: schedule --durable (persistent unit files) -----------
+# Persistent .service + .timer written to a unit dir (CCC_DETACHED_UNIT_DIR in
+# tests), enabled, and removed by the wrapper after the run. The fake systemctl
+# logs its argv and calls a timer "active" while its unit file exists.
+UD="$TMP/units"; mkdir -p "$UD" || exit 1
+DLOG="$TMP/durable-systemctl.log"; : > "$DLOG"
+DREG="$TMP/reg-durable.jsonl"; : > "$DREG"
+export CCC_DETACHED_UNIT_DIR="$UD" DURABLE_CTL_LOG="$DLOG"
+write_exec_stub "$TMP/bin/systemctl" <<'SH'
+{ printf '%s ' "$@"; echo; } >> "${DURABLE_CTL_LOG:?}"
+[ "$1" = "--user" ] && shift
+case "$1" in
+  daemon-reload|disable) exit 0 ;;
+  enable) [ -n "${DURABLE_ENABLE_FAIL:-}" ] && { echo "Failed to enable unit: boom" >&2; exit 1; }; exit 0 ;;
+  is-active)
+    case "$2" in *.timer) [ -f "${CCC_DETACHED_UNIT_DIR:?}/$2" ] && { echo active; exit 0; } ;; esac
+    exit 3 ;;
+esac
+exit 3
+SH
+DFUT="2099-01-02 03:04:05 Asia/Seoul"
+
+out="$(HOME=/home/sched python3 "$MOD" schedule --unit dur-p --at "$DFUT" --log "$TMP/dur-p.log" --summary "night check" --durable --print -- bash -c 'echo "x $HOME" 100%')"; rc=$?
+ok "#2827A: --durable --print shows both unit files and the systemctl steps, writes nothing" \
+  '[ "$rc" = 0 ] && grep -q "^### $UD/dur-p.service" <<<"$out" && grep -q "^### $UD/dur-p.timer" <<<"$out" \
+   && grep -q "^OnCalendar=$DFUT$" <<<"$out" && grep -q "^Persistent=true$" <<<"$out" && grep -q "^Type=oneshot$" <<<"$out" \
+   && grep -q "^WantedBy=timers.target$" <<<"$out" && grep -q "enable --now dur-p.timer" <<<"$out" \
+   && [ -z "$(ls -A "$UD")" ] && [ ! -s "$DLOG" ]'
+ok "#2827A: --durable escapes systemd \$ and % in ExecStart (rc and 100% reach bash intact)" \
+  'grep -q "rc=\$\$?" <<<"$out" && grep -q "100%%" <<<"$out" && grep -q "Environment=\"HOME=/home/sched\"" <<<"$out"'
+
+out="$(python3 "$MOD" schedule --unit dur-r --at "05:00" --log "$TMP/dur-r.log" --durable -- true 2>&1; echo "rc=$?")"
+ok "#2827A: --durable refuses a recurring/relative time" 'grep -q "rc=2" <<<"$out" && grep -q "absolute time" <<<"$out"'
+out="$(python3 "$MOD" schedule --unit dur-o --at "2001-01-01 00:00 UTC" --log "$TMP/dur-o.log" --durable -- true 2>&1; echo "rc=$?")"
+ok "#2827A: --durable refuses a time already in the past" 'grep -q "rc=2" <<<"$out" && grep -q "in the past" <<<"$out"'
+
+out="$(HOME=/home/sched python3 "$MOD" schedule --unit dur-a --at "$DFUT" --log "$TMP/dur-a.log" --summary "night check" --tier action --durable --registry "$DREG" -- bash -c 'echo ran "$HOME"; exit 4' 2>&1)"; rc=$?
+ok "#2827A: --durable installs the pair, reloads, enables the timer, and records a durable row without launch_argv" \
+  '[ "$rc" = 0 ] && [ -f "$UD/dur-a.service" ] && [ -f "$UD/dur-a.timer" ] \
+   && grep -qx "daemon-reload " "$DLOG" && grep -qx "enable --now dur-a.timer " "$DLOG" \
+   && python3 -c "import json,sys
+r=[json.loads(l) for l in open(sys.argv[1]) if l.strip()][-1]
+assert r[\"unit\"]==\"dur-a\" and r[\"durable\"] is True and \"launch_argv\" not in r and r[\"tier\"]==\"action\"
+assert r[\"scheduled_epoch\"]>0 and r[\"unit_files\"]==sorted([sys.argv[2]+\"/dur-a.service\",sys.argv[2]+\"/dur-a.timer\"])" "$DREG" "$UD"'
+
+# shellcheck disable=SC2034  # read via eval inside ok()
+before="$(cat "$UD/dur-a.timer")"
+out="$(python3 "$MOD" schedule --unit dur-a --at "$DFUT" --log "$TMP/dur-a.log" --durable --registry "$DREG" -- true 2>&1; echo "rc=$?")"
+ok "#2827A: --durable never overwrites an existing unit file" 'grep -q "rc=3" <<<"$out" && grep -q "already exists" <<<"$out" && [ "$(cat "$UD/dur-a.timer")" = "$before" ]'
+
+out="$(DURABLE_ENABLE_FAIL=1 python3 "$MOD" schedule --unit dur-f --at "$DFUT" --log "$TMP/dur-f.log" --durable --registry "$DREG" -- true 2>&1; echo "rc=$?")"
+ok "#2827A: a failed enable removes the files it wrote and registers nothing" \
+  'grep -q "rc=3" <<<"$out" && [ ! -e "$UD/dur-f.service" ] && [ ! -e "$UD/dur-f.timer" ] && ! grep -q "\"dur-f\"" "$DREG"'
+
+# Reboot-safety bookkeeping: an armed durable timer is reported armed and
+# never replayed; one whose files vanished is reported, not re-armed.
+python3 "$MOD" export-timers --registry "$DREG" > "$TMP/dsnap.json" 2>/dev/null
+ok "#2827A: export-timers lists an armed durable timer as armed and marks it durable (nothing to replay)" \
+  'python3 -c "import json,sys
+d=json.load(open(sys.argv[1])); t={x[\"unit\"]:x for x in d[\"timers\"]}[\"dur-a\"]
+assert t[\"state\"]==\"armed\" and t[\"durable\"] is True and \"launch_argv\" not in t and len(t[\"unit_files\"])==2" "$TMP/dsnap.json"'
+
+# Run the generated ExecStart the way systemd would: unquote, $$->$ and %%->%.
+python3 - "$UD/dur-a.service" > "$TMP/dur-a.exec" <<'PY'
+import re, sys
+line = [l for l in open(sys.argv[1]) if l.startswith("ExecStart=")][0][len("ExecStart="):].strip()
+m = re.fullmatch(r'/bin/bash -c "((?:[^"\\]|\\.)*)"', line)
+body = re.sub(r'\\(.)', r'\1', m.group(1)).replace("$$", "$").replace("%%", "%")
+print(body)
+PY
+export CCC_PUSH_SPOOL="$TMP/spool-durable"; mkdir -p "$CCC_PUSH_SPOOL"
+HOME=/home/sched bash -c "$(cat "$TMP/dur-a.exec")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
+ok "#2827A: the unescaped wrapper runs the job, keeps its exit code, writes EXIT= and a notice" \
+  '[ "$rc" = 4 ] && grep -q "^ran /home/sched$" "$TMP/dur-a.log" && tail -1 "$TMP/dur-a.log" | grep -qx "EXIT=4" \
+   && ls "$CCC_PUSH_SPOOL"/*DetachedJob-dur-a-*.json >/dev/null 2>&1'
+ok "#2827A: after the run the wrapper disables the timer and deletes both unit files" \
+  '[ ! -e "$UD/dur-a.service" ] && [ ! -e "$UD/dur-a.timer" ] && grep -qx "disable dur-a.timer " "$DLOG"'
+
+python3 "$MOD" schedule --unit dur-g --at "$DFUT" --log "$TMP/dur-g.log" --durable --registry "$DREG" -- true >/dev/null 2>&1
+rm -f "$UD/dur-g.timer" "$UD/dur-g.service"
+# shellcheck disable=SC2034  # read via eval inside ok()
+n_enable="$(grep -c "^enable" "$DLOG")"
+out="$(python3 "$MOD" restore-timers --registry "$DREG" 2>&1)"
+ok "#2827A: restore-timers reports a durable job whose timer vanished and does not re-arm it" \
+  'grep -q "dur-g" <<<"$out" && grep -q "not re-armed automatically" <<<"$out" && [ "$(grep -c "^enable" "$DLOG")" = "$n_enable" ] && [ ! -e "$UD/dur-g.timer" ]'
+
+out="$(python3 "$MOD" schedule --unit dur-u --at "$DFUT" --log "$TMP/dur-u.log" --durable --user --print -- true)"
+ok "#2827A: --durable --user targets the user manager in the steps and the cleanup" \
+  'grep -q "systemctl --user daemon-reload && systemctl --user enable --now dur-u.timer" <<<"$out" && grep -q "systemctl --user disable" <<<"$out"'
+unset CCC_DETACHED_UNIT_DIR DURABLE_CTL_LOG
+
 # The summary line format is load-bearing: validate-harness.sh's
 # suite_summary() greps for exactly ^PASS=<n> FAIL=<n>$, so a lowercase variant
 # reads as a suite that asserted nothing.

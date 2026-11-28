@@ -89,10 +89,22 @@ restores from the registry alone (no pre-reboot comparison). Jobs without
 `launch_argv` stay `unrestorable` — re-create them from their issue comment or
 the job's script directory.
 
-## Why not just make the timers persistent?
+## Persistent timers: `schedule --durable` (#2827 proposal A)
 
-A persistent unit (`/etc/systemd/system` or `~/.config/systemd/user`, with
-`Persistent=true`) would survive the reboot, but writing and enabling it is a
-node configuration change (fresh approval on most hosts) and is tracked
-separately as #2827 proposal A (`schedule --durable`). Until that lands, the
-steps above are the required reboot procedure.
+`detached_jobs.py schedule --durable` writes the job as a persistent pair —
+`<unit>.service` (oneshot) + `<unit>.timer` (`Persistent=true`) under
+`/etc/systemd/system` (or `~/.config/systemd/user` with `--user`) — enables the
+timer, and has the wrapper disable the timer and delete both files after the
+run. Such a job survives a reboot with no export/restore step; a run whose time
+passed while the node was down fires once at the next boot. `export-timers`
+lists it as `armed` with `durable: true`, and `restore-timers` never replays it
+(if its timer has vanished it is reported, not re-armed).
+
+- It is one-shot: `--at` must be an absolute future instant
+  (`YYYY-MM-DD HH:MM[:SS] [zone]`). Recurring checks stay with agent-cron or a
+  hand-written unit.
+- Writing unit files is a node configuration change: it needs the same
+  approval as a hand-written persistent unit. `--print` shows both files and
+  the `systemctl` steps without writing anything.
+- Jobs already armed with plain `schedule` are not converted; for them the
+  export/restore steps above remain the reboot procedure.

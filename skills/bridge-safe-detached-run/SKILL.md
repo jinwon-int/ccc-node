@@ -194,10 +194,12 @@ use the `setsid`/`nohup` fallback with a sleep-until and the same `notify`.
 `Automatic-Reboot`, a provider maintenance or a power cut — so the job never
 runs and the owner's promised check silently does not happen (same property as
 #2287 for `systemd-run` timers in general). Use `schedule` for waits that
-cannot cross a reboot. For a wait that spans nights or days, write a persistent
-unit pair under `/etc/systemd/system/` (or `~/.config/systemd/user/`) with
-`Persistent=true` on the timer and the same `EXIT=`/`notify` tail, and remove it
-after it fires. A row whose `--at` is a single instant records
+cannot cross a reboot. For a wait that spans nights or days, use
+`schedule --durable` (an absolute future `--at`): it writes the persistent
+`.service`/`.timer` pair (`Persistent=true`) with the same `EXIT=`/`notify`
+tail and removes it after the run. Writing unit files is a node configuration
+change, so it needs the same approval as a hand-written persistent unit;
+`--print` shows the files first. A row whose `--at` is a single instant records
 `scheduled_epoch`, so the SessionStart sweep keeps it for a week after it was
 due (not after it was registered) and a vanished timer shows up as `lost`; a
 recurring spec keeps the registration-time week.
