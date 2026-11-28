@@ -344,7 +344,7 @@ leaving it enrolled but stopped), delete the CF token.
 
 | Gap | Why | Tracking |
 |---|---|---|
-| Push spool on the hande bridge | closed: the hande unit is the node's one spool consumer since the Matrix retirement (see *One push-spool consumer per node*); on gongmyoung 2026-11-28 the unit runs `CCC_PUSH_ENABLED=true` and records reach `sent/` | #2380 (done) |
+| Push spool on the hande bridge | closed: the hande unit is the node's one spool consumer since the Matrix retirement (see *One push-spool consumer per node*); measured 2026-11-28 on a hande-only node: the unit runs `CCC_PUSH_ENABLED=true` and records reach `sent/` | #2380 (done) |
 | Multi-room per node | the bot serves one agent room and sends no `room` | family-messenger#423 (bridge already keys by `(user, room)` when `room` is present) |
 | Live preview (edited bubble) | the port has no edit frame; progress lines are `interim` (`interim_frames`) | family-messenger#423 |
 | Attachments: the bot side, voice | the bridge accepts `turn.attachment` (#2606, `attachment_frames`); the bot still drops `file-v1-*`/`file-v2-*` messages before the responder until its sender lands. Voice notes are not part of the contract | family-messenger#636 |
