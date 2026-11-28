@@ -874,6 +874,7 @@ r=[json.loads(l) for l in open(sys.argv[1]) if l.strip()][-1]
 assert r[\"unit\"]==\"dur-a\" and r[\"durable\"] is True and \"launch_argv\" not in r and r[\"tier\"]==\"action\"
 assert r[\"scheduled_epoch\"]>0 and r[\"unit_files\"]==sorted([sys.argv[2]+\"/dur-a.service\",sys.argv[2]+\"/dur-a.timer\"])" "$DREG" "$UD"'
 
+# shellcheck disable=SC2034  # read via eval inside ok()
 before="$(cat "$UD/dur-a.timer")"
 out="$(python3 "$MOD" schedule --unit dur-a --at "$DFUT" --log "$TMP/dur-a.log" --durable --registry "$DREG" -- true 2>&1; echo "rc=$?")"
 ok "#2827A: --durable never overwrites an existing unit file" 'grep -q "rc=3" <<<"$out" && grep -q "already exists" <<<"$out" && [ "$(cat "$UD/dur-a.timer")" = "$before" ]'
@@ -899,7 +900,9 @@ body = re.sub(r'\\(.)', r'\1', m.group(1)).replace("$$", "$").replace("%%", "%")
 print(body)
 PY
 export CCC_PUSH_SPOOL="$TMP/spool-durable"; mkdir -p "$CCC_PUSH_SPOOL"
-HOME=/home/sched bash -c "$(cat "$TMP/dur-a.exec")"; rc=$?
+HOME=/home/sched bash -c "$(cat "$TMP/dur-a.exec")"
+# shellcheck disable=SC2034  # read via eval inside ok()
+rc=$?
 ok "#2827A: the unescaped wrapper runs the job, keeps its exit code, writes EXIT= and a notice" \
   '[ "$rc" = 4 ] && grep -q "^ran /home/sched$" "$TMP/dur-a.log" && tail -1 "$TMP/dur-a.log" | grep -qx "EXIT=4" \
    && ls "$CCC_PUSH_SPOOL"/*DetachedJob-dur-a-*.json >/dev/null 2>&1'
@@ -908,6 +911,7 @@ ok "#2827A: after the run the wrapper disables the timer and deletes both unit f
 
 python3 "$MOD" schedule --unit dur-g --at "$DFUT" --log "$TMP/dur-g.log" --durable --registry "$DREG" -- true >/dev/null 2>&1
 rm -f "$UD/dur-g.timer" "$UD/dur-g.service"
+# shellcheck disable=SC2034  # read via eval inside ok()
 n_enable="$(grep -c "^enable" "$DLOG")"
 out="$(python3 "$MOD" restore-timers --registry "$DREG" 2>&1)"
 ok "#2827A: restore-timers reports a durable job whose timer vanished and does not re-arm it" \
