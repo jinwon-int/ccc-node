@@ -91,12 +91,34 @@ prompt-level guard; tool use in the turn is still governed by the node's normal 
   "attachment_out_frames": false,
   "skill_frames": false,
   "reply_split": true,
+  "send_to_user_tool": false,
   "bot_reply_max_bytes": 8192,
   "bot_interim_max": 40,
   "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
 }
 ```
 
+- `send_to_user_tool` (default off, #2942) gives the model one tool, `send_to_user(message)`
+  (`mcp__bridge__send_to_user`, `core/send_to_user.py`), for content the owner must receive
+  exactly as written before the turn ends — text to paste elsewhere, exact values.
+  - Why: on Claude Fable 5.x / Mythos 5.x / Opus 5.5, text written between tool calls comes
+    back as a progress-update `thinking` block once it is longer than a sentence or two, and
+    that block is a short summary (#2161 posts it as the interim bubble). A 2 KB body arrived
+    as two lines, and sending it again did not help. Tool inputs are never summarized.
+  - The message goes into the room of the turn being served as one plain `interim` frame,
+    unchanged apart from ANSI/control characters. There is no room argument and no per-call
+    approval: the destination is the one the final answer has.
+  - The tool result is the outcome: `{"ok": true, "bytes": N, "interims_left": M}`, or an error
+    and nothing sent — `too_long` (above one bubble: `min(8192, bot_reply_max_bytes)`; the
+    model splits it), `interim_limit` (the turn has used `bot_interim_max` interims; the bot
+    would drop the frame without a word), `interim_frames_off`, `no_active_turn`,
+    `send_failed`. Nothing is cut and nothing is dropped in silence.
+  - It needs `interim_frames: true` and the Claude provider.
+  - A provider session only gets the tool from its first turn: adding a tool to a session
+    under way changes the conversation prefix and invalidates its earlier thinking blocks.
+    The session record keeps the id the tool was declared for (`send_to_user_session`), so
+    switching the knob on takes effect with each room's next new session (`/new`, or the
+    automatic new session), and an older session resumed later stays as it was.
 - `attachment_frames` (default off, #2606) accepts `turn.attachment` (see the mapping table).
   `attachment_spool_dir` is required with it: the **same absolute path** the bot writes
   decrypted attachments to — a frame `path` is accepted only as a direct child

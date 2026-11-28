@@ -48,7 +48,7 @@ from telegram_bot.contracts.transport import (  # noqa: F401 (TransportPort re-e
     TurnResult,
     TurnSink,
 )
-from telegram_bot.core import restart_handoff, session_resume, tool_policy
+from telegram_bot.core import restart_handoff, send_to_user, session_resume, tool_policy
 from telegram_bot.core import revert as revert_ops
 from telegram_bot.core.claude_default_model import claude_default_model
 from telegram_bot.core.skill_display import bounded_skills
@@ -781,6 +781,11 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         self._active_sink: Any = None
         # #2001: event id of the turn being served, keying its outbound files.
         self._active_turn_id = ""
+        # #2942: the room of the turn being served — where ``send_to_user`` posts.
+        self._active_room_id = ""
+        self._send_to_user_server: Any = None
+        self._send_to_user_built = False
+        self._send_to_user_waiting_logged = False
         self._config: Mapping[str, Any] | None = None
         self._ids: MatrixIdMap | None = None
         self._direct_rooms: _DirectRoomMap | None = None
@@ -2367,6 +2372,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         body = str(job.get("body") or "")
         self._active_sink = sink
         self._active_turn_id = str(job.get("event_id") or "")
+        self._active_room_id = room_id
         try:
             # #1955: before attachment staging, command parsing or self-jobs.
             if self._refuses_non_owner_turn(user_id):
@@ -2416,6 +2422,7 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         finally:
             self._active_sink = None
             self._active_turn_id = ""
+            self._active_room_id = ""
 
     async def _run_attachment(
         self, job: Mapping[str, Any], *, user_id: int, chat_id: int, room_id: str, sink: TurnSink
@@ -2963,6 +2970,10 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         # steward MCP server). Empty here; a subclass may add kwargs that
         # ``process_message`` forwards into ``SessionRequest``.
         extra.update(self._turn_request_extras())
+        # #2942: the verbatim mid-turn tool, declared only from a session's first turn.
+        send_to_user_offered = self._offer_send_to_user(
+            extra, session, None if new_session else session_id
+        )
         response = await self._record_turn_health(self._project_chat.process_message(
             user_message=body,
             user_id=user_id,
@@ -2982,6 +2993,8 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
             **extra,
         ))
         await self._save_session_id(key, response, user_id=user_id, chat_id=chat_id)
+        if send_to_user_offered:
+            await self._mark_send_to_user_session(key, response)
         if getattr(response, "success", True):
             await self._record_codex_checkpoint(
                 key, response, request_text=body, turn_marker=turn_marker,
@@ -2993,6 +3006,83 @@ class MatrixBot(MemoryDistillMixin, DansoRecoveryMixin, MatrixWaitStatusMixin):
         """Extra ``process_message`` kwargs for every turn of this frontend (none for Matrix)."""
 
         return {}
+
+    # -- send_to_user: verbatim mid-turn delivery (#2942) -----------------------
+
+    def _send_to_user_enabled(self) -> bool:
+        """Opt-in per frontend config (``send_to_user_tool``), Claude provider only."""
+
+        try:
+            enabled = bool(self.load_config().get("send_to_user_tool", False))
+        except Exception:  # noqa: BLE001 - unreadable config: the tool stays off
+            return False
+        return enabled and self._active_provider() == "claude"
+
+    def _send_to_user_max_bytes(self) -> int:
+        """One bubble: the transport's reply limit when it has one, capped at the frame bound."""
+
+        limit = getattr(self._transport, "bot_reply_max_bytes", None)
+        if type(limit) is int and limit > 0:
+            return min(limit, send_to_user.DEFAULT_MAX_BYTES)
+        return send_to_user.DEFAULT_MAX_BYTES
+
+    def _offer_send_to_user(
+        self, extra: dict[str, Any], session: Mapping[str, Any], session_id: str | None
+    ) -> bool:
+        """Add the tool to this turn's request when the session may carry it.
+
+        Declared on a fresh session and on the session it was declared for,
+        never added to one already under way (see
+        :func:`send_to_user.offered_for_session`). True when it was added.
+        """
+
+        if not self._send_to_user_enabled():
+            return False
+        if not send_to_user.offered_for_session(session, session_id):
+            if not self._send_to_user_waiting_logged:
+                self._send_to_user_waiting_logged = True
+                logger.info("send_to_user tool waits for a new session (not added mid-session)")
+            return False
+        if not self._send_to_user_built:
+            self._send_to_user_built = True
+            self._send_to_user_server = send_to_user.build_send_to_user_server(
+                self._send_to_user, max_bytes=self._send_to_user_max_bytes
+            )
+        if self._send_to_user_server is None:
+            return False
+        send_to_user.merge_request_extras(extra, self._send_to_user_server)
+        return True
+
+    async def _mark_send_to_user_session(self, key: Any, response: ChatResponse) -> None:
+        """Remember which provider session carries the tool, so its later turns keep it."""
+
+        session_id = getattr(response, "session_id", None)
+        if not session_id or not getattr(response, "success", True):
+            return
+        try:
+            await self._session_manager.patch_session(
+                key, updates={send_to_user.SESSION_FIELD: session_id}
+            )
+        except Exception:  # noqa: BLE001 - worst case the next turn runs without the tool
+            logger.warning("send_to_user session marker not saved", exc_info=True)
+
+    async def _send_to_user(self, message: str) -> Mapping[str, Any]:
+        """Post ``message`` into the room of the turn being served; the tool's outcome.
+
+        A sink with its own ``send_to_user`` (hande) reports exactly what the
+        transport did. Any other sink takes the interim path — the durable
+        outbox on Matrix — and the outcome says the delivery is queued, not
+        confirmed.
+        """
+
+        sink = self._active_sink
+        if sink is None:
+            return {"ok": False, "error": "no_active_turn"}
+        deliver = getattr(sink, "send_to_user", None)
+        if callable(deliver):
+            return await deliver(message)
+        await self._make_interim_callback(sink, self._active_room_id)(message)
+        return {"ok": True, "bytes": len(message.encode("utf-8")), "confirmed": False}
 
     async def _record_turn_health(self, turn: Awaitable[ChatResponse]) -> ChatResponse:
         """Await one agent turn and mark ``agent`` in health.json by its outcome (#1820).
