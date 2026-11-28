@@ -466,6 +466,87 @@ def _is_mutable_ops_fact(text):
     return bool(_MUTABLE_OPS.search(text))
 
 
+# #2885 — meta-records: rows that only say the agent could not confirm, could
+# not find or answered "no record" from the context it was given ("제공된 근거에서
+# 확인되지 않았다", "'기록 없음'으로 답변했다", "could not be verified in the
+# provided context"). They describe one session's retrieval, not the world, and
+# took 12% of the benchmark's top-10 hits. Narrow on purpose — a row is meta only
+# when EVERY sentence of it is:
+#   * a negative finding (_META_NEG) that points at the retrieval context
+#     (_META_CTX), or an answer of "no record" (_META_ANSWERED);
+#   * with no clause joined before it ("…했으나 …", "…, but …"), since that
+#     clause is usually the real finding and the hedge only qualifies it;
+#   * followed by nothing but a hedge tail ("…확인해야 한다", "미확인 상태다").
+# A bare "X는 확인되지 않았다" with no context reference is an open item, not a
+# meta-record, and is kept. Rule-like kinds are never dropped.
+_META_EXEMPT_KINDS = ("constraint", "preference", "decision", "procedure", "correction")
+_META_NEG = re.compile(
+    r"확인(?:되|하)지\s*(?:않|못)|확인할\s*수\s*(?:없|가\s*없)|확인이\s*(?:안\s*되|되지\s*않)"
+    r"|찾(?:지\s*못|을\s*수\s*없)|못\s*찾|기록(?:이|은|도)?\s*없|명시(?:되어\s*있|돼\s*있|되)지\s*않"
+    r"|포함(?:되어\s*있|돼\s*있|되)지\s*않|언급(?:되어\s*있|돼\s*있|되)지\s*않|나타나지\s*않"
+    r"|\b(?:could\s*not|couldn't|cannot|can't|was\s+unable\s+to|unable\s+to|did\s+not|didn't)"
+    r"\s+(?:be\s+)?(?:find|found|verif(?:y|ied)|confirm(?:ed)?|locate[d]?|determine[d]?)\b"
+    r"|\bno\s+(?:record|mention|evidence|information)\b"
+    r"|\bnot\s+(?:found|mentioned|confirmed|verified|recorded|stated)\b",
+    re.IGNORECASE)
+_META_CTX = re.compile(
+    r"제공(?:된|받은)|주어진|검색\s*(?:근거|결과)|발췌|대화(?:에서|에는|상|에)|해당\s*세션"
+    r"|근거(?:에서|에는|에도|로는|에)|(?:Wiki|위키|메모리|기억)\s*(?:근거|발췌|검색|에서|에는)"
+    r"|\b(?:provided|given|retrieved|supplied|available)\s+(?:context|evidence|excerpts?|memory|"
+    r"search\s+results|sources|snippets?|wiki|notes)\b"
+    r"|\bin\s+(?:the|this)\s+(?:conversation|session|transcript|excerpts?)\b",
+    re.IGNORECASE)
+_META_ANSWERED = re.compile(
+    r"['\"‘“「]?기록\s*없음['\"’”」]?\s*(?:으로|이라고|라고)\s*(?:답변|답|응답|안내)(?:했|됐|되었|하였)"
+    r"|\b(?:answered|replied|responded)\s+(?:with\s+)?(?:that\s+)?(?:there\s+(?:is|was)\s+)?"
+    r"[\"']?no\s+record\b",
+    re.IGNORECASE)
+_META_JOIN = re.compile(
+    r"(?:으나|지만|는데|은데|었고|았고|였고|했고|되고|이고|으며|이며|었으며|았으며|였으며|했으며|되며|하며)"
+    r"[\s,]|;|,\s*(?:but|although|while|whereas)\b|\s(?:but|although|however|whereas)\s",
+    re.IGNORECASE)
+_META_HEDGE_TAIL = re.compile(
+    r"확인(?:해야|이\s*필요|할\s*필요)|단정(?:할\s*수\s*없|하지\s*않|할\s*수\s*없다고)"
+    r"|확정(?:할\s*수\s*없|하지\s*않|\s*사실로\s*인계할\s*수\s*없)|미확인|기록\s*없음"
+    r"|답변|답했|응답했|안내했|남았다|남는다"
+    r"|\b(?:needs?|should\s+be|must\s+be|to\s+be)\s+(?:re-?)?(?:checked|verified|confirmed)\b",
+    re.IGNORECASE)
+# "…no record of <object>" — the object of the negative, one phrase with no clause in it.
+_META_OBJECT_TAIL = re.compile(r"(?:of|for|about|on|regarding)\s[^,;:]{1,80}", re.IGNORECASE)
+_META_TAIL_FREE = 12  # characters after the last negative that need no hedge word ("았다.", "는다")
+_META_SENTENCE = re.compile(r"(?<=[다요음함됨])\.\s+|(?<=[.!?])\s+(?=[A-Z가-힣])")
+
+
+def _meta_records_enabled():
+    return os.environ.get("NUNCHI_SKIP_META_RECORDS", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _meta_sentence(sentence):
+    answered = _META_ANSWERED.search(sentence)
+    negs = list(_META_NEG.finditer(sentence))
+    ctxs = list(_META_CTX.finditer(sentence))
+    if not answered and not (negs and ctxs):
+        return False
+    hedges = negs + ([answered] if answered else [])
+    first = min(m.start() for m in hedges)
+    if _META_JOIN.search(sentence[:first]):
+        return False  # a clause before the hedge carries a finding of its own
+    last = max(m.end() for m in hedges + ctxs)  # English names the context after the negative
+    tail = sentence[last:].strip(" .,'\"’”」")
+    if len(tail) <= _META_TAIL_FREE or _META_OBJECT_TAIL.fullmatch(tail):
+        return True
+    # a joined clause after the hedge may be a finding too; only a hedge tail is allowed
+    return not _META_JOIN.search(tail) and bool(_META_HEDGE_TAIL.search(tail))
+
+
+def _is_meta_record(kind, text):
+    """True for a row that only reports what the agent could not confirm or find (#2885)."""
+    if kind in _META_EXEMPT_KINDS or not text:
+        return False
+    sentences = [s for s in _META_SENTENCE.split(text.strip()) if s.strip()]
+    return bool(sentences) and all(_meta_sentence(s) for s in sentences)
+
+
 # #1264 P1-5 — the documented fact taxonomy. procedure is a first-class kind,
 # not an accident: multi-step operational procedures whose canonical home may
 # be skills/Wiki still need their pointer/summary recallable here (measured
@@ -1047,6 +1128,16 @@ def _source_refs(sid, item, transcript_ref):
     return json.dumps(refs, ensure_ascii=False) if refs else None
 
 
+def _write_time_drop(kind, text, skip_meta):
+    """Why an extracted row is not stored at all, or None: "mutable" — transient operational
+    state in a legacy `fact` (#1010); "meta" — a meta-record (#2885, `skip_meta` on)."""
+    if kind == "fact" and _is_mutable_ops_fact(text):
+        return "mutable"
+    if skip_meta and _is_meta_record(kind, text):
+        return "meta"
+    return None
+
+
 def ingest(path):
     try:
         payload = (json.loads(_read_stdin_text()) if path == "-"
@@ -1069,7 +1160,8 @@ def ingest(path):
     c = db()
     pool = _OpenPool(c)  # #1478 — G1/G3/B2 candidates, tokenised once per scope
     n = 0
-    skipped_mutable = 0
+    skip_meta = _meta_records_enabled()
+    dropped = {"mutable": 0, "meta": 0}
     skipped_reasonless_decisions = 0
     flagged_unknown_kind = 0
     for it in items:
@@ -1083,9 +1175,11 @@ def ingest(path):
             continue
         observed = map_observed(it.get("subject"), sid)
         kind = it.get("kind", "fact")
-        # #1010: transient operational-state facts never enter the store.
-        if kind == "fact" and _is_mutable_ops_fact(text):
-            skipped_mutable += 1
+        # #1010 transient operational state and #2885 meta-records never
+        # enter the store (_write_time_drop).
+        drop = _write_time_drop(kind, text, skip_meta)
+        if drop:
+            dropped[drop] += 1
             continue
         rank, review = _verify_rank(it, transcript)
         because = (it.get("because") or "").strip() or None
@@ -1160,9 +1254,10 @@ def ingest(path):
         c.commit()
     print(
         f"ingested {n}/{len(items)} facts (session={sid},"
-        f" skipped_mutable_ops={skipped_mutable},"
+        f" skipped_mutable_ops={dropped['mutable']},"
         f" skipped_reasonless_decisions={skipped_reasonless_decisions},"
-        f" flagged_unknown_kind={flagged_unknown_kind})"
+        f" flagged_unknown_kind={flagged_unknown_kind},"
+        f" skipped_meta_records={dropped['meta']})"
     )
 
 

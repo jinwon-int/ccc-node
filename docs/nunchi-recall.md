@@ -74,6 +74,43 @@ their targets more than real questions do. Cost: on a synthetic 20,000-fact stor
 query went from about 2 ms to about 13 ms (prefix operands match several times more rows).
 `claude/hooks/nunchi/query-prefix.test.sh` pins the behaviour on a synthetic fixture.
 
+## Meta-records are not stored (#2885)
+
+Distillation sometimes turned the agent's own retrieval into a "fact": "X는 제공된 근거에서 확인되지
+않았다", "'기록 없음'으로 답변했다", "could not be verified in the provided context". Such a row
+says what one session's context did not contain, not anything about the world, and later shows up
+in recall as if it were an answer. `ingest()` — the one write path every feed (distill, journal,
+auto-distill, audience feeds) goes through — now drops it before the dedup check and counts it in
+`skipped_meta_records=` on its summary line.
+
+The classifier (`_is_meta_record`) is narrow on purpose. A row is dropped only when **every**
+sentence of it
+
+- reports a negative finding ("확인되지 않았다", "기록이 없다", "명시되지 않았다", "could not
+  find/verify", "no record", "not found", …) **and** points at the retrieval context ("제공된",
+  "발췌", "검색 근거", "대화에서", "해당 세션", "provided/retrieved context", "in the
+  conversation", …), or reports an answer of "no record" ("기록 없음으로 답변했다", "answered that
+  there was no record");
+- has no clause joined before the negative ("…했으나", "…이며", "…, but", "…;"), because that
+  clause is usually a real finding the hedge only qualifies;
+- is followed by nothing but a hedge tail ("…확인해야 한다", "미확인 상태다", "…단정할 수 없다") or,
+  in English, the object of the negative ("no record of <thing>").
+
+So "오븐은 6시에 예열하며 주말 온도는 제공된 근거에서 확인되지 않았다" is kept, and so is a bare
+"X는 확인되지 않았다" with no context reference (an open item, not a meta-record). `constraint`,
+`preference`, `decision`, `procedure` and `correction` rows are never dropped. Rows already in a
+store are not touched; closing them is a separate, owner-approved step.
+
+Knob: `NUNCHI_SKIP_META_RECORDS` (on; `0`/`false`/`off`/`no` = store them as before).
+
+On a read-only copy of one node's fact store the classifier matches 23 of 1,905 open facts (1.2%;
+28 of 3,666 rows including closed ones) — fewer than the 4% the issue estimated with a looser
+pattern. A hand check of 20 random matches found no row with a real finding (one borderline: it
+restates an earlier answer's claim as unverified); of 20 random near-misses (a negative plus a
+context reference, not matched) 17 carry a real finding and are rightly kept, 3 are meta-records
+the rules miss. `claude/hooks/nunchi/meta-records.test.sh` pins the behaviour on a synthetic
+fixture.
+
 ## Point-in-time recall, citations and `why` (#2464 제안 3, #2466)
 
 All LLM-free except the one dialectic call that already existed.
