@@ -108,6 +108,9 @@ TURN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # (``reply_split``, #2856); this is the port ceiling so a huge reply never ends
 # the connection.
 MAX_RESULT_TEXT_BYTES = 256 * 1024
+# One ``interim`` frame's text bound (``_bounded_text(text, 8192)``): what one
+# ``send_to_user`` message may carry without being cut (#2942).
+SEND_TO_USER_FRAME_BYTES = 8192
 # Kept free in every part of a split answer, on top of the page marker.
 REPLY_PART_MARGIN_BYTES = 128
 # The line the bot appends to an answer that used skills (family-messenger#834).
@@ -410,6 +413,50 @@ class _HandeSink:
             self._transport._status_resent += 1
             await self._send_status_frame(turn.status_text)
 
+    async def send_to_user(self, text: str) -> dict[str, Any]:
+        """The ``send_to_user`` tool (#2942): one plain ``interim`` frame, with its outcome.
+
+        Unlike :meth:`interim` nothing is bounded or dropped in silence: a
+        message over one bubble, a turn out of interim frames (the bot posts
+        ``interim_max`` per turn and discards the rest without a word) and a
+        port with ``interim_frames`` off are each reported, so the model can
+        split, wait for the final answer or say so.
+        """
+
+        transport, turn = self._transport, self._turn
+        if not self._live():
+            return {"ok": False, "error": "no_active_turn"}
+        if not transport.interim_frames:
+            transport._dropped("send_to_user", "interim-frames-off")
+            return {"ok": False, "error": "interim_frames_off"}
+        size = len(text.encode("utf-8"))
+        limit = min(SEND_TO_USER_FRAME_BYTES, transport.bot_reply_max_bytes)
+        if size > limit:
+            return {"ok": False, "error": "too_long", "bytes": size, "max_bytes": limit}
+        if turn.interims_sent >= transport.bot_interim_max:
+            return {
+                "ok": False,
+                "error": "interim_limit",
+                "interims_sent": turn.interims_sent,
+                "interim_max": transport.bot_interim_max,
+            }
+        if not await self._client.send({"type": "interim", "turn_id": turn.turn_id, "text": text}):
+            return {"ok": False, "error": "send_failed"}
+        turn.interims_sent += 1
+        logger.info(
+            "hande: send_to_user delivered bytes=%d interims_sent=%d", size, turn.interims_sent
+        )
+        # Same re-post as after any interim (#2602): the status-v1 apps drop the
+        # sender's ``⏳`` bubble when a normal message from it lands.
+        if transport.status_frames and turn.status_text and self._live():
+            transport._status_resent += 1
+            await self._send_status_frame(turn.status_text)
+        return {
+            "ok": True,
+            "bytes": size,
+            "interims_left": max(0, transport.bot_interim_max - turn.interims_sent),
+        }
+
     async def _send_status_frame(self, text: str) -> None:
         await self._client.send(
             {
@@ -561,6 +608,21 @@ class _SelfJobSink:
         if not self._live() or not self._transport.interim_frames:
             return
         await self._transport._post_notice(self._room, text)
+
+    async def send_to_user(self, text: str) -> dict[str, Any]:
+        """The ``send_to_user`` tool on a self-job (#2942): a ``notice``, with its outcome."""
+
+        if not self._live():
+            return {"ok": False, "error": "no_active_turn"}
+        if not self._transport.interim_frames:
+            return {"ok": False, "error": "interim_frames_off"}
+        size = len(text.encode("utf-8"))
+        limit = min(SEND_TO_USER_FRAME_BYTES, self._transport.bot_reply_max_bytes)
+        if size > limit:
+            return {"ok": False, "error": "too_long", "bytes": size, "max_bytes": limit}
+        if not await self._transport._post_notice(self._room, text):
+            return {"ok": False, "error": "send_failed"}
+        return {"ok": True, "bytes": size}
 
     async def approval_outcome(self, text: str) -> str:
         if self._live():

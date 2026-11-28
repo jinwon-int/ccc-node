@@ -26,6 +26,7 @@ A small private JSON file, the hande counterpart of the Matrix config:
       "attachment_out_frames": false,
       "skill_frames": false,
       "reply_split": true,
+      "send_to_user_tool": false,
       "bot_reply_max_bytes": 8192,
       "bot_interim_max": 40,
       "attachment_spool_dir": "/var/lib/native-relay-bot/hande-attachments"
@@ -67,6 +68,10 @@ DEFAULT_WAIT_STATUS_INTERVAL_S = 120
 MIN_WAIT_STATUS_INTERVAL_S = 30
 MAX_WAIT_STATUS_INTERVAL_S = 240
 DEFAULT_SOCKET_MODE = 0o660
+# ``send_to_user_tool`` (#2942, default off): give the model a ``send_to_user``
+# tool that posts its message into the turn's room verbatim, as one ``interim``
+# frame. Needs ``interim_frames``. A session only gets the tool from its first
+# turn, so switching it on takes effect with each room's next new session.
 # ``reply_split`` (#2856): a final answer above the bot's message bound is sent as
 # ``(k/N)`` parts. These two mirror the bot's own settings (``reply_max_bytes``,
 # ``interim_max`` in family-messenger ``responder.rs``); change them only together
@@ -188,6 +193,7 @@ def _validate_knobs(config: Mapping[str, Any]) -> dict[str, Any]:
         "attachment_out_frames",
         "skill_frames",
         "reply_split",
+        "send_to_user_tool",
     ):
         # Default on: steward tools, and reply_split (it needs no bot change).
         value = config.get(key, key in ("steward_tools", "reply_split"))
