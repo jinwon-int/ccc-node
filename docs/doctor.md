@@ -259,6 +259,14 @@ writes a `<file>.bak-refresh-guidance-<UTC timestamp>` backup first, then:
 | CLAUDE.md without markers, any other span (node-customized) / unbalanced markers | `refused` — file untouched |
 | A line equal to a known old template line (Standing Orders reads row, MEMORY.md memory-stack line) | replace with the current template line |
 | MEMORY.md stale lines that are not an exact known line | `refused` — file untouched |
+| CLAUDE.md with `<!-- ccc:web-reading:begin -->` … `<!-- ccc:web-reading:end -->` (#2892 A) | replace that block with the template's block |
+| CLAUDE.md without web-reading markers and no hand-written `` `web-reader` sub-agent `` paragraph | insert the template block before `## Standing Orders` (else `## Interaction`, else at the end) |
+| CLAUDE.md without markers but with a hand-written `web-reader` paragraph | no-op (the node's own text) |
+| Unbalanced web-reading markers | that block is left untouched and reported `refused (left untouched)` |
+
+The web-reading block is handled independently of the Memory Stack block: a
+node whose memory span is refused as node-customized still gets the block
+inserted, and the run still exits 1 so the memory refusal is not lost.
 
 Comparison ignores trailing spaces and blank-line runs only. Everything outside
 the managed block / known lines — every node-specific section — is preserved,

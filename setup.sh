@@ -17,7 +17,9 @@
 #                              #   ~/.claude/CLAUDE.md and MEMORY.md files (#2238), then exit:
 #                              #   back up each file (*.bak-refresh-guidance-<UTC>), replace the
 #                              #   marker-delimited Memory Stack block (or a marker-less span that
-#                              #   is a known old template version) and the old memory-stack line.
+#                              #   is a known old template version) and the old memory-stack line,
+#                              #   and keep the marked Web reading block (#2892 A) current —
+#                              #   inserted when missing, unless a hand-written one exists.
 #                              #   Customized spans/lines are refused and left untouched.
 #                              #   Combine with --dry-run to preview; no other flag applies.
 #
@@ -218,7 +220,7 @@ ccc_validate_setup_roots "$CLAUDE_DIR" "$HERMES_ROOT" || exit 2
 # --refresh-guidance (#2238): seed() never overwrites node-owned CLAUDE.md /
 # MEMORY.md, so a template fix (e.g. the Honcho retirement) never reaches an
 # already-seeded node. This standalone mode refreshes only the managed Memory
-# Stack guidance — detection is shared with ccc-doctor's stale-memory-guidance
+# Stack guidance and the Web reading block (#2892 A) — detection is shared with ccc-doctor's stale-memory-guidance
 # row via scripts/ccc_memory_guidance.py — and exits before any install step.
 if [ "$REFRESH_GUIDANCE" = 1 ]; then
   if [ "$WITH_PLUGIN" = 1 ] || [ "$BACKUP" != 1 ] || [ -n "$OPT_NODE$OPT_DISPLAY$OPT_SLOT$OPT_FLEET_ROLE$OPT_LANG$OPT_USER_NAME$OPT_USER_GH$OPT_USER_TZ$OPT_USER_CONTEXT" ]; then

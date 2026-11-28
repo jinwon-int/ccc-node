@@ -15,6 +15,14 @@ module is the single home of that knowledge:
   version, and (c) single lines that equal a known old template line exactly.
   Anything else is refused and left untouched: a node-customized span is the
   operator's to fix by hand.
+* web-reading block (#2892 A) — the same refresh keeps the marker-delimited
+  "Web reading" paragraph of CLAUDE.md current: a marked block is replaced by
+  the template block; a file without the markers gets the block inserted
+  before ``## Standing Orders`` (else ``## Interaction``, else at the end)
+  unless it already carries a hand-written ``web-reader`` paragraph, which is
+  left alone. It is independent of the Memory Stack block, so a node whose
+  memory span is refused still receives it (the run then still reports the
+  refusal and exits 1).
 
 The report names files, line numbers and pattern labels only — never file text.
 """
@@ -76,6 +84,14 @@ MEMORY_STACK_END = "## Fresh Approval Required"
 MARKER_BEGIN = "<!-- ccc:memory-stack:begin -->"
 MARKER_END = "<!-- ccc:memory-stack:end -->"
 _MARKERS = frozenset({MARKER_BEGIN, MARKER_END})
+
+# Web-reading block (#2892 A): the main session reads the web through the
+# isolated ``web-reader`` sub-agent. A hand-written paragraph naming it (the
+# pre-marker form some nodes already carry) counts as present.
+WEB_MARKER_BEGIN = "<!-- ccc:web-reading:begin -->"
+WEB_MARKER_END = "<!-- ccc:web-reading:end -->"
+WEB_HAND_WRITTEN = "`web-reader` sub-agent"
+WEB_INSERT_BEFORE = ("## Standing Orders", "## Interaction")
 
 
 def stale_memory_guidance_hits(text: str) -> list[tuple[int, list[str]]]:
@@ -219,6 +235,18 @@ def template_block(template_text: str) -> list[str]:
     return block
 
 
+def template_web_block(template_text: str) -> list[str]:
+    """The marker-delimited web-reading block of the CLAUDE.md template, markers included."""
+    lines = template_text.splitlines()
+    begins = [i for i, line in enumerate(lines) if line.strip() == WEB_MARKER_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.strip() == WEB_MARKER_END]
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        raise TemplateError(
+            "claude/CLAUDE.md.template must hold exactly one web-reading marker pair"
+        )
+    return [line.rstrip() for line in lines[begins[0] : ends[0] + 1]]
+
+
 def _template_line(template_text: str, prefix: str) -> str:
     found = [line for line in template_text.splitlines() if line.startswith(prefix)]
     if len(found) != 1:
@@ -236,6 +264,8 @@ class Outcome:
     refused: str = ""
     changes: list[str] = field(default_factory=list)
     remaining: list[tuple[int, list[str]]] = field(default_factory=list)
+    # A part left untouched while other parts were still refreshed (#2892 A).
+    partial: str = ""
 
 
 def _replace_known_lines(
@@ -299,6 +329,36 @@ def _refresh_memory_block(lines: list[str], block: list[str]) -> tuple[list[str]
     )
 
 
+def _refresh_web_block(lines: list[str], block: list[str]) -> tuple[list[str], str, str]:
+    """``(new lines, change note, refusal)`` for the web-reading block of CLAUDE.md."""
+    begins = [i for i, line in enumerate(lines) if line.strip() == WEB_MARKER_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.strip() == WEB_MARKER_END]
+    if begins or ends:
+        if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+            return lines, "", "web-reading markers are unbalanced or out of order; fix them by hand"
+        b, e = begins[0], ends[0]
+        if [line.rstrip() for line in lines[b : e + 1]] == block:
+            return lines, "", ""
+        return (
+            lines[:b] + block + lines[e + 1 :],
+            f"L{b + 1}-L{e + 1} web-reading block -> current template block",
+            "",
+        )
+    if any(WEB_HAND_WRITTEN in line for line in lines):
+        return lines, "", ""  # hand-written web-reader paragraph: the node's own, keep it
+    at = next(
+        (i for heading in WEB_INSERT_BEFORE for i, line in enumerate(lines) if line.rstrip() == heading),
+        len(lines),
+    )
+    before = [""] if at > 0 and lines[at - 1].strip() else []
+    after = [""] if at < len(lines) else []
+    return (
+        lines[:at] + before + block + after + lines[at:],
+        f"L{at + 1} web-reading block inserted (template block)",
+        "",
+    )
+
+
 def _join(lines: list[str], original: str) -> str:
     """Re-join edited lines keeping the file's newline style and final newline."""
     newline = "\r\n" if "\r\n" in original else "\n"
@@ -309,14 +369,32 @@ def _join(lines: list[str], original: str) -> str:
 def refresh_claude_md(text: str, template_text: str) -> Outcome:
     """Refresh the Memory Stack block and known stale lines of a node CLAUDE.md."""
     block = [line.rstrip() for line in template_block(template_text)]
+    web_block = template_web_block(template_text)
     lines = text.splitlines()
+    lines, web_note, web_refused = _refresh_web_block(lines, web_block)
+    changes = [web_note] if web_note else []
     lines, note, refused = _refresh_memory_block(lines, block)
     if refused:
-        return Outcome(text, refused=refused, remaining=stale_memory_guidance_hits(text))
-    changes = [note] if note else []
+        if not changes:
+            reason = "; ".join(r for r in (refused, web_refused) if r)
+            return Outcome(text, refused=reason, remaining=stale_memory_guidance_hits(text))
+        new_text = _join(lines, text)
+        return Outcome(
+            new_text,
+            changes=changes,
+            remaining=stale_memory_guidance_hits(new_text),
+            partial=refused,
+        )
+    if note:
+        changes.append(note)
     _replace_known_lines(lines, CLAUDE_KNOWN_LINES, template_text, changes)
     new_text = _join(lines, text) if changes else text
-    return Outcome(new_text, changes=changes, remaining=stale_memory_guidance_hits(new_text))
+    return Outcome(
+        new_text,
+        changes=changes,
+        remaining=stale_memory_guidance_hits(new_text),
+        partial=web_refused,
+    )
 
 
 def refresh_memory_md(text: str, template_text: str) -> Outcome:
@@ -397,18 +475,23 @@ def _process(target: Target, templates: dict[str, str], dry_run: bool, stamp: st
     if outcome.refused:
         print(f"  refused   {label}: {outcome.refused}{left}", file=out)
         return False
+    partial = f"; refused (left untouched): {outcome.partial}" if outcome.partial else ""
+    clean = not outcome.remaining and not outcome.partial
     if outcome.text == text:
-        print(f"  current   {label}: nothing to refresh{left}", file=out)
-        return not outcome.remaining
+        print(f"  current   {label}: nothing to refresh{partial}{left}", file=out)
+        return clean
     what = "; ".join(outcome.changes)
     if dry_run:
-        print(f"  would     {label}: {what} (backup *.bak-refresh-guidance-<UTC>){left}", file=out)
-        return not outcome.remaining
+        print(
+            f"  would     {label}: {what} (backup *.bak-refresh-guidance-<UTC>){partial}{left}",
+            file=out,
+        )
+        return clean
     backup = _backup_path(target.path, stamp)
     shutil.copy2(target.path, backup)
     _atomic_write(target.path, outcome.text)
-    print(f"  refreshed {label}: {what}; backup {backup.name}{left}", file=out)
-    return not outcome.remaining
+    print(f"  refreshed {label}: {what}; backup {backup.name}{partial}{left}", file=out)
+    return clean
 
 
 def run_refresh(
@@ -421,6 +504,7 @@ def run_refresh(
             encoding="utf-8"
         )
         template_block(claude_template)
+        template_web_block(claude_template)
     except (OSError, TemplateError) as exc:
         print(f"refresh-guidance: ERROR: {exc}", file=sys.stderr)
         return 2
