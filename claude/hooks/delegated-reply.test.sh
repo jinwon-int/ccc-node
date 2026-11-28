@@ -29,6 +29,18 @@ TR="$TMP/transcript.jsonl"
 PRJSON="$TMP/pr.json"
 mkdir -p "$CCC_STATE_DIR"
 printf '{"files":[{"path":"docs/a.md"}],"additions":1,"deletions":0,"title":"docs (#1)","author":{"login":"jinon86"},"baseRefName":"main"}' >"$PRJSON"
+# The classifier asks gh for the PR state before it writes a row. A stub answers instead of GitHub:
+# GH_STUB_STATE (default OPEN) is printed, GH_STUB_FAIL=1 exits 1, GH_STUB_SLEEP stalls it.
+GH_STUB="$TMP/gh-stub"
+cat >"$GH_STUB" <<'SH'
+#!/usr/bin/env bash
+[ -n "${GH_STUB_SLEEP:-}" ] && sleep "$GH_STUB_SLEEP"
+[ "${GH_STUB_FAIL:-0}" = 1 ] && exit 1
+echo "${GH_STUB_STATE:-OPEN}"
+SH
+chmod +x "$GH_STUB"
+export CCC_DELEGATED_REPLY_GH="$GH_STUB"
+unset GH_STUB_STATE GH_STUB_FAIL GH_STUB_SLEEP
 
 reset() { rm -rf "$DA"; mkdir -p "$DA"; : >"$TR"; }
 on() { : >"$DA/reply-hook.on"; }
@@ -111,6 +123,41 @@ send '오늘은 여기서 중단하자'
 ok "hold word without the PR number records nothing" '[ -z "$(decisions)" ]'
 send '141 보류'
 ok "another number that merely contains the digits records nothing" '[ -z "$(decisions)" ]'
+
+# --- hold must sit next to the PR number (#2137 observation: ccc-node#2921) ---
+reset; on; ask ccc-node 41 a; say "작업을 계속합니다."
+send '41 진행해 줘. 52는 보류'
+ok "hold word about another PR on the same line records nothing" '[ -z "$(decisions)" ]'
+send $'41번은 진행\n다른 건 전부 보류'
+ok "hold word on another line records nothing" '[ -z "$(decisions)" ]'
+reset; on; ask ccc-node 41 a; say "작업을 계속합니다."
+send '41, 42 보류'
+ok "a listed number before the hold word is still a hold" '[ "$(decisions)" = "41:hold:hold-word:reply" ]'
+reset; on; ask ccc-node 41 a; say "작업을 계속합니다."
+send '보류: 40·41'
+ok "hold word in front of a number list is a hold" '[ "$(decisions)" = "41:hold:hold-word:reply" ]'
+reset; on; ask ccc-node 41 a; say "작업을 계속합니다."
+send '#41 hold'
+ok "the English word next to #N is a hold" '[ "$(decisions)" = "41:hold:hold-word:reply" ]'
+reset; on; ask ccc-node 41 a; say "$ONE"
+send '41 진행해 줘. 52는 보류'
+ok "with the approval on offer, an unrelated hold is a free-text note" '[ "$(decisions)" = "41:reply-unclassified:free-text:reply" ]'
+
+# --- an ask whose PR already merged or closed is stale (#2137 observation: wiki-agent#257) ---
+reset; on; ask ccc-node 41 a; say "$ONE"
+GH_STUB_STATE=MERGED send '41 보류'
+ok "merged PR: nothing recorded" '[ "$rc" = 0 ] && [ -z "$out" ] && [ -z "$(decisions)" ]'
+GH_STUB_STATE=CLOSED send '2'
+ok "closed PR: nothing recorded" '[ -z "$(decisions)" ]'
+GH_STUB_FAIL=1 send '2'
+ok "gh failing: records as before" '[ "$(decisions)" = "41:decline:other-option:reply" ]'
+reset; on; ask ccc-node 41 a; say "$ONE"
+start=$(date +%s)
+GH_STUB_SLEEP=5 GH_STUB_STATE=MERGED send '2'
+ok "a stalled gh is cut off: records as before, well inside the hook timeout" '[ "$rc" = 0 ] && [ "$(decisions)" = "41:decline:other-option:reply" ] && [ $(( $(date +%s) - start )) -le 3 ]'
+reset; on; ask ccc-node 41 a; ask a2a-nexus 41 b; say "$ONE"
+GH_STUB_STATE=MERGED send '2'
+ok "ambiguous PR number with both PRs merged: nothing" '[ -z "$(decisions)" ]'
 
 # --- when in doubt it is not a refusal ---
 reset; on; ask ccc-node 41 a; say "$MANY"

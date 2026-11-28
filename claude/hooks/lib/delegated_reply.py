@@ -12,11 +12,18 @@ Rules — when in doubt, it is not a refusal:
   → nothing; the approval tool records the approval.
 - the block is single-choice, one of its options carries the approval phrase, and the reply picks
   a *different* option of that block → ``decline``.
-- the reply says hold / 보류 / 중단 together with the PR number → ``hold``.
+- the reply puts hold / 보류 / 중단 right next to the PR number ("41 보류", "41은 일단 보류",
+  "보류: 41, 42") → ``hold``. A hold word elsewhere in the reply ("2921 진행, 2922는 보류") is about
+  another item, so it does not count (#2137 3-day observation: ccc-node#2921 was noted hold 37 s
+  before the same head was approved).
 - the block is multi-choice and the approval option was not picked, or the reply is free text
   while the approval option was on the table → ``reply-unclassified`` (a note, not a refusal).
 - two open asks share the PR number (different repositories) → ``reply-unclassified``.
 - anything unrelated to an open ask → nothing.
+- the PR was already merged or closed on GitHub → nothing. The ledger alone cannot tell (an ask is
+  closed only by an approve or decision row), so right before writing a row the hook asks ``gh`` for
+  the PR state, bounded by a short timeout; when ``gh`` fails it records as before (#2137
+  observation: wiki-agent#257 was noted hold 21 min after it merged).
 - a prompt the harness produced (an external-event wake-up, a task notification) → nothing.
 
 Nothing textual is stored: the row holds the class, the source ``reply``, the PR and the head.
@@ -28,6 +35,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -37,7 +45,15 @@ TAIL_BYTES = 400_000
 MARKER_OPEN = "open-asks"
 HEADER_RE = re.compile(r"^\s*\*{0,2}\[(?:답변 필요|Answer needed)\]\*{0,2}\s*(.*)$")
 OPTION_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(.*\S)\s*$")
-HOLD_RE = re.compile(r"(?<![a-z])hold(?![a-z])|보류|중단", re.I)
+HOLD_WORD = r"(?:(?<![a-z])hold(?![a-z])|보류|중단)"
+# Other PR numbers listed with this one ("41, 42 보류", "보류: 41·42") stay part of the same hold.
+NUMBER_LIST = r"(?:\s*[,·/&]\s*#?\d+)*"
+# The gap between the number and the hold word: a particle or a few words, never another number
+# or a sentence break — past that, the word is about something else.
+HOLD_GAP_AFTER = r"[^\d\n,.;!?]{0,10}?"
+HOLD_GAP_BEFORE = r"[^\d\n,.;!?]{0,6}?"
+GH_TIMEOUT_S = 1.2
+GH_BUDGET_S = 2.0  # the wrapper kills the classifier at 3 s; leave room for python start-up
 BARE_NUMBERS_RE = re.compile(r"^[\s\d,.·/&+]+$")
 # Turns the harness starts by itself (a CI or queue wake-up, a background-task notice) arrive as
 # prompts too. They are not the owner answering, so they are never classified.
@@ -155,8 +171,27 @@ def approves(text_norm: str, pr: int) -> bool:
     return bool(re.search(rf"(?<!\d){pr}\s*(?:외부\s*)?승인", text_norm))
 
 
-def mentions(text: str, pr: int) -> bool:
-    return bool(re.search(rf"(?<!\d){pr}(?!\d)", text))
+def holds(text: str, pr: int) -> bool:
+    """A hold word right next to this PR number, on the same line (see the module docstring)."""
+    number = rf"(?<!\d)#?{pr}(?!\d)"
+    after = rf"{number}{NUMBER_LIST}{HOLD_GAP_AFTER}{HOLD_WORD}"
+    before = rf"{HOLD_WORD}{HOLD_GAP_BEFORE}(?:#?\d+\s*[,·/&]\s*)*{number}"
+    return any(re.search(after, line, re.I) or re.search(before, line, re.I) for line in text.split("\n"))
+
+
+def pr_state(repo: str, pr: int, *, deadline: float) -> Optional[str]:
+    """``OPEN`` / ``MERGED`` / ``CLOSED`` from ``gh``, or None when it cannot be read in time."""
+    left = min(GH_TIMEOUT_S, deadline - time.monotonic())
+    if left <= 0.1:
+        return None
+    gh = os.environ.get("CCC_DELEGATED_REPLY_GH") or "gh"
+    try:
+        out = subprocess.run([gh, "pr", "view", str(pr), "--repo", str(repo), "--json", "state", "--jq", ".state"],
+                             capture_output=True, text=True, timeout=left, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    state = out.stdout.strip().upper()
+    return state if out.returncode == 0 and state in ("OPEN", "MERGED", "CLOSED") else None
 
 
 def classify(prompt: str, block: Optional[dict], pr: int) -> Optional[tuple[str, str]]:
@@ -169,7 +204,7 @@ def classify(prompt: str, block: Optional[dict], pr: int) -> Optional[tuple[str,
     picked = selected_options(prompt, options) if options else set()
     if picked & approve_at:
         return None
-    if HOLD_RE.search(prompt) and mentions(prompt, pr):
+    if holds(prompt, pr):
         return "hold", "hold-word"
     if not approve_at:
         return None  # the approval was not on the table: unrelated to this ask
@@ -207,9 +242,15 @@ def main() -> int:
     by_pr: dict = {}
     for repo, pr, head in open_keys:
         by_pr.setdefault(pr, []).append((repo, head))
+    deadline = time.monotonic() + GH_BUDGET_S
     for pr, targets in by_pr.items():
         verdict = classify(prompt, block, int(pr))
         if verdict is None:
+            continue
+        # A stale ask (its PR already merged or closed) is not something the owner is answering.
+        targets = [(repo, head) for repo, head in targets
+                   if pr_state(repo, int(pr), deadline=deadline) not in ("MERGED", "CLOSED")]
+        if not targets:
             continue
         if len(targets) > 1:
             verdict = ("reply-unclassified", "ambiguous-pr")
