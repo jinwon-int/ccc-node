@@ -33,15 +33,20 @@ ok "judge-batch writes peer_facts only as review=0" '[ -z "$jb_other" ]'
 [ -n "$jb_other" ] && echo "$jb_other"
 
 # ---- rule 3: conflict-sweep flags, never closes -----------------------------------------
+# #2910 A split the pass into helpers; the guard reads all of them and fails if one is missing.
 sweep_src="$(python3 - "$NP" <<'PY'
 import ast, sys
 src = open(sys.argv[1], encoding="utf-8").read()
+want = {"conflict_sweep", "_judge_sweep_batch", "_apply_sweep_batch", "_print_sweep"}
+found = {}
 for node in ast.parse(src).body:
-    if isinstance(node, ast.FunctionDef) and node.name == "conflict_sweep":
-        print(ast.get_source_segment(src, node))
+    if isinstance(node, ast.FunctionDef) and node.name in want:
+        found[node.name] = ast.get_source_segment(src, node)
+if set(found) == want:
+    print("\n".join(found[n] for n in sorted(found)))
 PY
 )"
-ok "conflict_sweep function found" '[ -n "$sweep_src" ]'
+ok "conflict_sweep and its helpers found" '[ -n "$sweep_src" ]'
 ok "conflict_sweep never writes valid_to" '! grep -qE "SET[^\"]*valid_to[[:space:]]*=" <<<"$sweep_src"'
 ok "conflict_sweep sets review=1" 'grep -q "SET review=1" <<<"$sweep_src"'
 

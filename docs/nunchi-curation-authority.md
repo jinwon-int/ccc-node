@@ -29,7 +29,7 @@ passes add and update, deletion is a human-confirmed proposal.
 | task-progress TTL (opt-in, #2759) | same sweep step as the observation TTL | **off by default.** With `NUNCHI_TASK_PROGRESS_TTL_DAYS` > 0: close `kind=task-progress` facts older than that many days, except user-stated ones (`source_rank` 3), review-flagged ones and facts this sweep already closed once; one body-free `ttl_close` ledger row per close | `nunchi.py` `_close_expired_task_progress` |
 | session-constraint idle TTL (opt-in, #2838) | same sweep step as the observation TTL | **off by default.** With `NUNCHI_SESSION_CONSTRAINT_TTL_DAYS` > 0: close `kind=constraint` facts observed on a `session:*` peer once that session has produced no fact of any kind for that many days, except user-stated ones (`source_rank` 3), review-flagged ones and facts a TTL sweep already closed once; one body-free `ttl_close` row (`kind=constraint`) per close. Never touches a node or person constraint | `nunchi.py` `_close_idle_session_constraints` |
 | judge-batch | hourly cron (`install-nunchi.sh`, managed marker) | `review=0` only, and only with `NUNCHI_JUDGE_APPLY=1`; supersede appears as proposal text | `judge-batch.py` `apply_clear` |
-| conflict-sweep (opt-in) | daily cron when installed with `install-nunchi.sh --conflict-sweep` (#2479) | `review=1` on the newer fact plus a `conflict_sweep` ledger row; never closes | `nunchi.py` `conflict_sweep` |
+| conflict-sweep (opt-in) | daily cron when installed with `install-nunchi.sh --conflict-sweep` (#2479) | `review=1` on the stale side (the older fact when the newer one replaced it, #2910 A; otherwise the newer fact) plus a `conflict_sweep` ledger row; never closes | `nunchi.py` `conflict_sweep` |
 | schema migration | first open | backfill derived columns (`mutability`) | `nunchi.py` `_migrate_gate_cols` |
 
 A lower-rank fact never closes a higher-rank one (G2), so an agent inference cannot bury a user
@@ -99,7 +99,7 @@ constraint lines.
 |---|---|
 | `review-stale [--close]` | close facts the retro G1 pass finds stale |
 | `constraints-triage [--apply]` | fold near-duplicate constraints into a survivor (`merged-away:#id`) and close phase-scoped ones (`because` records why) |
-| `conflict-sweep [--apply]` | `review=1` on the newer fact plus a `conflict_sweep` ledger row; **never closes** ([nunchi-conflict-sweep.md](nunchi-conflict-sweep.md)) |
+| `conflict-sweep [--apply]` | `review=1` on the stale side of the pair plus a `conflict_sweep` ledger row; **never closes** — folding the stale older fact is the owner's `merge` ([nunchi-conflict-sweep.md](nunchi-conflict-sweep.md)) |
 | `g5-legacy-close [--apply]` | on the 2026-08 G5 legacy backlog only: retag progress-log rows to `task-progress`, set a fixed policy `because` on the rest, plus a `g5_legacy_close` ledger row; **never closes, never touches `review`** (see below) |
 | `reattribute-unknown [--apply]` | on provable `subject=node` rows stored under the legacy `observed='unknown'` peer only: set `observed` to the node name, plus a `reattribute_unknown` ledger row; closes a legacy row only when the same open fact already exists under the node name (`merged-away:#id`); **never rewrites text, kind, rank, `review`, `dedup` or timestamps** (see below) |
 | `merge-proposals [--apply]` | fold every g3-duplicate proposal in the judge-batch report in one pass: the same write as `merge` (close the duplicate, evidence markers on both rows) for each pair, plus one body-free audit row; a duplicate that outranks its survivor is held back (#2910) |
