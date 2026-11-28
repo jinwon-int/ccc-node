@@ -284,8 +284,13 @@ processes whose environment has `CCC_CHANNEL=hande`, takes `<home>` from that pr
   no bot connected` until the bot connects, then `available`). `start.sh --path <root>
   --channel hande --status` renders it with the `Hande:` label.
 - **Notices are counted, not delivered**, until the bot speaks the `notice` frame
-  (`health_signals().notices_dropped`); keep `CCC_PUSH_ENABLED=false` on the hande unit
-  so the node's push spool keeps exactly one consumer.
+  (`health_signals().notices_dropped`).
+- **One push-spool consumer per node.** Since the Matrix bridges were retired
+  (2026-11-06/07, Wiki DOC-4543 TM-4544) the hande unit is the node's spool consumer:
+  `CCC_PUSH_ENABLED=true` there (with `CCC_PUSH_FLEET_RELAY_*` for fleet alerts —
+  `HandeBot` inherits the Matrix notifier, relay forwarding included). Only on a node
+  that still runs a Matrix bridge as well, set `CCC_PUSH_ENABLED=true` on exactly one of
+  the two units; a second consumer makes records vanish at random.
 
 ## Deployment (per node)
 
@@ -339,7 +344,7 @@ leaving it enrolled but stopped), delete the CF token.
 
 | Gap | Why | Tracking |
 |---|---|---|
-| Push spool on the hande bridge | a second spool consumer makes records vanish at random; the node's Matrix bridge keeps it | #2380 |
+| Push spool on the hande bridge | closed: the hande unit is the node's one spool consumer since the Matrix retirement (see *One push-spool consumer per node*); on gongmyoung 2026-11-28 the unit runs `CCC_PUSH_ENABLED=true` and records reach `sent/` | #2380 (done) |
 | Multi-room per node | the bot serves one agent room and sends no `room` | family-messenger#423 (bridge already keys by `(user, room)` when `room` is present) |
 | Live preview (edited bubble) | the port has no edit frame; progress lines are `interim` (`interim_frames`) | family-messenger#423 |
 | Attachments: the bot side, voice | the bridge accepts `turn.attachment` (#2606, `attachment_frames`); the bot still drops `file-v1-*`/`file-v2-*` messages before the responder until its sender lands. Voice notes are not part of the contract | family-messenger#636 |
