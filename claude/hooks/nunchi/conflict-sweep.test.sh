@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # conflict-sweep (ccc-node#2464 제안 2): implicit-conflict pass that may only flag review=1.
 # Private temp DB; the judge is ALWAYS a PATH stub (no real provider, no network, no cost).
+# #2910 A: a second call names the stale side of each conflict; stale=old flags the OLDER fact (section 8).
 # Covers: candidate scope (same peer scope + same kind, excluded kinds, machine rows), dry-run is
 # read-only, --apply flags the newer fact and never closes/supersedes, ledger idempotency and
 # owner-clear respect, fail-closed on unusable verdicts, review listing, and the judge-batch
@@ -36,7 +37,7 @@ chmod 755 "$TMP/bin/codex"
 CALLS="$TMP/calls"
 # Judge stub: flags exactly the pairs whose OLDER line mentions Seattle and NEWER mentions Austin
 # (the STALE shape: no shared word); counts its invocations.
-write_judge() { # write_judge <mode: austin|garbage|outofrange>
+write_judge() { # write_judge <mode: austin|old|new|unclear|garbage|outofrange|badstale|twice>
   cat >"$TMP/bin/claude" <<SH
 #!/usr/bin/env bash
 echo call >>"$CALLS"
@@ -44,6 +45,18 @@ case "$1" in
   garbage) echo "I think pair one maybe"; exit 0 ;;
   outofrange) echo '{"conflicts": [99]}'; exit 0 ;;
 esac
+if printf '%s' "\$2" | grep -q "already been judged to conflict"; then
+  # #2910 A second call: the stale side of every listed pair
+  n="\$(printf '%s\n' "\$2" | grep -c '^[0-9][0-9]*\. OLDER')"
+  case "$1" in
+    old|new) st="$1" ;;
+    badstale) echo '{"stale": [{"pair": 1, "stale": "maybe"}]}'; exit 0 ;;
+    twice) echo '{"stale": [{"pair": 1, "stale": "old"}, {"pair": 1, "stale": "old"}]}'; exit 0 ;;
+    *) st=unclear ;;
+  esac
+  printf '{"stale": [%s]}\n' "\$(seq 1 "\$n" | awk -v st="\$st" '{printf "%s{\"pair\": %d, \"stale\": \"%s\"}", sep, \$1, st; sep=", "}')"
+  exit 0
+fi
 nums="\$(printf '%s\n' "\$2" | awk '/^[0-9]+\. OLDER/ {n=\$1+0; s=/Seattle/} /^   NEWER/ && /Austin/ && s {printf "%s%d", sep, n; sep=","}')"
 printf '{"conflicts": [%s]}\n' "\$nums"
 SH
@@ -85,8 +98,8 @@ ok "--judge none --apply is refused" '! PATH="$STUBPATH" python3 "$NP" conflict-
 
 # 2. dry-run judge: verdict shown, DB untouched
 out="$(PATH="$STUBPATH" python3 "$NP" conflict-sweep 2>&1)"
-ok "dry-run reports the conflict" 'grep -q "^#$new ⟂ #$old \[conflict\]" <<<"$out"'
-ok "dry-run summary names the mode" 'grep -q "conflict-sweep (dry-run) judge=llm: .*conflicts=1 flagged=0" <<<"$out"'
+ok "dry-run reports the conflict with its stale side" 'grep -q "^#$new ⟂ #$old \[conflict stale=unclear\]" <<<"$out"'
+ok "dry-run summary names the mode" 'grep -q "conflict-sweep (dry-run) judge=llm: .*conflicts=1 stale_old=0 flagged=0" <<<"$out"'
 ok "dry-run sets no flag" '[ "$(q "SELECT review FROM peer_facts WHERE id=$new")" = 0 ]'
 ok "dry-run writes no ledger" '[ "$(q "SELECT COUNT(*) FROM conflict_sweep")" = 0 ]'
 
@@ -148,7 +161,8 @@ import os, sqlite3, sys
 b, a, lone = map(int, sys.argv[1:4])
 c = sqlite3.connect(os.environ["NUNCHI_DB"])
 c.execute("UPDATE peer_facts SET review=1 WHERE id IN (?,?)", (b, lone))
-c.execute("INSERT INTO conflict_sweep VALUES(?,?,'conflict','llm','2026-08-19T00:00:00+00:00')", (b, a))
+c.execute("INSERT INTO conflict_sweep(new_id, old_id, verdict, method, swept_at)"
+          " VALUES(?,?,'conflict','llm','2026-08-19T00:00:00+00:00')", (b, a))
 c.commit()
 PY
 cat >"$TMP/bin/claude" <<'SH'
@@ -173,6 +187,81 @@ c.commit()
 PY
 PATH="$TMP/bin:$PATH" NUNCHI_JUDGE_APPLY=1 python3 "$JB" >/dev/null 2>&1
 ok "once the older partner is closed the sweep flag clears like any lonely flag" '[ "$(q "SELECT review FROM peer_facts WHERE id=$b")" = 0 ]'
+
+# 8. #2910 A — the judge names the stale side; stale=old flags the OLDER fact
+rm -f "$NUNCHI_DB"; python3 "$NP" init >/dev/null 2>&1
+s_old="$(seed seo-jin-on context "I have been based in Seattle for the last few years." "$OLD_TS" "$OLD_TS" distill:k1)"
+s_new="$(seed seo-jin-on context "Austin address updated, utilities being set up." "$NOW" "$NOW" distill:k2)"
+write_judge old
+out="$(PATH="$STUBPATH" python3 "$NP" conflict-sweep 2>&1)"
+ok "dry-run shows the stale side" 'grep -q "^#$s_new ⟂ #$s_old \[conflict stale=old\]" <<<"$out"'
+ok "dry-run counts stale_old" 'grep -q "conflicts=1 stale_old=1 flagged=0" <<<"$out"'
+: >"$CALLS"
+out="$(PATH="$STUBPATH" python3 "$NP" conflict-sweep --apply --json 2>&1)"
+ok "a batch with a conflict costs exactly one more call (direction)" '[ "$(wc -l <"$CALLS")" = 2 ]'
+ok "--json carries the stale side" \
+  'python3 -c "import json,sys;d=json.loads(sys.argv[1]);assert [i[\"stale\"] for i in d[\"items\"] if i[\"verdict\"]==\"conflict\"]==[\"old\"] and d[\"stale_old\"]==1" "$out"'
+ok "stale=old flags the older fact" '[ "$(q "SELECT review FROM peer_facts WHERE id=$s_old")" = 1 ]'
+ok "stale=old leaves the newer fact unflagged" '[ "$(q "SELECT review FROM peer_facts WHERE id=$s_new")" = 0 ]'
+ok "stale=old still closes nothing" '[ "$(q "SELECT COUNT(*) FROM peer_facts WHERE valid_to IS NOT NULL")" = 0 ]'
+ok "ledger records the stale side" '[ "$(q "SELECT stale FROM conflict_sweep WHERE new_id=$s_new AND old_id=$s_old")" = old ]'
+out="$(python3 "$NP" review 2>&1)"
+ok "review names the replacing fact and the fold command" \
+  'grep -q "^#$s_old .*\[conflict-sweep stale → #$s_new: nunchi.py merge $s_old --into $s_new\]" <<<"$out"'
+ok "review does not list the unflagged newer fact" '! grep -q "^#$s_new " <<<"$out"'
+PATH="$TMP/bin:$PATH" NUNCHI_JUDGE_APPLY=1 python3 "$JB" >/dev/null 2>&1
+ok "judge-batch keeps an older-side flag while the newer fact is open" '[ "$(q "SELECT review FROM peer_facts WHERE id=$s_old")" = 1 ]'
+REPORT="$CCC_STATE_DIR/nunchi-review-report.md"
+ok "judge report proposes folding old into new" \
+  'grep -q "^## conflict-sweep stale-old" "$REPORT" && grep -qx "nunchi.py merge $s_old --into $s_new  # conflict-sweep stale=old" "$REPORT"'
+python3 "$NP" merge "$s_old" --into "$s_new" >/dev/null 2>&1
+ok "the proposed merge closes the stale older fact" '[ -n "$(q "SELECT valid_to FROM peer_facts WHERE id=$s_old")" ]'
+ok "after the fold the newer fact stays open" '[ -z "$(q "SELECT valid_to FROM peer_facts WHERE id=$s_new")" ]'
+PATH="$TMP/bin:$PATH" NUNCHI_JUDGE_APPLY=1 python3 "$JB" >/dev/null 2>&1
+ok "a folded pair leaves the report" '! grep -q "^## conflict-sweep stale-old" "$REPORT"'
+
+# 8a. no conflict in the batch -> no direction call
+rm -f "$NUNCHI_DB"; python3 "$NP" init >/dev/null 2>&1
+seed seo-jin-on context "Has a standing desk at home." "$OLD_TS" "$OLD_TS" distill:k3 >/dev/null
+seed seo-jin-on context "Bought a second monitor." "$NOW" "$NOW" distill:k4 >/dev/null
+: >"$CALLS"
+PATH="$STUBPATH" python3 "$NP" conflict-sweep --apply >/dev/null 2>&1
+ok "a batch without conflicts spends only the conflict call" '[ "$(wc -l <"$CALLS")" = 1 ]'
+
+# 8b. stale=new / unclear keep today's placement (the newer fact)
+for st in new unclear; do
+  rm -f "$NUNCHI_DB"; python3 "$NP" init >/dev/null 2>&1
+  s_old="$(seed seo-jin-on context "I have been based in Seattle for the last few years." "$OLD_TS" "$OLD_TS" distill:k1)"
+  s_new="$(seed seo-jin-on context "Austin address updated, utilities being set up." "$NOW" "$NOW" distill:k2)"
+  write_judge "$st"
+  PATH="$STUBPATH" python3 "$NP" conflict-sweep --apply >/dev/null 2>&1
+  ok "stale=$st flags the newer fact" '[ "$(q "SELECT review FROM peer_facts WHERE id=$s_new")" = 1 ] && [ "$(q "SELECT review FROM peer_facts WHERE id=$s_old")" = 0 ]'
+  ok "stale=$st is recorded" '[ "$(q "SELECT stale FROM conflict_sweep WHERE new_id=$s_new AND old_id=$s_old")" = "$st" ]'
+done
+
+# 8c. fail-closed on a bad stale value or a pair answered twice (second call)
+for mode in badstale twice; do
+  rm -f "$NUNCHI_DB"; python3 "$NP" init >/dev/null 2>&1
+  s_old="$(seed seo-jin-on context "I have been based in Seattle for the last few years." "$OLD_TS" "$OLD_TS" distill:k1)"
+  s_new="$(seed seo-jin-on context "Austin address updated, utilities being set up." "$NOW" "$NOW" distill:k2)"
+  write_judge "$mode"
+  PATH="$STUBPATH" python3 "$NP" conflict-sweep --apply >/dev/null 2>&1; rc=$?
+  ok "$mode verdict is fail-closed" '[ "$rc" = 1 ] && [ "$(q "SELECT COUNT(*) FROM conflict_sweep")" = 0 ] && [ "$(q "SELECT SUM(review) FROM peer_facts")" = 0 ]'
+done
+
+# 8d. a pre-#2910 ledger gains the column in place; its rows keep the newer-side meaning
+rm -f "$NUNCHI_DB"
+python3 - <<'PY2'
+import os, sqlite3
+c = sqlite3.connect(os.environ["NUNCHI_DB"])
+c.execute("CREATE TABLE conflict_sweep(new_id INTEGER NOT NULL, old_id INTEGER NOT NULL, verdict TEXT NOT NULL,"
+          " method TEXT, swept_at TEXT NOT NULL, PRIMARY KEY(new_id, old_id))")
+c.execute("INSERT INTO conflict_sweep VALUES(9, 8, 'conflict', 'llm', '2026-10-01T00:00:00+00:00')")
+c.commit()
+PY2
+python3 "$NP" init >/dev/null 2>&1
+ok "old ledger gains the stale column" '[ "$(q "SELECT COUNT(*) FROM pragma_table_info(\"conflict_sweep\") WHERE name=\"stale\"")" = 1 ]'
+ok "old ledger rows are kept with stale NULL" '[ "$(q "SELECT COUNT(*) FROM conflict_sweep WHERE new_id=9 AND old_id=8 AND stale IS NULL")" = 1 ]'
 
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

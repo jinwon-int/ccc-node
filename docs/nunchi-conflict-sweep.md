@@ -7,8 +7,10 @@ compare token overlap, and the STALE bench measured 0/400 detections at write ti
 
 ## Authority boundary
 
-An unattended pass may only **flag**. The sweep sets `review=1` on the newer fact and records the
-pair in the `conflict_sweep` ledger. It never closes, supersedes, merges or deletes; the owner
+An unattended pass may only **flag**. The sweep sets `review=1` on **the stale side** of the pair —
+the older fact when the judge says the newer one replaced it (`stale=old`, the usual case), the
+newer fact otherwise (`stale=new`/`unclear`, and every ledger row written before #2910) — and
+records the pair and the side in the `conflict_sweep` ledger. It never closes, supersedes, merges or deletes; the owner
 resolves the flag (`review <id> --clear`, `supersede`, `merge`). This is the G3 rule (#1739)
 extended to vocabulary-disjoint pairs.
 
@@ -20,12 +22,18 @@ extended to vocabulary-disjoint pairs.
 | Older side | same peer scope as G3 (`session:*` peers form one pool), same `kind`, still open, older by `valid_from` (id breaks ties): the `--k` (5) newest, plus the `--k` nearest by cosine when `fact_vecs` holds model2vec vectors |
 | Ledger skip | pairs already in `conflict_sweep` are not asked again, so re-runs are idempotent and a flag the owner cleared stays cleared |
 | Judge | `--judge llm` (default) asks the synthesis backend (`llm_synthesize`, Haiku first) once per 20 pairs for `{"conflicts":[pair numbers]}`. Unparseable output, an out-of-range number or no backend is **fail-closed**: no flag, no ledger row, exit 1, and the next run asks again. `--judge none` lists candidates without a model call |
-| Apply | dry-run by default. `--apply` writes each batch's ledger rows and flags in one transaction, re-checking that both facts are still open and the newer one is not already queued |
+| Direction (#2910 A) | only when a batch has conflicts: one more call with just those pairs asks `{"stale":[{"pair":n,"stale":"old"\|"new"\|"unclear"}]}`, one entry per pair. It is a separate call because asking inside the conflict call cost recall (below). An unusable answer — unknown label, a pair missing or answered twice — fails the batch closed like the first call |
+| Apply | dry-run by default. `--apply` writes each batch's ledger rows (`stale` included) and flags in one transaction, re-checking that both facts are still open and the flagged one is not already queued |
 | Cap | `--max-pairs` (60) per run, newest facts first |
 
-`nunchi.py review` shows the older partner of a sweep flag: `#12 … [conflict-sweep ⟂ #5]`.
+`nunchi.py review` shows the older partner of a sweep flag: `#12 … [conflict-sweep ⟂ #5]`. A flag
+on a stale older fact names its replacement and the fold:
+`#5 … [conflict-sweep stale → #12: nunchi.py merge 5 --into 12]`. The judge-batch report lists the
+same `merge` commands under `## conflict-sweep stale-old` while both facts are open. Folding is the
+owner's command; a pair that is not a real replacement is cleared with `review <old> --clear`.
 
-`judge-batch.py` treats a recorded conflict partner as a live sibling while the partner is open.
+`judge-batch.py` treats a recorded conflict partner as a live sibling while the partner is open
+(for a `stale=old` row the partner of the flagged older fact is the newer fact).
 Without that, the deterministic pass (no ≥0.6-overlap sibling → clear) would remove every sweep
 flag the next day. Once the partner closes, the flag clears like any lonely flag.
 
@@ -37,6 +45,19 @@ flag the next day. Once the partner closes, the flag clears like any lonely flag
 | Same fixture, write gates only (`stale-bench.py` phase A) | 0/40 |
 | Read-only copy of one production node DB (968 open facts), `--since-days 7` | 460 candidate pairs; first 60 judged → 0 conflicts |
 | Same node, fresh sqlite backup copy (1,210 facts / 968 open), `--since-days 7`, **all 470 pairs judged** (#2479) | 6 conflicts (5 distinct newer facts flagged); hand review: **5 correct, 1 ambiguous, 0 false positives**; 30 random "none" pairs: 0 missed; ~24 Haiku calls, 0 failed batches |
+
+### Direction (#2910 A, 2026-11-28)
+
+Same STALE fixture shape (one peer per scenario: M_old + 2 other scenarios' M_old + M_new, 120 pairs), real
+Haiku judge, four runs per variant. The truth for every target pair is `stale=old`.
+
+| Variant | Recall (4 runs) | Distractor false positives | Direction of found pairs |
+|---|---|---|---|
+| main (conflict call only) | 29 · 27 · 28 · 29 /40 (mean 28.3) | 2–3/80 | — |
+| one call asking conflicts **and** sides | 24 · 24 · 25 · 27 /40 (two wordings) | 1–3/80 | old 99/100 |
+| **conflict call unchanged + direction call (shipped)** | 32 · 31 · 25 · 31 /40 (mean 29.8) | 2–3/80 | **old 112/119 (94%)**, new 5, unclear 2 |
+
+A wrong `new`/`unclear` side only falls back to today's placement (the newer fact is flagged).
 
 ## Scheduling (#2479)
 

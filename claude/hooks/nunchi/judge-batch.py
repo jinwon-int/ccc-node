@@ -388,6 +388,17 @@ def live_conflict(conn, fact_id, observed, text, kind=None):
             (fact_id,)).fetchall()
     except sqlite3.OperationalError:  # DB never opened by a nunchi.py with the ledger table
         swept = []
+    # #2910 A — a stale=old verdict flags the OLDER fact; its live sibling is
+    # the newer fact that replaces it. A ledger without the column (a store
+    # last opened by an older nunchi.py) has no such rows.
+    try:
+        swept += conn.execute(
+            "SELECT p.id, p.fact FROM conflict_sweep s JOIN peer_facts p ON p.id=s.new_id"
+            " WHERE s.old_id=? AND s.verdict='conflict' AND s.stale='old'"
+            " AND p.valid_to IS NULL ORDER BY p.id",
+            (fact_id,)).fetchall()
+    except sqlite3.OperationalError:
+        pass
     for fid, fact in swept:
         if fid not in seen:
             old = nunchi._tokens(fact)
@@ -441,6 +452,21 @@ def merge_proposal(dup, survivor):
     """The command the owner runs. Direction is decided by containment in
     duplicate_candidate/fetch_queue (#1898); this only formats it."""
     return f"nunchi.py merge {dup} --into {survivor}"
+
+
+def sweep_stale_proposals(conn):
+    """#2910 A — conflict-sweep pairs judged stale=old whose older fact is still
+    flagged and both sides still open: (old_id, new_id) in old-id order. The
+    newer fact replaces the older one, so the owner folds old into new. Report
+    only: nothing here closes anything (the unattended path only flags)."""
+    try:
+        return conn.execute(
+            "SELECT s.old_id, s.new_id FROM conflict_sweep s"
+            " JOIN peer_facts o ON o.id=s.old_id JOIN peer_facts n ON n.id=s.new_id"
+            " WHERE s.verdict='conflict' AND s.stale='old' AND o.valid_to IS NULL"
+            " AND n.valid_to IS NULL AND o.review=1 ORDER BY s.old_id, s.new_id").fetchall()
+    except sqlite3.OperationalError:  # no ledger, or a ledger without the stale column
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -1426,7 +1452,8 @@ def _confidence_cell(decision):
     return "—" if confidence is None else f"{float(confidence):.2f}"
 
 
-def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(), held=(), duplicates=()):
+def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(), held=(), duplicates=(),
+                 sweep_stale=()):
     mode = "APPLY" if APPLY else "dry-run"
     # The scoped fan-out re-runs this script per canonical scope and every child
     # inherits the same CCC_STATE_DIR, so each scope's run overwrites the same
@@ -1522,7 +1549,29 @@ def build_report(stamp, decisions, clears, humans, applied, backup, deferred=(),
         if len(duplicates) > len(sample):
             lines.append(f"# ... and {len(duplicates) - len(sample)} more")
         lines.append("```")
+    lines += _report_sweep_stale(sweep_stale)
     return "\n".join(lines) + "\n"
+
+
+def _report_sweep_stale(sweep_stale):
+    """#2910 A — report section for conflict-sweep pairs judged stale=old."""
+    if not sweep_stale:
+        return []
+    sample = list(sweep_stale)[:_DEFERRED_SAMPLE]
+    lines = [
+        "",
+        "## conflict-sweep stale-old (fold the older fact into the newer one)",
+        "",
+        f"- open pairs the sweep judged `stale=old` (the newer fact replaces the older one): **{len(sweep_stale)}** (#2910 A)",
+        "- the flag sits on the older fact; folding it closes it and leaves the queue. A pair that is not a real replacement: `nunchi.py review <old> --clear`",
+        "",
+        "```",
+    ]
+    lines += [f"{merge_proposal(old, new)}  # conflict-sweep stale=old" for old, new in sample]
+    if len(sweep_stale) > len(sample):
+        lines.append(f"# ... and {len(sweep_stale) - len(sample)} more")
+    lines.append("```")
+    return lines
 
 
 def run_single_db():
@@ -1586,7 +1635,8 @@ def run_single_db():
             })
         write_report(
             build_report(stamp, decisions, clears, humans, applied, backup,
-                         deferred, held, duplicates=duplicates)
+                         deferred, held, duplicates=duplicates,
+                         sweep_stale=sweep_stale_proposals(conn))
             + f"\nQueue: {QUEUE_COUNTS['eligible']} eligible, "
               f"{QUEUE_COUNTS['human_hold']} held for human review, "
               f"{QUEUE_COUNTS['retry_wait']} waiting for retry. "
