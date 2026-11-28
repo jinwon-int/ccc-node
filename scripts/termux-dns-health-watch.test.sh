@@ -15,6 +15,7 @@ export CCC_PUSH_SPOOL="$CCC_STATE_DIR/telegram-spool"
 export CCC_NODE="testnode"
 mkdir -p "$CCC_PUSH_SPOOL"
 STATE="$CCC_STATE_DIR/dns-health-watch.json"
+# shellcheck disable=SC2034  # LOG is read via eval inside ok()
 LOG="$CCC_STATE_DIR/dns-health-watch.log"
 
 pass=0; fail=0
@@ -44,6 +45,7 @@ ok "first broken run stays below threshold" '[ "$(spooled)" = 0 ] && [ "$(state_
 run fail ok
 ok "second broken run alerts once" '[ "$(spooled)" = 1 ]'
 ok "alert state is remembered" '[ "$(state_field alerted)" = True ]'
+# shellcheck disable=SC2034  # REC is read via eval inside ok()
 REC="$(find "$CCC_PUSH_SPOOL" -maxdepth 1 -name 'dns-health-*.json' | head -1)"
 ok "alert record is a notice dns-health event" 'python3 -c "import json,sys;d=json.load(open(sys.argv[1]));assert d[\"event\"]==\"dns-health\" and d[\"tier\"]==\"notice\" and d[\"node\"]==\"testnode\"" "$REC"'
 ok "alert text names the fix" 'grep -q "Tailscale" "$REC" && grep -q "시스템 DNS 고장" "$REC"'
@@ -81,7 +83,9 @@ ok "corrupt state is tolerated" '[ "$rc" = 0 ] && [ "$(state_field status)" = ok
 # usage errors
 bash "$WATCH" --bogus >/dev/null 2>&1; rc=$?
 ok "unknown arg exits 2" '[ "$rc" = 2 ]'
-CCC_DNS_WATCH_THRESHOLD=0 bash "$WATCH" >/dev/null 2>&1; rc=$?
+CCC_DNS_WATCH_THRESHOLD=0 bash "$WATCH" >/dev/null 2>&1
+# shellcheck disable=SC2034  # rc is read via eval inside ok()
+rc=$?
 ok "threshold 0 is rejected" '[ "$rc" = 2 ]'
 ok "--help prints the header" 'bash "$WATCH" --help | grep -q "sysdns-broken"'
 
