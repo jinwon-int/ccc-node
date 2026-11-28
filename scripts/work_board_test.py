@@ -151,11 +151,11 @@ print(json.dumps({{"data": data}}))
 
 
 def issue(number, title="Fix the thing", author="jinon86", comments=(), created="2026-11-01T00:00:00Z",
-          updated="2026-11-20T00:00:00Z"):
+          updated="2026-11-20T00:00:00Z", labels=("bug",)):
     return {
         "number": number, "title": title, "url": f"https://github.com/{ORG}/x/issues/{number}",
         "createdAt": created, "updatedAt": updated, "author": {"login": author},
-        "labels": {"nodes": [{"name": "bug"}]},
+        "labels": {"nodes": [{"name": name} for name in labels]},
         "comments": {"totalCount": len(comments), "nodes": [
             {"createdAt": at, "author": {"login": who}, "body": body} for at, who, body in comments]},
     }
@@ -251,10 +251,71 @@ def test_render_buckets_and_escaping(tmp_path):
     def count(title):
         mt = re.search(rf"^## {title} \((\d+)건\)$", page, re.M)
         return int(mt.group(1)) if mt else None
+    assert board.classify(items[6], today) == "outside"  # its own "marker" is not a fleet comment
     assert (count("오너 차례"), count("날짜 대기"), count("외부 대기"), count("기한 지남"),
-            count("표식 오류"), count("분류 안 됨"), count("열린 PR")) == (1, 1, 1, 1, 1, 3, 1)  # 4, 6 (외부), 8
+            count("표식 오류"), count("외부 작성"), count("분류 안 됨"), count("열린 PR")) == (1, 1, 1, 1, 1, 1, 2, 1)
     assert "merge ok?" in page and "(외부 작성)" in page and "| 리뷰 대기 | #7 |" in page
     assert "| 14일 이상 활동 없음 | 1 |" in page
+
+
+def _dated(number, marked_at, due, later=(), labels=("bug",), author="jinon86"):
+    return issue(number, author=author, labels=labels, comments=[
+        (marked_at, "seoseo-ai", m(waiting="date", due=due, next_text="scheduled check")), *later])
+
+
+def test_result_after_due_needs_a_fleet_comment_after_the_due_time(tmp_path):
+    issues = {"alpha-repo": [
+        # due 09:00 KST, the scheduled job posts its result at 09:00:31 KST -> refresh
+        _dated(1, "2026-11-27T03:43:20Z", "2026-11-28T09:00", [("2026-11-28T00:00:31Z", "seoseo-ai", "## result 12/12")]),
+        # a fleet comment after the marker but before due -> still a dated wait
+        _dated(2, "2026-11-27T03:43:20Z", "2026-11-28T09:00", [("2026-11-27T05:00:00Z", "jinon86", "note")]),
+        # only an outside comment after due -> not a result
+        _dated(3, "2026-11-27T03:43:20Z", "2026-11-28T09:00", [("2026-11-28T01:00:00Z", "stranger", "me too")]),
+        # due not reached yet at generation time (2026-11-28 20:30 UTC = 11-29 05:30 KST)
+        _dated(4, "2026-11-27T03:43:20Z", "2026-11-30T11:30", [("2026-11-28T02:00:00Z", "jinon86", "x")]),
+        # the result comment itself carries a fresh marker -> the new marker wins
+        _dated(5, "2026-11-27T03:43:20Z", "2026-11-28T09:00", [("2026-11-28T00:01:00Z", "seoseo-ai",
+               m(waiting="owner", next_text="close?") + "\n## result")]),
+        # bare-date due counts from the start of that KST day; long past -> refresh beats overdue
+        _dated(6, "2026-11-20T00:00:00Z", "2026-11-25", [("2026-11-25T01:00:00Z", "jinon86", "done")]),
+        # bare-date due, comment the evening before (KST) -> plain overdue
+        _dated(7, "2026-11-20T00:00:00Z", "2026-11-25", [("2026-11-24T12:00:00Z", "jinon86", "eve")]),
+    ]}
+    from datetime import datetime, timezone
+    snap = board.collect(ORG, str(fake_gh(tmp_path, issues, {})), now=datetime(2026, 11, 28, 20, 30, tzinfo=timezone.utc))
+    items = {i["number"]: i for i in snap["items"]}
+    gen = board._kst(snap["generated_at"])
+    got = {n: board.classify(items[n], gen.date(), gen) for n in items}
+    assert got == {1: "refresh", 2: "date", 3: "date", 4: "date", 5: "owner", 6: "refresh", 7: "overdue"}
+    assert board.classify(items[1], gen.date()) == "date"  # no clock given -> old behaviour
+    page = board.render(snap, "DOC-77")
+    section = page.split("## 표식 갱신 필요 (2건)", 1)[1].split("\n## ", 1)[0]
+    assert "예약된 확인의 결과" in section and "| scheduled check | — | 2026-11-28T09:00 | 11-28 |" in section
+    assert "## result" not in page and "12/12" not in page
+    legacy = {**snap, "items": [{k: v for k, v in i.items() if k != "last_fleet_comment_at"} for i in snap["items"]]}
+    assert "## 표식 갱신 필요 (0건)" in board.render(legacy, "DOC-77")  # snapshots from before the field
+
+
+def test_standing_label_and_outside_issues_leave_unclassified(tmp_path):
+    issues = {"alpha-repo": [
+        issue(1, labels=("board:standing",), comments=[("2026-11-27T23:10:00Z", "jinon86", "### daily report")]),
+        issue(2, labels=("board:standing",), comments=[("2026-11-27T00:00:00Z", "jinon86", m(waiting="owner", next_text="act"))]),
+        issue(3, title="Outside title", author="stranger"),
+        issue(4, title="Outside title two", author="stranger",
+              comments=[("2026-11-27T00:00:00Z", "jinon86", m(waiting="owner", next_text="owner reviews outside issue"))]),
+        issue(5),
+    ]}
+    from datetime import datetime, timezone
+    snap = board.collect(ORG, str(fake_gh(tmp_path, issues, {})), now=datetime(2026, 11, 28, 20, 30, tzinfo=timezone.utc))
+    items = {i["number"]: i for i in snap["items"]}
+    today = date(2026, 11, 29)
+    assert [board.classify(items[n], today) for n in (1, 2, 3, 4, 5)] == [
+        "standing", "owner", "outside", "owner", "unclassified"]
+    page = board.render(snap, "DOC-77")
+    assert "## 상시 추적 (1건)" in page and "## 외부 작성 (1건)" in page and "## 분류 안 됨 (1건)" in page
+    assert "Outside title" not in page and page.count("(외부 작성)") == 2
+    assert "| 상시 추적 | 1 |" in page and "| 외부 작성 | 1 |" in page
+    assert "| alpha-repo | 5 | 0 | 2 | 0 |" in page  # 표식 있음 counts markers only
 
 
 def test_render_refuses_bad_input(tmp_path):
