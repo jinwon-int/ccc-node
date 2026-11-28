@@ -241,3 +241,24 @@ reinstallation. If compilation or lock verification fails, retain the log and
 failed environment; it is not a successful migration. Only promote an environment
 in a separately verified service transition. This source fix does not rewrite
 existing wheels or automatically migrate a serving venv.
+
+## System DNS stall behind a VPN app (#2937)
+
+Android sends every app's `getaddrinfo` to the active VPN's DNS server. When
+the Tailscale Android app keeps its tunnel up but its in-VPN resolver
+(`100.100.100.100`) stops answering — seen after a short network blip on
+2026-11-28, upstream tailscale/tailscale#22273 — every Termux tool that
+resolves names (mail, mbsync, `gh`, `git`) fails with
+`[Errno 7] No address associated with hostname`, while `ping 8.8.8.8` and a raw
+UDP DNS query to a public resolver still work.
+
+- **Triage**: ① `ping -c2 8.8.8.8` ② raw DNS query to `8.8.8.8` ③ raw DNS query
+  to `100.100.100.100`. ① and ② fine with ③ silent = VPN-DNS stall.
+- **Fix**: toggle the Tailscale connection off → on in the app (tunnels and ssh
+  drop for a few seconds). Reconnecting Wi-Fi alone does not clear it.
+- **Watch**: `scripts/install-termux-dns-health-watch-cron.sh --apply` installs
+  a 5-minute `scripts/termux-dns-health-watch.sh` run that pushes one
+  `dns-health` notice after two consecutive broken runs and one on recovery.
+  It only detects and alerts; it never reconnects the VPN.
+- Turning off "Use Tailscale DNS" avoids the stall but breaks MagicDNS
+  (`*.ts.net`) names, so check the node's config for those first.

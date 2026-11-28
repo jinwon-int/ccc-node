@@ -57,8 +57,9 @@ ccc_installer_gen_inputs() {
     # install-skill-promotion-results-cron.sh (#2239) and
     # install-timed-followup-scan-cron.sh (#2324),
     # install-agent-trust-audit-cron.sh (#2538) and
-    # install-timed-relative-scan-cron.sh (#2544) likewise.)
-    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh|install-agent-trust-audit-cron.sh|install-timed-test-deadline-scan-cron.sh|install-skill-promotion-results-cron.sh|install-timed-followup-scan-cron.sh|install-timed-relative-scan-cron.sh)
+    # install-timed-relative-scan-cron.sh (#2544) and
+    # install-termux-dns-health-watch-cron.sh (#2937) likewise.)
+    install-memory-refresh-cron.sh|install-pr-status-poll-cron.sh|install-skill-autosave-cron.sh|install-fleet-skills-sync-cron.sh|install-tunnel-audit-cron.sh|install-agent-trust-audit-cron.sh|install-timed-test-deadline-scan-cron.sh|install-skill-promotion-results-cron.sh|install-timed-followup-scan-cron.sh|install-timed-relative-scan-cron.sh|install-termux-dns-health-watch-cron.sh)
       extras="installer-cron-common.sh" ;;
   esac
   printf '%s\n' "$self"
