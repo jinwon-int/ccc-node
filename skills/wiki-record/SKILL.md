@@ -62,12 +62,13 @@ Use this when work produces reusable operating knowledge (a decision, runbook, n
 4. **Edit in the worktree** with Read/Edit (Read the file first). Keep it public-safe:
    - No tokens, keys, cookies, private keys, real phone numbers, or endpoint values — only locations + handling/rotation rules.
    - Cross-link related pages. Mark uncertain items "확인 필요". Don't delete stale content — mark "상태: 폐기/대체됨".
+   - When a page states an issue's or PR's status (열림, 닫힘, 머지됨, 고침), check it live first (`gh issue view <n> --repo <owner/repo> --json state,closedAt`, or `gh pr view`) and write it with its date — `닫힘 2026-11-28`, not a bare `닫힘`. Never copy a status from an older page, a saved report or memory, and never change the issue to match the page.
 
 5. **Open the PR**
    ```bash
    wiki-agent pr     # creates the PR and enables auto-merge
    ```
-   `wiki-agent pr` runs the checks itself, so there is no separate scan step: added lines are checked for secret-like values (a fixed pattern list that always refuses the PR, plus gitleaks where it is installed — a warning by default), for conflict markers, and for an edited `pages/log.md` digest. A refusal is never worked around: replace the value with a location-only reference (or fix what it names) and run it again. A `warning - gitleaks found …` line did not block the PR, so act on it at once (see **Exposed credentials**).
+   `wiki-agent pr` runs the checks itself, so there is no separate scan step: added lines are checked for secret-like values (a fixed pattern list that always refuses the PR, plus gitleaks where it is installed — a warning by default), for conflict markers, and for an edited `pages/log.md` digest. After the push the Wiki's PR gate also lints the changed pages (`wiki-lint --strict`: broken links and anchors, duplicate DOC/ND ids, secret-like values) — a red gate means fix the link or id and push again, not bypass. A refusal is never worked around: replace the value with a location-only reference (or fix what it names) and run it again. A `warning - gitleaks found …` line did not block the PR, so act on it at once (see **Exposed credentials**).
 
 6. **Verify after merge**
    ```bash

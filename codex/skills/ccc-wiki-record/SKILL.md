@@ -34,6 +34,9 @@ description: Record durable operating knowledge in the Seoyoon Family Wiki throu
 
 4. Record secret locations and handling rules only. Exclude tokens, cookies,
    private keys, message bodies, credential values, and private endpoints.
+   When a page states an issue's or PR's status, check it live (`gh issue view`
+   / `gh pr view`) and write it with its date (`닫힘 2026-11-28`); never copy it
+   from an older page or report, and never change the issue to match the page.
 
 5. Review the exact diff, then submit:
 
@@ -47,7 +50,9 @@ description: Record durable operating knowledge in the Seoyoon Family Wiki throu
 
 7. `wiki-agent pr` checks the added lines for secret-like values itself (fixed
    patterns that refuse the PR, plus gitleaks where installed — a warning by
-   default). Never work around a refusal. If a raw credential reached a pushed
+   default). After the push the Wiki PR gate lints the changed pages
+   (`wiki-lint --strict`: broken links and anchors, duplicate ids, secret-like
+   values); fix and push again when it is red. Never work around a refusal. If a raw credential reached a pushed
    branch or a merged page, do not rotate or revoke it on your own judgement:
    report it by location only (credential, where and since when, owner,
    dependents) and ask its owner for an explicit decision.
